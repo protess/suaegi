@@ -1,0 +1,12 @@
+[package]
+name = "iced-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = "0.14"
+iced_term = "0.8.0"
+
+[profile.release]
+lto = true
+strip = true
