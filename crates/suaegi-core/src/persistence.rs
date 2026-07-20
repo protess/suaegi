@@ -81,7 +81,11 @@ impl Store {
     }
 
     fn backup_path(&self, slot: usize) -> PathBuf {
-        let name = self.data_file.file_name().unwrap_or_default().to_string_lossy();
+        let name = self
+            .data_file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         self.data_file.with_file_name(format!("{name}.bak.{slot}"))
     }
 
@@ -106,7 +110,10 @@ impl Store {
             match Self::parse_trusted(&text) {
                 Ok(state) => {
                     self.last_written_hash = Some(content_hash(&text));
-                    return LoadOutcome { state, source: LoadSource::MainFile };
+                    return LoadOutcome {
+                        state,
+                        source: LoadSource::MainFile,
+                    };
                 }
                 Err(is_future) => {
                     if is_future {
@@ -125,11 +132,17 @@ impl Store {
         for slot in 0..BACKUP_SLOTS {
             if let Ok(text) = fs::read_to_string(self.backup_path(slot)) {
                 if let Ok(state) = Self::parse_trusted(&text) {
-                    return LoadOutcome { state, source: LoadSource::Backup(slot) };
+                    return LoadOutcome {
+                        state,
+                        source: LoadSource::Backup(slot),
+                    };
                 }
             }
         }
-        LoadOutcome { state: PersistedState::default(), source: LoadSource::Default }
+        LoadOutcome {
+            state: PersistedState::default(),
+            source: LoadSource::Default,
+        }
     }
 
     /// 본파일을 .bak.0으로 복사하고 기존 백업들을 한 칸씩 뒤로. 직전 백업이
@@ -221,7 +234,10 @@ mod tests {
         let mut store = Store::new(dir.path().join("data.json"));
         let state = sample_state("a");
         store.save(&state).unwrap();
-        assert!(matches!(store.save(&state).unwrap(), SaveOutcome::SkippedUnchanged));
+        assert!(matches!(
+            store.save(&state).unwrap(),
+            SaveOutcome::SkippedUnchanged
+        ));
     }
 
     #[test]
@@ -233,7 +249,10 @@ mod tests {
         // 재시작 시뮬레이션: 새 Store 인스턴스
         let mut fresh = Store::new(file);
         fresh.load();
-        assert!(matches!(fresh.save(&state).unwrap(), SaveOutcome::SkippedUnchanged));
+        assert!(matches!(
+            fresh.save(&state).unwrap(),
+            SaveOutcome::SkippedUnchanged
+        ));
     }
 
     #[test]
@@ -248,7 +267,10 @@ mod tests {
         std::fs::write(&file, "corrupt").unwrap();
         let loaded = store.load();
         assert_eq!(loaded.source, LoadSource::Default);
-        assert!(matches!(store.save(&loaded.state).unwrap(), SaveOutcome::Written));
+        assert!(matches!(
+            store.save(&loaded.state).unwrap(),
+            SaveOutcome::Written
+        ));
         // 복구 확인
         assert_eq!(store.load().source, LoadSource::MainFile);
     }
@@ -306,14 +328,17 @@ mod tests {
         let loaded = store.load();
         assert_eq!(loaded.state, v1); // 백업으로 폴백은 하되
         assert!(store.future_schema_guarded()); // 가드가 선다
-        // 가드 중 저장은 거부 — 신버전 데이터 덮어쓰기 방지
+                                                // 가드 중 저장은 거부 — 신버전 데이터 덮어쓰기 방지
         assert!(matches!(
             store.save(&loaded.state),
             Err(PersistenceError::FutureSchemaGuard)
         ));
         // 명시적 해제 후에만 저장 가능
         store.override_future_schema_guard();
-        assert!(matches!(store.save(&loaded.state).unwrap(), SaveOutcome::Written));
+        assert!(matches!(
+            store.save(&loaded.state).unwrap(),
+            SaveOutcome::Written
+        ));
     }
 
     #[test]
@@ -340,7 +365,10 @@ mod tests {
             store.save(&sample_state(&format!("s{i}"))).unwrap();
         }
         for i in 0..5 {
-            assert!(dir.path().join(format!("data.json.bak.{i}")).exists(), "bak.{i}");
+            assert!(
+                dir.path().join(format!("data.json.bak.{i}")).exists(),
+                "bak.{i}"
+            );
         }
         assert!(!dir.path().join("data.json.bak.5").exists());
     }

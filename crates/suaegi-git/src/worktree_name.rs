@@ -4,9 +4,9 @@ const MAX_SUFFIX: u32 = 100;
 // 대소문자 무관 비교. CON.txt류 확장자 케이스는 sanitize가 '.'을 제거하므로 불필요.
 // 위첨자 ¹²³ 변형(COM¹ 등)도 Windows 예약 — is_alphanumeric을 통과하므로 명시 필요.
 const WINDOWS_RESERVED: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
-    "com8", "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
-    "lpt6", "lpt7", "lpt8", "lpt9", "lpt¹", "lpt²", "lpt³",
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
+    "lpt9", "lpt¹", "lpt²", "lpt³",
 ];
 
 /// 유니코드 문자/숫자만 유지하고 나머지는 `-`로. 출력이 `[alnum|-]`로만 구성되므로
@@ -100,10 +100,23 @@ mod tests {
     #[test]
     fn output_charset_is_always_ref_safe() {
         // 브랜치명/디렉토리명 안전성의 근거: 문자·숫자·단일 대시 외 아무것도 남지 않는다
-        for input in ["a b", "x/../y", "--", "évoluer!", "한글 이름", "a..b", ".git", "-x", "nul"] {
+        for input in [
+            "a b",
+            "x/../y",
+            "--",
+            "évoluer!",
+            "한글 이름",
+            "a..b",
+            ".git",
+            "-x",
+            "nul",
+        ] {
             let out = sanitize_worktree_name(input);
             assert!(!out.is_empty());
-            assert!(out.chars().all(|c| c.is_alphanumeric() || c == '-'), "{input} -> {out}");
+            assert!(
+                out.chars().all(|c| c.is_alphanumeric() || c == '-'),
+                "{input} -> {out}"
+            );
             assert!(!out.starts_with('-') && !out.ends_with('-'));
             assert!(!out.contains("--"));
         }

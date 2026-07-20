@@ -20,7 +20,11 @@ pub enum GitError {
     #[error("git {args} timed out")]
     Timeout { args: String },
     #[error("git {args} failed (code {code:?}): {stderr}")]
-    Failed { args: String, code: Option<i32>, stderr: String },
+    Failed {
+        args: String,
+        code: Option<i32>,
+        stderr: String,
+    },
     #[error("git {args} produced unparseable output: {detail}")]
     Parse { args: String, detail: String },
 }
@@ -64,7 +68,8 @@ impl GitRunner {
         args: &[&str],
         extra_ok_codes: &[i32],
     ) -> Result<GitOutput, GitError> {
-        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes).await
+        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes)
+            .await
     }
 
     async fn run_full(
@@ -133,6 +138,10 @@ impl GitRunner {
                 stderr,
             });
         }
-        Ok(GitOutput { stdout, stderr, code })
+        Ok(GitOutput {
+            stdout,
+            stderr,
+            code,
+        })
     }
 }

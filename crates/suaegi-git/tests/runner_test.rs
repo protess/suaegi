@@ -4,7 +4,10 @@ use suaegi_git::runner::{GitError, GitRunner};
 #[tokio::test]
 async fn run_version_succeeds() {
     let r = GitRunner::new();
-    let out = r.run(std::env::temp_dir().as_path(), &["--version"]).await.unwrap();
+    let out = r
+        .run(std::env::temp_dir().as_path(), &["--version"])
+        .await
+        .unwrap();
     assert!(out.stdout.starts_with("git version"));
 }
 
@@ -34,7 +37,13 @@ async fn run_expecting_accepts_listed_codes() {
     let out = r
         .run_expecting(
             dir.path(),
-            &["diff", "--no-index", "--", a.to_str().unwrap(), b.to_str().unwrap()],
+            &[
+                "diff",
+                "--no-index",
+                "--",
+                a.to_str().unwrap(),
+                b.to_str().unwrap(),
+            ],
             &[1],
         )
         .await

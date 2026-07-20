@@ -50,11 +50,7 @@ pub enum WorktreeError {
 
 /// rev-parse exit 1만 "브랜치 없음". 타임아웃/스폰 실패/기타 에러를 "없음"으로
 /// 오독하면 잘못된 전제로 생성이 진행되므로 전파한다.
-async fn branch_exists(
-    runner: &GitRunner,
-    repo: &Path,
-    branch: &str,
-) -> Result<bool, GitError> {
+async fn branch_exists(runner: &GitRunner, repo: &Path, branch: &str) -> Result<bool, GitError> {
     let refname = format!("refs/heads/{branch}");
     match runner
         .run(repo, &["rev-parse", "--verify", "--quiet", &refname])
@@ -73,8 +69,7 @@ pub async fn add_worktree(
     base_ref: &str,
     workspace_root: &Path,
 ) -> Result<CreatedWorktree, WorktreeError> {
-    validate_user_ref(base_ref)
-        .map_err(|_| WorktreeError::InvalidBaseRef(base_ref.to_string()))?;
+    validate_user_ref(base_ref).map_err(|_| WorktreeError::InvalidBaseRef(base_ref.to_string()))?;
 
     let sanitized = sanitize_worktree_name(requested_name);
     let repo_dir_name = repo_path
@@ -102,7 +97,15 @@ pub async fn add_worktree(
     let result = runner
         .run_with_timeout(
             repo_path,
-            &["worktree", "add", "--no-track", "-b", &branch, &path_str, base_ref],
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                &branch,
+                &path_str,
+                base_ref,
+            ],
             WORKTREE_ADD_TIMEOUT,
         )
         .await;
@@ -122,7 +125,11 @@ pub async fn add_worktree(
         return Err(e.into());
     }
 
-    Ok(CreatedWorktree { path, branch: branch.clone(), display_name: branch })
+    Ok(CreatedWorktree {
+        path,
+        branch: branch.clone(),
+        display_name: branch,
+    })
 }
 
 /// `git worktree list --porcelain -z` 파싱. -z 모드는 각 속성 라인이 NUL로

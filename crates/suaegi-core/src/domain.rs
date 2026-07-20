@@ -61,7 +61,9 @@ pub struct Settings {
 
 impl Settings {
     pub fn default_with_home(home: &Path) -> Self {
-        Self { workspace_root: home.join("suaegi-workspaces") }
+        Self {
+            workspace_root: home.join("suaegi-workspaces"),
+        }
     }
 }
 
@@ -117,7 +119,9 @@ mod tests {
             session: SessionState {
                 active_worktree_id: Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
             },
-            settings: Settings { workspace_root: PathBuf::from("/tmp/ws") },
+            settings: Settings {
+                workspace_root: PathBuf::from("/tmp/ws"),
+            },
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: PersistedState = serde_json::from_str(&json).unwrap();
