@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/suaegi-core", "crates/suaegi-git"]
+members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-term"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,3 +16,5 @@ tokio = { version = "1", features = ["process", "time", "rt-multi-thread", "macr
 dirs = "6"
 tempfile = "3"
 libc = "0.2"
+portable-pty = "0.9"
+alacritty_terminal = "0.25.1"
