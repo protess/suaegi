@@ -14,6 +14,28 @@ pub struct CreatedWorktree {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub is_main: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchDeletion {
+    NotRequested,
+    /// 삭제 성공 또는 이미 없음 (목표 상태 달성)
+    Deleted,
+    /// worktree는 제거됐지만 브랜치 삭제 실패 (예: 다른 worktree가 체크아웃 중)
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    pub branch_deletion: BranchDeletion,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
     #[error(transparent)]
@@ -101,4 +123,79 @@ pub async fn add_worktree(
     }
 
     Ok(CreatedWorktree { path, branch: branch.clone(), display_name: branch })
+}
+
+/// `git worktree list --porcelain -z` 파싱. -z 모드는 각 속성 라인이 NUL로
+/// 끝나고 엔트리 사이에 빈 NUL 레코드가 온다. 경로에 개행이 있어도 안전.
+/// git 문서 보장에 따라 첫 엔트리가 main worktree다.
+pub async fn list_worktrees(
+    runner: &GitRunner,
+    repo_path: &Path,
+) -> Result<Vec<WorktreeEntry>, GitError> {
+    let out = runner
+        .run(repo_path, &["worktree", "list", "--porcelain", "-z"])
+        .await?;
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for record in out.stdout.split('\0') {
+        if record.is_empty() {
+            // 엔트리 구분자
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            continue;
+        }
+        if let Some(rest) = record.strip_prefix("worktree ") {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            current = Some(WorktreeEntry {
+                path: PathBuf::from(rest),
+                branch: None,
+                head: None,
+                is_main: entries.is_empty(),
+            });
+        } else if let Some(rest) = record.strip_prefix("HEAD ") {
+            if let Some(e) = current.as_mut() {
+                e.head = Some(rest.to_string());
+            }
+        } else if let Some(rest) = record.strip_prefix("branch ") {
+            if let Some(e) = current.as_mut() {
+                e.branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+            }
+        }
+        // detached / locked / prunable 속성은 MVP에서 미사용 — Plan 3+ (삭제 UI)에서 확장
+    }
+    if let Some(e) = current.take() {
+        entries.push(e);
+    }
+    Ok(entries)
+}
+
+pub async fn remove_worktree(
+    runner: &GitRunner,
+    repo_path: &Path,
+    worktree_path: &Path,
+    force: bool,
+    delete_branch: Option<&str>,
+) -> Result<RemoveOutcome, WorktreeError> {
+    let path_str = worktree_path.to_string_lossy().into_owned();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path_str);
+    runner.run(repo_path, &args).await?;
+    let branch_deletion = match delete_branch {
+        None => BranchDeletion::NotRequested,
+        Some(branch) => match runner.run(repo_path, &["branch", "-D", branch]).await {
+            Ok(_) => BranchDeletion::Deleted,
+            // "이미 없음"은 목표 상태 달성 — 실패로 보고하면 UI가 헛경고를 띄운다
+            Err(GitError::Failed { ref stderr, .. }) if stderr.contains("not found") => {
+                BranchDeletion::Deleted
+            }
+            Err(e) => BranchDeletion::Failed(e.to_string()),
+        },
+    };
+    Ok(RemoveOutcome { branch_deletion })
 }
