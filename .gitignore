@@ -3,3 +3,5 @@ spikes/tauri-spike/node_modules/
 spikes/tauri-spike/dist/
 spikes/*/target/
 .context/
+.superpowers/
+/target/

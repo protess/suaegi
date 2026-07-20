@@ -1,0 +1,21 @@
+[package]
+name = "suaegi-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+suaegi-core = { path = "../suaegi-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
