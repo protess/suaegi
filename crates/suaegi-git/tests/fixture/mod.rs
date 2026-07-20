@@ -14,8 +14,9 @@ pub fn init_repo(dir: &Path) {
     run(dir, &["config", "commit.gpgsign", "false"]);
     run(dir, &["config", "tag.gpgsign", "false"]);
     run(dir, &["config", "core.hooksPath", ".no-hooks"]);
+    std::fs::write(dir.join(".gitignore"), ".test-gitconfig\n.no-hooks/\n").unwrap();
     std::fs::write(dir.join("README.md"), "hello\n").unwrap();
-    run(dir, &["add", "README.md"]);
+    run(dir, &["add", "README.md", ".gitignore"]);
     run(dir, &["commit", "-m", "init"]);
 }
 
@@ -33,5 +34,9 @@ pub fn run(dir: &Path, args: &[&str]) {
         .env("GIT_CONFIG_GLOBAL", dir.join(".test-gitconfig"))
         .output()
         .expect("spawn git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
