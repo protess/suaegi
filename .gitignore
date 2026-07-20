@@ -1,7 +1,27 @@
-reference/
-spikes/tauri-spike/node_modules/
-spikes/tauri-spike/dist/
-spikes/*/target/
-.context/
-.superpowers/
+# 빌드 산출물
 /target/
+spikes/*/target/
+spikes/tauri-spike/src-tauri/target/
+spikes/tauri-spike/src-tauri/gen/
+spikes/tauri-spike/dist/
+node_modules/
+
+# 분석용 외부 소스 (Orca 클론 — 커밋 금지)
+reference/
+
+# 세션/에이전트 스크래치 (로컬 전용)
+.superpowers/
+.context/
+.claude/settings.local.json
+
+# 시크릿 — 절대 커밋 금지
+.env
+.env.*
+*.pem
+*.key
+
+# OS/에디터 잡파일
+.DS_Store
+Thumbs.db
+*.log
+.idea/
