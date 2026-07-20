@@ -1,0 +1,275 @@
+use std::io::{ErrorKind, Read};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use crate::grid::{GridSize, TerminalGrid, TerminalSnapshot, TitleChange};
+use crate::pty::{PtySession, PtySpawn, TermError};
+
+const READ_BUFFER_SIZE: usize = 64 * 1024;
+/// exit_code를 원자적으로 다루기 위한 "아직 종료 안 됨" 표식
+const NO_EXIT: i64 = i64::MIN;
+/// UI 입력 큐 상한. 무제한 채널은 자식이 읽기를 멈췄을 때 메모리를 무한히 먹는다.
+/// 가득 차면 UI 입력은 버린다 (입력 유실 < 앱 다운).
+const WRITE_QUEUE_CAPACITY: usize = 256;
+/// 라이터 스레드가 UI 큐를 기다리는 간격. 이 주기마다 장치 응답 큐를 먼저 비운다.
+const WRITER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[derive(Debug, Clone)]
+pub struct SessionSpec {
+    pub pty: PtySpawn,
+    pub scrollback: usize,
+}
+
+pub struct TerminalSession {
+    pty: Arc<PtySession>,
+    grid: Arc<TerminalGrid>,
+    generation: Arc<AtomicU64>,
+    exit_code: Arc<AtomicI64>,
+    running: Arc<AtomicBool>,
+    /// Drop에서 닫아 라이터 스레드를 끝낸다
+    writes: Mutex<Option<SyncSender<Vec<u8>>>>,
+    reader_thread: Mutex<Option<JoinHandle<()>>>,
+    writer_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TerminalSession {
+    pub fn start(spec: SessionSpec) -> Result<Self, TermError> {
+        let size = GridSize {
+            rows: spec.pty.rows.max(1) as usize,
+            cols: spec.pty.cols.max(1) as usize,
+        };
+        let (pty, reader) = PtySession::spawn(spec.pty)?;
+
+        let pty = Arc::new(pty);
+        let grid = Arc::new(TerminalGrid::new(size, spec.scrollback));
+        let generation = Arc::new(AtomicU64::new(0));
+        let exit_code = Arc::new(AtomicI64::new(NO_EXIT));
+        let running = Arc::new(AtomicBool::new(true));
+        // UI 입력은 바운드(유실 허용), 장치 응답은 언바운드 별도 큐(유실 불가).
+        // 하나의 큐를 공유하면 UI 입력이 큐를 채운 사이 리더가 응답 송신에서
+        // 블로킹돼 PTY 출력 소비가 멈추는 교착이 생긴다.
+        let (ui_tx, ui_rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CAPACITY);
+        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
+
+        // 라이터 스레드: PTY write도 블로킹이므로 UI가 직접 부르지 않게 분리한다.
+        // 매 주기마다 장치 응답을 먼저 비워 UI 입력 뒤에 밀리지 않게 한다.
+        let writer_thread = {
+            let writer_pty = Arc::clone(&pty);
+            match std::thread::Builder::new()
+                .name("suaegi-pty-writer".to_string())
+                .spawn(move || loop {
+                    let mut failed = false;
+                    while let Ok(bytes) = reply_rx.try_recv() {
+                        if writer_pty.write(&bytes).is_err() {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed {
+                        break;
+                    }
+                    match ui_rx.recv_timeout(WRITER_POLL_INTERVAL) {
+                        Ok(bytes) => {
+                            if writer_pty.write(&bytes).is_err() {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        // UI 송신자가 사라졌으면 남은 응답만 비우고 끝낸다
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            while let Ok(bytes) = reply_rx.try_recv() {
+                                let _ = writer_pty.write(&bytes);
+                            }
+                            break;
+                        }
+                    }
+                }) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    // 자식이 이미 떠 있다 — PtySession의 Drop이 kill+reap을 한다
+                    return Err(TermError::ThreadSpawn(e.to_string()));
+                }
+            }
+        };
+
+        // 리더 스레드: 블로킹 read 전용
+        let reader_thread = {
+            // 클로저로 옮길 클론은 이름을 달리한다 — 섀도잉하면 실패 분기에서
+            // 바깥 `pty`를 쓸 수 없게 되어 컴파일 에러가 난다
+            let reader_pty = Arc::clone(&pty);
+            let grid = Arc::clone(&grid);
+            let generation = Arc::clone(&generation);
+            let exit_code = Arc::clone(&exit_code);
+            let running = Arc::clone(&running);
+            // 클론은 이름을 달리해 소유권을 분명히 한다 — 같은 이름으로 섀도잉하면
+            // 실패 분기에서 "moved value" 컴파일 에러가 난다
+            let reader_reply_tx = reply_tx.clone();
+            let mut reader = reader;
+            let spawned = std::thread::Builder::new()
+                .name("suaegi-pty-reader".to_string())
+                .spawn(move || {
+                    let mut buf = vec![0u8; READ_BUFFER_SIZE];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                grid.feed(&buf[..n]);
+                                // 터미널이 만든 응답을 PTY로 돌려보내지 않으면
+                                // 장치 질의를 보낸 프로그램이 영원히 기다린다.
+                                // 전용 언바운드 큐라 여기서 블로킹되지 않는다.
+                                for reply in grid.take_pty_writes() {
+                                    if reader_reply_tx.send(reply.into_bytes()).is_err() {
+                                        break;
+                                    }
+                                }
+                                generation.fetch_add(1, Ordering::Release);
+                            }
+                            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    // EOF든 읽기 에러든 **수확 전에** 한 번 죽인다. 이 시점의 pgid는
+                    // 아직 유효하므로(수확 전) 남은 자손을 안전하게 정리할 수 있고,
+                    // 아래 블로킹 wait()가 살아 있는 자식 때문에 멈추지 않는다.
+                    // 자식이 이미 스스로 종료했다면 무해한 no-op이다.
+                    let _ = reader_pty.kill();
+                    // EOF가 자식 종료보다 먼저 올 수 있으므로 블로킹 wait로 확정한다
+                    if let Ok(code) = reader_pty.wait() {
+                        exit_code.store(code as i64, Ordering::Release);
+                    }
+                    running.store(false, Ordering::Release);
+                    generation.fetch_add(1, Ordering::Release);
+                });
+            match spawned {
+                Ok(handle) => handle,
+                Err(e) => {
+                    // 라이터 스레드와 자식을 정리하고 나간다. 두 송신자를 모두
+                    // 떨어뜨려야 라이터 루프가 Disconnected로 끝난다.
+                    drop(ui_tx);
+                    drop(reply_tx);
+                    let _ = pty.kill();
+                    let _ = writer_thread.join();
+                    return Err(TermError::ThreadSpawn(e.to_string()));
+                }
+            }
+        };
+
+        // reply_tx의 마지막 사본은 리더 스레드가 들고 있다 — 여기서 떨어뜨려야
+        // 리더 종료 시 라이터가 Disconnected를 보고 끝날 수 있다
+        drop(reply_tx);
+
+        Ok(Self {
+            pty,
+            grid,
+            generation,
+            exit_code,
+            running,
+            writes: Mutex::new(Some(ui_tx)),
+            reader_thread: Mutex::new(Some(reader_thread)),
+            writer_thread: Mutex::new(Some(writer_thread)),
+        })
+    }
+
+    pub fn snapshot(&self) -> TerminalSnapshot {
+        self.grid.snapshot()
+    }
+
+    /// 논블로킹. 실제 쓰기는 라이터 스레드가 수행한다. 큐가 가득 차면(자식이
+    /// 읽기를 멈춘 상태) 이 입력은 버린다 — 무한 버퍼링으로 메모리를 먹는 것보다
+    /// 낫다. 반환값으로 유실 여부를 알린다.
+    pub fn write(&self, bytes: Vec<u8>) -> bool {
+        let writes = self.writes.lock().expect("writes mutex poisoned");
+        match writes.as_ref() {
+            Some(tx) => tx.try_send(bytes).is_ok(),
+            None => false,
+        }
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), TermError> {
+        // 레이아웃 초기 패스에서 0이 들어올 수 있다 — 퇴화된 그리드를 만들지 않는다
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        self.pty.resize(rows, cols)?;
+        self.grid.resize(GridSize {
+            rows: rows as usize,
+            cols: cols as usize,
+        });
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// UI가 락 없이 "다시 그려야 하나"를 판단하는 값. 그리드 변경마다 증가한다.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        match self.exit_code.load(Ordering::Acquire) {
+            NO_EXIT => None,
+            code => Some(code as i32),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    pub fn kill(&self) -> Result<(), TermError> {
+        self.pty.kill()
+    }
+
+    pub fn take_title_changes(&self) -> Vec<TitleChange> {
+        self.grid.take_title_changes()
+    }
+
+    /// 스크롤백 이동. 화면 내용이 바뀌므로 generation을 올려 UI가 재렌더하게 한다.
+    pub fn scroll_display(&self, lines: i32) {
+        self.grid.scroll_display(lines);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(unix)]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        self.pty.foreground_pgid()
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        // 세션 객체를 놓으면 자식 프로세스와 두 스레드가 반드시 정리되어야 한다.
+        let _ = self.pty.kill();
+        // 라이터 채널을 닫아 라이터 루프를 끝낸다
+        if let Ok(mut writes) = self.writes.lock() {
+            writes.take();
+        }
+        // unix: killpg(SIGKILL)로 그룹 전체가 죽으므로 슬레이브가 닫히고 리더가
+        // EOF에 도달한다 — join이 끝난다는 보장이 있다.
+        // Windows: 자손 프로세스를 확실히 죽일 방법이 없어(job object는 post-MVP)
+        // 리더가 EOF를 못 볼 수 있으므로 join하지 않고 분리한다.
+        #[cfg(unix)]
+        if let Ok(mut handle) = self.reader_thread.lock() {
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
+        }
+        #[cfg(not(unix))]
+        if let Ok(mut handle) = self.reader_thread.lock() {
+            let _ = handle.take(); // 분리 (join하면 영원히 멈출 수 있다)
+        }
+        // 라이터도 같은 이유로 unix에서만 join한다. Windows에서는 자손이 의사
+        // 콘솔을 붙들고 있으면 write_all이 블로킹된 채로 남을 수 있다.
+        #[cfg(unix)]
+        if let Ok(mut handle) = self.writer_thread.lock() {
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
+        }
+        #[cfg(not(unix))]
+        if let Ok(mut handle) = self.writer_thread.lock() {
+            let _ = handle.take();
+        }
+    }
+}
