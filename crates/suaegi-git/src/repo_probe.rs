@@ -20,14 +20,14 @@ pub async fn probe_repo(runner: &GitRunner, path: &Path) -> Result<RepoProbe, Gi
         }
         Err(e) => return Err(e),
     }
-    // symbolic-ref exit 1 or 128 = detached HEAD (정상). 그 외 실패는 전파.
+    // symbolic-ref exit 1 or 128 = detached HEAD (정상), but must verify stderr contains
+    // "not a symbolic ref". 그 외 실패는 전파.
     let head = match runner.run(path, &["symbolic-ref", "--short", "HEAD"]).await {
         Ok(o) => {
             let s = o.stdout.trim().to_string();
             (!s.is_empty()).then_some(s)
         }
-        Err(GitError::Failed { code: Some(1), .. }) => None,
-        Err(GitError::Failed { code: Some(128), ref stderr, .. })
+        Err(GitError::Failed { code: Some(1) | Some(128), ref stderr, .. })
             if stderr.to_lowercase().contains("not a symbolic ref") =>
         {
             None
