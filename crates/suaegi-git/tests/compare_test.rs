@@ -93,6 +93,31 @@ async fn no_changes_yields_no_tracked_diffs() {
 }
 
 #[tokio::test]
+async fn compare_reports_renamed_files() {
+    let (_repo, _ws, wt) = setup().await;
+    // 내용 변경 없이 순수 rename만 수행 — 유사도 100%로 R100 감지를 보장한다.
+    fixture::run(&wt, &["mv", "README.md", "renamed.md"]);
+    fixture::run(&wt, &["add", "-A"]);
+    fixture::run(&wt, &["commit", "-m", "rename"]);
+
+    let r = GitRunner::new();
+    let cmp = branch_compare(&r, &wt, "main").await.unwrap();
+    let renamed = cmp
+        .files
+        .iter()
+        .find(|f| f.path == "renamed.md")
+        .expect("renamed file missing");
+    assert_eq!(
+        renamed.status,
+        ChangeStatus::Renamed {
+            from: "README.md".into()
+        }
+    );
+    assert!(renamed.additions.is_some());
+    assert!(renamed.deletions.is_some());
+}
+
+#[tokio::test]
 async fn dirty_detection() {
     let (_repo, _ws, wt) = setup().await;
     let r = GitRunner::new();
