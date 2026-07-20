@@ -1,9 +1,10 @@
-use crate::domain::PersistedState;
+use crate::domain::{PersistedState, SCHEMA_VERSION};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -11,6 +12,8 @@ pub enum PersistenceError {
     Io(#[from] std::io::Error),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("data file was written by a newer app version; saving is blocked")]
+    FutureSchemaGuard,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,9 +35,13 @@ pub struct LoadOutcome {
     pub source: LoadSource,
 }
 
+const BACKUP_SLOTS: usize = 5;
+
 pub struct Store {
     data_file: PathBuf,
     last_written_hash: Option<u64>,
+    backup_min_interval: Duration,
+    future_schema_guard: bool,
 }
 
 fn content_hash(text: &str) -> u64 {
@@ -45,33 +52,118 @@ fn content_hash(text: &str) -> u64 {
 
 impl Store {
     pub fn new(data_file: PathBuf) -> Self {
-        Self { data_file, last_written_hash: None }
+        Self {
+            data_file,
+            last_written_hash: None,
+            backup_min_interval: Duration::from_secs(3600),
+            future_schema_guard: false,
+        }
     }
 
     pub fn data_file(&self) -> &PathBuf {
         &self.data_file
     }
 
+    pub fn future_schema_guarded(&self) -> bool {
+        self.future_schema_guard
+    }
+
+    /// 사용자가 "구버전 앱으로 계속 진행(신버전 데이터 덮어쓰기)"을 명시적으로
+    /// 선택했을 때만 호출한다 (Plan 3 UI).
+    pub fn override_future_schema_guard(&mut self) {
+        self.future_schema_guard = false;
+    }
+
+    // 테스트 전용 훅 — 공개 API가 아니므로 pub 없음 (in-module 테스트에서만 접근)
+    #[cfg(test)]
+    fn set_backup_min_interval(&mut self, interval: Duration) {
+        self.backup_min_interval = interval;
+    }
+
+    fn backup_path(&self, slot: usize) -> PathBuf {
+        let name = self.data_file.file_name().unwrap_or_default().to_string_lossy();
+        self.data_file.with_file_name(format!("{name}.bak.{slot}"))
+    }
+
+    /// schema_version만 먼저 확인 — 미래 스키마 JSON은 전체 구조가 파싱되더라도
+    /// 신뢰하면 안 되기 때문. 반환: Ok(state) | Err(true)=미래 스키마 | Err(false)=손상
+    fn parse_trusted(text: &str) -> Result<PersistedState, bool> {
+        #[derive(serde::Deserialize)]
+        struct VersionProbe {
+            #[serde(default)]
+            schema_version: u32,
+        }
+        let probe: VersionProbe = serde_json::from_str(text).map_err(|_| false)?;
+        if probe.schema_version > SCHEMA_VERSION {
+            return Err(true);
+        }
+        serde_json::from_str::<PersistedState>(text).map_err(|_| false)
+    }
+
     pub fn load(&mut self) -> LoadOutcome {
+        self.future_schema_guard = false;
         if let Ok(text) = fs::read_to_string(&self.data_file) {
-            if let Ok(state) = serde_json::from_str::<PersistedState>(&text) {
-                // 재시작 직후 동일 상태 재저장을 스킵할 수 있도록 해시 시드
-                self.last_written_hash = Some(content_hash(&text));
-                return LoadOutcome { state, source: LoadSource::MainFile };
+            match Self::parse_trusted(&text) {
+                Ok(state) => {
+                    self.last_written_hash = Some(content_hash(&text));
+                    return LoadOutcome { state, source: LoadSource::MainFile };
+                }
+                Err(is_future) => {
+                    if is_future {
+                        self.future_schema_guard = true;
+                    }
+                }
             }
         }
         self.load_from_backups()
     }
 
-    // Task 4에서 백업 폴백 구현. 이 시점엔 default만.
     fn load_from_backups(&mut self) -> LoadOutcome {
         // 폴백 = 본파일이 신뢰 불가. 해시를 리셋해 복구 상태 저장이
         // SkippedUnchanged로 무시되지 않게 한다 (손상 영구화 방지).
         self.last_written_hash = None;
+        for slot in 0..BACKUP_SLOTS {
+            if let Ok(text) = fs::read_to_string(self.backup_path(slot)) {
+                if let Ok(state) = Self::parse_trusted(&text) {
+                    return LoadOutcome { state, source: LoadSource::Backup(slot) };
+                }
+            }
+        }
         LoadOutcome { state: PersistedState::default(), source: LoadSource::Default }
     }
 
+    /// 본파일을 .bak.0으로 복사하고 기존 백업들을 한 칸씩 뒤로. 직전 백업이
+    /// min_interval 이내면 생략 (Orca의 ≥1h 간격 패턴). 미래 mtime(시계 역행)은
+    /// "오래됨"으로 취급해 회전이 영구 정지하지 않게 한다.
+    fn rotate_backups(&self) -> Result<(), PersistenceError> {
+        if !self.data_file.exists() {
+            return Ok(());
+        }
+        let bak0 = self.backup_path(0);
+        if let Ok(modified) = fs::metadata(&bak0).and_then(|m| m.modified()) {
+            match SystemTime::now().duration_since(modified) {
+                Ok(age) if age < self.backup_min_interval => return Ok(()),
+                Ok(_) | Err(_) => {} // 오래됐거나 미래 mtime → 회전 진행
+            }
+        }
+        let oldest = self.backup_path(BACKUP_SLOTS - 1);
+        if oldest.exists() {
+            fs::remove_file(&oldest)?;
+        }
+        for slot in (0..BACKUP_SLOTS - 1).rev() {
+            let from = self.backup_path(slot);
+            if from.exists() {
+                fs::rename(&from, self.backup_path(slot + 1))?;
+            }
+        }
+        fs::copy(&self.data_file, &bak0)?;
+        Ok(())
+    }
+
     pub fn save(&mut self, state: &PersistedState) -> Result<SaveOutcome, PersistenceError> {
+        if self.future_schema_guard {
+            return Err(PersistenceError::FutureSchemaGuard);
+        }
         let json = serde_json::to_string_pretty(state)?;
         let hash = content_hash(&json);
         if self.last_written_hash == Some(hash) {
@@ -88,6 +180,7 @@ impl Store {
         let mut tmp = tempfile::NamedTempFile::new_in(&parent)?;
         tmp.write_all(json.as_bytes())?;
         tmp.as_file().sync_all()?;
+        self.rotate_backups()?;
         tmp.persist(&self.data_file).map_err(|e| e.error)?;
         self.last_written_hash = Some(hash);
         Ok(SaveOutcome::Written)
@@ -175,5 +268,92 @@ mod tests {
         let mut store = Store::new(dir.path().join("deep/nested/data.json"));
         store.save(&sample_state("a")).unwrap();
         assert!(dir.path().join("deep/nested/data.json").exists());
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn corrupt_main_file_falls_back_to_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut store = Store::new(file.clone());
+        store.set_backup_min_interval(Duration::ZERO);
+        let v1 = sample_state("v1");
+        store.save(&v1).unwrap();
+        let v2 = sample_state("v2");
+        store.save(&v2).unwrap(); // v2 저장 직전에 v1이 .bak.0으로 회전됨
+        std::fs::write(&file, "{ corrupted!!").unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.state, v1);
+        assert_eq!(loaded.source, LoadSource::Backup(0));
+        assert!(!store.future_schema_guarded());
+    }
+
+    #[test]
+    fn future_schema_blocks_saves_until_overridden() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut store = Store::new(file.clone());
+        store.set_backup_min_interval(Duration::ZERO);
+        let v1 = sample_state("v1");
+        store.save(&v1).unwrap();
+        store.save(&sample_state("v2")).unwrap();
+        // 미래 버전 앱이 쓴 파일 시뮬레이션
+        let mut future = sample_state("future");
+        future.schema_version = SCHEMA_VERSION + 1;
+        std::fs::write(&file, serde_json::to_string(&future).unwrap()).unwrap();
+
+        let loaded = store.load();
+        assert_eq!(loaded.state, v1); // 백업으로 폴백은 하되
+        assert!(store.future_schema_guarded()); // 가드가 선다
+        // 가드 중 저장은 거부 — 신버전 데이터 덮어쓰기 방지
+        assert!(matches!(
+            store.save(&loaded.state),
+            Err(PersistenceError::FutureSchemaGuard)
+        ));
+        // 명시적 해제 후에만 저장 가능
+        store.override_future_schema_guard();
+        assert!(matches!(store.save(&loaded.state).unwrap(), SaveOutcome::Written));
+    }
+
+    #[test]
+    fn corrupt_main_and_backups_return_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut store = Store::new(file.clone());
+        store.set_backup_min_interval(Duration::ZERO);
+        store.save(&sample_state("a")).unwrap();
+        store.save(&sample_state("b")).unwrap();
+        std::fs::write(&file, "bad").unwrap();
+        std::fs::write(dir.path().join("data.json.bak.0"), "also bad").unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.state, PersistedState::default());
+        assert_eq!(loaded.source, LoadSource::Default);
+    }
+
+    #[test]
+    fn backups_rotate_up_to_five() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::new(dir.path().join("data.json"));
+        store.set_backup_min_interval(Duration::ZERO);
+        for i in 0..8 {
+            store.save(&sample_state(&format!("s{i}"))).unwrap();
+        }
+        for i in 0..5 {
+            assert!(dir.path().join(format!("data.json.bak.{i}")).exists(), "bak.{i}");
+        }
+        assert!(!dir.path().join("data.json.bak.5").exists());
+    }
+
+    #[test]
+    fn backup_rotation_respects_min_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::new(dir.path().join("data.json"));
+        // 기본 간격(1h): 첫 백업은 생기되, 연속 저장이 회전을 반복하지는 않는다
+        store.save(&sample_state("a")).unwrap();
+        store.save(&sample_state("b")).unwrap(); // bak.0 = a 생성 (첫 백업)
+        store.save(&sample_state("c")).unwrap(); // bak.0이 신선 → 회전 생략
+        assert!(dir.path().join("data.json.bak.0").exists());
+        assert!(!dir.path().join("data.json.bak.1").exists());
     }
 }
