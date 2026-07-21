@@ -12,7 +12,10 @@ use suaegi_core::persistence::{LoadSource, SaveOutcome, Store, BACKUP_SLOTS};
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 enum Request {
-    Save { seq: u64, state: Box<PersistedState> },
+    Save {
+        seq: u64,
+        state: Box<PersistedState>,
+    },
     OverrideFutureSchemaGuard,
 }
 
@@ -36,8 +39,10 @@ pub struct LoadDiagnostics {
 pub enum LoadOrigin {
     /// 본파일도 백업도 **하나도 없었다** — 신규 설치. 경고 금지.
     Fresh,
-    Loaded,                      // 본파일 정상
-    Recovered { slot: usize },   // 백업에서 복구 — 사용자에게 알린다
+    Loaded, // 본파일 정상
+    Recovered {
+        slot: usize,
+    }, // 백업에서 복구 — 사용자에게 알린다
     /// 뭔가는 있었는데 쓸 수 있는 게 없었다 — 강하게 알린다.
     /// (본파일이 없고 백업만 있는데 그 백업들이 다 깨진 경우도 여기다)
     RecoveryFailed,
@@ -45,18 +50,22 @@ pub enum LoadOrigin {
 
 /// 저장 요청 하나의 최종 상태. **모든 seq는 정확히 한 번 보고된다** —
 /// debounce로 대체된 요청도 조용히 사라지지 않고 Superseded로 보고한다.
-#[derive(Debug)]
+// Clone: `Message::Saved` (sidebar's seam for Task 8's persistence wiring)
+// carries this into `AppState`, and `Message` as a whole must be `Clone`.
+#[derive(Debug, Clone)]
 pub struct SaveReport {
     pub seq: u64,
     pub status: SaveStatus,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SaveStatus {
     Written,
     SkippedUnchanged,
     /// 더 새 요청이 들어와 이 요청은 쓰이지 않았다. 실패가 아니다.
-    Superseded { by: u64 },
+    Superseded {
+        by: u64,
+    },
     Failed(String),
 }
 
@@ -118,12 +127,16 @@ impl PersistenceHandle {
                             }
                             pending = Some((seq, state));
                         }
-                        Ok(Request::OverrideFutureSchemaGuard) => store.override_future_schema_guard(),
+                        Ok(Request::OverrideFutureSchemaGuard) => {
+                            store.override_future_schema_guard()
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             if let Some((seq, state)) = pending.take() {
                                 let status = match store.save(&state) {
                                     Ok(SaveOutcome::Written) => SaveStatus::Written,
-                                    Ok(SaveOutcome::SkippedUnchanged) => SaveStatus::SkippedUnchanged,
+                                    Ok(SaveOutcome::SkippedUnchanged) => {
+                                        SaveStatus::SkippedUnchanged
+                                    }
                                     Err(e) => SaveStatus::Failed(e.to_string()),
                                 };
                                 let _ = worker_res_tx.unbounded_send(SaveReport { seq, status });
@@ -134,7 +147,9 @@ impl PersistenceHandle {
                             if let Some((seq, state)) = pending.take() {
                                 let status = match store.save(&state) {
                                     Ok(SaveOutcome::Written) => SaveStatus::Written,
-                                    Ok(SaveOutcome::SkippedUnchanged) => SaveStatus::SkippedUnchanged,
+                                    Ok(SaveOutcome::SkippedUnchanged) => {
+                                        SaveStatus::SkippedUnchanged
+                                    }
                                     Err(e) => SaveStatus::Failed(e.to_string()),
                                 };
                                 let _ = worker_res_tx.unbounded_send(SaveReport { seq, status });
