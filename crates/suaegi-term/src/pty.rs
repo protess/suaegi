@@ -63,6 +63,16 @@ struct Lifecycle {
 }
 
 impl PtySession {
+    // 락 순서 규칙 (wait/try_wait/kill 전체에 적용): `lifecycle`과 `child`를
+    // **동시에** 잡지 않는다. 한쪽을 놓은 뒤에만 다른 쪽을 잡는다 — 두 락이
+    // 겹치는 구간이 없으면 ABBA 역전이 애초에 불가능하다. `wait()`는
+    // `child.wait()`처럼 블로킹 호출을 거는 동안 `lifecycle`을 들고 있지
+    // 않아야 하고(진입 전에 `reaping`만 세우고 놓는다), `child` 락을 요구하는
+    // 코드는 `lifecycle`을 쥔 채로 그 락을 기다려서는 안 된다 — `try_wait`가
+    // `reaping`을 먼저 확인해 이를 지킨다(수확이 진행 중이면 `child`에
+    // 손대지 않고 바로 반환). 이 규칙을 깨는 변경은 `wait`/`try_wait`/`kill`
+    // 사이에 데드락을 재도입한다.
+
     pub fn spawn(spec: PtySpawn) -> Result<(Self, PtyReader), TermError> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -168,8 +178,16 @@ impl PtySession {
 
     /// 비블로킹. lifecycle 락을 호출 **전 구간** 잡는다 — try_wait 자체가
     /// 블로킹하지 않으므로 안전하고, 이렇게 해야 "수확됨"과 kill 사이에 틈이 없다.
+    ///
+    /// `reaping`이 이미 서 있으면(블로킹 `wait()`가 진행 중이거나 이미 끝났으면)
+    /// `child` 락에는 **절대 손대지 않고** 바로 `Ok(None)`을 반환한다. `wait()`는
+    /// 그 락을 쥔 채로 블로킹하므로, 여기서 그걸 기다리면 `lifecycle`을 쥔 채
+    /// 파킹하게 되어 `kill()`의 "즉시 반환" 보장이 깨진다(락 순서 규칙 위반).
     pub fn try_wait(&self) -> Result<Option<i32>, TermError> {
         let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
+        if lifecycle.reaping {
+            return Ok(None);
+        }
         let mut child = self.child.lock().expect("pty child mutex poisoned");
         let status = child.try_wait()?;
         if status.is_some() {
@@ -182,13 +200,20 @@ impl PtySession {
     /// 블로킹. 리더 스레드가 EOF를 본 뒤 호출한다.
     /// 블로킹 구간에 lifecycle 락을 걸치지 않는 대신, 진입 **전에** `reaping`을
     /// 세워 그 순간부터 kill이 시그널을 보내지 않게 한다 (PID 재사용 방지).
+    ///
+    /// `child` 락은 블로킹 `child.wait()` 호출을 감싸는 스코프 안에서만 잡고
+    /// 반환 즉시 놓는다 — 꼬리의 `reaped` 기록은 그 스코프 **밖**에서, `child`를
+    /// 놓은 뒤에 `lifecycle`을 다시 잡아 수행한다. 두 락을 동시에 쥐지 않아야
+    /// `try_wait`/`kill`과의 ABBA 역전을 피한다(락 순서 규칙, 위 참고).
     pub fn wait(&self) -> Result<i32, TermError> {
         {
             let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
             lifecycle.reaping = true;
         }
-        let mut child = self.child.lock().expect("pty child mutex poisoned");
-        let status = child.wait()?;
+        let status = {
+            let mut child = self.child.lock().expect("pty child mutex poisoned");
+            child.wait()?
+        };
         {
             let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
             lifecycle.reaped = true;
