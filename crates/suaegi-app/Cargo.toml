@@ -25,3 +25,10 @@ dirs = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+# Task 5 — 행당 `with_spans` vs 셀당 `fill_text`. 플랜이 이 선택을 추측으로
+# 정하는 것을 금지하므로 실측한다. criterion을 끌어오지 않고 직접 잰다 —
+# 재는 것이 두 경로의 비율 하나뿐이라 통계 하네스가 값을 더하지 않는다.
+[[bench]]
+name = "render_paths"
+harness = false
