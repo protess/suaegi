@@ -124,6 +124,8 @@ fn segments(token: &str) -> Vec<String> {
         .collect()
 }
 
+/// 런처의 스크립트 인자(예: `node .../claude-code/cli.js`)용 — 경로의 **모든**
+/// 세그먼트를 검사한다. 패키지 디렉토리명이 곧 에이전트명인 경우를 잡기 위함.
 fn segment_matches(token: &str) -> Option<AgentKind> {
     let lowered = token.to_ascii_lowercase();
     for segment in segments(&lowered) {
@@ -136,13 +138,26 @@ fn segment_matches(token: &str) -> Option<AgentKind> {
     None
 }
 
+/// 실행 파일 토큰용 — **basename만** 검사한다. 모든 세그먼트를 보면
+/// `~/code/codex/run.sh`나 `/home/claude/bin/backup.sh`처럼 에이전트명과 같은
+/// 디렉토리 아래의 무관한 실행 파일까지 에이전트로 오인한다. 세그먼트 전체
+/// 매칭이 필요한 건 런처의 스크립트 인자뿐이다(`segment_matches` 참고).
+fn basename_matches(token: &str) -> Option<AgentKind> {
+    let lowered = token.to_ascii_lowercase();
+    let basename = segments(&lowered).last().cloned().unwrap_or_default();
+    AGENT_DEFS
+        .iter()
+        .find(|def| def.process_names.iter().any(|name| *name == basename))
+        .map(|def| def.kind)
+}
+
 /// 명령줄에서 에이전트를 식별한다. **실행 파일 자리만** 본다 —
 /// `grep codex README.md`처럼 인자에 이름이 스쳐 지나가는 경우를 배제하기 위함.
 /// 첫 토큰이 스크립트 런처(node 등)면 두 번째 토큰까지 본다.
 pub fn match_agent(command_line: &str) -> Option<AgentKind> {
     let mut tokens = command_line.split_whitespace();
     let first = tokens.next()?;
-    if let Some(kind) = segment_matches(first) {
+    if let Some(kind) = basename_matches(first) {
         return Some(kind);
     }
     let first_base = segments(&first.to_ascii_lowercase())
@@ -259,6 +274,28 @@ mod tests {
         assert_eq!(match_agent("vim claude-notes.md"), None);
         assert_eq!(match_agent("grep codex README.md"), None);
         assert_eq!(match_agent(""), None);
+    }
+
+    /// 회귀 테스트: 실행 파일 토큰은 basename만 봐야 한다. 전체 경로 세그먼트를
+    /// 보면 에이전트명과 같은 디렉토리 아래의 무관한 실행 파일이 에이전트로
+    /// 오인된다 — `~/code/codex/run.sh`나 `/home/claude/bin/backup.sh`는 codex나
+    /// claude가 아니다.
+    #[test]
+    fn does_not_match_an_executable_under_a_directory_named_like_an_agent() {
+        assert_eq!(match_agent("~/code/codex/run.sh"), None);
+        assert_eq!(match_agent("/home/claude/bin/backup.sh"), None);
+        assert_eq!(match_agent("/home/claude-code/scripts/deploy.sh"), None);
+    }
+
+    /// basename 전용 매칭으로 좁혀도 런처의 스크립트 인자(두 번째 토큰)는
+    /// 여전히 세그먼트 전체를 봐야 한다 — claude-code는 패키지 디렉토리명으로만
+    /// 나타나고 실행 파일 자체는 `cli.js`이기 때문이다.
+    #[test]
+    fn launcher_script_argument_still_matches_by_directory_segment() {
+        assert_eq!(
+            match_agent("node /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
+            Some(AgentKind::Claude)
+        );
     }
 
     #[test]
