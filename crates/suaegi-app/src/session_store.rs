@@ -244,10 +244,17 @@ impl SessionStore {
     /// - 캐시보다 오래된 generation이면 **버린다**(캐시도 가드도 건드리지 않는다)
     /// - 캐시에 반영한 뒤, 가드는 **자기 요청의 결과일 때만** 푼다
     ///   (`in_flight == Some(generation)`)
-    /// - 푼 직후 `session.generation()`이 이미 더 나아가 있으면 곧바로 다음
-    ///   요청을 낸다 — 그러지 않으면 스냅샷이 도는 동안 도착한 출력이 영영
-    ///   화면에 반영되지 않는다(구독은 그 generation을 이미 알렸으므로 다시
-    ///   알리지 않는다).
+    /// - 푼 직후 `session.generation()`이 이미 더 나아가 있으면 다음 요청을
+    ///   낸다 — 그러지 않으면 스냅샷이 도는 동안 도착한 출력이 영영 화면에
+    ///   반영되지 않는다(구독은 그 generation을 이미 알렸으므로 다시 알리지
+    ///   않는다). 이 재요청은 곧바로 스레드를 스폰하지 않고 `POLL_INTERVAL`만큼
+    ///   늦춘다 — 바쁜 세션에서 스냅샷 완료마다 곧장 다음 스냅샷(~190KB 할당 +
+    ///   전용 OS 스레드, `background.rs`는 스레드 풀이 없다)이 나가면 초당
+    ///   수백 번씩 돌며 PTY 리더 스레드와 같은 `FairMutex`를 다툰다 — 알림
+    ///   경로(`workbench::feed_stream`)와 같은 주기로 페이싱해 바쁜 세션도
+    ///   ~16ms 주기에 안착시킨다. 가드는 여기서 곧바로 세운다 — 무거운
+    ///   작업(스레드 스폰 + snapshot())만 늦춰야, 그 사이 도착하는
+    ///   `SessionDirty`가 가드 없는 틈을 타 중복 요청을 내지 못한다.
     pub fn apply_snapshot(
         &mut self,
         id: SessionId,
@@ -270,12 +277,27 @@ impl SessionStore {
         slot.snapshot_in_flight = None;
 
         let current_generation = slot.session.generation();
-        if current_generation > generation {
-            let (_, task) = self.request_snapshot(id, current_generation);
-            Some(task)
-        } else {
-            None
+        if current_generation <= generation {
+            return None;
         }
+
+        slot.snapshot_in_flight = Some(current_generation);
+        let session = Arc::clone(&slot.session);
+        let task = Task::future(async move {
+            tokio::time::sleep(crate::workbench::POLL_INTERVAL).await;
+        })
+        .then(move |()| {
+            let session = Arc::clone(&session);
+            background::blocking(move |mut sender| {
+                let snapshot = session.snapshot();
+                let _ = sender.try_send(Message::SnapshotReady {
+                    id,
+                    generation: current_generation,
+                    snapshot,
+                });
+            })
+        });
+        Some(task)
     }
 
     pub fn request_presence(&mut self, id: SessionId, generation: u64) -> (bool, Task<Message>) {

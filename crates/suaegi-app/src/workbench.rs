@@ -28,7 +28,11 @@ use crate::state::{AppState, Message};
 /// executor 워커를 점유한 채 busy-spin 하고, `std::thread::sleep`은 async
 /// 워커 스레드를 블로킹한다 — 그래서 `tokio::time::sleep`을 쓴다. 60fps
 /// 화면 갱신에 충분하면서도 CPU를 태우지 않는 절충값.
-const POLL_INTERVAL: Duration = Duration::from_millis(16);
+///
+/// `pub(crate)`인 이유: `session_store.rs`의 `apply_snapshot`이 바쁜
+/// 세션에서 재요청을 곧바로 다시 내지 않고 이 값만큼 늦춰, 스냅샷을 요청하는
+/// 두 경로(이 구독의 알림, 재요청 루프)가 같은 주기로 안정된다.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn view(state: &AppState) -> Element<'_, Message> {
     let Some(panes) = state.panes() else {

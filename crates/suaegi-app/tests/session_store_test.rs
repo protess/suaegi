@@ -121,6 +121,17 @@ fn output_arriving_during_a_snapshot_is_not_lost() {
         follow_up.is_some(),
         "completion must schedule another snapshot when the session moved on"
     );
+    // pr4 항목 4: 재요청은 실제 스레드 스폰(무거운 작업)만 POLL_INTERVAL만큼
+    // 늦춘다 — in-flight 가드는 여기서 이미 (동기적으로) 세워져 있어야 한다.
+    // 그러지 않으면 그 지연 창 동안 도착하는 별도의 `request_snapshot` 호출이
+    // 가드 없는 틈을 타 중복 요청을 낸다. `_task`를 실제로 실행하지 않아도
+    // (이 크레이트의 다른 테스트들도 `Task<Message>`를 끝까지 돌리지 않는다)
+    // 가드가 이미 세워졌는지는 여기서 확인할 수 있다.
+    let (issued_during_delay, _task) = store.request_snapshot(id, 999);
+    assert!(
+        !issued_during_delay,
+        "the guard for the paced re-issue must be held immediately, not only once the delay elapses"
+    );
 }
 
 #[test]
