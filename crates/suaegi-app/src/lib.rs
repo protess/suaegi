@@ -1,6 +1,8 @@
 pub mod background;
 pub mod git_tasks;
 pub mod persistence_thread;
+pub mod reaper;
+pub mod session_store;
 pub mod sidebar;
 pub mod state;
 

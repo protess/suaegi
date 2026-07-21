@@ -3,8 +3,11 @@ use std::path::PathBuf;
 
 use suaegi_core::domain::{PersistedState, Repo, RepoId, WorktreeId};
 use suaegi_git::worktree::{CreatedWorktree, RemoveOutcome, WorktreeEntry};
+use suaegi_term::grid::TerminalSnapshot;
+use suaegi_term::presence::AgentPresence;
 
 use crate::persistence_thread::{LoadOrigin, SaveReport, SaveStatus};
+use crate::session_store::{SessionId, StartedSession};
 
 /// 비동기 작업 하나를 식별한다. 결과가 순서를 바꿔 도착해도 대상을 잃지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +60,29 @@ pub enum Message {
     /// 여기로 연결하는 건 Task 8(통합)의 몫이다. 상태 표시줄(`status_line`)이
     /// 미리 반응할 수 있도록 자리만 만들어 둔다.
     Saved(SaveReport),
+
+    // ---- Task 5: session_store.rs의 비동기 결과. `AppState`가 `SessionStore`를
+    // 들고 이 메시지들을 실제로 처리하는 배선은 Task 6/7(워크벤치 UI)의 몫이다
+    // — 지금은 `Message`가 컴파일되도록 변형만 미리 만들어 둔다(Task 1의
+    // "뒤 태스크가 참조할 공용 타입은 여기서 미리 만든다" 원칙과 대칭이다). ----
+    /// `SessionStore::start`의 완료. 실패도 `id`/`worktree_id` 맥락을 나른다.
+    SessionStarted {
+        id: SessionId,
+        worktree_id: WorktreeId,
+        result: Result<StartedSession, String>,
+    },
+    /// `SessionStore::request_snapshot`의 완료.
+    SnapshotReady {
+        id: SessionId,
+        generation: u64,
+        snapshot: TerminalSnapshot,
+    },
+    /// `SessionStore::request_presence`의 완료.
+    PresenceReady {
+        id: SessionId,
+        generation: u64,
+        presence: AgentPresence,
+    },
 }
 
 pub struct AppState {
@@ -321,6 +347,12 @@ impl AppState {
                 self.last_save_status = Some(report.status);
                 iced::Task::none()
             }
+            // `SessionStore`를 `AppState`에 들이고 실제로 처리하는 건 Task
+            // 6/7의 몫이다 — 지금은 `Message`가 컴파일되도록 변형만 있고
+            // `AppState`는 아직 아무 세션 상태도 들고 있지 않다.
+            Message::SessionStarted { .. }
+            | Message::SnapshotReady { .. }
+            | Message::PresenceReady { .. } => iced::Task::none(),
         }
     }
 }
