@@ -60,12 +60,11 @@
    계정)로 고정해두어 protess 저장소들이 깨진다. 계정 분리 정책(예: 디렉토리별
    `includeIf` + keychain)을 정한 뒤 정리해야 한다.
 
-## suaegi-core — 미래 스키마 가드의 허점 (Plan 3 리뷰에서 발견)
+## suaegi-core — 미래 스키마 가드의 허점 (Plan 3 리뷰에서 발견) — 완료
 
-9. **미래 스키마 **백업**은 가드를 세우지 않는다** (`crates/suaegi-core/src/persistence.rs`)
-   `load_from_backups()`는 `parse_trusted`가 거부한 백업(미래 스키마 포함)을 그냥
-   건너뛰고 다음 슬롯으로 간다. 본파일이 손상됐고 백업이 더 새 버전으로 쓰였다면,
-   앱은 `LoadSource::Default`로 떨어지면서 **저장 차단을 걸지 않아** 신버전 데이터를
-   덮어쓸 수 있다. 본파일이 미래 스키마일 때만 가드가 선다.
-   수정안: 백업을 미래 스키마 때문에 거부했을 때도 가드를 세운다.
-   드문 조합(손상된 본파일 + 신버전 백업)이지만 결과가 데이터 손실이라 값이 있다.
+9. ~~**미래 스키마 **백업**은 가드를 세우지 않는다**~~ (`crates/suaegi-core/src/persistence.rs`)
+   → `981342f`로 수정. `load_from_backups()`가 이제 `parse_trusted`의 거부 사유를
+   구분한다 — 미래 스키마(`Err(true)`)면 `future_schema_guard`를 세우고 다음 슬롯을
+   계속 보고, 손상/파싱 실패(`Err(false)`)는 지금처럼 그냥 건너뛴다. 회귀 테스트:
+   `a_future_schema_backup_also_blocks_saves`(가드가 서야 함),
+   `a_merely_corrupt_backup_does_not_block_saves`(쓰레기 백업은 막지 않아야 함).
