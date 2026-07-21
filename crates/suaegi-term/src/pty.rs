@@ -62,6 +62,20 @@ struct Lifecycle {
     reaped: bool,
 }
 
+/// `PtySession::kill()`이 실제로 무엇을 했는지. `Ok(())` 하나로는 "시그널을
+/// 보냈다"와 "수확이 이미 시작돼 아무것도 안 보냈다"를 구분할 수 없어, 자식이
+/// 아직 멀쩡히 살아 있는데도(예: 다른 스레드가 `wait()`에 파킹된 채 자연
+/// 종료를 기다리는 중) 호출자에게는 kill이 성공한 것처럼 보이는 문제가 있었다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// 시그널을 실제로 보냈다.
+    Signalled,
+    /// 수확이 이미 시작됐거나 끝나서 시그널을 보내지 않았다(PID/PGID 재사용
+    /// 위험 때문 — `kill()` 문서 참고). **자식이 죽었다는 뜻이 아니다**: 이미
+    /// 파킹된 `wait()`가 있다면 그 자연 종료를 계속 기다릴 뿐이다.
+    SuppressedAfterReap,
+}
+
 impl PtySession {
     // 락 순서 규칙 (wait/try_wait/kill 전체에 적용): `lifecycle`을 쥔 채로
     // `child` 락을 **기다리지** 않는다. (`try_wait`는 둘을 잠깐 동시에 잡지만,
@@ -248,10 +262,18 @@ impl PtySession {
     /// (리더 스레드는 EOF/에러 어느 경로든 `wait()` 직전에 `kill()`을 부른다).
     /// 그래도 PTY 디스크립터를 닫고 살아남은 자손은 놓칠 수 있다 — 재사용된 PID를
     /// 죽일 위험보다 낫다고 판단한 트레이드오프다.
-    pub fn kill(&self) -> Result<(), TermError> {
+    ///
+    /// 반환값은 `Ok`이 곧 "자식이 죽는다"는 뜻이 아님을 드러낸다:
+    /// `TerminalSession`(리더가 EOF 뒤에만 `wait()`를 부름) 안에서는 억제가
+    /// 항상 안전하지만, 이 raw API를 직접 쓰면서 어떤 스레드가 **살아 있는**
+    /// 자식에 대해 이미 `wait()`에 파킹돼 있는 상태로 `kill()`을 부르면,
+    /// `Ok(SuppressedAfterReap)`가 돌아오는데도 자식은 그 `wait()`가 자연
+    /// 종료를 기다리는 동안 계속 살아 있다 — 호출자는 이 값을 보고 "시그널이
+    /// 안 갔다, 자식이 곧 죽는다고 가정하지 마라"를 알 수 있어야 한다.
+    pub fn kill(&self) -> Result<KillOutcome, TermError> {
         let lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
         if lifecycle.reaping || lifecycle.reaped {
-            return Ok(());
+            return Ok(KillOutcome::SuppressedAfterReap);
         }
         #[cfg(unix)]
         {
@@ -265,7 +287,7 @@ impl PtySession {
         let mut killer = self.killer.lock().expect("pty killer mutex poisoned");
         killer.kill()?;
         drop(lifecycle);
-        Ok(())
+        Ok(KillOutcome::Signalled)
     }
 
     /// PTY의 foreground 프로세스 그룹. portable-pty가 tcgetpgrp를 안전 래핑한 것.

@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Select, Sender, TryRecvError, TrySendError};
 
 use crate::grid::{GridSize, TerminalGrid, TerminalSnapshot, TitleChange};
-use crate::pty::{PtySession, PtySpawn, TermError};
+use crate::pty::{KillOutcome, PtySession, PtySpawn, TermError};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 /// exit_code를 원자적으로 다루기 위한 "아직 종료 안 됨" 표식
@@ -310,7 +310,11 @@ impl TerminalSession {
         self.running.load(Ordering::Acquire)
     }
 
-    pub fn kill(&self) -> Result<(), TermError> {
+    /// 안에서는 리더가 EOF를 본 뒤에만 `wait()`를 부르므로 억제(`Suppressed
+    /// AfterReap`)가 관찰되더라도 언제나 안전하다 — 그 시점엔 자식이 이미 죽어
+    /// 있거나 죽는 중이다. 그래도 반환값 자체는 raw `PtySession::kill()`과
+    /// 동일하게 정직해야 하므로 그대로 넘긴다.
+    pub fn kill(&self) -> Result<KillOutcome, TermError> {
         self.pty.kill()
     }
 
