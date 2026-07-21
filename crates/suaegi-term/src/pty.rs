@@ -63,9 +63,11 @@ struct Lifecycle {
 }
 
 impl PtySession {
-    // 락 순서 규칙 (wait/try_wait/kill 전체에 적용): `lifecycle`과 `child`를
-    // **동시에** 잡지 않는다. 한쪽을 놓은 뒤에만 다른 쪽을 잡는다 — 두 락이
-    // 겹치는 구간이 없으면 ABBA 역전이 애초에 불가능하다. `wait()`는
+    // 락 순서 규칙 (wait/try_wait/kill 전체에 적용): `lifecycle`을 쥔 채로
+    // `child` 락을 **기다리지** 않는다. (`try_wait`는 둘을 잠깐 동시에 잡지만,
+    // `reaping`을 먼저 확인하므로 그 시점엔 `child`를 붙들 수 있는 스레드가
+    // 없어 대기가 발생하지 않는다.) 대기가 겹치지 않으면 ABBA 역전이 성립하지
+    // 않는다. `wait()`는
     // `child.wait()`처럼 블로킹 호출을 거는 동안 `lifecycle`을 들고 있지
     // 않아야 하고(진입 전에 `reaping`만 세우고 놓는다), `child` 락을 요구하는
     // 코드는 `lifecycle`을 쥔 채로 그 락을 기다려서는 안 된다 — `try_wait`가
