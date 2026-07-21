@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-term"]
+members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-term", "crates/suaegi-app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,3 +19,5 @@ libc = "0.2"
 portable-pty = "0.9"
 alacritty_terminal = "0.25.1"
 crossbeam-channel = "0.5"
+iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "lazy"] }
+futures = "0.3"
