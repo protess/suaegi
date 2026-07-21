@@ -49,7 +49,11 @@ pub struct SessionId(pub u64);
 pub struct StartedSession(Arc<Mutex<Option<TerminalSession>>>);
 
 impl StartedSession {
-    fn new(session: TerminalSession) -> Self {
+    /// `pub(crate)`인 이유: `state.rs`(Task 6)가 `SessionStarted`의 성공 경로를
+    /// 테스트할 때 실제 `Task` 파이프라인 없이 직접 봉투를 만들어야 한다 —
+    /// `tests/`의 별도 크레이트 경계를 넘지 않으므로 `doc(hidden) pub`보다
+    /// `pub(crate)`가 정확한 가시성이다.
+    pub(crate) fn new(session: TerminalSession) -> Self {
         Self(Arc::new(Mutex::new(Some(session))))
     }
 
@@ -354,6 +358,28 @@ impl SessionStore {
             .map(|slot| slot.presence)
             .unwrap_or(AgentPresence::Unknown)
     }
+
+    /// 워크벤치 구독(Task 6)이 세션마다 하나씩 붙이는 피드를 만들기 위한
+    /// 열거. `Arc`를 클론해 돌려준다 — 구독이 이 `Arc`를 들고 있는 동안
+    /// `SessionStore`가 슬롯을 지워도(`close`) 세션 자체는 reaper로 넘어갈
+    /// 뿐, 구독이 들고 있는 클론이 매달려 있는 한 즉시 죽지 않는다.
+    pub fn sessions(&self) -> impl Iterator<Item = (SessionId, Arc<TerminalSession>)> + '_ {
+        self.slots
+            .values()
+            .map(|slot| (slot.id, Arc::clone(&slot.session)))
+    }
+
+    /// 캐시된 스냅샷을 화면에 그대로 그릴 수 있는 줄 단위 텍스트로. 스냅샷이
+    /// 아직 한 번도 안 왔으면(`blank_snapshot`) 빈 문자열이다.
+    pub fn snapshot_text(&self, id: SessionId) -> String {
+        let Some(slot) = self.slots.get(&id) else {
+            return String::new();
+        };
+        (0..slot.snapshot.rows.len())
+            .map(|row| slot.snapshot.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 // ---- 테스트 전용 헬퍼. `#[cfg(test)]`가 아니라 `#[doc(hidden)]`인 이유:
@@ -453,5 +479,33 @@ impl SessionStore {
     #[doc(hidden)]
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// 어디에도 슬롯으로 등록되지 않은, 진짜로 살아있는 `TerminalSession`
+    /// 하나. `workbench.rs`의 구독 동일성 테스트와 `state.rs`의
+    /// `SessionStarted` 배선 테스트가 손으로 봉투를 만들 때 이 세션이
+    /// 필요하다 — 둘 다 `tests/`가 아니라 이 크레이트 안의 `#[cfg(test)]`라
+    /// `tests/platform/mod.rs`를 `mod`로 끌어올 수 없다.
+    #[doc(hidden)]
+    pub fn spawn_throwaway_for_test() -> TerminalSession {
+        #[cfg(unix)]
+        let (program, args) = ("sleep".to_string(), vec!["5".to_string()]);
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd".to_string(),
+            vec!["/C".to_string(), "ping -n 6 127.0.0.1 > nul".to_string()],
+        );
+        TerminalSession::start(SessionSpec {
+            pty: PtySpawn {
+                program,
+                args,
+                cwd: None,
+                env: Vec::new(),
+                rows: DEFAULT_ROWS,
+                cols: DEFAULT_COLS,
+            },
+            scrollback: TEST_SCROLLBACK_LINES,
+        })
+        .expect("throwaway test session must start")
     }
 }

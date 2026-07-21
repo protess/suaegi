@@ -1,13 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
 use iced::{Alignment, Element, Length};
 
-use suaegi_core::domain::{Repo, RepoId, WorktreeId};
+use suaegi_core::domain::{Repo, RepoId};
 use suaegi_git::worktree::WorktreeEntry;
 
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
-use crate::state::{AppState, Message};
+use crate::state::{worktree_id_for, AppState, Message};
 
 /// 사이드바 고정 폭. `pane_grid`는 고정 폭 pane이 없고(비율 분할만) 사이드바가
 /// 터미널 격자 한가운데로 드래그될 수 있으므로, 사이드바는 pane이 아니라 상위
@@ -106,13 +106,6 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     }
 
     container(rows).width(Length::Fill).into()
-}
-
-/// git이 돌려주는 `WorktreeEntry`에는 안정적인 id가 없다. `RepoId`가 정규화된
-/// 절대 경로 문자열이듯, worktree 경로도 이미 canonical absolute path다
-/// (`add_worktree`가 canonicalize한 parent 아래 만든다) — 같은 규칙을 따른다.
-fn worktree_id_for(path: &Path) -> WorktreeId {
-    WorktreeId(path.to_string_lossy().into_owned())
 }
 
 /// 존재 배지 자리는 비워둔 채 폭만 잡는다 — Task 7이 실제 `AgentPresence`로 채운다.
