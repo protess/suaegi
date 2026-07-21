@@ -131,11 +131,19 @@ impl Store {
         self.last_written_hash = None;
         for slot in 0..BACKUP_SLOTS {
             if let Ok(text) = fs::read_to_string(self.backup_path(slot)) {
-                if let Ok(state) = Self::parse_trusted(&text) {
-                    return LoadOutcome {
-                        state,
-                        source: LoadSource::Backup(slot),
-                    };
+                match Self::parse_trusted(&text) {
+                    Ok(state) => {
+                        return LoadOutcome {
+                            state,
+                            source: LoadSource::Backup(slot),
+                        };
+                    }
+                    Err(is_future) => {
+                        if is_future {
+                            self.future_schema_guard = true;
+                        }
+                        // 손상/파싱 실패는 쓰레기 — 다음 슬롯을 계속 본다
+                    }
                 }
             }
         }
@@ -383,5 +391,47 @@ mod tests {
         store.save(&sample_state("c")).unwrap(); // bak.0이 신선 → 회전 생략
         assert!(dir.path().join("data.json.bak.0").exists());
         assert!(!dir.path().join("data.json.bak.1").exists());
+    }
+
+    #[test]
+    fn a_future_schema_backup_also_blocks_saves() {
+        // 본파일은 손상, 백업은 더 새 버전 — 이 조합에서 저장을 막지 않으면
+        // 다음 저장이 신버전 데이터를 덮어쓴다.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        std::fs::write(&file, "{ corrupt").unwrap();
+        let mut future = sample_state("newer");
+        future.schema_version = SCHEMA_VERSION + 1;
+        std::fs::write(
+            dir.path().join("data.json.bak.0"),
+            serde_json::to_string(&future).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = Store::new(file);
+        let loaded = store.load();
+        assert_eq!(loaded.source, LoadSource::Default, "a future backup is not usable data");
+        assert!(
+            store.future_schema_guarded(),
+            "a future-schema backup must block saves, or we overwrite newer data"
+        );
+        assert!(matches!(
+            store.save(&PersistedState::default()),
+            Err(PersistenceError::FutureSchemaGuard)
+        ));
+    }
+
+    #[test]
+    fn a_merely_corrupt_backup_does_not_block_saves() {
+        // 쓰레기 백업 때문에 저장이 막히면 사용자는 아무것도 못 한다
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        std::fs::write(&file, "{ corrupt").unwrap();
+        std::fs::write(dir.path().join("data.json.bak.0"), "also garbage").unwrap();
+
+        let mut store = Store::new(file);
+        store.load();
+        assert!(!store.future_schema_guarded());
+        assert!(store.save(&PersistedState::default()).is_ok());
     }
 }
