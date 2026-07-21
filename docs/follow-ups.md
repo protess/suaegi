@@ -42,6 +42,16 @@
    크기에서는 문제없지만 Plan 4의 렌더 경로에 놓인다. 실제 렌더 벤치마크를 보고
    판단한다 — 추측으로 최적화하지 않는다.
 
+## 결정 필요 (코드 변경 보류)
+
+8. **Windows에서 `claude.exe` 미탐지** (`crates/suaegi-term/src/agent.rs`)
+   `process_names`가 codex는 `&["codex", "codex.exe"]`로 두 형태를 다 갖고
+   있지만 claude는 `&["claude", "claude-code"]`뿐이라 `.exe` 확장자가 없다.
+   Windows에서 basename 매칭이 `claude.exe`를 놓친다(pre-existing, 이
+   브랜치의 변경으로 생긴 문제 아님). `bcd6b5b`에서 확정한 basename-only
+   매칭 규칙과 어떻게 맞물릴지(단순히 `"claude.exe"`를 추가할지, 확장자를
+   벗기는 정규화를 basename_matches에 넣을지) 별도로 결정한 뒤에 고친다.
+
 ## 개발 환경 (코드 아님)
 
 7. **전역 gitconfig의 평문 PAT**
