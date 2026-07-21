@@ -2,6 +2,7 @@ use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Select, Sender, TryRecvError, TrySendError};
 
@@ -24,6 +25,40 @@ const WRITE_QUEUE_CAPACITY: usize = 256;
 /// 많아야 수십 바이트인 걸 감안하면 정상적인 시동 핸드셰이크(여러 질의가
 /// 몰리는 vim/neovim류)를 넉넉히 흡수하면서도(약 수백 KB) 상한을 유지한다.
 const REPLY_QUEUE_CAPACITY: usize = 4096;
+/// Drop이 reader/writer 스레드의 조인을 기다리는 상한. `killpg(SIGKILL)`은
+/// 자식의 프로세스 그룹까지만 닿는다 — `setsid()`로 그룹을 빠져나갔지만
+/// 상속받은 PTY 슬레이브 FD를 닫지 않은 자손이 있으면 리더는 EOF를 영원히
+/// 보지 못해 join이 끝나지 않는다. 정상 경로(자식이 그룹 안에서 죽는 흔한
+/// 경우)에서는 killpg 직후 리더/라이터가 수십 ms 안에 끝난다 — 기존
+/// `dropping_the_session_does_not_block` 류 테스트가 그 사실의 실측 근거다.
+/// 2초는 그 정상 경로에 넉넉한 여유를 주면서, 탈출한 자손이 슬레이브를 붙든
+/// 드문 경우에도 UI 스레드가 이 시간을 넘겨 얼어붙지 않게 하는 상한이다 —
+/// Drop이 UI 스레드에서 도는 Plan 3 이후에는 "순간적으로 느껴짐"이 사용자
+/// 관점의 요구사항이다. 넘기면 스레드를 조인하지 않고 분리(detach)한다 —
+/// 러스트에는 스레드를 강제 종료할 방법이 없으므로 스레드 하나가 새게(누수)
+/// 되지만, 그 자손이 언젠가 끝나면(또는 프로세스 자체가 끝나면) 함께
+/// 정리된다. "가끔 스레드 하나가 새는 것"이 "UI가 영원히 멈추는 것"보다
+/// 명백히 나은 트레이드오프다.
+const JOIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// `handle`이 `deadline` 안에 끝나면 조인해서 패닉을 전파한다(다른 스레드의
+/// 패닉을 삼키지 않기 위함). 넘기면 조인을 포기하고 핸들을 버려(분리) 즉시
+/// 반환한다 — 이 함수 자체는 절대 `deadline`보다 오래 블로킹하지 않는다.
+fn join_with_deadline(handle: JoinHandle<()>, deadline: Duration) {
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= deadline {
+            // 조인을 포기하고 분리한다 — drop(handle)은 스레드를 죽이지 않지만
+            // (러스트는 스레드 강제 종료 수단이 없다) 더 이상 그 종료를 기다리지
+            // 않는다는 뜻이다. 스레드는 언젠가(자손이 슬레이브를 놓으면) 스스로
+            // 끝난다.
+            drop(handle);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionSpec {
@@ -342,31 +377,84 @@ impl Drop for TerminalSession {
         if let Ok(mut writes) = self.writes.lock() {
             writes.take();
         }
-        // unix: killpg(SIGKILL)로 그룹 전체가 죽으므로 슬레이브가 닫히고 리더가
-        // EOF에 도달한다 — join이 끝난다는 보장이 있다.
+        // unix: killpg(SIGKILL)로 그룹 전체가 죽으므로 보통은 슬레이브가 닫히고
+        // 리더가 EOF에 도달한다 — 하지만 `setsid()`로 그룹을 빠져나간 자손이
+        // 슬레이브 FD를 들고 있으면 killpg가 닿지 않아 리더가 영원히 블로킹될 수
+        // 있다. `join_with_deadline`으로 그 경우에도 Drop이 멈추지 않게 한다
+        // (`JOIN_DEADLINE` 주석 참고).
         // Windows: 자손 프로세스를 확실히 죽일 방법이 없어(job object는 post-MVP)
         // 리더가 EOF를 못 볼 수 있으므로 join하지 않고 분리한다.
         #[cfg(unix)]
         if let Ok(mut handle) = self.reader_thread.lock() {
             if let Some(handle) = handle.take() {
-                let _ = handle.join();
+                join_with_deadline(handle, JOIN_DEADLINE);
             }
         }
         #[cfg(not(unix))]
         if let Ok(mut handle) = self.reader_thread.lock() {
             let _ = handle.take(); // 분리 (join하면 영원히 멈출 수 있다)
         }
-        // 라이터도 같은 이유로 unix에서만 join한다. Windows에서는 자손이 의사
-        // 콘솔을 붙들고 있으면 write_all이 블로킹된 채로 남을 수 있다.
+        // 라이터도 같은 이유로 unix에서만(그리고 같은 데드라인으로) join한다.
+        // Windows에서는 자손이 의사 콘솔을 붙들고 있으면 write_all이 블로킹된
+        // 채로 남을 수 있다.
         #[cfg(unix)]
         if let Ok(mut handle) = self.writer_thread.lock() {
             if let Some(handle) = handle.take() {
-                let _ = handle.join();
+                join_with_deadline(handle, JOIN_DEADLINE);
             }
         }
         #[cfg(not(unix))]
         if let Ok(mut handle) = self.writer_thread.lock() {
             let _ = handle.take();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `join_with_deadline`은 Drop에서 쓰는 그대로다: 스레드가 데드라인을 넘겨도
+    /// 살아 있으면 그 자연 종료를 기다리지 않고 반환해야 한다(넘겨받은 데드라인
+    /// 근처에서, 스레드가 실제로 끝날 때까지 기다리지 않고). 이 스레드는
+    /// 데드라인보다 훨씬 오래(10초) 도는데, 검증 실패 시(=옛 무조건 join
+    /// 코드로 되돌리면) 이 테스트 자체가 10초 넘게 멈춰서 실패를 분명히
+    /// 드러낸다.
+    #[test]
+    fn join_with_deadline_detaches_instead_of_waiting_out_a_stuck_thread() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        let deadline = Duration::from_millis(200);
+        let start = Instant::now();
+        join_with_deadline(handle, deadline);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not wait for the 10s thread to finish once the deadline passed, took {elapsed:?}"
+        );
+    }
+
+    /// 스레드가 데드라인 안에 스스로 끝나면 정상적으로 조인해야 한다(=데드라인을
+    /// 다 채우고서야 반환하는 게 아니라 스레드 종료 직후 반환) — 위 테스트와
+    /// 짝을 이뤄 "빠르면 즉시 반환, 느리면 데드라인에서 분리"라는 계약 전체를
+    /// 검증한다.
+    #[test]
+    fn join_with_deadline_joins_promptly_when_the_thread_finishes_early() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+        });
+        let start = Instant::now();
+        join_with_deadline(handle, Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "should return shortly after the thread finishes, not wait out the full \
+             deadline, took {elapsed:?}"
+        );
     }
 }
