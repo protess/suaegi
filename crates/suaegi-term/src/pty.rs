@@ -60,6 +60,13 @@ struct Lifecycle {
     /// 언제든 재사용될 수 있으므로 시그널을 보내지 않는다.
     reaping: bool,
     reaped: bool,
+    /// 알려진 종료 코드. `wait()`든 `try_wait()`든 먼저 수확한 쪽이 채운다.
+    /// `reaped`만으로는 "이미 수확됨"만 알 수 있을 뿐 코드 자체를 나중 호출자에게
+    /// 전달할 수 없었다 — 그래서 `try_wait`가 한 번 `None`을 넘어가면 영원히
+    /// `None`만 돌려주는 버그가 있었다(수확 여부와 "그 결과가 뭐였는지"를
+    /// 구분하지 못함). 이 필드가 그 결과를 보관해 `try_wait`가 언제 불려도
+    /// 알려진 코드를 정직하게 돌려주게 한다.
+    exit_code: Option<i32>,
 }
 
 /// `PtySession::kill()`이 실제로 무엇을 했는지. `Ok(())` 하나로는 "시그널을
@@ -205,46 +212,71 @@ impl PtySession {
     /// 비블로킹. lifecycle 락을 호출 **전 구간** 잡는다 — try_wait 자체가
     /// 블로킹하지 않으므로 안전하고, 이렇게 해야 "수확됨"과 kill 사이에 틈이 없다.
     ///
-    /// `reaping`이 이미 서 있으면(블로킹 `wait()`가 진행 중이거나 이미 끝났으면)
-    /// `child` 락에는 **절대 손대지 않고** 바로 `Ok(None)`을 반환한다. `wait()`는
+    /// **계약**: 종료 코드가 알려지면(이 호출이 직접 수확했든, `wait()`가 다른
+    /// 스레드에서 먼저 수확했든) 이후 몇 번을 불러도 항상 `Ok(Some(code))`를
+    /// 돌려준다 — fire-once가 아니라 멱등이다. `Ok(None)`은 오직 "아직 종료
+    /// 안 했다"만을 뜻한다("이미 어딘가에서 수확됐는데 코드를 모른다"는 상태는
+    /// 없다).
+    ///
+    /// `reaping`은 서 있는데 코드가 아직 없는 경우(다른 스레드의 `wait()`가
+    /// `reaping`만 세우고 아직 블로킹 `child.wait()`를 끝내지 못한 극히 짧은
+    /// 창)에는 `child` 락에 **절대 손대지 않고** `Ok(None)`을 반환한다. `wait()`는
     /// 그 락을 쥔 채로 블로킹하므로, 여기서 그걸 기다리면 `lifecycle`을 쥔 채
     /// 파킹하게 되어 `kill()`의 "즉시 반환" 보장이 깨진다(락 순서 규칙 위반).
+    /// 그 창을 지나면 `wait()`가 `exit_code`를 채우므로 다음 호출부터는 코드가
+    /// 보인다.
     pub fn try_wait(&self) -> Result<Option<i32>, TermError> {
         let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
+        if let Some(code) = lifecycle.exit_code {
+            return Ok(Some(code));
+        }
         if lifecycle.reaping {
             return Ok(None);
         }
         let mut child = self.child.lock().expect("pty child mutex poisoned");
         let status = child.try_wait()?;
-        if status.is_some() {
+        if let Some(status) = status {
+            let code = status.exit_code() as i32;
             lifecycle.reaping = true;
             lifecycle.reaped = true;
+            lifecycle.exit_code = Some(code);
+            return Ok(Some(code));
         }
-        Ok(status.map(|status| status.exit_code() as i32))
+        Ok(None)
     }
 
     /// 블로킹. 리더 스레드가 EOF를 본 뒤 호출한다.
     /// 블로킹 구간에 lifecycle 락을 걸치지 않는 대신, 진입 **전에** `reaping`을
     /// 세워 그 순간부터 kill이 시그널을 보내지 않게 한다 (PID 재사용 방지).
     ///
+    /// 이미 알려진 코드가 있으면(다른 스레드가 먼저 수확했으면) `child` 락을
+    /// 다시 잡지 않고 바로 그 값을 돌려준다 — portable-pty의 unix `Child`가
+    /// `std::process::Child`라 재호출이 원래도 안전하긴 하지만(캐시된 상태를
+    /// 돌려줌), 굳이 `child` 락을 다시 다툴 이유가 없다.
+    ///
     /// `child` 락은 블로킹 `child.wait()` 호출을 감싸는 스코프 안에서만 잡고
-    /// 반환 즉시 놓는다 — 꼬리의 `reaped` 기록은 그 스코프 **밖**에서, `child`를
-    /// 놓은 뒤에 `lifecycle`을 다시 잡아 수행한다. 두 락을 동시에 쥐지 않아야
-    /// `try_wait`/`kill`과의 ABBA 역전을 피한다(락 순서 규칙, 위 참고).
+    /// 반환 즉시 놓는다 — 꼬리의 `reaped`/`exit_code` 기록은 그 스코프 **밖**에서,
+    /// `child`를 놓은 뒤에 `lifecycle`을 다시 잡아 수행한다. 두 락을 동시에 쥐지
+    /// 않아야 `try_wait`/`kill`과의 ABBA 역전을 피한다(락 순서 규칙, 위 참고).
     pub fn wait(&self) -> Result<i32, TermError> {
         {
             let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
+            if let Some(code) = lifecycle.exit_code {
+                return Ok(code);
+            }
             lifecycle.reaping = true;
         }
         let status = {
             let mut child = self.child.lock().expect("pty child mutex poisoned");
             child.wait()?
         };
+        let code = status.exit_code() as i32;
         {
             let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
             lifecycle.reaped = true;
+            lifecycle.exit_code = Some(code);
         }
-        Ok(status.exit_code() as i32)
+        Ok(code)
     }
 
     /// unix: 자식의 프로세스 그룹 전체에 SIGKILL. portable-pty의 killer는 직속

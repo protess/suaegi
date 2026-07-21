@@ -113,6 +113,54 @@ fn try_wait_is_none_while_running_then_some() {
     assert_eq!(code, Some(0));
 }
 
+/// 회귀 테스트: 예전에는 수확이 끝난 뒤 `try_wait`가 영원히 `Ok(None)`을
+/// 돌려줬다(fire-once) — `Ok(None)`이 "아직 실행 중"과 "이미 어딘가에서
+/// 수확됨" 둘 다를 뜻하게 되어 폴링하는 쪽이 오해할 수 있었다. 이 테스트는
+/// `try_wait` 자신이 수확한 뒤 반복 호출해도 매번 같은 코드를 돌려준다는
+/// 계약(멱등성)을 확인한다.
+#[test]
+fn try_wait_is_idempotent_after_child_exits() {
+    let (session, reader) = PtySession::spawn(spec(platform::exit_with(4))).unwrap();
+    let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first = None;
+    while Instant::now() < deadline {
+        if let Some(c) = session.try_wait().unwrap() {
+            first = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        first,
+        Some(4),
+        "first try_wait should observe the exit code"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            session.try_wait().unwrap(),
+            Some(4),
+            "try_wait must keep reporting the known code, not fall back to None"
+        );
+    }
+}
+
+/// 회귀 테스트의 다른 절반: 수확이 `try_wait` 자신이 아니라 별도의 `wait()`
+/// 호출로 먼저 끝난 경우에도, 뒤이은 `try_wait`는 알려진 코드를 돌려줘야
+/// 한다 — `Lifecycle`에 코드를 저장하는 쪽은 `wait()`와 `try_wait()` 둘 다다.
+#[test]
+fn try_wait_reports_the_code_after_wait_already_reaped() {
+    let (session, reader) = PtySession::spawn(spec(platform::exit_with(9))).unwrap();
+    let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+    assert_eq!(session.wait().unwrap(), 9);
+    assert_eq!(
+        session.try_wait().unwrap(),
+        Some(9),
+        "try_wait after an external wait() already reaped must still report the code, \
+         not None"
+    );
+}
+
 #[test]
 fn kill_terminates_a_long_running_child() {
     let (session, reader) = PtySession::spawn(spec(platform::sleep_seconds(60))).unwrap();
