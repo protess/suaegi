@@ -19,8 +19,12 @@
    상속한다. PID 매칭이나 pane당 포트가 아니다.
 3. **상태는 셋이 아니라 넷** — `working / blocked / waiting / done`.
 4. **`StopFailure`를 반드시 등록한다.** 없으면 API 오류 뒤 pane이 **영원히 `working`**에 멈춘다.
-5. **`AskUserQuestion`은 도구 이름으로 특수 처리**해야 한다. 자동 허용이라 사람을 기다리는 동안
-   `PermissionRequest`가 아니라 `PreToolUse`를 낸다.
+5. **`waiting`은 규칙 하나로 끝난다** — `PermissionRequest`가 들어가고 `PostToolUse`/`Stop`이
+   나온다. `AskUserQuestion` 특수 처리는 **필요 없다**(실측: 자동 허용이 아니고 온전한
+   `PermissionRequest`를 낸다). Orca의 특수 케이스를 베끼지 않는다.
+5b. **`Stop`은 "끝났다"가 아니다.** Agent 도구가 기본 백그라운드라 서브에이전트가 도는 중에
+   `Stop`이 먼저 온다 — **done = `Stop` AND `background_tasks`가 빔.** 아니면 배지가 깜빡인다.
+5c. **모든 훅을 `async: true`로 건다**(실측: 턴 지연 18.4s → 3.0s, 전달은 유지).
 6. **Codex도 훅이 있다** — 배지가 Claude 전용일 필요가 없다. 단 트러스트 해시 + `CODEX_HOME`
    미러링이 필요해 Claude보다 훨씬 무겁다.
 7. **diff 패널은 예상보다 작다.** `suaegi-git/src/compare.rs`가 이미 완성·테스트돼 있고 앱 배선만
