@@ -1,8 +1,9 @@
 use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+use crossbeam_channel::{Select, Sender, TryRecvError, TrySendError};
 
 use crate::grid::{GridSize, TerminalGrid, TerminalSnapshot, TitleChange};
 use crate::pty::{PtySession, PtySpawn, TermError};
@@ -23,8 +24,6 @@ const WRITE_QUEUE_CAPACITY: usize = 256;
 /// 많아야 수십 바이트인 걸 감안하면 정상적인 시동 핸드셰이크(여러 질의가
 /// 몰리는 vim/neovim류)를 넉넉히 흡수하면서도(약 수백 KB) 상한을 유지한다.
 const REPLY_QUEUE_CAPACITY: usize = 4096;
-/// 라이터 스레드가 UI 큐를 기다리는 간격. 이 주기마다 장치 응답 큐를 먼저 비운다.
-const WRITER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct SessionSpec {
@@ -39,7 +38,7 @@ pub struct TerminalSession {
     exit_code: Arc<AtomicI64>,
     running: Arc<AtomicBool>,
     /// Drop에서 닫아 라이터 스레드를 끝낸다
-    writes: Mutex<Option<SyncSender<Vec<u8>>>>,
+    writes: Mutex<Option<Sender<Vec<u8>>>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
     /// `resize()`가 pty와 grid를 한 쌍으로 갱신하는 동안 다른 resize 호출이
@@ -65,58 +64,88 @@ impl TerminalSession {
         // UI 입력은 바운드(유실 허용), 장치 응답은 언바운드 별도 큐(유실 불가).
         // 하나의 큐를 공유하면 UI 입력이 큐를 채운 사이 리더가 응답 송신에서
         // 블로킹돼 PTY 출력 소비가 멈추는 교착이 생긴다.
-        let (ui_tx, ui_rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = mpsc::sync_channel::<Vec<u8>>(REPLY_QUEUE_CAPACITY);
+        let (ui_tx, ui_rx) = crossbeam_channel::bounded::<Vec<u8>>(WRITE_QUEUE_CAPACITY);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Vec<u8>>(REPLY_QUEUE_CAPACITY);
 
         // 라이터 스레드: PTY write도 블로킹이므로 UI가 직접 부르지 않게 분리한다.
-        // 매 주기마다 장치 응답을 먼저 비워 UI 입력 뒤에 밀리지 않게 한다.
+        // std::sync::mpsc 대신 crossbeam_channel을 쓰는 이유: `Select`로 두 큐를
+        // 동시에 기다릴 수 있어 폴링 없이(따라서 지연 없이) 응답을 받을 수 있다
+        // — 예전에는 20ms 주기로만 깨어나 장치 질의 핸드셰이크(vim/neovim의
+        // DA1/DSR/OSC 색상 질의 등)가 눈에 보이는 지연을 겪었다.
         let writer_thread = {
             let writer_pty = Arc::clone(&pty);
             match std::thread::Builder::new()
                 .name("suaegi-pty-writer".to_string())
-                .spawn(move || loop {
-                    let mut failed = false;
-                    // 리더는 reply_tx의 마지막 사본을 들고 있다(아래에서 세션이
-                    // 자기 사본을 drop한다) — 그래서 Disconnected는 곧 "리더가
-                    // 끝났다 = 자식이 죽었다"는 신호다. UI 송신자가 아직 살아
-                    // 있어도(세션이 보관 중이어도) 여기서 끝내야, 자식이 죽은
-                    // 세션을 오래 들고 있을 때 이 스레드가 20ms마다 깨어나며
-                    // 남아 있는 비용을 없앨 수 있다.
-                    let mut reader_gone = false;
+                .spawn(move || {
+                    // 한 번만 등록하고 루프 내내 재사용한다 — select는 재등록 없이
+                    // 반복 호출할 수 있다.
+                    let mut select = Select::new();
+                    let reply_idx = select.recv(&reply_rx);
+                    let ui_idx = select.recv(&ui_rx);
+
                     loop {
-                        match reply_rx.try_recv() {
-                            Ok(bytes) => {
-                                if writer_pty.write(&bytes).is_err() {
-                                    failed = true;
+                        let mut failed = false;
+                        // 리더는 reply_tx의 마지막 사본을 들고 있다(아래에서 세션이
+                        // 자기 사본을 drop한다) — 그래서 Disconnected는 곧 "리더가
+                        // 끝났다 = 자식이 죽었다"는 신호다. UI 송신자가 아직 살아
+                        // 있어도(세션이 보관 중이어도) 여기서 끝내야, 자식이 죽은
+                        // 세션을 오래 들고 있을 때 이 스레드가 계속 깨어나며 남아
+                        // 있는 비용을 없앨 수 있다.
+                        let mut reader_gone = false;
+                        loop {
+                            match reply_rx.try_recv() {
+                                Ok(bytes) => {
+                                    if writer_pty.write(&bytes).is_err() {
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    reader_gone = true;
                                     break;
                                 }
                             }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                reader_gone = true;
-                                break;
-                            }
                         }
-                    }
-                    if failed {
-                        break;
-                    }
-                    if reader_gone {
-                        break;
-                    }
-                    match ui_rx.recv_timeout(WRITER_POLL_INTERVAL) {
-                        Ok(bytes) => {
-                            if writer_pty.write(&bytes).is_err() {
-                                break;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        // UI 송신자가 사라졌으면 남은 응답만 비우고 끝낸다
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            while let Ok(bytes) = reply_rx.try_recv() {
-                                let _ = writer_pty.write(&bytes);
-                            }
+                        if failed {
                             break;
+                        }
+                        if reader_gone {
+                            break;
+                        }
+
+                        // 매 반복 위에서 응답을 먼저 다 비운 뒤에만 여기 도달하므로,
+                        // select가 어느 쪽을 깨우든 응답 우선순위는 유지된다.
+                        let oper = select.select();
+                        if oper.index() == reply_idx {
+                            match oper.recv(&reply_rx) {
+                                Ok(bytes) => {
+                                    if writer_pty.write(&bytes).is_err() {
+                                        break;
+                                    }
+                                }
+                                // 리더가 select 대기 중에 사라졌다 — 다음 반복의
+                                // 위쪽 드레인 루프가 Disconnected로 잡아 끝낸다.
+                                Err(_) => {}
+                            }
+                        } else if oper.index() == ui_idx {
+                            match oper.recv(&ui_rx) {
+                                Ok(bytes) => {
+                                    if writer_pty.write(&bytes).is_err() {
+                                        break;
+                                    }
+                                }
+                                // UI 송신자가 사라졌으면(세션 Drop) 남은 응답만
+                                // 비우고 끝낸다
+                                Err(_) => {
+                                    while let Ok(bytes) = reply_rx.try_recv() {
+                                        let _ = writer_pty.write(&bytes);
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            unreachable!("select only registered reply_rx and ui_rx");
                         }
                     }
                 }) {
@@ -159,8 +188,8 @@ impl TerminalSession {
                                 for reply in grid.take_pty_writes() {
                                     match reader_reply_tx.try_send(reply.into_bytes()) {
                                         Ok(()) => {}
-                                        Err(mpsc::TrySendError::Full(_)) => {}
-                                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                                        Err(TrySendError::Full(_)) => {}
+                                        Err(TrySendError::Disconnected(_)) => break,
                                     }
                                 }
                                 generation.fetch_add(1, Ordering::Release);
