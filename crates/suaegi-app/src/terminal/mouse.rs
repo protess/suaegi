@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::mouse as iced_mouse;
 use iced::advanced::Shell;
-use iced::{Event, Point, Rectangle};
+use iced::{window, Event, Point, Rectangle};
 
 use suaegi_term::grid::GridSize;
 use suaegi_term::input_types::{
@@ -290,12 +290,30 @@ pub(crate) fn update(
     size: GridSize,
     shell: &mut Shell<'_, Published>,
 ) {
+    // **창 포커스를 잃으면 제스처를 닫는다.** `held`를 푸는 경로 중 유일하게
+    // 마우스 이벤트에 기대지 않는 것이다 — OS가 릴리스를 아예 주지 않는 경우
+    // (드래그 중 포커스를 빼앗김)에 남는 마지막 그물이다.
+    if matches!(event, Event::Window(window::Event::Unfocused)) {
+        let hit = state.metrics.and_then(|m| {
+            hit_for(cursor, bounds, m, size).or_else(|| last_known_hit(state, m, size))
+        });
+        resolve_held_gesture(state, id, hit, shell);
+        return;
+    }
+
     let Event::Mouse(mouse_event) = event else {
         return;
     };
     // 다른 위젯이 이미 가져간 이벤트는 건드리지 않는다. **캡처는 단락이 아니라
     // 플래그이므로** 이 검사가 없으면 같은 이벤트를 두 번 처리할 수 있다.
-    if shell.is_event_captured() {
+    //
+    // **예외: 이미 우리가 소유한 제스처의 릴리스.** 그것까지 흘려보내면 `held`가
+    // 남고, 그 뒤로 이 pane의 **모든 press가 조용히 죽는다**(`press_intent`가
+    // 계속 `None`). 남이 캡처한 이벤트를 가로채는 것이 아니라, 이미 시작한 우리
+    // 제스처를 닫는 것이므로 예외로 둘 근거가 있다.
+    let owns_this_release = state.held.is_some()
+        && matches!(*mouse_event, iced_mouse::Event::ButtonReleased(b) if to_button(b) == state.held);
+    if shell.is_event_captured() && !owns_this_release {
         return;
     }
     // 아직 측정 전이면 셀을 알 수 없다. 추측한 좌표로 선택을 시작하는 것보다
@@ -314,6 +332,14 @@ pub(crate) fn update(
             let (Some(button), Some(hit)) = (to_button(button), hit) else {
                 return;
             };
+            // **같은 버튼이 이미 눌려 있다는 것은 릴리스를 잃었다는 증거다** —
+            // 버튼을 떼지 않고 두 번 누를 수는 없다. 다른 버튼의 press는 진짜
+            // 코드 클릭이라 모호하지만, 이 경우만은 모호하지 않으므로 여기서
+            // 제스처를 닫고 새로 시작한다. 이것이 없으면 잃어버린 릴리스 하나가
+            // 이 pane의 마우스 입력을 세션 끝까지 죽인다.
+            if state.held == Some(button) {
+                resolve_held_gesture(state, id, Some(hit), shell);
+            }
             let now = Instant::now();
             let pos = cursor_point(state);
             let kind = classify_click(state.last_click, button, now, pos);
@@ -339,12 +365,24 @@ pub(crate) fn update(
             // 포인터 래치가 풀리지 않아, 버튼을 뗀 뒤에도 마우스를 움직이는
             // 것만으로 선택이 계속 따라온다. bounds 밖이면 마지막으로 알던
             // 셀을 쓴다 — press가 안에서 일어났으므로 반드시 하나 있다.
-            let Some(hit) = hit.or_else(|| last_known_hit(state, metrics, size)) else {
-                return;
-            };
+            //
+            // **놓을 자리를 못 찾아도 `held`는 반드시 정리한다.** 예전에는 여기서
+            // 그냥 빠져나갔는데, 드래그 도중 pane이 줄어 그 셀이 사라지기만 해도
+            // (평범한 리사이즈다) `held`가 남아 이후 모든 press가 죽었다.
+            // **발행과 상태 정리는 다른 관심사다** — 전자가 실패해도 후자는 한다.
+            let placed = hit.or_else(|| last_known_hit(state, metrics, size));
             let kind = state.last_click.map_or(ClickKind::Single, |c| c.kind);
-            if let Some(intent) = release_intent(state, button, hit, kind) {
-                publish(shell, id, intent);
+            match placed {
+                Some(hit) => {
+                    if let Some(intent) = release_intent(state, button, hit, kind) {
+                        publish(shell, id, intent);
+                    }
+                }
+                None if state.held == Some(button) => {
+                    // 그리드의 래치는 자기 자가복구(같은 버튼 재-press)에 맡긴다.
+                    state.held = None;
+                }
+                None => {}
             }
         }
         iced_mouse::Event::CursorMoved { .. } => {
@@ -375,6 +413,33 @@ pub(crate) fn update(
         // 커서가 창을 드나드는 것 자체로는 터미널이 할 일이 없다. 버튼이
         // 눌린 채 나갔다면 릴리스가 위에서 처리한다.
         iced_mouse::Event::CursorEntered | iced_mouse::Event::CursorLeft => {}
+    }
+}
+
+/// 진행 중인 제스처를 강제로 닫는다. `held`를 풀고, 놓을 자리를 알면 **합성
+/// 릴리스까지 발행해** 그리드의 포인터 래치도 함께 해소한다.
+///
+/// 자리를 모르면 `held`만 푼다 — 그리드 쪽은 같은 버튼이 다시 눌릴 때 스스로
+/// 복구한다(`resolve_route`). 여기서 좌표를 지어내지 않는 이유는, 지어낸 셀로
+/// 릴리스를 보내면 사용자가 만들던 선택의 **끝점이 엉뚱한 곳으로 확정**되기
+/// 때문이다. 래치가 잠시 남는 것보다 그쪽이 눈에 더 잘 띄는 오류다.
+fn resolve_held_gesture(
+    state: &mut State,
+    id: SessionId,
+    hit: Option<ViewportHit>,
+    shell: &mut Shell<'_, Published>,
+) {
+    let Some(button) = state.held else {
+        return;
+    };
+    let kind = state.last_click.map_or(ClickKind::Single, |c| c.kind);
+    match hit {
+        Some(hit) => {
+            if let Some(intent) = release_intent(state, button, hit, kind) {
+                publish(shell, id, intent);
+            }
+        }
+        None => state.held = None,
     }
 }
 
@@ -1104,6 +1169,166 @@ mod tests {
              button's release must still fire"
         );
         assert_eq!(state.held, None, "nothing is left held");
+    }
+
+    // ------------------------------------------------- 제스처 유실 복구
+    //
+    // **불변식: `held`에는 특정 미래 이벤트에 기대지 않는 해소 경로가 있어야
+    // 한다.** 없으면 릴리스 하나를 잃는 순간 `press_intent`가 영원히 `None`을
+    // 돌려주고, 그 pane의 마우스 입력이 세션 끝까지 조용히 죽는다.
+
+    /// 릴리스가 아예 오지 않아도 **같은 버튼을 다시 누르면 복구된다.**
+    /// 버튼을 떼지 않고 두 번 누를 수는 없으므로 둘째 press는 유실의 증거다.
+    #[test]
+    fn a_lost_release_is_recovered_by_pressing_the_same_button_again() {
+        let mut state = wired_state();
+        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        // 릴리스가 오지 않는다.
+
+        let got = intents(&run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(2.0, 2.0),
+        ));
+        let actions: Vec<MouseAction> = got.iter().map(|i| i.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                // 먼저 잃어버린 제스처를 닫고(그리드 래치까지 해소된다),
+                MouseAction::Release(TermMouseButton::Left),
+                // 그 다음 새 제스처를 연다.
+                MouseAction::Press(TermMouseButton::Left),
+            ],
+            "the stale gesture must be closed before the new one opens"
+        );
+        assert_eq!(state.held, Some(TermMouseButton::Left));
+
+        // 그리고 계속 동작해야 한다 — 한 번 복구되고 다시 막히면 의미가 없다.
+        let _ = run(&mut state, &release(iced_mouse::Button::Left), cursor_at(2.0, 2.0));
+        for i in 0..3 {
+            let again = intents(&run(
+                &mut state,
+                &press(iced_mouse::Button::Left),
+                cursor_at(1.0, 1.0),
+            ));
+            assert!(!again.is_empty(), "press #{i} after recovery produced nothing");
+            let _ = run(&mut state, &release(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        }
+    }
+
+    /// 릴리스가 다른 위젯에 캡처돼도 **우리가 소유한 제스처는 닫아야 한다.**
+    /// `pane_grid`의 `TitleBar`가 있으면 충분히 일어날 수 있다.
+    #[test]
+    fn a_captured_release_still_resolves_our_own_gesture() {
+        let mut state = wired_state();
+        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        shell.capture_event();
+        update(
+            &mut state,
+            SessionId(1),
+            &release(iced_mouse::Button::Left),
+            BOUNDS,
+            cursor_at(1.0, 1.0),
+            grid(),
+            &mut shell,
+        );
+
+        assert_eq!(state.held, None, "the gesture must be closed");
+        assert!(
+            matches!(
+                intents(&messages).first().map(|i| i.action),
+                Some(MouseAction::Release(TermMouseButton::Left))
+            ),
+            "and the grid's latch must be resolved too"
+        );
+
+        // 대조군: 우리가 소유하지 않은 제스처의 캡처된 press는 여전히 무시한다.
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        shell.capture_event();
+        update(
+            &mut state,
+            SessionId(1),
+            &press(iced_mouse::Button::Left),
+            BOUNDS,
+            cursor_at(1.0, 1.0),
+            grid(),
+            &mut shell,
+        );
+        assert!(
+            intents(&messages).is_empty(),
+            "a captured press is still not ours to take"
+        );
+    }
+
+    /// 드래그 도중 pane이 줄어 눌렀던 셀이 사라져도 `held`는 정리된다.
+    /// **리뷰가 짚은 두 경로 밖의 세 번째 경로다** — OS가 이상하게 굴 필요도,
+    /// 다른 위젯이 캡처할 필요도 없이 평범한 리사이즈만으로 일어난다.
+    #[test]
+    fn a_release_that_cannot_be_placed_still_clears_held() {
+        let mut state = wired_state();
+        let big = GridSize { rows: 10, cols: 20 };
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        update(
+            &mut state,
+            SessionId(1),
+            &press(iced_mouse::Button::Left),
+            BOUNDS,
+            cursor_at(1.0, 8.0),
+            big,
+            &mut shell,
+        );
+        assert_eq!(state.held, Some(TermMouseButton::Left));
+
+        // pane이 2행으로 줄었다 — 8행은 이제 존재하지 않는다.
+        let small = GridSize { rows: 2, cols: 20 };
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        update(
+            &mut state,
+            SessionId(1),
+            &release(iced_mouse::Button::Left),
+            BOUNDS,
+            cursor_at(1.0, 8.0),
+            small,
+            &mut shell,
+        );
+        assert_eq!(
+            state.held, None,
+            "publishing may fail, but the bookkeeping must not"
+        );
+
+        // 대조군: 그래서 다음 press가 정상적으로 나간다.
+        let after = intents(&run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
+        assert_eq!(after.len(), 1);
+    }
+
+    /// 창 포커스를 잃으면 제스처를 닫는다. **마우스 이벤트에 기대지 않는 유일한
+    /// 해소 경로**라, OS가 릴리스를 아예 주지 않는 경우의 마지막 그물이다.
+    #[test]
+    fn losing_window_focus_resolves_a_held_gesture() {
+        let mut state = wired_state();
+        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+
+        let unfocused = Event::Window(window::Event::Unfocused);
+        let got = intents(&run(&mut state, &unfocused, cursor_at(1.0, 1.0)));
+
+        assert!(
+            matches!(
+                got.first().map(|i| i.action),
+                Some(MouseAction::Release(TermMouseButton::Left))
+            ),
+            "a synthetic release must resolve the grid latch as well"
+        );
+        assert_eq!(state.held, None);
+
+        // 대조군: 아무것도 눌려 있지 않을 때의 포커스 상실은 조용하다.
+        let quiet = intents(&run(&mut state, &unfocused, cursor_at(1.0, 1.0)));
+        assert!(quiet.is_empty(), "nothing to resolve, nothing to publish");
     }
 
     #[test]

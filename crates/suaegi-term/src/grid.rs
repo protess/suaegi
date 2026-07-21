@@ -232,6 +232,20 @@ fn resolve_route(state: &mut GridState, intent: &MouseIntent, live: MouseRoute) 
         // 래치와 어긋나 제스처가 해소되지 않는다(리뷰에서 발견). 첫 버튼이 제스처의
         // 주인이고, 둘째 press는 그 라우트를 따른다.
         MouseAction::Press(button) => match state.pointer {
+            // **같은 버튼의 press가 또 왔다 = 릴리스를 잃었다.** 버튼을 떼지 않고
+            // 두 번 누를 수는 없으므로 이건 모호하지 않다 — 래치를 새 제스처로
+            // 갈아끼운다. 이 갈래가 없으면 릴리스 하나를 잃었을 때 래치가 영영
+            // 남아, `request_copy`가 계속 `None`을 돌려주고 단축키 복사가 죽는다.
+            Some(latch) if latch.button == button => {
+                state.pointer = Some(PointerLatch {
+                    button,
+                    route: live,
+                });
+                live
+            }
+            // 다른 버튼이면 진짜 코드 클릭이다. 첫 버튼이 제스처의 주인이므로
+            // 래치를 덮어쓰지 않는다 — 덮어쓰면 첫 버튼의 release가 래치와
+            // 어긋나 제스처가 해소되지 않는다.
             Some(latch) => latch.route,
             None => {
                 state.pointer = Some(PointerLatch {
@@ -1292,57 +1306,140 @@ mod tests {
         );
     }
 
-    /// 두 버튼이 겹쳐 눌려도 **첫 버튼의 release가 래치를 해소해야 한다.**
+    /// 코드 클릭이 끝나면 **다음 press가 라이브 모드로 다시 판정돼야 한다.**
     ///
-    /// 둘째 press가 래치를 덮어쓰면 첫 버튼의 release가 래치와 어긋나(`_ => live`)
-    /// 래치가 남는다. 그러면 `request_copy`가 "아직 선택을 만드는 중"이라고 보고
-    /// **영원히 `None`**을 돌려줘, 단축키 복사가 그 세션 내내 죽는다. 래치는
-    /// 관찰창이 없으므로 그 효과로 확인한다.
+    /// 관찰 방법이 이 테스트의 핵심이다. "래치가 남았는가"를 `request_copy`로
+    /// 물었던 이전 판은 이 버그를 못 잡았다 — 둘째 press가 `Ignore`로 라우팅돼
+    /// `local_selection_in_progress`(=`LocalSelect`만 매치)에 걸리지 않았고,
+    /// **이름이 걸린 마지막 단언이 아니라 대조군에서 죽었다.**
     ///
-    /// 위젯은 이제 겹친 press를 아예 발행하지 않으므로 이 경로는 **깊이 방어**다.
-    /// 그래도 `handle_mouse`는 공개 API라 직접 부르는 호출자에게는 여전히 닿는다.
+    /// 선택 결과로도 못 잡는다 — 남은 래치가 우연히 같은 라우트를 들고 있으면
+    /// 재사용해도 결과가 같기 때문이다. **모드를 바꿔야** 낡은 래치를 재사용한
+    /// 것과 라이브로 다시 판정한 것이 갈린다.
     #[test]
-    fn a_chorded_press_does_not_strand_the_pointer_latch() {
+    fn a_finished_chord_lets_the_next_press_route_against_the_live_mode() {
         let grid = grid_with_scrollback();
         let left = Some(TermMouseButton::Left);
         let right = Some(TermMouseButton::Right);
 
+        // 로컬 선택 모드에서 코드 클릭을 하고 첫 버튼을 뗀다.
+        for (action, held) in [
+            (MouseAction::Press(TermMouseButton::Left), left),
+            (MouseAction::Press(TermMouseButton::Right), right),
+            (MouseAction::Release(TermMouseButton::Left), left),
+        ] {
+            grid.handle_mouse(&intent(action, (0, 0), Side::Left, held))
+                .expect("every step of the chord routes");
+        }
+
+        // 이제 TUI가 마우스 리포팅을 켠다.
+        grid.feed(b"\x1b[?1000h\x1b[?1006h");
+
+        let next = grid
+            .handle_mouse(&intent(
+                MouseAction::Press(TermMouseButton::Left),
+                (1, 1),
+                Side::Left,
+                left,
+            ))
+            .expect("press routes");
+        assert!(
+            next.bytes.is_some(),
+            "the chord left a stale latch: this press was routed by the old \
+             gesture instead of the live mouse mode"
+        );
+    }
+
+    /// 코드 클릭의 둘째 버튼은 **첫 버튼이 잡은 라우트를 따른다.** 래치의 존재
+    /// 이유가 이것이다 — 제스처 도중 모드가 바뀌어도 한 제스처가 반으로 갈리면
+    /// 안 된다.
+    ///
+    /// 모드를 **제스처 도중에** 끄는 것이 유일한 관찰 방법이다. 모드가 그대로면
+    /// 래치를 따르든 라이브로 다시 보든 같은 라우트가 나와 구분되지 않는다 —
+    /// 여기서 한 번 헛발을 디뎠다.
+    #[test]
+    fn the_second_button_of_a_chord_follows_the_first_buttons_latched_route() {
+        let grid = grid_with_scrollback();
+        let left = Some(TermMouseButton::Left);
+        let right = Some(TermMouseButton::Right);
+
+        grid.feed(b"\x1b[?1000h\x1b[?1006h");
+        let press = grid
+            .handle_mouse(&intent(
+                MouseAction::Press(TermMouseButton::Left),
+                (0, 0),
+                Side::Left,
+                left,
+            ))
+            .expect("press routes");
+        assert!(press.bytes.is_some(), "the gesture starts as a report");
+
+        // 제스처 도중 TUI가 마우스 리포팅을 끈다.
+        grid.feed(b"\x1b[?1000l");
+
+        let second = grid
+            .handle_mouse(&intent(
+                MouseAction::Press(TermMouseButton::Right),
+                (0, 1),
+                Side::Left,
+                right,
+            ))
+            .expect("second press routes");
+        assert!(
+            second.bytes.is_some(),
+            "the chord's second button must follow the latched route — otherwise \
+             one gesture is split in half by a mid-drag mode change"
+        );
+    }
+
+    /// 릴리스를 잃어버려도 **같은 버튼을 다시 누르면 라이브로 재판정된다.**
+    /// 버튼을 떼지 않고 두 번 누를 수는 없으므로 둘째 press는 유실의 증거다.
+    ///
+    /// 모드를 바꾸는 이유는 위와 같다 — 낡은 래치가 같은 라우트를 들고 있으면
+    /// 재사용해도 선택 결과가 같아서 구분되지 않는다.
+    #[test]
+    fn a_lost_release_lets_the_same_button_re_press_route_against_the_live_mode() {
+        let grid = grid_with_scrollback();
+        let left = Some(TermMouseButton::Left);
+
+        // press만 하고 release가 오지 않는다.
         grid.handle_mouse(&intent(
             MouseAction::Press(TermMouseButton::Left),
             (0, 0),
             Side::Left,
             left,
         ))
-        .expect("left press routes");
-        // 좌버튼을 쥔 채 우버튼을 누른다. 그 자체로는 모순 없는 intent다.
-        grid.handle_mouse(&intent(
-            MouseAction::Press(TermMouseButton::Right),
-            (0, 1),
-            Side::Left,
-            right,
-        ))
-        .expect("right press routes");
+        .expect("press routes");
 
-        // 선택을 만드는 중이므로 아직 복사할 수 없다 — 대조군.
-        assert_eq!(
-            grid.request_copy(CopyTargets::EXPLICIT),
-            None,
-            "the gesture is still in progress"
-        );
+        grid.feed(b"\x1b[?1000h\x1b[?1006h");
 
-        grid.handle_mouse(&intent(
-            MouseAction::Release(TermMouseButton::Left),
-            (0, 3),
-            Side::Right,
-            left,
-        ))
-        .expect("left release routes");
-
+        let again = grid
+            .handle_mouse(&intent(
+                MouseAction::Press(TermMouseButton::Left),
+                (1, 1),
+                Side::Left,
+                left,
+            ))
+            .expect("press routes");
         assert!(
-            grid.request_copy(CopyTargets::EXPLICIT).is_some(),
-            "the first button's release must resolve the latch — otherwise \
-             shortcut copy is dead for the rest of the session"
+            again.bytes.is_some(),
+            "a lost release left the latch stuck on the old route, so this \
+             press never reached the reporting TUI"
         );
+
+        // 대조군: 라우팅이 되살아났을 뿐 아니라 로컬 선택도 여전히 정상이다.
+        let grid2 = grid_with_scrollback();
+        grid2
+            .handle_mouse(&intent(
+                MouseAction::Press(TermMouseButton::Left),
+                (0, 0),
+                Side::Left,
+                left,
+            ))
+            .expect("press routes");
+        drag(&grid2, (0, 0), (0, 3));
+        let epoch = grid2.selection_epoch();
+        assert_eq!(grid2.extract_selection(epoch), Some("ffff".to_string()));
     }
 
     /// 리포트로 래치된 드래그는 선택을 건드리지 않는다 — 그동안 단축키 복사를
