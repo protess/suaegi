@@ -219,52 +219,65 @@ fn bump_after_feed(state: &mut GridState) {
 
 /// 이번 intent가 실제로 실행할 라우트를 정하고 래치를 갱신한다.
 ///
-/// **휠은 래치에 참여하지 않는다**(플랜 0.4) — 드래그 중이라도 매번 라이브 모드로
-/// 독립 판정한다. 선택하는 도중에 휠을 굴리는 TUI가 래치 때문에 리포트를 못 받는
-/// 일이 없어야 한다. 포인터 버튼의 press/motion/release만 래치를 탄다.
+/// **위젯과 그리드는 이벤트 스트림으로만 이어져 있다.** 위젯 상태는 `Tree::diff`가
+/// 서브트리를 재생성할 때 조용히 리셋되고(`terminal/state.rs`의 `RESIZE_SEQ` 주석),
+/// 그리드의 래치는 세션에 그대로 남는다. 둘을 맞춰주는 시퀀스 번호도 핸드셰이크도
+/// 없으므로 **양쪽은 독립적으로 어긋날 수 있다.**
+///
+/// 그래서 규칙 하나로 못박는다: **제스처 수명주기의 권위는 위젯이고, 래치는 그
+/// 파생 상태다.**
+///
+/// | intent | 래치 |
+/// |--------|------|
+/// | `Press` — 제스처의 시작 | **언제나** 새로 잡는다 |
+/// | `Release` — 제스처의 끝 | **언제나** 푼다 |
+/// | `Motion`인데 `held`가 없음 | 어긋난 것이다 → 푼다 |
+/// | `Motion`인데 `held`가 있음 | 래치된 라우트를 따른다(제스처가 갈리지 않게) |
+/// | `Wheel` | 읽지도 쓰지도 않는다 — 매번 라이브 판정(플랜 0.4) |
+///
+/// **세 경우 모두 프로덕션에서 모호하지 않다.** `route_mouse`는 `Press(b)`에
+/// `held == Some(b)`를 요구하고 `press_intent`는 이미 눌린 것이 있으면 `None`을
+/// 돌려준다 → **위젯은 코드 클릭 press를 만들어낼 수 없다.** 따라서 다른 버튼의
+/// press가 살아 있는 래치 위로 들어왔다면 그것은 코드 클릭이 아니라 **위젯이
+/// 기억을 잃었다는 증거**이고, 그때 낡은 래치를 지키는 것은 증거에 대한 잘못된
+/// 응답이다. (코드 클릭 억제는 위젯 쪽 `press_intent`가 맡는다 — 거기서는 코드
+/// 클릭이 실재하므로 두 층의 정책이 반대인 것이 맞다.)
 fn resolve_route(state: &mut GridState, intent: &MouseIntent, live: MouseRoute) -> MouseRoute {
     match intent.action {
-        // 휠: 래치를 읽지도 쓰지도 않는다.
+        // 휠은 래치에 참여하지 않는다 — 드래그 중 휠을 굴리는 TUI가 래치 때문에
+        // 리포트를 못 받으면 안 된다.
         MouseAction::Wheel { .. } => live,
-        // press가 라우트를 정하고 release까지 붙든다 — 드래그 도중 모드가 바뀌어도
-        // 한 제스처가 반으로 갈리지 않는다.
-        // **이미 래치가 있으면 덮어쓰지 않는다.** 덮어쓰면 원래 버튼의 release가
-        // 래치와 어긋나 제스처가 해소되지 않는다(리뷰에서 발견). 첫 버튼이 제스처의
-        // 주인이고, 둘째 press는 그 라우트를 따른다.
-        MouseAction::Press(button) => match state.pointer {
-            // **같은 버튼의 press가 또 왔다 = 릴리스를 잃었다.** 버튼을 떼지 않고
-            // 두 번 누를 수는 없으므로 이건 모호하지 않다 — 래치를 새 제스처로
-            // 갈아끼운다. 이 갈래가 없으면 릴리스 하나를 잃었을 때 래치가 영영
-            // 남아, `request_copy`가 계속 `None`을 돌려주고 단축키 복사가 죽는다.
-            Some(latch) if latch.button == button => {
-                state.pointer = Some(PointerLatch {
-                    button,
-                    route: live,
-                });
-                live
-            }
-            // 다른 버튼이면 진짜 코드 클릭이다. 첫 버튼이 제스처의 주인이므로
-            // 래치를 덮어쓰지 않는다 — 덮어쓰면 첫 버튼의 release가 래치와
-            // 어긋나 제스처가 해소되지 않는다.
-            Some(latch) => latch.route,
-            None => {
-                state.pointer = Some(PointerLatch {
-                    button,
-                    route: live,
-                });
-                live
-            }
-        },
-        MouseAction::Motion => state.pointer.map_or(live, |latch| latch.route),
-        MouseAction::Release(button) => match state.pointer {
-            // 눌렸던 그 버튼이 놓였다 — 래치된 라우트로 마무리하고 해제한다.
-            Some(latch) if latch.button == button => {
+        // 제스처의 시작. 언제나 라이브 모드로 다시 판정해 새로 잡는다.
+        MouseAction::Press(button) => {
+            state.pointer = Some(PointerLatch {
+                button,
+                route: live,
+            });
+            live
+        }
+        MouseAction::Motion => match state.pointer {
+            // 정상 드래그 — 래치된 라우트를 따라 제스처가 반으로 갈리지 않게 한다.
+            Some(latch) if intent.held.is_some() => latch.route,
+            // 버튼이 눌리지 않았는데 래치가 있다 = 위젯이 기억을 잃었다.
+            // 마우스는 쉬지 않고 움직이므로 이 갈래가 가장 빨리 복구시킨다.
+            Some(_) => {
                 state.pointer = None;
-                latch.route
+                live
             }
-            // 래치가 없거나 다른 버튼의 것이다(창 밖에서 눌렸다 들어온 경우 등).
-            // 래치는 그 버튼의 주인 것이므로 건드리지 않는다.
-            _ => live,
+            None => live,
+        },
+        // 제스처의 끝. 래치는 언제나 푼다 — 버튼이 어긋나면 어긋난 쪽이 낡은
+        // 것이므로, 붙들고 있으면 `request_copy`가 계속 `None`을 돌려준다.
+        MouseAction::Release(button) => match state.pointer {
+            Some(latch) => {
+                state.pointer = None;
+                if latch.button == button {
+                    latch.route
+                } else {
+                    live
+                }
+            }
+            None => live,
         },
     }
 }
@@ -1350,45 +1363,119 @@ mod tests {
         );
     }
 
-    /// 코드 클릭의 둘째 버튼은 **첫 버튼이 잡은 라우트를 따른다.** 래치의 존재
-    /// 이유가 이것이다 — 제스처 도중 모드가 바뀌어도 한 제스처가 반으로 갈리면
-    /// 안 된다.
+    /// **위젯이 기억을 잃어도 press 하나로 복구된다.**
     ///
-    /// 모드를 **제스처 도중에** 끄는 것이 유일한 관찰 방법이다. 모드가 그대로면
-    /// 래치를 따르든 라이브로 다시 보든 같은 라우트가 나와 구분되지 않는다 —
-    /// 여기서 한 번 헛발을 디뎠다.
+    /// `Tree::diff`가 서브트리를 재생성하면 위젯의 `held`는 조용히 `None`이 되고
+    /// 그리드의 래치는 남는다. 그 뒤 위젯은 어느 버튼의 press든 받아들이므로,
+    /// 그리드에는 **살아 있는 래치와 다른 버튼의 press**가 도착한다.
+    ///
+    /// 이것이 코드 클릭일 수는 없다 — `route_mouse`가 `Press(b)`에
+    /// `held == Some(b)`를 요구하고 `press_intent`는 이미 눌린 것이 있으면 `None`을
+    /// 돌려주므로 **위젯은 코드 클릭 press 자체를 만들지 못한다.** 따라서 이
+    /// 입력은 어긋남의 증거이고, 낡은 래치를 따르면 새 제스처가 통째로 잘못
+    /// 라우팅된다.
     #[test]
-    fn the_second_button_of_a_chord_follows_the_first_buttons_latched_route() {
+    fn a_press_re_latches_even_when_it_names_a_different_button() {
         let grid = grid_with_scrollback();
-        let left = Some(TermMouseButton::Left);
-        let right = Some(TermMouseButton::Right);
 
+        // 로컬 모드에서 좌버튼 제스처가 시작돼 래치가 잡힌다.
+        grid.handle_mouse(&intent(
+            MouseAction::Press(TermMouseButton::Left),
+            (0, 0),
+            Side::Left,
+            Some(TermMouseButton::Left),
+        ))
+        .expect("press routes");
+
+        // 그 사이 TUI가 마우스 리포팅을 켠다. 그리고 위젯이 상태를 잃어
+        // 우버튼 press가 그대로 들어온다.
         grid.feed(b"\x1b[?1000h\x1b[?1006h");
-        let press = grid
-            .handle_mouse(&intent(
-                MouseAction::Press(TermMouseButton::Left),
-                (0, 0),
-                Side::Left,
-                left,
-            ))
-            .expect("press routes");
-        assert!(press.bytes.is_some(), "the gesture starts as a report");
-
-        // 제스처 도중 TUI가 마우스 리포팅을 끈다.
-        grid.feed(b"\x1b[?1000l");
-
-        let second = grid
+        let desynced = grid
             .handle_mouse(&intent(
                 MouseAction::Press(TermMouseButton::Right),
-                (0, 1),
+                (1, 1),
                 Side::Left,
-                right,
+                Some(TermMouseButton::Right),
             ))
-            .expect("second press routes");
+            .expect("press routes");
+
         assert!(
-            second.bytes.is_some(),
-            "the chord's second button must follow the latched route — otherwise \
-             one gesture is split in half by a mid-drag mode change"
+            desynced.bytes.is_some(),
+            "the stale latch must not route a brand-new gesture — a press is \
+             always the authoritative start of one"
+        );
+    }
+
+    /// **release는 버튼이 어긋나도 래치를 푼다.** 안 풀면
+    /// `local_selection_in_progress`가 계속 참이라 단축키 복사가 죽는다 —
+    /// 리뷰가 실제로 관측한 증상이다.
+    #[test]
+    fn a_release_clears_the_latch_even_when_it_names_a_different_button() {
+        let grid = grid_with_scrollback();
+        grid.handle_mouse(&intent(
+            MouseAction::Press(TermMouseButton::Left),
+            (0, 0),
+            Side::Left,
+            Some(TermMouseButton::Left),
+        ))
+        .expect("press routes");
+
+        // 대조군: 제스처가 살아 있는 동안에는 복사가 막힌다.
+        assert_eq!(
+            grid.request_copy(CopyTargets::EXPLICIT),
+            None,
+            "a live local gesture blocks copying"
+        );
+
+        // 위젯이 기억을 잃은 뒤 다른 버튼의 release가 도착한다.
+        grid.handle_mouse(&intent(
+            MouseAction::Release(TermMouseButton::Right),
+            (0, 1),
+            Side::Left,
+            Some(TermMouseButton::Right),
+        ))
+        .expect("release routes");
+
+        assert!(
+            grid.request_copy(CopyTargets::EXPLICIT).is_some(),
+            "a mismatched release means our latch is the stale one — holding it \
+             keeps shortcut copy dead"
+        );
+    }
+
+    /// 버튼이 눌리지 않은 모션인데 래치가 살아 있으면 어긋난 것이다. 마우스는
+    /// 쉬지 않고 움직이므로 **이 갈래가 가장 빨리 복구시킨다.**
+    #[test]
+    fn a_motion_with_no_button_held_clears_a_stale_latch() {
+        let grid = grid_with_scrollback();
+        grid.handle_mouse(&intent(
+            MouseAction::Press(TermMouseButton::Left),
+            (0, 0),
+            Side::Left,
+            Some(TermMouseButton::Left),
+        ))
+        .expect("press routes");
+
+        // 대조군: 드래그 중(버튼이 눌린) 모션은 래치를 유지한다.
+        grid.handle_mouse(&intent(
+            MouseAction::Motion,
+            (0, 2),
+            Side::Right,
+            Some(TermMouseButton::Left),
+        ))
+        .expect("motion routes");
+        assert_eq!(
+            grid.request_copy(CopyTargets::EXPLICIT),
+            None,
+            "a real drag must keep the latch"
+        );
+
+        // 버튼이 눌리지 않은 모션 = 위젯은 제스처가 없다고 믿는다.
+        grid.handle_mouse(&intent(MouseAction::Motion, (0, 3), Side::Right, None))
+            .expect("motion routes");
+        assert!(
+            grid.request_copy(CopyTargets::EXPLICIT).is_some(),
+            "hovering with no button down proves the latch is stale"
         );
     }
 
