@@ -105,6 +105,47 @@ fn the_guard_clears_on_its_own_result_and_not_on_someone_elses() {
     );
 }
 
+// ---- pr4 적대적 리뷰 항목 5: in-flight 가드에 복구 경로가 없었다. 정상
+// 경로에서는 자기 결과가 캐시보다 낡아서 도착할 일이 없지만, 그런 상황이
+// 생기면(레이스, 버그) "값을 버린다" 이른 반환이 가드 해제보다 먼저 있어
+// 가드가 영영 안 풀렸다 — 그 세션의 스냅샷은 그 뒤로 다시는 갱신되지 않는다
+// (요청이 계속 `issued=false`로 막힌다). `pump_for_test`로 가드를 거치지
+// 않고 캐시를 인위적으로 앞서게 만들어, 그 뒤 도착하는 "자기 결과"가
+// staleness 검사에 걸리는 상황을 재현한다 ----
+
+#[test]
+fn an_own_result_that_arrives_stale_still_releases_its_guard() {
+    let mut store = SessionStore::for_test();
+    let id = store.start_for_test(platform::echo("x"));
+
+    let (issued, _) = store.request_snapshot(id, 5);
+    assert!(issued);
+
+    // 가드(5)를 거치지 않고 캐시를 그보다 앞선 generation으로 밀어둔다 —
+    // 정상 경로에서는 안 일어나지만, 방어 대상 시나리오(자기 결과가
+    // 캐시보다 낡아 도착)를 인위적으로 만든다.
+    store.bump_generation_for_test(id, 20);
+    store.pump_for_test(id);
+    assert!(
+        store.snapshot_generation(id) > 5,
+        "the cache must now be ahead of the in-flight guard's generation"
+    );
+
+    // 이제야 가드(5)의 "자기 결과"가 도착한다 — 캐시 입장에선 낡았다.
+    let follow_up = store.apply_snapshot(id, 5, blank_snapshot());
+    assert!(
+        follow_up.is_none(),
+        "a stale result must not schedule a follow-up snapshot"
+    );
+
+    // 값은 버려졌더라도 가드는 풀렸어야 한다 — 안 그러면 이 세션은 다시는
+    // 스냅샷을 못 뜬다.
+    assert!(
+        store.request_snapshot(id, 999).0,
+        "the guard for generation 5 must release even though its own result arrived stale"
+    );
+}
+
 #[test]
 fn output_arriving_during_a_snapshot_is_not_lost() {
     // 스냅샷이 도는 동안 generation이 올라가면 구독은 그 세대를 이미 알린 뒤라

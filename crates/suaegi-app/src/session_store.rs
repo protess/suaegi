@@ -241,20 +241,27 @@ impl SessionStore {
     }
 
     /// 도착한 결과를 반영한다:
-    /// - 캐시보다 오래된 generation이면 **버린다**(캐시도 가드도 건드리지 않는다)
-    /// - 캐시에 반영한 뒤, 가드는 **자기 요청의 결과일 때만** 푼다
-    ///   (`in_flight == Some(generation)`)
-    /// - 푼 직후 `session.generation()`이 이미 더 나아가 있으면 다음 요청을
-    ///   낸다 — 그러지 않으면 스냅샷이 도는 동안 도착한 출력이 영영 화면에
-    ///   반영되지 않는다(구독은 그 generation을 이미 알렸으므로 다시 알리지
-    ///   않는다). 이 재요청은 곧바로 스레드를 스폰하지 않고 `POLL_INTERVAL`만큼
-    ///   늦춘다 — 바쁜 세션에서 스냅샷 완료마다 곧장 다음 스냅샷(~190KB 할당 +
-    ///   전용 OS 스레드, `background.rs`는 스레드 풀이 없다)이 나가면 초당
-    ///   수백 번씩 돌며 PTY 리더 스레드와 같은 `FairMutex`를 다툰다 — 알림
-    ///   경로(`workbench::feed_stream`)와 같은 주기로 페이싱해 바쁜 세션도
-    ///   ~16ms 주기에 안착시킨다. 가드는 여기서 곧바로 세운다 — 무거운
-    ///   작업(스레드 스폰 + snapshot())만 늦춰야, 그 사이 도착하는
-    ///   `SessionDirty`가 가드 없는 틈을 타 중복 요청을 내지 못한다.
+    /// - 이 결과가 지금 진행 중인 가드의 주인이면(`in_flight == Some(generation)`)
+    ///   **가드부터 먼저 푼다** — 캐시가 이 결과보다 이미 앞서 있는지(stale)와
+    ///   무관하게. 정상 경로에서 자기 결과가 캐시보다 낡아 도착할 일은 없지만,
+    ///   그런 상황이 생겨도(예: generation 계산 버그, 재전송) "값을 버린다"가
+    ///   "가드를 영영 못 푼다"로 번지면 안 된다 — 후자는 그 세션의 스냅샷이
+    ///   다시는 갱신되지 않는 영구 프리즈다. 가드 해제는 되돌릴 수 없는 값
+    ///   반영보다 훨씬 싼 보험이라 항상 먼저 처리한다.
+    /// - 캐시보다 오래된 generation이면 **값은 버린다**(캐시 자체는 안 건드린다)
+    /// - 값을 캐시에 반영한 뒤, 자기 요청의 결과가 아니었으면 여기서 끝낸다
+    /// - 자기 요청이었고 `session.generation()`이 이미 더 나아가 있으면
+    ///   다음 요청을 낸다 — 그러지 않으면 스냅샷이 도는 동안 도착한 출력이
+    ///   영영 화면에 반영되지 않는다(구독은 그 generation을 이미 알렸으므로
+    ///   다시 알리지 않는다). 이 재요청은 곧바로 스레드를 스폰하지 않고
+    ///   `POLL_INTERVAL`만큼 늦춘다 — 바쁜 세션에서 스냅샷 완료마다 곧장
+    ///   다음 스냅샷(~190KB 할당 + 전용 OS 스레드, `background.rs`는 스레드
+    ///   풀이 없다)이 나가면 초당 수백 번씩 돌며 PTY 리더 스레드와 같은
+    ///   `FairMutex`를 다툰다 — 알림 경로(`workbench::feed_stream`)와 같은
+    ///   주기로 페이싱해 바쁜 세션도 ~16ms 주기에 안착시킨다. 가드는 여기서
+    ///   곧바로 세운다 — 무거운 작업(스레드 스폰 + snapshot())만 늦춰야, 그
+    ///   사이 도착하는 `SessionDirty`가 가드 없는 틈을 타 중복 요청을 내지
+    ///   못한다.
     pub fn apply_snapshot(
         &mut self,
         id: SessionId,
@@ -263,18 +270,22 @@ impl SessionStore {
     ) -> Option<Task<Message>> {
         let slot = self.slots.get_mut(&id)?;
 
+        let is_own_request = slot.snapshot_in_flight == Some(generation);
+        if is_own_request {
+            slot.snapshot_in_flight = None;
+        }
+
         if generation < slot.snapshot_generation {
-            return None; // 캐시보다 오래된 결과 — 버린다
+            return None; // 캐시보다 오래된 결과 — 값은 버린다(가드는 이미 풀었다)
         }
         slot.snapshot = snapshot;
         slot.snapshot_generation = generation;
 
-        if slot.snapshot_in_flight != Some(generation) {
+        if !is_own_request {
             // 이 결과의 값은 캐시에 반영했지만(위에서 이미 최신임을 확인했다),
             // 이 요청이 지금 진행 중인 가드의 주인은 아니다 — 가드는 그대로 둔다.
             return None;
         }
-        slot.snapshot_in_flight = None;
 
         let current_generation = slot.session.generation();
         if current_generation <= generation {
@@ -341,19 +352,25 @@ impl SessionStore {
         (true, task)
     }
 
-    /// 슬롯이 소유한(persist된) 모니터로 프로브를 한 번 돈다. `request_presence`의
-    /// 블로킹 스레드 클로저와 [`Self::probe_now_for_test`]가 이 함수 하나를
-    /// 공유한다 — "호출마다 모니터를 새로 만드는" 회귀가 프로덕션 경로든 테스트
-    /// 경로든 똑같이 드러나야 하기 때문이다. `&mut self`를 받지 않는 이유는
-    /// `request_presence`가 이걸 블로킹 스레드로 옮겨 부르므로 `self`를 그
-    /// 스레드로 가져갈 수 없어서다(`Arc<TerminalSession>`/`Arc<Mutex<..>>`만
-    /// 넘긴다).
+    /// 슬롯이 소유한(persist된) 모니터로 프로브를 한 번 돈다.
+    /// `request_presence_with`의 블로킹 스레드 클로저가 이 함수를 부른다.
+    /// `&mut self`를 받지 않는 이유는 `request_presence_with`가 이걸 블로킹
+    /// 스레드로 옮겨 부르므로 `self`를 그 스레드로 가져갈 수 없어서다
+    /// (`Arc<TerminalSession>`/`Arc<Mutex<..>>`만 넘긴다).
+    ///
+    /// 락을 `expect`로 풀지 않는다: 이 호출은 백그라운드 스레드에서 도는데
+    /// (`request_presence_with`), 거기서 패닉하면 그 스레드는 그냥 죽고
+    /// `PresenceReady`가 영영 보내지지 않는다 — `presence_in_flight` 가드가
+    /// 영구히 묶여 그 세션의 존재 배지가 다시는 갱신되지 않는다(재시도
+    /// 경로가 없다). 중독된 락이라도 안의 `PresenceMonitor`는 그저 캐시일
+    /// 뿐이라(다음 성공한 프로브가 덮어쓴다) 잠긴 값을 그대로 회수해 계속
+    /// 쓰는 쪽이 "다시는 갱신 안 됨"보다 훨씬 낫다.
     fn probe_with(
         session: &TerminalSession,
         monitor: &Mutex<PresenceMonitor>,
         probe: &dyn ProcessProbe,
     ) -> AgentPresence {
-        let mut guard = monitor.lock().expect("presence monitor mutex poisoned");
+        let mut guard = monitor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.probe(session, probe)
     }
 
