@@ -413,6 +413,7 @@ impl AppState {
             }
             Message::RepoProbed { result, .. } => match result {
                 Ok((mut repo, head_branch)) => {
+                    self.last_error = None;
                     if repo.worktree_base_ref.is_none() {
                         repo.worktree_base_ref = head_branch;
                     }
@@ -431,6 +432,7 @@ impl AppState {
                 result,
             } => match result {
                 Ok(entries) => {
+                    self.last_error = None;
                     self.apply_worktree_listing(repo_id, request, entries);
                     iced::Task::none()
                 }
@@ -471,6 +473,7 @@ impl AppState {
                 repo_id, result, ..
             } => match result {
                 Ok(_created) => {
+                    self.last_error = None;
                     self.worktree_name_draft.remove(&repo_id);
                     self.refresh_worktrees(repo_id)
                 }
@@ -512,7 +515,10 @@ impl AppState {
             Message::WorktreeRemoved {
                 repo_id, result, ..
             } => match result {
-                Ok(_outcome) => self.refresh_worktrees(repo_id),
+                Ok(_outcome) => {
+                    self.last_error = None;
+                    self.refresh_worktrees(repo_id)
+                }
                 Err(err) => {
                     self.last_error = Some(err);
                     iced::Task::none()
@@ -580,6 +586,7 @@ impl AppState {
                 self.pending_session_starts.remove(&worktree_id);
                 match result {
                     Ok(started) => {
+                        self.last_error = None;
                         let Some(session) = started.take() else {
                             // 이미 다른 곳에서 소비됐다 — 정상 경로에서는 밟지
                             // 않지만(봉투는 한 번만 만들어진다), 방어적으로
@@ -901,6 +908,66 @@ mod tests {
             state.session_store().snapshot_text(id),
             "hello",
             "a stale snapshot result must not overwrite a newer one"
+        );
+    }
+
+    #[test]
+    fn presence_ready_updates_the_session_and_is_visible_through_worktree_presence() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        assert!(matches!(
+            state.worktree_presence(&worktree_id),
+            AgentPresence::Unknown
+        ));
+
+        let _ = state.update(Message::PresenceReady {
+            id,
+            generation: 1,
+            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+        });
+
+        assert!(matches!(
+            state.worktree_presence(&worktree_id),
+            AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude)
+        ));
+    }
+
+    #[test]
+    fn a_worktree_with_no_session_reports_unknown_presence() {
+        let state = AppState::default();
+        assert!(matches!(
+            state.worktree_presence(&WorktreeId("/tmp/no-session".into())),
+            AgentPresence::Unknown
+        ));
+    }
+
+    #[test]
+    fn a_successful_git_op_clears_a_stale_error_banner() {
+        // last_error가 실패에서만 세워지고 성공에서 지워지지 않으면, 사용자가
+        // 재시도에 성공한 뒤에도 사이드바에 옛 에러 배너가 계속 떠 있다.
+        let mut state = AppState::default();
+        let _ = state.update(Message::RepoProbed {
+            request: OpId(1),
+            requested_path: PathBuf::from("/tmp/bad"),
+            result: Err("not a git repo".to_string()),
+        });
+        assert_eq!(state.last_error(), Some("not a git repo"));
+
+        let repo = Repo {
+            id: RepoId("/tmp/good".into()),
+            path: PathBuf::from("/tmp/good"),
+            display_name: "good".into(),
+            worktree_base_ref: None,
+        };
+        let _ = state.update(Message::RepoProbed {
+            request: OpId(2),
+            requested_path: PathBuf::from("/tmp/good"),
+            result: Ok((repo, Some("main".to_string()))),
+        });
+
+        assert_eq!(
+            state.last_error(),
+            None,
+            "a success after a failure must clear the stale error banner"
         );
     }
 }
