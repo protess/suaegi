@@ -320,7 +320,11 @@ fn process_rss_kb() -> u64 {
 #[cfg(unix)]
 #[test]
 fn flooding_unread_device_queries_does_not_grow_memory_unbounded() {
-    let script = "while true; do printf '\\033[c'; done";
+    // `-icanon`이 없으면 자식이 정규 모드에 머물러, tty 입력 큐가 차면 커널이
+    // 응답 바이트를 그냥 버린다 — 라이터가 절대 파킹되지 않고, 이 테스트가
+    // 지키려는 실패 경로(파킹된 라이터 뒤로 큐가 무한히 쌓임)가 아예 발동하지
+    // 않는다. 비정규 모드로 바꿔야 커널이 응답을 실제로 입력 큐에 채운다.
+    let script = "stty -icanon min 1 time 0 -echo; while true; do printf '\\033[c'; done";
     let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
 
     // 리더가 최소 한 번은 PTY 출력을 소비했는지 확인한다 — 그렇지 않으면
@@ -348,8 +352,10 @@ fn flooding_unread_device_queries_does_not_grow_memory_unbounded() {
         "session should still be alive while flooded"
     );
     let grew_kb = rss_after.saturating_sub(rss_before);
+    // 바운드 큐는 실측상 0.1-0.2MB(100-200KB) 안에서 머문다. 언바운드 큐로
+    // 되돌리면 3초에 ~23MB 자란다(실측). 10MB는 둘 사이에 넉넉한 여유를 둔다.
     assert!(
-        grew_kb < 25_000,
+        grew_kb < 10_000,
         "RSS grew by {grew_kb}KB while flooding unread device queries \
          (before={rss_before}KB, after={rss_after}KB) — the reply queue \
          appears unbounded"
