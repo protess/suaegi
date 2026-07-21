@@ -178,6 +178,14 @@ impl PtySession {
             .map_err(|e| TermError::Pty(e.to_string()))
     }
 
+    /// 현재 PTY 크기 (rows, cols). 주로 테스트에서 PTY와 grid 크기가
+    /// 일치하는지 독립적으로 확인하는 용도.
+    pub fn size(&self) -> Result<(u16, u16), TermError> {
+        let master = self.master.lock().expect("pty master mutex poisoned");
+        let size = master.get_size().map_err(|e| TermError::Pty(e.to_string()))?;
+        Ok((size.rows, size.cols))
+    }
+
     /// 비블로킹. lifecycle 락을 호출 **전 구간** 잡는다 — try_wait 자체가
     /// 블로킹하지 않으므로 안전하고, 이렇게 해야 "수확됨"과 kill 사이에 틈이 없다.
     ///

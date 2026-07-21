@@ -77,6 +77,36 @@ fn resize_updates_both_pty_and_grid() {
     assert_eq!(snap.size.cols, 100);
 }
 
+/// resize()는 &self로 동시 호출될 수 있다(Sync). pty.resize와 grid.resize가
+/// 한 락으로 직렬화되지 않으면 두 호출이 인터리브돼(PTY=A, PTY=B, grid=B,
+/// grid=A) pty와 grid가 서로 다른 크기로 영구히 어긋날 수 있다. 여러 스레드가
+/// 서로 다른 크기로 동시에 resize를 반복해도, 각 라운드가 끝난 뒤에는 항상
+/// pty와 grid가 같은 크기를 보고해야 한다.
+#[test]
+fn concurrent_resizes_never_leave_the_pty_and_grid_disagreeing() {
+    let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();
+    let candidates: [(u16, u16); 4] = [(24, 80), (30, 100), (50, 132), (20, 60)];
+
+    for round in 0..100u32 {
+        std::thread::scope(|scope| {
+            for &(rows, cols) in &candidates {
+                let session = &session;
+                scope.spawn(move || {
+                    session.resize(rows, cols).unwrap();
+                });
+            }
+        });
+
+        let grid_size = session.snapshot().size;
+        let pty_size = session.pty_size().unwrap();
+        assert_eq!(
+            (grid_size.rows as u16, grid_size.cols as u16),
+            pty_size,
+            "pty and grid disagree after concurrent resize round {round}"
+        );
+    }
+}
+
 #[test]
 fn zero_size_resize_is_ignored() {
     let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();

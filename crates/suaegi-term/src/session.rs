@@ -42,6 +42,11 @@ pub struct TerminalSession {
     writes: Mutex<Option<SyncSender<Vec<u8>>>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
+    /// `resize()`가 pty와 grid를 한 쌍으로 갱신하는 동안 다른 resize 호출이
+    /// 끼어들지 못하게 막는다. `&self`가 `Sync`라 동시 호출이 가능한데, 이 락이
+    /// 없으면 두 resize가 인터리브돼(PTY=A, PTY=B, grid=B, grid=A) pty와 grid가
+    /// 서로 다른 크기로 어긋난 채 남을 수 있다.
+    resize_lock: Mutex<()>,
 }
 
 impl TerminalSession {
@@ -189,6 +194,7 @@ impl TerminalSession {
             writes: Mutex::new(Some(ui_tx)),
             reader_thread: Mutex::new(Some(reader_thread)),
             writer_thread: Mutex::new(Some(writer_thread)),
+            resize_lock: Mutex::new(()),
         })
     }
 
@@ -212,6 +218,9 @@ impl TerminalSession {
         if rows == 0 || cols == 0 {
             return Ok(());
         }
+        // pty.resize와 grid.resize를 한 쌍으로 직렬화한다 — 동시 호출이
+        // 인터리브되면 둘이 서로 다른 크기로 어긋난 채 남을 수 있다.
+        let _guard = self.resize_lock.lock().expect("resize mutex poisoned");
         self.pty.resize(rows, cols)?;
         self.grid.resize(GridSize {
             rows: rows as usize,
@@ -219,6 +228,13 @@ impl TerminalSession {
         });
         self.generation.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// 테스트 전용 관찰창: 현재 PTY 크기를 grid 크기와 독립적으로 조회한다.
+    /// resize()의 pty/grid 원자성을 외부에서 검증하려면 둘을 각자 읽을 방법이
+    /// 있어야 한다 — snapshot()은 grid 크기만 준다.
+    pub fn pty_size(&self) -> Result<(u16, u16), TermError> {
+        self.pty.size()
     }
 
     /// UI가 락 없이 "다시 그려야 하나"를 판단하는 값. 그리드 변경마다 증가한다.
