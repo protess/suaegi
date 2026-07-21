@@ -151,6 +151,11 @@ impl TerminalSession {
                     // 자식이 이미 스스로 종료했다면 무해한 no-op이다.
                     let _ = reader_pty.kill();
                     // EOF가 자식 종료보다 먼저 올 수 있으므로 블로킹 wait로 확정한다
+                    // 순서 의존성: exit_code를 먼저 저장하고 running을 나중에
+                    // 저장한다 — PresenceMonitor::probe(presence.rs)가 이 순서에
+                    // 기대어 "!is_running()을 봤다면 exit_code도 이미 발행됐다"고
+                    // 가정한다. 이 둘의 저장 순서를 바꾸면 그 재읽기가 다시
+                    // stale None을 볼 수 있다.
                     if let Ok(code) = reader_pty.wait() {
                         exit_code.store(code as i64, Ordering::Release);
                     }

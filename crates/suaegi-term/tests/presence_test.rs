@@ -65,6 +65,21 @@ fn exited_session_reports_exited() {
     ));
 }
 
+/// `probe()`는 running을 관찰한 *뒤에* exit_code를 다시 읽어야 한다. 먼저 읽은
+/// exit_code(None)를 재사용해 -1로 단정하면, 그 두 읽기 사이에 리더가 실제
+/// 코드를 발행해버리는 좁은 창에서 진짜 코드(7)를 -1로 잘못 보고한다.
+#[test]
+fn exited_session_reports_the_real_exit_code_not_a_placeholder() {
+    let session = TerminalSession::start(spec(platform::exit_with(7))).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || session.exit_code() == Some(7)));
+    let mut monitor = PresenceMonitor::default();
+    let probe = FakeProbe(HashMap::new());
+    assert_eq!(
+        monitor.probe(&session, &probe),
+        AgentPresence::Exited { code: 7 }
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn non_unix_reports_unknown_while_running() {
