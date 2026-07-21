@@ -48,6 +48,43 @@ pub struct Worktree {
     pub created_at_unix_ms: u64,
 }
 
+/// `pane_grid::Axis`의 serde 거울. iced 타입은 `Serialize`를 갖지 않고, 갖게
+/// 만들 수도 없다(외래 타입) — 그리고 **`suaegi-core`는 iced를 모른다.**
+/// 값이 둘뿐이라 거울의 유지 비용이 사실상 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// `pane_grid::Configuration<T>`의 serde 거울. 저장할 때 `State::layout()`의
+/// `Node`를 걸으며 만들고, 복원할 때 `Configuration`으로 되돌린다.
+///
+/// **잎이 `SessionId`가 아니라 `WorktreeId`인 것이 핵심이다.** `SessionId`는
+/// 실행마다 매기는 카운터라 재시작을 넘지 못하고, `pane_grid::Pane`/`Split`의
+/// 내부 `usize`는 비공개라 애초에 직렬화할 수 없다. worktree id는 경로에서
+/// 나오므로 앱을 껐다 켜도 같다 — 훅 상관관계(`PaneKey`)와 레이아웃 복원이
+/// **같은 키**를 쓴다.
+///
+/// **`suaegi-app`이 아니라 여기 사는 이유**: [`SessionState`]가 이걸 필드로
+/// 담고, `SessionState`는 `suaegi-core`의 타입이다. 반대 방향 의존은 없다
+/// (`suaegi-app → suaegi-term → suaegi-core`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedPane {
+    Split {
+        axis: PersistedAxis,
+        ratio: f32,
+        a: Box<PersistedPane>,
+        b: Box<PersistedPane>,
+    },
+    Leaf(WorktreeId),
+}
+
+/// **Task 5 주의**: 여기에 `PersistedPane` 필드를 더하는 순간 `ratio: f32`
+/// 때문에 `Eq`를 파생할 수 없다. `SessionState`와 이를 담는 [`PersistedState`]
+/// 양쪽에서 `Eq`를 떼야 하고, `Eq`를 요구하는 호출부가 있으면 같이 고쳐야 한다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     #[serde(default)]

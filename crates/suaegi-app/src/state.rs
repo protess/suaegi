@@ -13,6 +13,7 @@ use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::{CopyTargets, WriteOutcome};
 use suaegi_term::presence::AgentPresence;
 
+use crate::agent_status::contract::{HookEvent, HydrationStep};
 use crate::persistence_thread::{
     LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
 };
@@ -188,6 +189,44 @@ pub enum Message {
         id: SessionId,
         targets: CopyTargets,
         text: Option<String>,
+    },
+
+    // ---- Plan 5 Task 0.6: 훅·diff·복원 ----
+    /// 훅 서버가 정규화해 보낸 이벤트. **`OpId`를 갖지 않는다** — 요청에 대한
+    /// 응답이 아니라 푸시이고, 상관관계 키는 `PaneKey`뿐이다. `BadgeChanged`가
+    /// 없는 것도 같은 이유다: 배지는 `agent_status::contract::reduce`에서
+    /// 파생되지 전달되지 않는다.
+    HookArrived(HookEvent),
+    /// 배지 재계산 틱. `PresenceTick`과 같은 티어에 둔다 — 나이 기반 규칙
+    /// (`HOOK_STALE_AFTER`)은 새 이벤트가 없어도 상태를 바꾸므로 무언가가
+    /// 주기적으로 `reduce`를 다시 불러야 한다.
+    BadgeTick,
+    DiffRequested {
+        worktree: WorktreeId,
+        op: OpId,
+    },
+    FileDiffRequested {
+        worktree: WorktreeId,
+        path: String,
+        op: OpId,
+    },
+    /// 패널을 닫았다. 진행 중인 compare를 취소한다 — **취소는 오류가 아니다**,
+    /// 배너를 띄우지 않고 조용히 끝난다.
+    DiffCancelled {
+        worktree: WorktreeId,
+    },
+    // TODO(Plan 5): `DiffLoaded`/`FileDiffLoaded`는 여기 없다. 페이로드 타입
+    // (`CompareOutcome`, `FileDiff`)이 `suaegi-git`의 Task 1 산출물인데 Task 1은
+    // Task 0 뒤에 시작하도록 되어 있어, Task 0 시점에는 참조할 타입이 존재하지
+    // 않는다. 추측으로 만들지 않는다 — Task 1이 타입을 확정하면서 이 두 변형을
+    // 함께 추가한다. (`FileDiff`는 플랜 어디에도 정의가 없다는 점도 같이 해결해야
+    // 한다. 지금 `suaegi_git::compare::file_diff`는 patch `String`을 돌려준다.)
+    /// 하이드레이션 게이트의 진행. 셋이 모두 도착해야 `persist()`가 풀린다.
+    HydrationStep(HydrationStep),
+    /// 레이아웃 저장 디바운스 타이머의 만료. **최신 세대만 저장한다** — 리사이즈
+    /// 메시지마다 세대를 올리므로 앞선 타이머는 여기서 걸러진다.
+    LayoutPersistDue {
+        generation: u64,
     },
 }
 
@@ -1160,6 +1199,18 @@ impl AppState {
                 let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
                 task
             }
+
+            // ---- Plan 5: 변형만 먼저 만들어 두고 처리는 소유 태스크가 채운다.
+            // **`_ =>` 와일드카드를 쓰지 않는다** — 그러면 다음에 변형을 더할 때
+            // 컴파일러가 배선 누락을 잡아주지 못한다. 여기 이름을 늘어놓는 비용이
+            // 그 안전망의 값이다. ----
+            Message::HookArrived(_) => iced::Task::none(), // Task 3
+            Message::BadgeTick => iced::Task::none(),      // Task 3
+            Message::DiffRequested { .. }
+            | Message::FileDiffRequested { .. }
+            | Message::DiffCancelled { .. } => iced::Task::none(), // Task 4
+            Message::HydrationStep(_) => iced::Task::none(), // Task 5
+            Message::LayoutPersistDue { .. } => iced::Task::none(), // Task 5
         }
     }
 }
