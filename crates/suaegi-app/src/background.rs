@@ -29,6 +29,9 @@ mod tests {
             tx.send(std::thread::current().id()).unwrap();
         });
         let ran_on = rx.recv_timeout(Duration::from_secs(5)).expect("body ran");
-        assert_ne!(ran_on, caller, "blocking body must not run on the caller thread");
+        assert_ne!(
+            ran_on, caller,
+            "blocking body must not run on the caller thread"
+        );
     }
 }

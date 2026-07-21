@@ -411,7 +411,11 @@ mod tests {
 
         let mut store = Store::new(file);
         let loaded = store.load();
-        assert_eq!(loaded.source, LoadSource::Default, "a future backup is not usable data");
+        assert_eq!(
+            loaded.source,
+            LoadSource::Default,
+            "a future backup is not usable data"
+        );
         assert!(
             store.future_schema_guarded(),
             "a future-schema backup must block saves, or we overwrite newer data"

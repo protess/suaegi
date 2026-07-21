@@ -46,9 +46,15 @@ pub async fn create_worktree_now(
     workspace_root: PathBuf,
 ) -> Result<CreatedWorktree, String> {
     let runner = GitRunner::new();
-    add_worktree(&runner, &repo.path, &requested_name, &base_ref, &workspace_root)
-        .await
-        .map_err(|e| e.to_string())
+    add_worktree(
+        &runner,
+        &repo.path,
+        &requested_name,
+        &base_ref,
+        &workspace_root,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub async fn remove_worktree_now(
@@ -58,9 +64,15 @@ pub async fn remove_worktree_now(
     delete_branch: Option<String>,
 ) -> Result<RemoveOutcome, String> {
     let runner = GitRunner::new();
-    git_remove_worktree(&runner, &repo.path, &worktree_path, force, delete_branch.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    git_remove_worktree(
+        &runner,
+        &repo.path,
+        &worktree_path,
+        force,
+        delete_branch.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---- Thin `Task<Message>` wrappers: untestable glue, kept as small as possible ----
@@ -92,7 +104,11 @@ pub fn add_repo(request: OpId, path: PathBuf) -> Task<Message> {
 pub fn list_worktrees(request: OpId, repo: Repo) -> Task<Message> {
     let repo_id = repo.id.clone();
     Task::perform(list_worktrees_now(repo), move |result| {
-        Message::WorktreesListed { request, repo_id, result }
+        Message::WorktreesListed {
+            request,
+            repo_id,
+            result,
+        }
     })
 }
 
@@ -106,7 +122,11 @@ pub fn create_worktree(
     let repo_id = repo.id.clone();
     Task::perform(
         create_worktree_now(repo, requested_name, base_ref, workspace_root),
-        move |result| Message::WorktreeCreated { request, repo_id, result },
+        move |result| Message::WorktreeCreated {
+            request,
+            repo_id,
+            result,
+        },
     )
 }
 
