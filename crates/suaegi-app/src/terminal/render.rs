@@ -90,8 +90,14 @@ pub fn resolve_cell(
     let mut fg = p.resolve(cell.fg);
     let mut bg = p.resolve(cell.bg);
 
-    // 2. DIM 감쇠 (DIM_BOLD는 DIM 비트를 포함한다 — `intersects`가 맞다)
-    if flags.intersects(Flags::DIM | Flags::DIM_BOLD) {
+    // 2. DIM 감쇠. **`contains(DIM)` 하나면 충분하고, `intersects`는 틀린다.**
+    //
+    // `DIM_BOLD == DIM | BOLD`(alacritty `term/cell.rs:24-25`, `0b1000_0010`)이므로
+    // `DIM | DIM_BOLD`는 그냥 `DIM | BOLD`다. 거기에 `intersects`를 쓰면 **BOLD만
+    // 켜진 셀도 걸려** `ESC[1m`으로 굵게 쓴 글자가 전부 어두워진다(리뷰에서 발견).
+    // DIM_BOLD가 DIM 비트를 포함한다는 사실은 `contains(DIM)`이 그것도 잡는다는
+    // 뜻이지, 마스크에 DIM_BOLD를 더해야 한다는 뜻이 아니다.
+    if flags.contains(Flags::DIM) {
         fg = palette::attenuate(fg, palette::DIM_FACTOR);
     }
 
@@ -735,6 +741,26 @@ mod tests {
         let r = resolve_cell(&cell(Flags::DIM_BOLD), &p(), false, false);
         assert_eq!(r.fg, palette::attenuate(red(), palette::DIM_FACTOR));
         assert!(r.bold, "DIM_BOLD is bold as well as dim");
+    }
+
+    /// **`ESC[1m`만 켠 셀은 절대 감쇠되면 안 된다.**
+    ///
+    /// `DIM_BOLD == DIM | BOLD`라, 마스크를 `DIM | DIM_BOLD`로 쓰고 `intersects`를
+    /// 걸면 **BOLD만 있어도 걸린다** — 셸 프롬프트·`ls`·grep 매치가 전부 어두워진다.
+    /// 위의 `dim_bold_attenuates_too_and_is_still_bold`는 `DIM_BOLD`만 먹이므로
+    /// 이 경우를 잡지 못한다. 두 구현이 갈라지는 지점이 plain BOLD 하나뿐이다.
+    #[test]
+    fn plain_bold_is_never_attenuated() {
+        let r = resolve_cell(&cell(Flags::BOLD), &p(), false, false);
+        assert_eq!(
+            r.fg,
+            red(),
+            "plain BOLD must keep full brightness — only DIM attenuates"
+        );
+        assert!(r.bold, "and it is still bold");
+        // 대조군: DIM이 켜지면 실제로 감쇠된다.
+        let dim = resolve_cell(&cell(Flags::DIM), &p(), false, false);
+        assert_eq!(dim.fg, palette::attenuate(red(), palette::DIM_FACTOR));
     }
 
     /// 감쇠가 **교환보다 먼저**라는 계약. 순서를 뒤집으면 배경이 감쇠된다.
