@@ -19,7 +19,7 @@ use iced::Task;
 use suaegi_core::domain::{Worktree, WorktreeId};
 use suaegi_term::agent::{build_spawn, AgentKind};
 use suaegi_term::grid::TerminalSnapshot;
-use suaegi_term::presence::{AgentPresence, PresenceMonitor, PsProbe};
+use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe, PsProbe};
 use suaegi_term::pty::PtySpawn;
 use suaegi_term::session::{SessionSpec, TerminalSession};
 
@@ -289,10 +289,7 @@ impl SessionStore {
         let session = Arc::clone(&slot.session);
         let monitor = Arc::clone(&slot.monitor);
         let task = background::blocking(move |mut sender| {
-            let presence = {
-                let mut guard = monitor.lock().expect("presence monitor mutex poisoned");
-                guard.probe(&session, &PsProbe)
-            };
+            let presence = Self::probe_with(&session, &monitor, &PsProbe);
             let _ = sender.try_send(Message::PresenceReady {
                 id,
                 generation,
@@ -300,6 +297,22 @@ impl SessionStore {
             });
         });
         (true, task)
+    }
+
+    /// 슬롯이 소유한(persist된) 모니터로 프로브를 한 번 돈다. `request_presence`의
+    /// 블로킹 스레드 클로저와 [`Self::probe_now_for_test`]가 이 함수 하나를
+    /// 공유한다 — "호출마다 모니터를 새로 만드는" 회귀가 프로덕션 경로든 테스트
+    /// 경로든 똑같이 드러나야 하기 때문이다. `&mut self`를 받지 않는 이유는
+    /// `request_presence`가 이걸 블로킹 스레드로 옮겨 부르므로 `self`를 그
+    /// 스레드로 가져갈 수 없어서다(`Arc<TerminalSession>`/`Arc<Mutex<..>>`만
+    /// 넘긴다).
+    fn probe_with(
+        session: &TerminalSession,
+        monitor: &Mutex<PresenceMonitor>,
+        probe: &dyn ProcessProbe,
+    ) -> AgentPresence {
+        let mut guard = monitor.lock().expect("presence monitor mutex poisoned");
+        guard.probe(session, probe)
     }
 
     /// 캐시보다 오래된 결과는 값을 버린다. 프레즌스 요청은 한 번에 하나만
@@ -479,6 +492,17 @@ impl SessionStore {
     #[doc(hidden)]
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// `id`의 슬롯이 소유한 모니터로 `probe`를 동기적으로 한 번 돌린다.
+    /// `request_presence`가 쓰는 것과 **같은** [`Self::probe_with`]를 거치므로,
+    /// 이 함수를 두 번 부르면 프로덕션 경로와 똑같이 pgid 캐시가 재사용된다 —
+    /// `presence_poll`의 티어링 테스트가 실제 `ps` 대신 카운팅 프로브를 꽂아
+    /// "틱마다 모니터를 새로 만드는" 회귀를 잡는 데 쓴다.
+    #[doc(hidden)]
+    pub fn probe_now_for_test(&self, id: SessionId, probe: &dyn ProcessProbe) -> AgentPresence {
+        let slot = self.slots.get(&id).expect("session exists");
+        Self::probe_with(&slot.session, &slot.monitor, probe)
     }
 
     /// 어디에도 슬롯으로 등록되지 않은, 진짜로 살아있는 `TerminalSession`

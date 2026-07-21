@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Alignment, Element, Length};
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::{Alignment, Color, Element, Length};
 
 use suaegi_core::domain::{Repo, RepoId};
 use suaegi_git::worktree::WorktreeEntry;
+use suaegi_term::presence::AgentPresence;
 
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
 use crate::state::{worktree_id_for, AppState, Message};
@@ -101,18 +102,43 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
 
     let mut rows = column![header, create_row].spacing(6);
     for entry in &group.worktrees {
-        let is_selected = state.selected_worktree() == Some(&worktree_id_for(&entry.path));
-        rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected));
+        let worktree_id = worktree_id_for(&entry.path);
+        let is_selected = state.selected_worktree() == Some(&worktree_id);
+        let presence = state.worktree_presence(&worktree_id);
+        rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, presence));
     }
 
     container(rows).width(Length::Fill).into()
 }
 
-/// 존재 배지 자리는 비워둔 채 폭만 잡는다 — Task 7이 실제 `AgentPresence`로 채운다.
+/// 존재 배지: 세션이 없거나 아직 판정 전이면(`Unknown`) 아무 표시도 없다 —
+/// "모른다"를 굳이 시끄럽게 알릴 필요는 없다. `Agent`는 채워진 점,
+/// `Exited`/`NoAgent`(에이전트가 foreground를 내줬거나 셸로 돌아간 경우)는
+/// 옅게 구분한다. `working|waiting|done` 3색 상태는 Plan 5(hook 서버)의
+/// 몫이다 — 여기서는 "에이전트가 떠 있는지"만 안다.
+/// `Element`는 직접 검사할 수 없으므로 매핑 자체를 순수 함수로 뽑아 테스트한다.
+fn badge_glyph(presence: AgentPresence) -> (&'static str, Color) {
+    match presence {
+        AgentPresence::Agent(_) => ("●", Color::from_rgb8(0x2e, 0xa0, 0x43)),
+        AgentPresence::Exited { .. } => ("×", Color::from_rgb8(0xc0, 0x39, 0x2b)),
+        AgentPresence::NoAgent => ("○", Color::from_rgb8(0x88, 0x88, 0x88)),
+        AgentPresence::Unknown => ("", Color::TRANSPARENT),
+    }
+}
+
+fn presence_badge(presence: AgentPresence) -> Element<'static, Message> {
+    let (label, color) = badge_glyph(presence);
+    container(text(label).size(10).color(color))
+        .width(Length::Fixed(10.0))
+        .height(Length::Fixed(10.0))
+        .into()
+}
+
 fn worktree_row(
     repo_id: RepoId,
     entry: &WorktreeEntry,
     is_selected: bool,
+    presence: AgentPresence,
 ) -> Element<'static, Message> {
     let worktree_id = worktree_id_for(&entry.path);
     let label = entry
@@ -126,9 +152,7 @@ fn worktree_row(
     let remove_branch = entry.branch.clone();
 
     row![
-        space()
-            .width(Length::Fixed(10.0))
-            .height(Length::Fixed(10.0)),
+        presence_badge(presence),
         button(text(format!("{marker}{label}")))
             .on_press(Message::WorktreeSelected(worktree_id))
             .width(Length::Fill),
@@ -254,6 +278,24 @@ mod tests {
         assert!(status_line(&AppState::with_save_error("disk full"))
             .unwrap()
             .contains("disk full"));
+    }
+
+    #[test]
+    fn presence_glyphs_distinguish_agent_from_no_agent_and_unknown() {
+        use suaegi_term::agent::AgentKind;
+
+        let (agent_glyph, _) = badge_glyph(AgentPresence::Agent(AgentKind::Claude));
+        let (no_agent_glyph, _) = badge_glyph(AgentPresence::NoAgent);
+        let (unknown_glyph, _) = badge_glyph(AgentPresence::Unknown);
+        let (exited_glyph, _) = badge_glyph(AgentPresence::Exited { code: 0 });
+
+        assert!(!agent_glyph.is_empty());
+        assert_ne!(agent_glyph, no_agent_glyph);
+        assert_ne!(agent_glyph, unknown_glyph);
+        assert_ne!(no_agent_glyph, exited_glyph);
+        // "모른다"는 조용히 아무것도 안 보여준다 — 시끄러운 badge는 아직
+        // 판정 전인 worktree 전부를 에러처럼 보이게 만든다.
+        assert!(unknown_glyph.is_empty());
     }
 
     #[test]

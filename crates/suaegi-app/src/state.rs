@@ -85,6 +85,10 @@ pub enum Message {
         generation: u64,
         presence: AgentPresence,
     },
+    /// `presence_poll::subscription`의 티어링된 타이머 틱. 그 자체로는 화면을
+    /// 갱신하지 않는다 — in-flight가 아닌 세션마다 `request_presence`를 내는
+    /// 트리거일 뿐이다.
+    PresenceTick,
 
     // ---- Task 6: workbench.rs의 pane_grid + 세션 구독 ----
     /// 세션별 구독(`workbench::subscription`)이 `generation()` 변화를 감지했다는
@@ -148,6 +152,14 @@ pub struct AppState {
     /// 채워둔다 — `SessionStarted`가 도착하기 전에도(또는 실패해도) 어떤
     /// worktree를 위한 시도였는지 사용자에게 보여줄 수 있다.
     session_titles: HashMap<SessionId, String>,
+
+    // ---- Task 7: 존재 폴링 ----
+    /// `SessionStore::request_presence`에 넘길, 계속 증가하는 시퀀스. 프레즌스
+    /// 요청은 세션당 한 번에 하나만 진행되므로(`presence_in_flight`는 bool)
+    /// 이 값 자체가 요청을 식별하지는 않지만, `apply_presence`의 staleness
+    /// 비교(`generation >= slot.presence_generation`)가 항상 최신 값을
+    /// 받아들이도록 단조 증가를 보장한다.
+    next_presence_seq: u64,
 }
 
 impl Default for AppState {
@@ -173,6 +185,7 @@ impl Default for AppState {
             session_worktrees: HashMap::new(),
             pending_session_starts: HashMap::new(),
             session_titles: HashMap::new(),
+            next_presence_seq: 0,
         }
     }
 }
@@ -248,6 +261,29 @@ impl AppState {
 
     pub(crate) fn session_store(&self) -> &SessionStore {
         &self.session_store
+    }
+
+    // ---- Task 7: accessors presence_poll (and its tests) read/mutate ----
+
+    pub(crate) fn session_store_mut(&mut self) -> &mut SessionStore {
+        &mut self.session_store
+    }
+
+    /// `request_presence`에 넘길 다음 시퀀스 값. 호출마다 증가한다.
+    pub(crate) fn next_presence_seq(&mut self) -> u64 {
+        self.next_presence_seq += 1;
+        self.next_presence_seq
+    }
+
+    /// worktree 하나에 세션이 열려 있으면 그 세션의 존재 판정을, 아니면
+    /// `Unknown`을 돌려준다(세션이 없으면 판정할 게 없다 — `NoAgent`로
+    /// 단정하면 "에이전트가 없다"와 "아직 아무것도 모른다"를 혼동한다).
+    /// 사이드바가 worktree 행의 존재 배지를 그릴 때 읽는다.
+    pub(crate) fn worktree_presence(&self, worktree_id: &WorktreeId) -> AgentPresence {
+        self.worktree_sessions
+            .get(worktree_id)
+            .map(|&id| self.session_store.presence(id))
+            .unwrap_or(AgentPresence::Unknown)
     }
 
     pub(crate) fn session_title(&self, id: SessionId) -> &str {
@@ -624,9 +660,18 @@ impl AppState {
                 iced::Task::none()
             }
 
-            // Task 7(존재 폴링)의 몫 — 지금은 `Message`가 컴파일되도록 변형만
-            // 있고 `AppState`는 아직 프레즌스 결과를 반영하지 않는다.
-            Message::PresenceReady { .. } => iced::Task::none(),
+            Message::PresenceReady {
+                id,
+                generation,
+                presence,
+            } => {
+                self.session_store.apply_presence(id, generation, presence);
+                iced::Task::none()
+            }
+            Message::PresenceTick => {
+                let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
+                task
+            }
         }
     }
 }
