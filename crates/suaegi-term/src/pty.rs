@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
@@ -83,6 +84,61 @@ pub enum KillOutcome {
     SuppressedAfterReap,
 }
 
+/// `openpty` 재시도 횟수(최초 시도 포함).
+///
+/// 실측(아래 주석 참고)에서 실패한 호출은 **전부** 두 번째 시도에서 성공했고
+/// 세 번째를 필요로 한 경우는 한 번도 없었다. 4는 그 위에 얹은 여유분이다.
+const OPENPTY_ATTEMPTS: u32 = 4;
+
+/// 재시도 사이 대기. 첫 재시도는 **즉시**(0ms) — 실측상 그것으로 충분하다.
+/// 이후 시도만 조금씩 물러선다(부하가 훨씬 심한 상황을 위한 보험).
+fn openpty_backoff(attempt: u32) -> Duration {
+    match attempt {
+        1 => Duration::ZERO,
+        n => Duration::from_millis(u64::from(n) * 2),
+    }
+}
+
+/// `openpty`를 유한 횟수 재시도한다.
+///
+/// **왜 필요한가**: macOS(Darwin)의 `openpty(3)`는 동시 호출에 안전하지 않다.
+/// 여러 스레드 **또는 여러 프로세스**가 동시에 부르면 간헐적으로 실패하며,
+/// 그때 `errno`조차 유효한 값이 아니다(관측값 `-6` — 실패 경로가 errno를 제대로
+/// 세우지 않는다는 뜻). 프로젝트 코드가 전혀 없는 순수 C 프로그램으로 재현했다:
+/// 스레드 14개 × 400회 배리어 동기 호출에서 5600회 중 55회가 첫 시도에 실패했고,
+/// **55회 전부 두 번째 시도에서 성공**했다(3번째 시도가 필요한 경우 0회).
+/// 단일 스레드 프로세스 14개를 동시에 돌려도 실패가 나오므로 이 경쟁은
+/// **프로세스를 넘나든다** — 프로세스 내부 뮤텍스로는 막을 수 없고, 재시도가
+/// 유일하게 통하는 수단이다.
+///
+/// 이건 타임아웃을 늘려 문제를 덮는 것이 아니라, **일시적이고 재시도 가능한
+/// OS 오류**를 재시도하는 것이다(위 실측이 일시성을 보여준다). 실패가 진짜로
+/// 지속되면(예: ptmx 고갈) 몇 밀리초 안에 시도를 소진하고 마지막 오류를 그대로
+/// 올려보낸다 — 삼키지 않는다.
+///
+/// `openpty`는 실패 시 fd를 남기지 않으므로 재시도에 부작용이 없다. errno를
+/// 신뢰할 수 없어 오류 종류로 구분하지 않고 일괄 재시도한다.
+fn open_pty_retrying<T, E>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, E> {
+    let mut last = match attempt() {
+        Ok(pair) => return Ok(pair),
+        Err(e) => e,
+    };
+    for n in 1..OPENPTY_ATTEMPTS {
+        let backoff = openpty_backoff(n);
+        if !backoff.is_zero() {
+            sleep(backoff);
+        }
+        match attempt() {
+            Ok(pair) => return Ok(pair),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 impl PtySession {
     // 락 순서 규칙 (wait/try_wait/kill 전체에 적용): `lifecycle`을 쥔 채로
     // `child` 락을 **기다리지** 않는다. (`try_wait`는 둘을 잠깐 동시에 잡지만,
@@ -98,13 +154,15 @@ impl PtySession {
 
     pub fn spawn(spec: PtySpawn) -> Result<(Self, PtyReader), TermError> {
         let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: spec.rows.max(1),
-                cols: spec.cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        let size = PtySize {
+            rows: spec.rows.max(1),
+            cols: spec.cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        // Darwin의 openpty는 동시 호출에서 간헐적으로 실패한다 —
+        // `open_pty_retrying` 문서 참고.
+        let pair = open_pty_retrying(|| pty_system.openpty(size), std::thread::sleep)
             .map_err(|e| TermError::Pty(e.to_string()))?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
@@ -346,5 +404,123 @@ impl Drop for PtySession {
         if !already_reaped {
             let _ = self.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// 실측된 실제 케이스: 첫 시도가 실패하고 **두 번째**가 성공한다
+    /// (Darwin openpty 경쟁의 관측된 형태 그대로 — 55/55가 이랬다).
+    /// 재시도가 없다면 이 호출은 Err로 끝난다.
+    #[test]
+    fn a_failure_on_the_first_attempt_is_retried_and_succeeds() {
+        let calls = RefCell::new(0);
+        let result: Result<&str, &str> = open_pty_retrying(
+            || {
+                *calls.borrow_mut() += 1;
+                if *calls.borrow() == 1 {
+                    Err("transient")
+                } else {
+                    Ok("pty")
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(result, Ok("pty"));
+        assert_eq!(*calls.borrow(), 2, "should have retried exactly once");
+    }
+
+    /// 재시도 예산 안이라면 연속 실패도 회복한다.
+    #[test]
+    fn failures_up_to_the_budget_are_retried() {
+        let calls = RefCell::new(0);
+        let result: Result<&str, &str> = open_pty_retrying(
+            || {
+                *calls.borrow_mut() += 1;
+                if *calls.borrow() < OPENPTY_ATTEMPTS as i32 {
+                    Err("transient")
+                } else {
+                    Ok("pty")
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(result, Ok("pty"));
+        assert_eq!(*calls.borrow(), OPENPTY_ATTEMPTS as i32);
+    }
+
+    /// 지속되는 실패는 삼키지 않는다: 예산만큼만 시도하고 **마지막** 오류를
+    /// 그대로 올려보낸다. 무한 재시도가 되면 이 테스트는 영영 끝나지 않는다.
+    #[test]
+    fn a_persistent_failure_gives_up_and_reports_the_last_error() {
+        let calls = RefCell::new(0);
+        let result: Result<&str, String> = open_pty_retrying(
+            || {
+                *calls.borrow_mut() += 1;
+                Err(format!("failure #{}", calls.borrow()))
+            },
+            |_| {},
+        );
+        assert_eq!(
+            *calls.borrow(),
+            OPENPTY_ATTEMPTS as i32,
+            "must attempt exactly OPENPTY_ATTEMPTS times, no more and no fewer"
+        );
+        assert_eq!(
+            result,
+            Err(format!("failure #{}", OPENPTY_ATTEMPTS)),
+            "the error surfaced must be the last one, not the first"
+        );
+    }
+
+    /// 성공하는 호출은 재시도도 대기도 하지 않는다 — 정상 경로에 비용을
+    /// 얹지 않는다는 것이 이 수정의 전제다.
+    #[test]
+    fn the_happy_path_does_not_sleep_or_retry() {
+        let calls = RefCell::new(0);
+        let sleeps = RefCell::new(0);
+        let result: Result<&str, &str> = open_pty_retrying(
+            || {
+                *calls.borrow_mut() += 1;
+                Ok("pty")
+            },
+            |_| *sleeps.borrow_mut() += 1,
+        );
+        assert_eq!(result, Ok("pty"));
+        assert_eq!(*calls.borrow(), 1);
+        assert_eq!(*sleeps.borrow(), 0);
+    }
+
+    /// 첫 재시도는 즉시 이뤄져야 한다(실측상 그것으로 충분하고, 대기는
+    /// 순수한 손해다). 그 뒤 시도만 물러선다.
+    #[test]
+    fn the_first_retry_is_immediate_and_later_ones_back_off() {
+        let waits = RefCell::new(Vec::new());
+        let calls = RefCell::new(0);
+        let _: Result<&str, &str> = open_pty_retrying(
+            || {
+                *calls.borrow_mut() += 1;
+                Err("transient")
+            },
+            |d| waits.borrow_mut().push(d),
+        );
+        // 첫 재시도 전에는 sleep이 호출되지 않는다(ZERO는 건너뛴다).
+        let waits = waits.borrow();
+        assert!(
+            waits.iter().all(|d| !d.is_zero()),
+            "zero backoffs must not reach the sleeper at all, got {waits:?}"
+        );
+        assert_eq!(
+            waits.len(),
+            OPENPTY_ATTEMPTS.saturating_sub(2) as usize,
+            "only retries after the first should sleep, got {waits:?}"
+        );
+        assert!(
+            waits.windows(2).all(|w| w[1] > w[0]),
+            "backoff must increase, got {waits:?}"
+        );
     }
 }
