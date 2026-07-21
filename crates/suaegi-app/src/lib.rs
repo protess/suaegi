@@ -1,4 +1,5 @@
 pub mod background;
+pub mod git_tasks;
 pub mod persistence_thread;
 pub mod state;
 
