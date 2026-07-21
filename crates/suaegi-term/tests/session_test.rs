@@ -260,6 +260,22 @@ fn saturated_write_queue_does_not_stall_the_reader() {
     );
 }
 
+/// 자식이 죽으면 리더가 exit_code/running을 발행하고 자기 reply_tx 사본을
+/// drop한다. 세션(과 그 UI 송신자)을 계속 들고 있어도 라이터 스레드가 그
+/// 신호를 보고 곧 스스로 끝나야 한다 — 그러지 않으면 끝난 세션마다 20ms
+/// 주기로 깨어나는 라이터 스레드가 계속 남는다.
+#[test]
+fn writer_thread_exits_after_child_death_even_while_session_is_kept_alive() {
+    let session = TerminalSession::start(spec(platform::exit_with(0))).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || !session.is_running()));
+    assert!(
+        wait_until(Duration::from_secs(2), || session
+            .writer_thread_is_finished()),
+        "writer thread should exit shortly after the child dies, even while \
+         the session is still alive"
+    );
+}
+
 /// 프로세스의 RSS(KB). `/proc` 없는 macOS도 지원해야 하므로 `ps`를 쓴다.
 #[cfg(unix)]
 fn process_rss_kb() -> u64 {

@@ -76,13 +76,32 @@ impl TerminalSession {
                 .name("suaegi-pty-writer".to_string())
                 .spawn(move || loop {
                     let mut failed = false;
-                    while let Ok(bytes) = reply_rx.try_recv() {
-                        if writer_pty.write(&bytes).is_err() {
-                            failed = true;
-                            break;
+                    // 리더는 reply_tx의 마지막 사본을 들고 있다(아래에서 세션이
+                    // 자기 사본을 drop한다) — 그래서 Disconnected는 곧 "리더가
+                    // 끝났다 = 자식이 죽었다"는 신호다. UI 송신자가 아직 살아
+                    // 있어도(세션이 보관 중이어도) 여기서 끝내야, 자식이 죽은
+                    // 세션을 오래 들고 있을 때 이 스레드가 20ms마다 깨어나며
+                    // 남아 있는 비용을 없앨 수 있다.
+                    let mut reader_gone = false;
+                    loop {
+                        match reply_rx.try_recv() {
+                            Ok(bytes) => {
+                                if writer_pty.write(&bytes).is_err() {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                reader_gone = true;
+                                break;
+                            }
                         }
                     }
                     if failed {
+                        break;
+                    }
+                    if reader_gone {
                         break;
                     }
                     match ui_rx.recv_timeout(WRITER_POLL_INTERVAL) {
@@ -235,6 +254,18 @@ impl TerminalSession {
     /// 있어야 한다 — snapshot()은 grid 크기만 준다.
     pub fn pty_size(&self) -> Result<(u16, u16), TermError> {
         self.pty.size()
+    }
+
+    /// 테스트 전용 관찰창: 라이터 스레드가 이미 끝났는지. 프로덕션 코드는 이
+    /// 값에 의존하지 않는다 — "자식이 죽으면 라이터도 곧 끝난다"를 세션을
+    /// 계속 들고 있는 상태에서 외부에서 검증하기 위한 창일 뿐이다.
+    pub fn writer_thread_is_finished(&self) -> bool {
+        self.writer_thread
+            .lock()
+            .expect("writer thread mutex poisoned")
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(true)
     }
 
     /// UI가 락 없이 "다시 그려야 하나"를 판단하는 값. 그리드 변경마다 증가한다.
