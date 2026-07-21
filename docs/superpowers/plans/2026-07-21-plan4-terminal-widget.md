@@ -19,7 +19,17 @@
 
 ### 이 플랜이 뒤집는 Plan 3의 전제
 
-1. **`scrollable`을 제거한다**(`workbench.rs:75`). 첫 스크롤 후 트랜잭션이 열리면 휠이 자식에게 전달되지 않는다. 터미널이 스크롤백을 직접 소유한다.
+1. **`scrollable`을 제거한다**(`workbench.rs:75`). 터미널이 스크롤백을 직접 소유한다.
+
+   **다만 원래 적었던 근거는 우리 구성에서 성립하지 않는다**(구현 중 mutation으로 확인).
+   "첫 스크롤 후 트랜잭션이 열려 휠이 자식에게 전달되지 않는다"는 기제 자체는 실재하지만
+   (`pane_grid_behavior.rs`가 5000px 프로브로 고정해 뒀다), **트랜잭션은 실제 스크롤이
+   일어나야 열린다.** 터미널 위젯은 `Length::Fill`이라 콘텐츠가 뷰포트와 정확히 같고,
+   넘치는 게 없으니 스크롤이 일어나지 않고, 따라서 트랜잭션도 열리지 않는다 —
+   `scrollable`을 다시 씌워도 휠은 매번 통과한다(M35가 살아남아 이걸 드러냈다).
+
+   그래도 제거가 옳다: **죽은 레이어**이고, 콘텐츠가 넘치기 시작하는 순간 삼키기 시작한다.
+   단 "이 테스트가 제거를 지킨다"고 말할 수는 없다 — 지키지 못한다.
 2. **`.spacing(2).on_resize(8, ..)` → `.spacing(4).on_resize(0, ..)`.** 본문 침범량은 `leeway/2`이고 `spacing`과 무관하다. `leeway = 0`이면 리사이즈 밴드가 거터와 정확히 일치해 침범이 0이 된다(실측 확인).
 3. **`TitleBar`는 하중을 받는 부재다.** 본문 드래그가 pane을 옮기지 못하게 막는 **유일한** 기제다. `on_drag`를 타이틀바 없는 `Content`와 짝지으면 안 된다. 생성부에 이유를 주석으로 남긴다.
 
@@ -52,6 +62,10 @@ impl text::Paragraph for () {           // iced_core/src/renderer/null.rs
 그 순수 함수를 실제 값으로 테스트하고, null 하네스는 **이벤트/메시지 배선에만** 쓴다.
 이 분리는 선택이 아니라 **테스트 가능성의 전제**다.
 
+- **`TermCommand`는 `PartialEq`를 파생할 수 없다.** `alacritty_terminal::grid::Scroll`이
+  `Debug, Copy, Clone`만 파생한다(`grid/mod.rs:72`). 헤드리스 테스트가 발행 커맨드를 비교할 때는
+  `matches!`와 필드 분해를 쓴다. **`assert_eq!`로 커맨드 목록을 통째로 비교하려다 막히면
+  래퍼 타입을 만들지 말고** 이 방식을 쓴다 — Task 0 구현 중 발견.
 - **모든 테스트는 mutation 검증한다.** 구현(또는 기대값)을 바꿔 테스트가 **실제로 FAIL하는 것**을 확인하고 보고한다. 이 저장소에서 공허한 테스트가 5번 나왔다.
 - **대조군 없이 "아무 일도 안 일어났다"를 단언하지 않는다.** 비교 대상을 같이 단언한다.
 - **시계에 의존하는 것을 mutation 검증했다고 주장하지 않는다.** `mouse::Click::new`는 내부에서 `Instant::now()`를 읽고 300ms/6px로 분류한다(`iced_core/src/mouse/click.rs:43-90`). 하네스가 시계를 주입할 수 없다 → **우리 소유의 순수 분류기를 만들고 그것을 테스트한다**(Task 6).
@@ -59,7 +73,28 @@ impl text::Paragraph for () {           // iced_core/src/renderer/null.rs
 
 ### 성능은 실측 후 결정 (추측 금지)
 
-행당 `Paragraph::with_spans` 1 draw call이 이론적으로 최선이지만 `with_spans`는 `Shaping::Advanced`를 강제한다. 셀당 `fill_text`보다 나은지 **재본다**(Task 5). `follow-ups.md` 6번(스냅샷 복사 비용)과 damage 추적 도입 여부도 그 결과로 판단한다.
+~~행당 `with_spans`가 이론적으로 최선~~ → **측정했고, 틀렸다. 셀당 `fill_text`를 쓴다.**
+
+| 경로 | 24×80 | 50×200 |
+|---|---|---|
+| A. 행당 `with_spans`(재구축) | 1.02ms | **4.70ms** |
+| B. 셀당 `fill_text`(캐시됨) | 55µs | **261µs** |
+
+**A가 18배 느리다.** 200×50에서 4.70ms면 pane 하나가 16ms 예산의 28%를 먹는다.
+
+이유가 두 겹이다. (1) `with_spans`가 `Shaping::Advanced`를 강제한다
+(`iced_graphics/src/text/paragraph.rs:161`) — 매 행 매 프레임 전체 리치텍스트 셰이핑.
+(2) **A는 캐시할 수 없고 이건 구조적이다**: `Widget::draw`가 `&State`(불변)를 받아
+만든 `Paragraph`를 되쓸 수 없고, 동결된 위젯 상태에 paragraph 캐시 필드가 없다.
+
+그리고 **B는 "셀당 셰이핑"이 아니다.** `fill_text`는 `Text::Cached`를 레이어에 넣고
+prepare가 내용을 해시해 셰이핑된 버퍼를 재사용한다(`iced_graphics/src/text/cache.rs:29-42`).
+터미널 셀은 문자 하나라 히트율이 사실상 100%이고, B의 실제 비용은 String 할당 + 해시 +
+맵 조회다. 벤치가 프레임 간에 진짜 `Cache`를 물려 이걸 쟀다 — B를 "셀당 `with_text`"로
+쟀다면 캐시가 항상 빗나가는 세계의 숫자가 나왔을 것이다.
+
+측정 못 한 것: GPU 업로드, 아틀라스, draw call 제출(창·GPU 없음). A의 draw call 수
+이점은 여기 안 잡힌다 — 다만 B의 55µs/261µs면 그게 뒤집을 여지가 없다.
 
 ---
 
@@ -360,11 +395,42 @@ pub struct ViewportSelection { pub start: (usize, usize), pub end: (usize, usize
   ```rust
   pub fn encode_key(input: &KeyInput, mode: TermMode) -> Option<Vec<u8>>;
   pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8>;
-  pub fn encode_mouse(route: &MouseRoute, intent: &MouseIntent) -> Option<Vec<u8>>;
+  pub fn encode_mouse(route: &MouseRoute, intent: &MouseIntent, mode: TermMode) -> Option<Vec<u8>>;
   pub fn encode_focus(focused: bool, mode: TermMode) -> Option<Vec<u8>>;
   pub fn route_mouse(intent: &MouseIntent, mode: TermMode) -> Result<MouseRoute, MouseEncodeError>;
   ```
+  **`encode_mouse`도 `mode`를 받는다**: `MouseRoute::Report`는 와이어 포맷(SGR/X10/UTF8)을
+  나르지 않고, `AltScreenArrows`는 `APP_CURSOR`를 봐야 한다. `handle_mouse`가 락을 쥔 채
+  부르므로 비용이 없다. (`MouseRoute`를 넓히지 않는다 — 구현 중 발견.)
   **표 테스트가 전부 여기 있다** — 이 플랜에서 테스트 밀도가 가장 높아야 할 곳.
+
+  **키 인코딩 규칙은 Task 4에 있다**(모드가 필요해 코드만 여기 산다). **마우스 규칙은 여기다**:
+  - 버튼 코드: 좌 0, 중 1, 우 2, 레거시 릴리스 3, 휠 64/65. 드래그(버튼 눌린 채 이동) +32
+  - 수식자 비트: shift +4, alt +8, ctrl +16
+  - **모드 구분**: `MOUSE_REPORT_CLICK`(press/release만), `MOUSE_DRAG`(버튼 눌린 채 이동 추가),
+    `MOUSE_MOTION`(버튼 없는 이동까지). **합성 플래그 `MOUSE_MODE` 하나로 판단하지 않는다**
+  - 프로토콜: `SGR_MOUSE` → `ESC [ < b ; x ; y M|m`(선호), 아니면 X10 `ESC [ M …`, `UTF8_MOUSE` 변형
+  - **좌표는 1-based 뷰포트 기준**(`iced_term`은 버퍼 좌표를 써서 스크롤백에서 음수 줄을 보낸다)
+  - **레거시 오버플로 — 좌표계를 헷갈리지 말 것**(구현 중 실제로 걸린 지점이다).
+    **와이어 값 = `33 + coord`**(마우스 좌표는 와이어에서 1-based다. `32 + coord`가 아니다).
+    **임계값은 와이어가 아니라 좌표에 걸린다**: `UTF8_MOUSE`일 때 `coord >= 95`부터 2바이트
+    UTF-8(`(0xC0 + wire/64, 0x80 + (wire & 63))`). `coord = 95` → 와이어 `128` → `0xC2 0x80`으로
+    **정확한 UTF-8이고 overlong이 아니다**(임계값을 와이어 95로 읽으면 overlong이 나온다).
+    상한은 **좌표 기준 배타적**: 비UTF8 `coord >= 223`, UTF8 `coord >= 2015`에서 **`None`**
+    (에러가 아니다) — 각각 와이어 `255`, `2047 = U+07FF`에 대응한다.
+    `SGR_MOUSE`는 십진 문자열이라 한계가 없다.
+    (근거: `iced_term-0.8.0/src/backend.rs:330-352`. 클로저가 `pos`를 `32 + 1 + pos`로 재바인딩해
+    읽기 어렵게 되어 있다.)
+  - 드래그 중 눌린 버튼을 추적한다(레거시 릴리스 코드를 만들려면 필요)
+
+  **두 가지 추가 결정**(구현 중 발견, 계획이 침묵했던 곳):
+  - **`mods.logo`가 켜져 있으면 `encode_key`는 `None`이다.** macOS의 Cmd, 그 외의 Super는
+    터미널 입력이 아니다. 억제하지 않으면 앱의 `classify_shortcut`이 거절한 `Cmd+W` 같은
+    조합이 `text` 갈래로 흘러 셸에 `w`를 보낸다.
+  - **비-bracketed 붙여넣기는 개행을 정규화한다**: `\r\n` → `\r`, 그 다음 `\n` → `\r`.
+    비-bracketed 모드에서 앱은 붙여넣기와 타이핑을 구별할 수 없고 Enter가 실제로 내는 것은
+    `\r`다 — `\n`을 보내면 여러 줄 붙여넣기가 타이핑과 다르게 동작한다.
+    (alacritty_terminal은 파서라 이걸 하지 않는다. 프론트엔드 몫이고 우리가 프론트엔드다.)
 - [ ] **`TerminalGrid`의 intent 메서드**(락을 안에서 잡고 놓는다, 바이트를 돌려준다):
   `encode_key_locked`, `encode_paste_locked`, `handle_mouse`, `encode_focus_locked`,
   `extract_selection(epoch)`, `request_copy(to)`. **쓰기 큐를 만지지 않는다.**
@@ -448,14 +514,16 @@ mutation: 보정 제거, epoch 비교 제거 시 각각 FAIL해야 한다.
 - [ ] **위젯 상태(여기서 동결)** — Task 6이 쓸 **원시 사실만** 둔다. **선택 상태기계를 두지 않는다**
   (라우팅을 모르므로 유지할 수 없다 — Task 0.4):
   포커스, `CellMetrics` 캐시, `last_bounds`, `last_emitted: Option<GridSize>`,
-  `held: Option<TermMouseButton>`, `last_click: Option<(TermMouseButton, Instant, Point)>`,
+  `held: Option<TermMouseButton>`, `last_click: Option<LastClick>`,
   `cursor_pos: Option<Point>`, `scroll_acc: f32`, `mods: Mods`.
 - [ ] **측정**(순수 함수 밖): `Paragraph::with_text`로 `"MMMMMMMMMM"` → `min_bounds().width / 10.0`. **줄 높이는 측정하지 말고 `LineHeight::to_absolute(size)`** — cosmic-text에 그대로 들어가는 권위 있는 값. **f32로 유지**하고 `WindowSize`를 만들 때만 반올림(`iced_term`은 u16으로 잘라 열당 ~1px 드리프트를 만든다).
 - [ ] **리사이즈**: 캐시를 **두 개** 둔다 — `last_bounds`(측정한 크기)와 `last_emitted: Option<GridSize>`
   (실제로 발행한 그리드 크기). `grid_size`가 `None`을 주면(pane이 0으로 접힘) **`last_emitted`를
   `None`으로 무효화한다.** 하나만 두면 pane이 접혔다 원래 크기로 돌아올 때 "같은 크기"로 보여
   리사이즈가 발행되지 않고 PTY가 낡은 크기에 남는다. `Some`이고 `last_emitted`와 다를 때만 발행.
-- [ ] `session_store.rs`의 고정 스폰(`DEFAULT_ROWS`/`COLS`) → 첫 레이아웃 후 실제 크기로.
+  (`session_store.rs`의 고정 스폰 보정은 **Task 7**이다 — 스폰 시점엔 레이아웃이 없어
+  실제 크기를 알 수 없다. `DEFAULT_ROWS`/`COLS`는 부트스트랩 기본값으로 남고,
+  `last_emitted`가 `None`에서 시작하므로 첫 유효 레이아웃이 반드시 보정을 발행한다.)
 
 **테스트:** `grid_size`/`hit_test`를 **실제 메트릭 값으로** 표 테스트(경계: 딱 떨어지는 크기, 나머지가 남는 크기, 0행/0열, 음수/NaN 방어). 헤드리스로는 "크기 변화 → 1회 발행, 재진입 → 발행 없음"만. **측정 자체와 캐시 무효화는 검증 불가** — 코드 주석과 보고서에 명시.
 
@@ -541,11 +609,19 @@ Task 0의 계약과 Task 3의 `hit_test`, Task 1의 `route_mouse`/`handle_mouse`
   스크롤 픽셀 누산기, 수식자. **선택 상태기계를 위젯에 두지 않는다.**
 - [ ] **우리 소유의 클릭 분류기**(순수 함수):
   ```rust
+  pub struct LastClick { pub button: TermMouseButton, pub at: Instant, pub pos: Point, pub kind: ClickKind }
+
   pub fn classify_click(
-      prev: Option<(TermMouseButton, Instant, Point)>,
+      prev: Option<LastClick>,
       button: TermMouseButton, now: Instant, pos: Point,
   ) -> ClickKind;
   ```
+  **`kind`를 반드시 들고 다녀야 한다.** 분류는 "직전 클릭이 있었나"가 아니라
+  **"직전 클릭의 종류를 한 단계 전진"**이다. 이전 종류가 없으면 2번째 클릭이 Double,
+  3번째도 Double이 되어 **`Triple`이 영원히 도달 불가능**해지고 `SelectionType::Lines`
+  (트리플 클릭 줄 선택)가 조용히 죽는다. iced도 같은 벽에 부딪혀 `Click`에 `kind`를
+  넣어 푼다(`iced_core/src/mouse/click.rs:9-14`, `previous.kind.next()` at `:53`).
+  (구현 중 발견 — Task 3의 동결 목록이 이 필드를 좁게 잡고 있었다.)
   **버튼을 반드시 받는다.** 없으면 좌클릭 직후 같은 자리 우클릭이 더블클릭으로 분류된다
   (iced의 분류기도 버튼 일치를 요구한다 — `iced_core/src/mouse/click.rs:50-53`).
   **`mouse::Click::new`에 의존하지 않는다** — 내부에서 `Instant::now()`를 읽어 시계를 주입할 수
@@ -569,8 +645,18 @@ Task 0의 계약과 Task 3의 `hit_test`, Task 1의 `route_mouse`/`handle_mouse`
   intent를 만들지 않고 버린다.
 - [ ] **스크롤**: `Lines`와 `Pixels` **양쪽** 처리(휠=Lines, 트랙패드=Pixels). Pixels는 나머지 누산기:
   ```
-  acc -= y;  let lines = (acc / cell_height).trunc();  acc %= cell_height;
+  acc += lines_from(delta);   // 부호 주의 — 아래
+  let lines = acc.trunc();  acc %= 1.0;
   ```
+  **부호는 `+`다.** 초안의 `acc -= y`는 방향이 뒤집혀 있었다(구현 중 발견). 셋이 모두
+  "양수 = 위로"로 이미 고정돼 있기 때문이다: `MouseAction::Wheel { lines }`의 문서
+  (`input_types.rs:132`), iced의 `y`(`scrollable`이 `-Vector::new(x, y)`를 아래 방향
+  오프셋에 더한다 — `scrollable.rs:873, 1799`), 그리고 `Scroll::Delta` 양수가
+  `display_offset`을 올린다는 실측. `-=`면 모든 스크롤이 반대로 간다.
+
+  **줄 단위로 누산한다**(픽셀 단위가 아니라). 동결된 `scroll_acc`가 `f32` 하나인데
+  휠은 `Lines`, 트랙패드는 `Pixels`로 온다 — 진입 시 줄로 정규화해 누산하면 세션 중
+  장치가 바뀌어도 남은 나머지가 엉뚱한 스케일로 재해석되지 않는다.
   누산 결과가 0줄이면 커맨드를 발행하지 않는다. **줄 수를 `MouseIntent`에 실어 보내고**,
   그것이 로컬 스크롤인지 alt-screen 화살표인지 리포트인지는 Task 1이 정한다.
 - [ ] 앱은 `MouseResult.copy`가 `Some`이면 워커로 `extract_selection(epoch)`을 돌린다.
@@ -593,6 +679,9 @@ Task 0의 계약과 Task 3의 `hit_test`, Task 1의 `route_mouse`/`handle_mouse`
 
 - [ ] `workbench.rs`: `scrollable` 제거, `.spacing(4).on_resize(0, ..)`, `text()` → 새 위젯.
 - [ ] `TitleBar` 생성부에 **왜 하중 부재인지** 주석.
+- [ ] **`DEFAULT_ROWS`/`COLS` 보정**(Task 3에서 넘어옴): 고정 스폰은 부트스트랩 기본값으로
+  두고, 위젯이 첫 레이아웃에서 발행하는 `Resize`가 실제 크기로 고친다. 세션 스폰 시점에
+  크기를 알아내려 하지 않는다 — 그때는 레이아웃이 존재하지 않는다.
 - [ ] `TermCommand` → 세션 배선을 **Task 0.8의 스레딩 정책 표대로**. 리사이즈 합치기와 seq 가드, `MouseResult` 후속 처리(copy 워커 + redraw) 포함.
 - [ ] 포커스 전환 + `FOCUS_IN_OUT` 바이트(Task 0의 경로).
 - [ ] 입력 유실 피드백 UI — 앱 레벨 메시지/상태 전이(`WriteOutcome::Dropped`)에서 온다. `Suppressed`는 유실이 아니다.

@@ -2,7 +2,12 @@ mod platform;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use alacritty_terminal::index::Side;
 use suaegi_term::grid::TitleChange;
+use suaegi_term::input_types::{
+    ClickKind, KeyInput, KeyLocation, Mods, MouseAction, MouseIntent, NamedKey, TermKey,
+    ViewportHit, WriteOutcome,
+};
 use suaegi_term::pty::PtySpawn;
 use suaegi_term::session::{SessionSpec, TerminalSession};
 
@@ -376,5 +381,103 @@ fn device_query_is_answered_back_to_the_pty() {
             &session, "ANSWERED"
         )),
         "device query reply never reached the child"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 입력 래퍼 — grid가 인코딩하고 session이 큐에 넣는다
+// ---------------------------------------------------------------------------
+
+fn wheel(lines: i32) -> MouseIntent {
+    MouseIntent {
+        action: MouseAction::Wheel { lines },
+        hit: ViewportHit {
+            row: 0,
+            col: 0,
+            side: Side::Left,
+        },
+        held: None,
+        mods: Mods::default(),
+        click: ClickKind::Single,
+        force_local: false,
+    }
+}
+
+/// 인코딩부터 PTY 도달까지 전 경로. 단위 테스트는 바이트 모양까지만 보므로
+/// "큐에 들어갔다"가 "실제로 자식에게 갔다"인지는 여기서만 확인된다.
+#[test]
+fn send_paste_reaches_the_child_process() {
+    let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();
+    assert_eq!(session.send_paste("suaegi-paste\n"), WriteOutcome::Queued);
+    assert!(
+        wait_until(Duration::from_secs(10), || snapshot_contains(
+            &session,
+            "suaegi-paste"
+        )),
+        "the pasted text never reached the child"
+    );
+}
+
+/// `Suppressed`와 `Queued`는 서로 다른 결과다 — `bool`이었다면 둘 다 실패로
+/// 뭉개져 앱이 "모드상 보낼 것 없음"에도 유실 피드백을 냈을 것이다.
+#[test]
+fn suppression_and_queueing_are_distinguishable_outcomes() {
+    let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();
+
+    // FOCUS_IN_OUT이 꺼져 있으므로 포커스 리포트는 보낼 것이 없다.
+    assert_eq!(session.report_focus(true), WriteOutcome::Suppressed);
+    // 매핑 없는 키도 마찬가지다.
+    let unknown = KeyInput {
+        key: TermKey::Unknown,
+        physical_latin: None,
+        location: KeyLocation::Standard,
+        mods: Mods::default(),
+        text: None,
+        repeat: false,
+    };
+    assert_eq!(session.send_key(&unknown), WriteOutcome::Suppressed);
+    // 빈 붙여넣기는 인코더가 **빈 바이트열**을 준다(None이 아니다) — 앞의 두
+    // 경우와 다른 코드 경로다.
+    assert_eq!(session.send_paste(""), WriteOutcome::Suppressed);
+
+    // 대조군: 실제로 보낼 것이 있으면 Queued다.
+    let enter = KeyInput {
+        key: TermKey::Named(NamedKey::Enter),
+        physical_latin: None,
+        location: KeyLocation::Standard,
+        mods: Mods::default(),
+        text: None,
+        repeat: false,
+    };
+    assert_eq!(session.send_key(&enter), WriteOutcome::Queued);
+}
+
+/// `redraw`면 generation을 올려야 한다. 올리지 않으면 스냅샷 스케줄링이
+/// (generation으로 돈다) 새 스냅샷을 찍지 않아 **옛 화면을 다시 그린다.**
+#[test]
+fn send_mouse_bumps_the_generation_when_it_asks_for_a_redraw() {
+    let script = "for i in 1 2 3 4 5 6 7 8 9 0; do printf 'row%s\\n' \"$i\"; done; sleep 5";
+    let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || snapshot_contains(
+        &session, "row0"
+    )));
+
+    let before = session.generation();
+    let result = session.send_mouse(&wheel(2)).expect("wheel routes");
+    assert!(result.redraw, "a local scroll changes what is on screen");
+    assert_eq!(result.write, WriteOutcome::Suppressed, "nothing goes to the pty");
+    assert!(
+        session.generation() > before,
+        "a redraw without a generation bump repaints the stale snapshot"
+    );
+
+    // 대조군: 아무것도 하지 않는 intent는 generation을 건드리지 않는다.
+    let quiet = session.generation();
+    let ignored = session.send_mouse(&wheel(0)).expect("a zero wheel routes");
+    assert!(!ignored.redraw);
+    assert_eq!(
+        session.generation(),
+        quiet,
+        "an ignored intent must not schedule a snapshot"
     );
 }

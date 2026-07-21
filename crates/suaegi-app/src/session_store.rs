@@ -19,6 +19,7 @@ use iced::Task;
 use suaegi_core::domain::{Worktree, WorktreeId};
 use suaegi_term::agent::{build_spawn, AgentKind};
 use suaegi_term::grid::TerminalSnapshot;
+use suaegi_term::input_types::CopyRequest;
 use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe, PsProbe};
 use suaegi_term::pty::PtySpawn;
 use suaegi_term::session::{SessionSpec, TerminalSession};
@@ -27,9 +28,13 @@ use crate::background;
 use crate::reaper::Reaper;
 use crate::state::Message;
 
-/// 렌더링 뷰포트 고정 크기. 이 플랜의 터미널 렌더링은 읽기 전용 단색
-/// 모노스페이스 텍스트로 범위가 좁혀져 있다(Plan 4가 리사이즈 가능한 커스텀
-/// 위젯을 맡는다) — 그래서 지금은 세션마다 고정 크기로 스폰한다.
+/// 세션을 스폰할 때 쓰는 **부트스트랩 기본값**이다. 실제 크기가 아니다.
+///
+/// 스폰 시점에는 레이아웃이 존재하지 않으므로 진짜 크기를 알아낼 방법이 없다 —
+/// 위젯이 첫 레이아웃에서 발행하는 `TermCommand::Resize`가 이 값을 실제 pane
+/// 크기로 고친다(`State::last_emitted`가 `None`에서 시작하므로 첫 유효
+/// 레이아웃은 **반드시** 발행된다). 그러니 이 상수를 "고칠" 필요가 없고,
+/// 여기서 크기를 추측하려 들면 안 된다.
 const DEFAULT_ROWS: u16 = 50;
 const DEFAULT_COLS: u16 = 80;
 /// 스크롤백 상한(줄 수). 세션당 메모리 상한과 사용성 사이의 절충값 — 정확한
@@ -41,6 +46,87 @@ const TEST_SCROLLBACK_LINES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
+
+// ---------------------------------------------------------------------------
+// 리사이즈 합치기
+// ---------------------------------------------------------------------------
+
+/// 한 번의 `submit`이 내리는 결정.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeDecision {
+    /// 지금 워커로 보낸다.
+    Dispatch { rows: u16, cols: u16, seq: u64 },
+    /// 이미 워커가 돌고 있다 — 최신 것으로 대기열을 덮어썼다. 워커가 끝나면
+    /// `completed`가 이걸 꺼내 보낸다.
+    Coalesce,
+    /// 이미 본 것보다 낡았다. 버린다.
+    Discard,
+}
+
+/// 세션 하나의 리사이즈 합치기 상태.
+///
+/// **왜 필요한가.** `TerminalSession::resize`는 블로킹이다(resize_lock + pty +
+/// grid). 분할선을 끄는 동안 위젯은 셀 경계를 넘을 때마다 리사이즈를 발행하므로,
+/// 하나씩 순서대로 실행하면 워커 큐가 사용자의 드래그보다 뒤처지고 마지막
+/// 크기에 도달하기까지 쓸모없는 중간 크기를 전부 PTY에 적용한다. **세션당 최신
+/// `seq` 하나만** 실행한다.
+///
+/// **`seq`가 왜 전역 단조 카운터에서 오는가**는 `terminal::state`의 `RESIZE_SEQ`
+/// 문서에 있다 — 요약하면 위젯 상태에 두면 `Tree::diff`가 조용히 리셋해 이
+/// 가드가 이후의 모든 리사이즈를 영구히 버린다.
+#[derive(Debug, Default)]
+pub struct ResizeCoalescer {
+    /// 지금까지 본 가장 큰 `seq`. 순서가 뒤집혀 도착한 낡은 리사이즈를 버리는
+    /// 기준이다.
+    last_seq: u64,
+    /// 워커가 실행 중인 `seq`.
+    in_flight: Option<u64>,
+    /// 워커가 도는 동안 도착한 **가장 최신** 리사이즈. 하나만 들고 있는 것이
+    /// 곧 합치기다.
+    pending: Option<(u16, u16, u64)>,
+}
+
+impl ResizeCoalescer {
+    /// 새 리사이즈 요청.
+    ///
+    /// **`seq`가 엄격히 커야 받아들인다.** `>=`가 아니라 `>`인 이유: 같은 `seq`가
+    /// 두 번 오는 것은 중복 전달이지 새 요청이 아니다. 그리고 순서가 뒤집혀
+    /// 도착한 낡은 요청을 받아들이면 사용자가 이미 지나온 크기로 PTY를
+    /// 되돌린다 — 화면과 셸이 어긋난 채 남는다.
+    pub fn submit(&mut self, rows: u16, cols: u16, seq: u64) -> ResizeDecision {
+        if seq <= self.last_seq {
+            return ResizeDecision::Discard;
+        }
+        self.last_seq = seq;
+
+        if self.in_flight.is_some() {
+            // 대기열은 **덮어쓴다**. 중간 크기를 큐에 쌓아 순서대로 적용하는
+            // 것이야말로 이 타입이 막으려는 것이다.
+            self.pending = Some((rows, cols, seq));
+            return ResizeDecision::Coalesce;
+        }
+
+        self.in_flight = Some(seq);
+        ResizeDecision::Dispatch { rows, cols, seq }
+    }
+
+    /// 워커가 `seq`를 끝냈다. 대기 중인 것이 있으면 그것을 돌려준다(호출자가
+    /// 워커로 보낸다).
+    ///
+    /// **끝난 `seq`가 진행 중이던 것과 다르면 아무것도 하지 않는다.** 남의 완료
+    /// 알림이 이쪽 가드를 풀면 리사이즈 두 개가 동시에 돌고, 그중 나중에 끝난
+    /// 쪽이 최종 크기가 되어 순서 보장이 깨진다.
+    pub fn completed(&mut self, seq: u64) -> Option<(u16, u16, u64)> {
+        if self.in_flight != Some(seq) {
+            return None;
+        }
+        self.in_flight = None;
+
+        let (rows, cols, next) = self.pending.take()?;
+        self.in_flight = Some(next);
+        Some((rows, cols, next))
+    }
+}
 
 /// `TerminalSession`은 `Clone`이 아니라서 `Message`(iced 위젯이 `Message:
 /// Clone`을 요구한다)에 직접 담을 수 없다. 봉투로 감싸 **한 번만** 꺼내 쓴다 —
@@ -95,6 +181,14 @@ pub struct SessionSlot {
     presence_generation: u64,
     /// 세션마다 하나 — 틱마다 새로 만들면 pgid 캐시가 죽어 매번 ps를 띄운다.
     pub monitor: Arc<Mutex<PresenceMonitor>>,
+    /// 리사이즈는 블로킹이라 워커로 나가고, 세션당 최신 `seq` 하나만 실행한다.
+    pub resize: ResizeCoalescer,
+    /// 선택 추출도 워커로 나간다(`selection_to_string()`이 선택 범위 전체를
+    /// 훑는다). **세션당 직렬**이라 in-flight 가드를 둔다.
+    pub extract_in_flight: bool,
+    /// 추출이 도는 동안 도착한 복사 요청. 최신 하나만 남긴다 — 낡은 요청은
+    /// epoch 가드가 어차피 거절하므로 쌓아둘 값이 없다.
+    pub extract_pending: Option<CopyRequest>,
 }
 
 impl SessionSlot {
@@ -110,6 +204,9 @@ impl SessionSlot {
             presence_in_flight: false,
             presence_generation: 0,
             monitor: Arc::new(Mutex::new(PresenceMonitor::default())),
+            resize: ResizeCoalescer::default(),
+            extract_in_flight: false,
+            extract_pending: None,
         }
     }
 }
@@ -123,6 +220,8 @@ pub fn blank_snapshot() -> TerminalSnapshot {
         cursor: None,
         display_offset: 0,
         history_size: 0,
+        mode: alacritty_terminal::term::TermMode::empty(),
+        selection: None,
     }
 }
 
@@ -437,6 +536,12 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    /// 세션 핸들. `Arc`를 클론해 돌려주는 이유는 호출부가 세션을 부르면서 동시에
+    /// `&mut SessionStore`가 필요하기 때문이다(예: 마우스 결과로 스냅샷 재요청).
+    pub fn session(&self, id: SessionId) -> Option<Arc<TerminalSession>> {
+        self.slots.get(&id).map(|slot| Arc::clone(&slot.session))
+    }
+
     pub fn presence(&self, id: SessionId) -> AgentPresence {
         self.slots
             .get(&id)
@@ -454,6 +559,89 @@ impl SessionStore {
             .map(|slot| (slot.id, Arc::clone(&slot.session)))
     }
 
+    /// 커스텀 위젯이 그릴 캐시된 스냅샷. 슬롯이 없으면 빈 스냅샷을 돌려준다 —
+    /// 뷰는 `Option`을 다룰 자리가 아니고, 없는 세션은 빈 화면이 맞다.
+    pub fn snapshot(&self, id: SessionId) -> &TerminalSnapshot {
+        static EMPTY: std::sync::OnceLock<TerminalSnapshot> = std::sync::OnceLock::new();
+        match self.slots.get(&id) {
+            Some(slot) => &slot.snapshot,
+            None => EMPTY.get_or_init(blank_snapshot),
+        }
+    }
+
+    // ---- 리사이즈: 워커 + 세션당 최신 seq만 (Task 0.8 스레딩 정책 표) ----
+
+    /// 위젯이 발행한 리사이즈를 합치기에 넣고, 실행하기로 결정됐으면 워커
+    /// 태스크를 돌려준다. 결정을 함께 돌려주는 이유는 테스트가 "버려졌다"와
+    /// "합쳐졌다"를 구별해야 하기 때문이다 — `Task`는 들여다볼 수 없다.
+    pub fn request_resize(
+        &mut self,
+        id: SessionId,
+        rows: u16,
+        cols: u16,
+        seq: u64,
+    ) -> (ResizeDecision, Task<Message>) {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return (ResizeDecision::Discard, Task::none());
+        };
+        let decision = slot.resize.submit(rows, cols, seq);
+        let task = match decision {
+            ResizeDecision::Dispatch { rows, cols, seq } => {
+                resize_task(Arc::clone(&slot.session), id, rows, cols, seq)
+            }
+            ResizeDecision::Coalesce | ResizeDecision::Discard => Task::none(),
+        };
+        (decision, task)
+    }
+
+    /// 워커가 하나를 끝냈다. 합치기에 대기 중이던 것이 있으면 이어서 보낸다.
+    pub fn resize_completed(&mut self, id: SessionId, seq: u64) -> Task<Message> {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return Task::none();
+        };
+        match slot.resize.completed(seq) {
+            Some((rows, cols, next)) => {
+                resize_task(Arc::clone(&slot.session), id, rows, cols, next)
+            }
+            None => Task::none(),
+        }
+    }
+
+    // ---- 선택 추출: 워커(세션당 직렬) ----
+
+    /// 복사 요청을 워커로 보낸다. 이미 추출이 돌고 있으면 대기열에 **최신
+    /// 하나만** 남기고 `false`를 돌려준다.
+    pub fn request_extraction(
+        &mut self,
+        id: SessionId,
+        request: CopyRequest,
+    ) -> (bool, Task<Message>) {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return (false, Task::none());
+        };
+        if slot.extract_in_flight {
+            slot.extract_pending = Some(request);
+            return (false, Task::none());
+        }
+        slot.extract_in_flight = true;
+        (true, extract_task(Arc::clone(&slot.session), id, request))
+    }
+
+    /// 추출 하나가 끝났다. 대기 중이던 요청이 있으면 이어서 보낸다.
+    pub fn extraction_completed(&mut self, id: SessionId) -> Task<Message> {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return Task::none();
+        };
+        slot.extract_in_flight = false;
+        match slot.extract_pending.take() {
+            Some(request) => {
+                slot.extract_in_flight = true;
+                extract_task(Arc::clone(&slot.session), id, request)
+            }
+            None => Task::none(),
+        }
+    }
+
     /// 캐시된 스냅샷을 화면에 그대로 그릴 수 있는 줄 단위 텍스트로. 스냅샷이
     /// 아직 한 번도 안 왔으면(`blank_snapshot`) 빈 문자열이다.
     pub fn snapshot_text(&self, id: SessionId) -> String {
@@ -465,6 +653,40 @@ impl SessionStore {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// 블로킹 리사이즈를 전용 스레드에서. **실패해도 완료 메시지를 반드시 보낸다** —
+/// 안 보내면 합치기의 `in_flight`가 영영 풀리지 않아 그 세션은 다시는
+/// 리사이즈되지 않는다(`apply_snapshot`이 가드를 값 반영보다 **먼저** 푸는 것과
+/// 같은 이유다).
+fn resize_task(
+    session: Arc<TerminalSession>,
+    id: SessionId,
+    rows: u16,
+    cols: u16,
+    seq: u64,
+) -> Task<Message> {
+    background::blocking(move |mut sender| {
+        let result = session.resize(rows, cols).map_err(|e| e.to_string());
+        let _ = sender.try_send(Message::ResizeApplied { id, seq, result });
+    })
+}
+
+/// 선택 추출을 전용 스레드에서. `extract_selection`이 epoch를 락 안에서 비교해
+/// 불일치면 `None`을 돌려준다 — 그 `None`은 **조용한 취소**이지 오류가 아니다.
+fn extract_task(
+    session: Arc<TerminalSession>,
+    id: SessionId,
+    request: CopyRequest,
+) -> Task<Message> {
+    background::blocking(move |mut sender| {
+        let text = session.extract_selection(request.epoch);
+        let _ = sender.try_send(Message::SelectionExtracted {
+            id,
+            targets: request.to,
+            text,
+        });
+    })
 }
 
 // ---- 테스트 전용 헬퍼. `#[cfg(test)]`가 아니라 `#[doc(hidden)]`인 이유:
@@ -539,14 +761,15 @@ impl SessionStore {
     }
 
     /// `TerminalSession`의 실제 generation 카운터는 private이라 밖에서 직접
-    /// 건드릴 수 없다. `scroll_display(0)`은 화면을 실제로 옮기지 않으면서도
+    /// 건드릴 수 없다. `scroll_display(Scroll::Delta(0))`은 화면을 실제로 옮기지 않으면서도
     /// (delta 0) 호출마다 generation을 1씩 올린다(session.rs) — 이를 빌려
     /// "스냅샷이 도는 동안 출력이 더 들어왔다"는 상황을 재현한다.
     #[doc(hidden)]
     pub fn bump_generation_for_test(&mut self, id: SessionId, times: u32) {
         if let Some(slot) = self.slots.get(&id) {
             for _ in 0..times {
-                slot.session.scroll_display(0);
+                slot.session
+                    .scroll_display(alacritty_terminal::grid::Scroll::Delta(0));
             }
         }
     }
@@ -596,5 +819,181 @@ impl SessionStore {
             scrollback: TEST_SCROLLBACK_LINES,
         })
         .expect("throwaway test session must start")
+    }
+}
+
+#[cfg(test)]
+mod resize_coalescer_tests {
+    use super::*;
+
+    /// 워커가 도는 동안 아무것도 안 오면 그대로 끝난다.
+    #[test]
+    fn a_single_resize_dispatches_and_completes() {
+        let mut c = ResizeCoalescer::default();
+        assert_eq!(
+            c.submit(25, 100, 1),
+            ResizeDecision::Dispatch {
+                rows: 25,
+                cols: 100,
+                seq: 1
+            }
+        );
+        assert_eq!(c.completed(1), None, "nothing was queued behind it");
+    }
+
+    /// **이 가드가 존재하는 이유.** 워커 두 개의 완료 순서가 뒤집히거나 메시지가
+    /// 재전송되면 낡은 `seq`가 새 것 뒤에 도착한다. 그걸 받아들이면 사용자가
+    /// 이미 지나온 크기로 PTY를 되돌려, 화면과 셸이 어긋난 채 남는다.
+    #[test]
+    fn an_older_seq_arriving_after_a_newer_one_is_discarded() {
+        let mut c = ResizeCoalescer::default();
+
+        assert_eq!(
+            c.submit(25, 100, 5),
+            ResizeDecision::Dispatch {
+                rows: 25,
+                cols: 100,
+                seq: 5
+            }
+        );
+        assert_eq!(c.completed(5), None);
+
+        // 뒤늦게 도착한 낡은 것.
+        assert_eq!(
+            c.submit(10, 40, 3),
+            ResizeDecision::Discard,
+            "seq 3 is older than the seq 5 already applied"
+        );
+        // 같은 seq의 중복 전달도 새 요청이 아니다.
+        assert_eq!(
+            c.submit(25, 100, 5),
+            ResizeDecision::Discard,
+            "a duplicate delivery of seq 5 is not a new request"
+        );
+
+        // **대조군**: 더 새로운 것은 반드시 적용된다. 이게 없으면 위의 두
+        // `Discard`가 "가드가 옳다"가 아니라 "이 타입이 아무것도 안 한다"로도
+        // 설명된다.
+        assert_eq!(
+            c.submit(30, 120, 6),
+            ResizeDecision::Dispatch {
+                rows: 30,
+                cols: 120,
+                seq: 6
+            },
+            "control: a newer seq must still be applied"
+        );
+    }
+
+    /// 드래그하는 동안 셀 경계를 넘을 때마다 리사이즈가 나온다. 워커가 하나
+    /// 도는 사이 도착한 것들은 **마지막 하나로 뭉쳐야** 한다 — 순서대로 다
+    /// 실행하면 워커 큐가 드래그보다 뒤처지고 중간 크기를 전부 PTY에 적용한다.
+    #[test]
+    fn resizes_arriving_during_a_dispatch_collapse_to_the_latest() {
+        let mut c = ResizeCoalescer::default();
+
+        assert!(matches!(
+            c.submit(25, 100, 1),
+            ResizeDecision::Dispatch { .. }
+        ));
+        assert_eq!(c.submit(26, 104, 2), ResizeDecision::Coalesce);
+        assert_eq!(c.submit(27, 108, 3), ResizeDecision::Coalesce);
+        assert_eq!(c.submit(28, 112, 4), ResizeDecision::Coalesce);
+
+        assert_eq!(
+            c.completed(1),
+            Some((28, 112, 4)),
+            "only the newest of the three queued resizes may run"
+        );
+        assert_eq!(
+            c.completed(4),
+            None,
+            "and after it, the queue is empty — the middle sizes never ran"
+        );
+    }
+
+    /// 합치기가 끝난 뒤에도 가드가 정상 상태로 돌아와야 한다. 여기가 새면
+    /// `in_flight`가 영영 안 풀려 그 세션은 다시는 리사이즈되지 않는다.
+    #[test]
+    fn the_coalescer_returns_to_idle_and_keeps_working() {
+        let mut c = ResizeCoalescer::default();
+
+        assert!(matches!(
+            c.submit(25, 100, 1),
+            ResizeDecision::Dispatch { .. }
+        ));
+        assert_eq!(c.submit(26, 104, 2), ResizeDecision::Coalesce);
+        assert_eq!(c.completed(1), Some((26, 104, 2)));
+        assert_eq!(c.completed(2), None);
+
+        // 유휴로 돌아왔으니 다음 것은 다시 곧바로 나가야 한다(Coalesce가 아니라).
+        assert_eq!(
+            c.submit(27, 108, 3),
+            ResizeDecision::Dispatch {
+                rows: 27,
+                cols: 108,
+                seq: 3
+            },
+            "after the queue drains the next resize must dispatch immediately"
+        );
+    }
+
+    /// **대기열에서 꺼낸 것도 in-flight다.** `completed`가 꺼내 돌려준 리사이즈는
+    /// 호출자가 곧바로 워커로 보내므로, 그 시점부터 다시 워커가 돌고 있다.
+    /// 여기서 가드를 다시 세우지 않으면 코얼레서는 유휴라고 착각하고, 직후에
+    /// 도착한 리사이즈를 곧바로 dispatch해 **블로킹 리사이즈 두 개가 동시에
+    /// 돈다** — 나중에 끝난 쪽이 최종 크기가 되어 순서 보장이 깨진다.
+    ///
+    /// (이 테스트는 mutation이 살아남아서 추가됐다: `completed`에서
+    /// `in_flight = Some(next)`를 지워도 기존 테스트가 전부 통과했다.)
+    #[test]
+    fn a_drained_resize_is_itself_in_flight() {
+        let mut c = ResizeCoalescer::default();
+
+        assert!(matches!(
+            c.submit(25, 100, 1),
+            ResizeDecision::Dispatch { .. }
+        ));
+        assert_eq!(c.submit(26, 104, 2), ResizeDecision::Coalesce);
+        assert_eq!(
+            c.completed(1),
+            Some((26, 104, 2)),
+            "precondition: seq 2 is now the one running"
+        );
+
+        assert_eq!(
+            c.submit(27, 108, 3),
+            ResizeDecision::Coalesce,
+            "seq 2 is still running, so seq 3 must queue behind it — dispatching \\
+             here would run two blocking resizes at once"
+        );
+        // 그리고 그 2가 끝나야 비로소 3이 나간다.
+        assert_eq!(c.completed(2), Some((27, 108, 3)));
+    }
+
+    /// 남의 완료 알림이 이쪽 가드를 풀면 리사이즈 두 개가 동시에 돌고, 나중에
+    /// 끝난 쪽이 최종 크기가 되어 순서 보장이 깨진다.
+    #[test]
+    fn a_completion_for_a_different_seq_does_not_release_the_guard() {
+        let mut c = ResizeCoalescer::default();
+
+        assert!(matches!(
+            c.submit(25, 100, 7),
+            ResizeDecision::Dispatch { .. }
+        ));
+        assert_eq!(
+            c.completed(6),
+            None,
+            "a stale completion must not drain the queue"
+        );
+
+        // 가드가 아직 살아 있으므로 새 요청은 합쳐져야 한다.
+        assert_eq!(
+            c.submit(26, 104, 8),
+            ResizeDecision::Coalesce,
+            "the guard must still be held — a foreign completion released it if this dispatches"
+        );
+        // 그리고 진짜 완료가 오면 그때 대기열이 풀린다.
+        assert_eq!(c.completed(7), Some((26, 104, 8)));
     }
 }

@@ -1,3 +1,4 @@
+use alacritty_terminal::grid::Scroll;
 use suaegi_term::grid::{GridSize, TerminalGrid, TitleChange, TITLE_CHANGES_CAPACITY};
 
 #[test]
@@ -66,7 +67,7 @@ fn scrolled_view_shows_history_not_the_live_screen() {
     }
     let live = grid.snapshot();
     assert_eq!(live.display_offset, 0);
-    grid.scroll_display(5); // 위로 5줄
+    grid.scroll_display(Scroll::Delta(5)); // 위로 5줄
     let scrolled = grid.snapshot();
     assert_eq!(scrolled.display_offset, 5);
     assert_ne!(

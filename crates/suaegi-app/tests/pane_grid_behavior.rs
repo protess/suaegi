@@ -5,6 +5,12 @@
 //! 이벤트로 구동할 수 있다. 여기서 검증하는 건 우리 코드가 아니라
 //! **iced_widget 0.14.2의 동작**이다 — workbench.rs가 그 동작에 의존하므로,
 //! iced 업그레이드가 전제를 깨면 이 테스트가 먼저 깨진다.
+//!
+//! 구동 장치는 `tests/harness`에 있다 — 원래 이 파일 안에 있던 것을 위젯
+//! 테스트와 공유하려고 뽑아냈다. 하네스의 한계(측정 불가)는 그 모듈 문서에
+//! 적혀 있고, 이 파일의 주장들은 측정에 의존하지 않는다.
+
+mod harness;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -14,6 +20,8 @@ use iced::advanced::widget::{Tree, Widget};
 use iced::advanced::{Clipboard, Shell, mouse, renderer};
 use iced::widget::{button, pane_grid, scrollable, text};
 use iced::{Element, Event, Length, Point, Rectangle, Size, Theme};
+
+use harness::{Harness, Step};
 
 // ---------------------------------------------------------------- 테스트 배선
 
@@ -128,13 +136,6 @@ where
     }
 }
 
-/// 헤드리스 하네스. workbench.rs와 **동일한** pane_grid 설정을 만든다.
-struct Harness {
-    log: Rc<RefCell<Vec<String>>>,
-    messages: Vec<Message>,
-    bounds: Size,
-}
-
 /// 본문을 어떻게 감쌀지 — C6(스크롤 트랜잭션) 확인용으로만 갈라진다.
 #[derive(Clone, Copy, PartialEq)]
 enum Body {
@@ -142,83 +143,61 @@ enum Body {
     Scrollable,
 }
 
-impl Harness {
-    fn new() -> Self {
-        Self {
-            log: Rc::new(RefCell::new(Vec::new())),
-            messages: Vec::new(),
-            bounds: Size::new(800.0, 600.0),
-        }
-    }
+/// workbench.rs와 **동일한** pane_grid 설정을 만들어 이벤트 시퀀스를 흘린다.
+///
+/// `pane_grid::State`를 여기서 소유하는 이유: `PaneGrid::new`가 그걸 빌리므로
+/// Element보다 오래 살아야 한다. 하네스는 트리와 상태를 스텝 사이에 유지하므로
+/// press→move→release가 하나의 상태 기계로 이어진다.
+fn run(body: Body, capture: bool, events: &[(Event, Point)]) -> (Vec<Message>, Vec<String>) {
+    let (mut state, first) = pane_grid::State::new(0usize);
+    let (_second, _split) = state
+        .split(pane_grid::Axis::Vertical, first, 1usize)
+        .expect("split must succeed");
 
-    /// 이벤트 시퀀스를 하나의 위젯 트리/상태에 대해 순서대로 흘린다.
-    /// 트리와 pane_grid 내부 상태(Action)가 이벤트 사이에 유지돼야
-    /// press→move→release 같은 상태 기계를 재현할 수 있다.
-    fn run(&mut self, body: Body, events: &[(Event, Point)]) {
-        self.run_with_capture(body, false, events);
-    }
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let build_log = Rc::clone(&log);
 
-    fn run_with_capture(&mut self, body: Body, capture: bool, events: &[(Event, Point)]) {
-        let (mut state, first) = pane_grid::State::new(0usize);
-        let (_second, _split) = state
-            .split(pane_grid::Axis::Vertical, first, 1usize)
-            .expect("split must succeed");
+    let grid: Element<'_, Message, Theme, ()> =
+        pane_grid::PaneGrid::new(&state, move |pane, index, _is_maximized| {
+            let name: &'static str = if *index == 0 { "left" } else { "right" };
+            let title_bar = pane_grid::TitleBar::new(text(name).size(13))
+                .controls(pane_grid::Controls::new(
+                    button(text("x").size(12)).on_press(Message::PaneCloseRequested(pane)),
+                ))
+                .padding(6);
 
-        let log = Rc::clone(&self.log);
-        let mut grid: Element<'_, Message, Theme, ()> =
-            pane_grid::PaneGrid::new(&state, move |pane, index, _is_maximized| {
-                let name: &'static str = if *index == 0 { "left" } else { "right" };
-                let title_bar = pane_grid::TitleBar::new(text(name).size(13))
-                    .controls(pane_grid::Controls::new(
-                        button(text("x").size(12)).on_press(Message::PaneCloseRequested(pane)),
-                    ))
-                    .padding(6);
+            // 프로브를 pane보다 훨씬 크게 만들어야 scrollable이 실제로
+            // 스크롤 가능해지고, 그래야 트랜잭션 경로를 탄다.
+            let probe = Probe::new(name, &build_log, 5_000.0, capture);
+            let content: Element<'_, Message, Theme, ()> = match body {
+                Body::Bare => probe.into(),
+                Body::Scrollable => scrollable(probe)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            };
+            pane_grid::Content::new(content).title_bar(title_bar)
+        })
+        .spacing(2)
+        .on_click(Message::PaneClicked)
+        .on_drag(Message::PaneDragged)
+        .on_resize(8, Message::PaneResized)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
 
-                // 프로브를 pane보다 훨씬 크게 만들어야 scrollable이 실제로
-                // 스크롤 가능해지고, 그래야 트랜잭션 경로를 탄다.
-                let probe = Probe::new(name, &log, 5_000.0, capture);
-                let content: Element<'_, Message, Theme, ()> = match body {
-                    Body::Bare => probe.into(),
-                    Body::Scrollable => scrollable(probe)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into(),
-                };
-                pane_grid::Content::new(content).title_bar(title_bar)
-            })
-            .spacing(2)
-            .on_click(Message::PaneClicked)
-            .on_drag(Message::PaneDragged)
-            .on_resize(8, Message::PaneResized)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+    let steps: Vec<Step> = events
+        .iter()
+        .map(|(event, cursor)| Step::at(event.clone(), *cursor))
+        .collect();
 
-        let mut tree = Tree::new(&grid);
-        let limits = layout::Limits::new(Size::ZERO, self.bounds);
-        let node = grid.as_widget_mut().layout(&mut tree, &(), &limits);
-        let layout = Layout::new(&node);
-        let viewport = Rectangle::with_size(self.bounds);
-        let mut clipboard = iced::advanced::clipboard::Null;
+    let messages = Harness::new()
+        .with_bounds(Size::new(800.0, 600.0))
+        .run(grid, &steps)
+        .into_messages();
 
-        for (event, cursor) in events {
-            let mut shell = Shell::new(&mut self.messages);
-            grid.as_widget_mut().update(
-                &mut tree,
-                event,
-                layout,
-                mouse::Cursor::Available(*cursor),
-                &(),
-                &mut clipboard,
-                &mut shell,
-                &viewport,
-            );
-        }
-    }
-
-    fn log(&self) -> Vec<String> {
-        self.log.borrow().clone()
-    }
+    let log = log.borrow().clone();
+    (messages, log)
 }
 
 fn press() -> Event {
@@ -253,19 +232,18 @@ fn dragged(messages: &[Message]) -> Vec<&pane_grid::DragEvent> {
 /// 자식이 그 press를 보고 **동시에** pane_grid가 리사이즈를 시작한다.
 #[test]
 fn press_near_divider_reaches_the_body_and_still_starts_a_resize() {
-    let mut h = Harness::new();
     // 세로 분할선은 x≈400. spacing 2 + leeway 8 = 10 폭 밴드 → 395..405.
     // 오른쪽 pane 본문 안쪽으로 3px 들어간 지점을 고른다.
     let inside_body_but_in_band = Point::new(404.0, 300.0);
-    h.run(
+    let (messages, log) = run(
         Body::Bare,
+        false,
         &[
             (press(), inside_body_but_in_band),
             (moved(Point::new(420.0, 300.0)), Point::new(420.0, 300.0)),
         ],
     );
 
-    let log = h.log();
     assert!(
         log.iter()
             .any(|l| l == "right:ButtonPressed:over=true:captured=false"),
@@ -274,11 +252,10 @@ fn press_near_divider_reaches_the_body_and_still_starts_a_resize() {
          press over the grid); log = {log:?}"
     );
     assert!(
-        h.messages
+        messages
             .iter()
             .any(|m| matches!(m, Message::PaneResized(_))),
-        "pane_grid must still start a resize from the same press; messages = {:?}",
-        h.messages
+        "pane_grid must still start a resize from the same press; messages = {messages:?}",
     );
 }
 
@@ -296,15 +273,13 @@ fn a_child_capturing_the_event_does_not_suppress_pane_grid() {
     let in_band = Point::new(404.0, 300.0);
     let moved_to = Point::new(420.0, 300.0);
 
-    let run = |capture: bool| {
-        let mut h = Harness::new();
-        h.run_with_capture(
+    let go = |capture: bool| {
+        let (messages, log) = run(
             Body::Bare,
             capture,
             &[(press(), in_band), (moved(moved_to), moved_to)],
         );
-        let kinds: Vec<&'static str> = h
-            .messages
+        let kinds: Vec<&'static str> = messages
             .iter()
             .map(|m| match m {
                 Message::PaneClicked(_) => "Clicked",
@@ -313,11 +288,11 @@ fn a_child_capturing_the_event_does_not_suppress_pane_grid() {
                 Message::PaneCloseRequested(_) => "Close",
             })
             .collect();
-        (kinds, h.log())
+        (kinds, log)
     };
 
-    let (captured_kinds, captured_log) = run(true);
-    let (uncaptured_kinds, _) = run(false);
+    let (captured_kinds, captured_log) = go(true);
+    let (uncaptured_kinds, _) = go(false);
 
     assert!(
         captured_log.iter().any(|l| l.contains(":captured=true")),
@@ -340,32 +315,26 @@ fn a_child_capturing_the_event_does_not_suppress_pane_grid() {
 /// 눌러 끌면 `PaneClicked`는 나오지만 `DragEvent::Picked`는 나오지 않는다.
 #[test]
 fn drag_from_the_body_clicks_but_never_picks_the_pane() {
-    let mut h = Harness::new();
     let start = Point::new(200.0, 300.0); // 왼쪽 pane 본문 한가운데
     let end = Point::new(300.0, 300.0); // 100px 끌기
-    h.run(
+    let (messages, log) = run(
         Body::Bare,
-        &[
-            (press(), start),
-            (moved(end), end),
-            (release(), end),
-        ],
+        false,
+        &[(press(), start), (moved(end), end), (release(), end)],
     );
 
     assert!(
-        h.messages
+        messages
             .iter()
             .any(|m| matches!(m, Message::PaneClicked(_))),
-        "a press in the body must publish PaneClicked; messages = {:?}",
-        h.messages
+        "a press in the body must publish PaneClicked; messages = {messages:?}",
     );
     assert!(
-        dragged(&h.messages).is_empty(),
+        dragged(&messages).is_empty(),
         "a press in the body must NOT start a pane drag; drag events = {:?}",
-        dragged(&h.messages)
+        dragged(&messages)
     );
 
-    let log = h.log();
     assert!(
         log.iter()
             .any(|l| l.starts_with("left:ButtonPressed:over=true")),
@@ -383,37 +352,29 @@ fn drag_from_the_body_clicks_but_never_picks_the_pane() {
 /// 그동안 그 pane의 본문 `update`는 아예 건너뛴다.
 #[test]
 fn drag_from_the_title_bar_gap_picks_the_pane_and_silences_its_body() {
-    let mut h = Harness::new();
     // 타이틀바: padding 6, 안에 title text와 controls 버튼. 제목 글자와
     // 컨트롤 사이의 빈 여백을 노린다. 왼쪽 pane 폭 ≈399, 제목은 왼쪽,
     // 닫기 버튼은 오른쪽 끝 → 중간쯤은 pick 영역이다.
     let start = Point::new(200.0, 15.0);
     let end = Point::new(300.0, 300.0);
-    h.run(
+    let (messages, log) = run(
         Body::Bare,
-        &[
-            (press(), start),
-            (moved(end), end),
-            (release(), end),
-        ],
+        false,
+        &[(press(), start), (moved(end), end), (release(), end)],
     );
 
-    let drags = dragged(&h.messages);
+    let drags = dragged(&messages);
     assert!(
         drags
             .iter()
             .any(|e| matches!(e, pane_grid::DragEvent::Picked { .. })),
-        "a press in the title bar gap must pick the pane; messages = {:?}",
-        h.messages
+        "a press in the title bar gap must pick the pane; messages = {messages:?}",
     );
 
     // C4: picked 이후에 온 이벤트(move, release)를 본문이 보면 안 된다.
-    let log = h.log();
     let left_after_pick: Vec<_> = log
         .iter()
-        .filter(|l| {
-            l.starts_with("left:CursorMoved") || l.starts_with("left:ButtonReleased")
-        })
+        .filter(|l| l.starts_with("left:CursorMoved") || l.starts_with("left:ButtonReleased"))
         .collect();
     assert!(
         left_after_pick.is_empty(),
@@ -433,11 +394,13 @@ fn drag_from_the_title_bar_gap_picks_the_pane_and_silences_its_body() {
 /// 열고 그동안 콘텐츠로 휠을 **전달하지 않는다**.
 #[test]
 fn scrollable_swallows_the_second_wheel_event_during_its_transaction() {
-    let mut h = Harness::new();
     let over_body = Point::new(200.0, 300.0);
-    h.run(Body::Scrollable, &[(wheel(), over_body), (wheel(), over_body)]);
+    let (_messages, log) = run(
+        Body::Scrollable,
+        false,
+        &[(wheel(), over_body), (wheel(), over_body)],
+    );
 
-    let log = h.log();
     let left_wheels = log
         .iter()
         .filter(|l| l.starts_with("left:WheelScrolled"))
@@ -453,11 +416,13 @@ fn scrollable_swallows_the_second_wheel_event_during_its_transaction() {
 /// (자기 로직은 없고, 자식에게는 매번 전달된다).
 #[test]
 fn without_a_scrollable_every_wheel_event_reaches_the_body() {
-    let mut h = Harness::new();
     let over_body = Point::new(200.0, 300.0);
-    h.run(Body::Bare, &[(wheel(), over_body), (wheel(), over_body)]);
+    let (_messages, log) = run(
+        Body::Bare,
+        false,
+        &[(wheel(), over_body), (wheel(), over_body)],
+    );
 
-    let log = h.log();
     let left_wheels = log
         .iter()
         .filter(|l| l.starts_with("left:WheelScrolled"))

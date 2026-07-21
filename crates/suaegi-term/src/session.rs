@@ -6,7 +6,12 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Select, Sender, TryRecvError, TrySendError};
 
+use alacritty_terminal::grid::Scroll;
+
 use crate::grid::{GridSize, TerminalGrid, TerminalSnapshot, TitleChange};
+use crate::input_types::{
+    CopyRequest, CopyTargets, KeyInput, MouseEncodeError, MouseIntent, MouseResult, WriteOutcome,
+};
 use crate::pty::{KillOutcome, PtySession, PtySpawn, TermError};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -332,6 +337,20 @@ impl TerminalSession {
     }
 
     /// UI가 락 없이 "다시 그려야 하나"를 판단하는 값. 그리드 변경마다 증가한다.
+    ///
+    /// **정확한 스냅샷 버전이 아니라 eventual 무효화 신호다.** 카운터는 그리드
+    /// 락 **밖에서** 올라간다 — `feed`/`resize`/`scroll_display` 모두 그리드
+    /// 호출이 반환한 **뒤에** `fetch_add` 한다. 따라서 generation을 `G`로 읽고
+    /// 뜬 스냅샷이 `G+1`짜리 변경까지 이미 담고 있을 수 있다.
+    ///
+    /// 이 순서가 안전한 방향인 이유: 변경이 **먼저**, 카운터가 **나중**이므로
+    /// "`G`를 읽었다"는 곧 "`G`까지의 변경은 이미 그리드에 반영돼 있다"는 뜻이다.
+    /// 그래서 스냅샷이 갱신을 **놓치는** 일은 없고, 기껏해야 이미 반영된 변경
+    /// 때문에 한 번 더 뜨는 **중복**이 생긴다. 반대 순서(카운터 먼저)였다면
+    /// 놓치는 쪽이 되어 화면이 영영 낡은 채로 남는다.
+    ///
+    /// → 소비자는 이 값을 **단조 staleness 라벨**로만 다뤄야 한다. "generation
+    /// `G`인 스냅샷은 정확히 `G`시점의 상태"라고 가정하는 코드를 쓰면 안 된다.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -360,9 +379,74 @@ impl TerminalSession {
     }
 
     /// 스크롤백 이동. 화면 내용이 바뀌므로 generation을 올려 UI가 재렌더하게 한다.
-    pub fn scroll_display(&self, lines: i32) {
-        self.grid.scroll_display(lines);
+    pub fn scroll_display(&self, scroll: Scroll) {
+        self.grid.scroll_display(scroll);
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    // -----------------------------------------------------------------------
+    // 입력 — grid가 인코딩하고(락 안), 여기서 큐에 넣는다(락 밖)
+    //
+    // **락 중첩이 없다.** grid 메서드는 바이트를 돌려주고 이미 락을 놓은 상태다.
+    // 앱은 `TerminalGrid`에 닿을 수 없으므로 이 래퍼들이 유일한 입구다.
+    // -----------------------------------------------------------------------
+
+    pub fn send_key(&self, input: &KeyInput) -> WriteOutcome {
+        match self.grid.encode_key_locked(input) {
+            Some(bytes) => self.enqueue(bytes),
+            None => WriteOutcome::Suppressed,
+        }
+    }
+
+    pub fn send_paste(&self, text: &str) -> WriteOutcome {
+        self.enqueue(self.grid.encode_paste_locked(text))
+    }
+
+    pub fn report_focus(&self, focused: bool) -> WriteOutcome {
+        match self.grid.encode_focus_locked(focused) {
+            Some(bytes) => self.enqueue(bytes),
+            None => WriteOutcome::Suppressed,
+        }
+    }
+
+    /// `redraw`면 generation을 올린다 — 스냅샷 스케줄링이 generation으로 도는데
+    /// (Plan 3) 다시 그리라고만 하면 **옛 스냅샷을 옛 선택으로 다시 그린다.**
+    /// 선택 변경을 화면에 반영하려면 새 스냅샷을 찍어야 한다.
+    pub fn send_mouse(&self, intent: &MouseIntent) -> Result<MouseResult, MouseEncodeError> {
+        let result = self.grid.handle_mouse(intent)?;
+        if result.redraw {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        let write = match result.bytes {
+            Some(bytes) => self.enqueue(bytes),
+            None => WriteOutcome::Suppressed,
+        };
+        Ok(MouseResult {
+            write,
+            redraw: result.redraw,
+            copy: result.copy,
+        })
+    }
+
+    pub fn extract_selection(&self, epoch: u64) -> Option<String> {
+        self.grid.extract_selection(epoch)
+    }
+
+    pub fn request_copy(&self, to: CopyTargets) -> Option<CopyRequest> {
+        self.grid.request_copy(to)
+    }
+
+    /// 빈 바이트열은 **억제다.** 보낼 것이 없는데 `Queued`를 돌려주면 앱이 유실
+    /// 피드백 규칙을 잘못된 쪽으로 적용한다.
+    fn enqueue(&self, bytes: Vec<u8>) -> WriteOutcome {
+        if bytes.is_empty() {
+            return WriteOutcome::Suppressed;
+        }
+        if self.write(bytes) {
+            WriteOutcome::Queued
+        } else {
+            WriteOutcome::Dropped
+        }
     }
 
     #[cfg(unix)]
