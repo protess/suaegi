@@ -261,3 +261,31 @@ fn a_stale_presence_result_does_not_overwrite_a_newer_one() {
         "an older presence result must be discarded"
     );
 }
+
+// ---- pr4 적대적 리뷰 항목 6: `reaped_at`은 테스트 관측(`reaper_drop_thread_
+// for_test`) 전용인데, 프로덕션 경로(`SessionStore::new()`)에서도 세션이
+// 닫힐 때마다 계속 채워지고 있었다 — 앱 수명 내내 지워지지 않는 맵. 오직
+// `SessionStore::for_test()`만 이 필드를 채우게 해서, 프로덕션 인스턴스는
+// 세션을 아무리 많이 열고 닫아도 이 맵이 비어 있어야 한다 ----
+
+#[test]
+fn production_stores_never_populate_reaped_at() {
+    // `for_test()`가 아니라 프로덕션이 실제로 부르는 `SessionStore::new()`를
+    // 그대로 쓴다. `start_for_test`/`reaper_drop_thread_for_test`는 시작/관측
+    // 편의를 위한 테스트 헬퍼일 뿐 — 어느 생성자로 만들었든 슬롯 조작 자체는
+    // 동작한다(그래서 이 조합으로 프로덕션 생성자를 검증할 수 있다).
+    let mut store = SessionStore::new();
+    let id = store.start_for_test(platform::sleep_seconds(30));
+
+    store.close(id);
+    assert!(
+        wait_until(Duration::from_secs(10), || store.reaper_retired_count() == 1),
+        "the session must still actually reach the reaper"
+    );
+    // retired_count로 이미 reap이 끝났다고 확인했으니, 더 기다려도 안 채워질
+    // reaped_at 엔트리를 기다리지 않는다 — 지금 바로 None이어야 한다.
+    assert!(
+        store.reaper_drop_thread_for_test(id).is_none(),
+        "a production SessionStore must never populate reaped_at"
+    );
+}

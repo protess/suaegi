@@ -132,7 +132,14 @@ pub struct SessionStore {
     /// `close()`/`accept_started`의 거절 경로로 넘어간 세션이 **실제로 어느
     /// 스레드에서** 떨어졌는지. 오직 Reaper의 콜백만 채운다 — 그 콜백이
     /// 실행되는 스레드가 곧 소멸자가 실행된 스레드라는 증거다.
+    ///
+    /// 테스트 관측용일 뿐이라(`reaper_drop_thread_for_test`) 프로덕션에서는
+    /// 절대 채우지 않는다 — `track_reaped_at`이 꺼져 있으면(기본값)
+    /// `retire`가 여기 아무것도 넣지 않는다. 앱 수명 내내 세션이 종료될
+    /// 때마다 엔트리가 하나씩 쌓이기만 하고 지워지지 않아, 채우면 프로덕션이
+    /// 무기한 자라는 맵을 하나 더 들고 있게 된다.
     reaped_at: Arc<Mutex<HashMap<SessionId, std::thread::ThreadId>>>,
+    track_reaped_at: bool,
     retired_count: Arc<AtomicU64>,
     next_id: u64,
 }
@@ -149,6 +156,7 @@ impl SessionStore {
             slots: HashMap::new(),
             reaper: Reaper::spawn(),
             reaped_at: Arc::new(Mutex::new(HashMap::new())),
+            track_reaped_at: false,
             retired_count: Arc::new(AtomicU64::new(0)),
             next_id: 0,
         }
@@ -400,13 +408,16 @@ impl SessionStore {
     fn retire(&self, session: Arc<TerminalSession>, id: Option<SessionId>) {
         let retired_count = Arc::clone(&self.retired_count);
         let reaped_at = Arc::clone(&self.reaped_at);
+        let track_reaped_at = self.track_reaped_at;
         self.reaper.retire_with_callback(session, move || {
             retired_count.fetch_add(1, Ordering::SeqCst);
-            if let Some(id) = id {
-                reaped_at
-                    .lock()
-                    .expect("reaped_at mutex poisoned")
-                    .insert(id, std::thread::current().id());
+            if track_reaped_at {
+                if let Some(id) = id {
+                    reaped_at
+                        .lock()
+                        .expect("reaped_at mutex poisoned")
+                        .insert(id, std::thread::current().id());
+                }
             }
         });
     }
@@ -461,7 +472,11 @@ impl SessionStore {
 impl SessionStore {
     #[doc(hidden)]
     pub fn for_test() -> Self {
-        Self::new()
+        let mut store = Self::new();
+        // 프로덕션은 `reaped_at`을 채우지 않는다(항목 6: 무기한 자라는 맵) —
+        // 이 필드로 관측하는 테스트만 `for_test()`를 거치므로 여기서 켠다.
+        store.track_reaped_at = true;
+        store
     }
 
     /// `platform::echo(...)` 등이 돌려주는 `(program, args)`로 즉시 세션을
