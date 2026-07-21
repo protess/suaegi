@@ -303,14 +303,19 @@ pub(crate) fn update(
                 return;
             };
             let now = Instant::now();
-            let kind = classify_click(state.last_click, button, now, cursor_point(state));
-            state.last_click = Some(LastClick {
-                button,
-                at: now,
-                pos: cursor_point(state),
-                kind,
-            });
+            let pos = cursor_point(state);
+            let kind = classify_click(state.last_click, button, now, pos);
+            // **`last_click`은 press가 실제로 받아들여진 뒤에만 갱신한다.**
+            // 무시된 코드 클릭(다른 버튼이 눌린 채 들어온 press)을 기록해버리면
+            // 더블클릭 사슬이 그 버튼으로 끊긴다 — 좌클릭 → 우버튼 스침 → 좌클릭이
+            // `Double`이 아니라 `Single`이 된다.
             if let Some(intent) = press_intent(state, button, hit, kind) {
+                state.last_click = Some(LastClick {
+                    button,
+                    at: now,
+                    pos,
+                    kind,
+                });
                 publish(shell, id, intent);
             }
         }
@@ -742,6 +747,29 @@ mod tests {
         let _ = press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single);
         assert!(
             release_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single).is_some()
+        );
+    }
+
+    /// **무시된 코드 클릭이 더블클릭 사슬을 끊으면 안 된다.**
+    ///
+    /// 좌클릭 → 우버튼을 스침(무시됨) → 좌클릭. `last_click`을 press 수락 전에
+    /// 기록하면 버려진 우클릭이 사슬에 남아 둘째 좌클릭이 `Double`이 아니라
+    /// `Single`이 된다. 리뷰가 잡은 1차 수정의 잔여 버그다.
+    #[test]
+    fn an_ignored_chord_does_not_corrupt_the_double_click_chain() {
+        let mut state = wired_state();
+        let at = cursor_at(1.0, 1.0);
+
+        let _ = run(&mut state, &press(iced_mouse::Button::Left), at);
+        let _ = run(&mut state, &press(iced_mouse::Button::Right), at); // 무시됨
+        let _ = run(&mut state, &release(iced_mouse::Button::Left), at);
+
+        let second = run(&mut state, &press(iced_mouse::Button::Left), at);
+        let kinds: Vec<ClickKind> = intents(&second).iter().map(|i| i.click).collect();
+        assert_eq!(
+            kinds,
+            vec![ClickKind::Double],
+            "the discarded right press must not enter the click chain"
         );
     }
 
