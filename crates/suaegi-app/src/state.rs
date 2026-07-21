@@ -642,18 +642,16 @@ impl AppState {
                 if self.selected_worktree.as_ref() == Some(&worktree_id) {
                     self.selected_worktree = None;
                 }
-                // 세션이 살아 있는 상태로 worktree를 지우면 셸이 사라진 디렉터리를
-                // 가리키게 된다 — pane은 남겨두되(사용자가 스크롤백을 볼 수 있게)
-                // 세션 자체는 정리해 PTY가 새지 않게 한다. pane_grid의 pane 자체는
-                // `PaneCloseRequested`가 올 때까지 그대로 둔다(닫는 UX는 이 태스크
-                // 범위 밖 — 워크벤치가 "세션이 종료됨"을 그리는 건 Plan 4).
-                if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
-                    self.close_session(session_id);
-                }
-                // 아직 시작 중인(`pending_session_starts`) 세션은 위에서 못 잡는다
-                // — `worktree_sessions`엔 `SessionStarted`가 도착해야 올라가기
-                // 때문이다. 그 경합을 `worktree_still_exists`가 알아채도록
-                // 표시해 둔다(위 `pending_worktree_removals` 문서 참고).
+                // 세션을 여기서 곧바로 닫으면 안 된다 — git이 삭제를 실제로
+                // 허용할지 아직 모른다. non-forced `git worktree remove`는
+                // dirty한 worktree에서 흔히 실패하고(에이전트가 파일을 바꾸는
+                // 게 이 앱의 존재 이유이니 그게 오히려 정상 상태다), 그때
+                // worktree는 살아남는다. 여기서 세션을 먼저 닫으면 삭제가
+                // 실패해도 방금 돌던(어쩌면 작업 중이던) 세션은 이미 reaper로
+                // 갔고 pane은 빈 화면으로 남는다 — `close_session`은
+                // `WorktreeRemoved`의 성공 경로로 미룬다. 아래
+                // `pending_worktree_removals` 가드가 그 사이 새 세션이 끼어드는
+                // 걸 막아주므로 순서를 미뤄도 안전하다.
                 self.pending_worktree_removals.insert(worktree_id.clone());
                 let op = self.next_op();
                 crate::git_tasks::remove_worktree(
@@ -675,6 +673,14 @@ impl AppState {
                 match result {
                     Ok(_outcome) => {
                         self.last_error = None;
+                        // git이 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
+                        // (`RemoveWorktreeRequested`의 문서 참고). pane_grid의
+                        // pane 자체는 `PaneCloseRequested`가 올 때까지 그대로
+                        // 둔다(닫는 UX는 이 태스크 범위 밖 — 워크벤치가 "세션이
+                        // 종료됨"을 그리는 건 Plan 4).
+                        if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
+                            self.close_session(session_id);
+                        }
                         // 재조회 응답을 기다리지 않고 곧바로 지운다 — 그 사이
                         // 도착하는 `worktree_still_exists` 판단이 새 목록이
                         // 반영되기 전 낡은 목록으로 "아직 있다"고 답하지 않게 한다.
@@ -1161,6 +1167,68 @@ mod tests {
             result: Err("worktree has uncommitted changes".to_string()),
         });
         assert_eq!(state.last_error(), Some("worktree has uncommitted changes"));
+    }
+
+    // ---- 최종 리뷰 항목 2: 제거 요청이 git 결과를 기다리지 않고 세션을
+    // 먼저 닫으면, non-forced 삭제가 흔하게 실패하는(dirty worktree) 상황에서
+    // worktree는 살아남았는데 그 위에서 돌던 세션(어쩌면 작업 중이던
+    // 에이전트)은 이미 reaper로 가버린다 — pane은 빈 화면으로 남는다.
+    // `close_session`은 `WorktreeRemoved`의 성공 경로로 미뤄야 한다 ----
+
+    #[test]
+    fn a_failed_worktree_removal_leaves_the_session_alive_and_its_pane_rendering() {
+        let (mut state, id, worktree_id, pane) = state_with_one_open_session();
+        // `state_with_one_open_session`은 목록만 채우고 repo는 등록하지
+        // 않는다 — `RemoveWorktreeRequested`는 `repo_by_id`를 요구하므로
+        // 여기서 등록해야 핸들러가 실제로 진행된다.
+        let repo_id = RepoId("/tmp/r2".into());
+        state.upsert_repo(Repo {
+            id: repo_id.clone(),
+            path: PathBuf::from("/tmp/r2"),
+            display_name: "r2".to_string(),
+            worktree_base_ref: None,
+        });
+
+        let _ = state.update(Message::RemoveWorktreeRequested {
+            repo_id: repo_id.clone(),
+            worktree_id: worktree_id.clone(),
+            worktree_path: PathBuf::from("/tmp/accepted"),
+            branch: Some("accepted".to_string()),
+        });
+
+        // 제거 요청을 보낸 직후(git 응답은 아직 안 옴) — 세션은 여전히 살아
+        // 있어야 하고 pane도 여전히 그걸 가리켜야 한다.
+        assert!(
+            state.session_store().is_running(id),
+            "the session must still be running while the removal request is in flight"
+        );
+        assert_eq!(
+            state.panes().and_then(|panes| panes.get(pane)),
+            Some(&id),
+            "the pane must still show the live session while removal is pending"
+        );
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(99),
+            repo_id,
+            worktree_id: worktree_id.clone(),
+            result: Err("worktree has uncommitted changes".to_string()),
+        });
+
+        assert!(
+            state.session_store().is_running(id),
+            "a failed removal must not have closed the still-live session"
+        );
+        assert_eq!(
+            state.panes().and_then(|panes| panes.get(pane)),
+            Some(&id),
+            "the pane must still render the session's content after a failed removal"
+        );
+        assert_eq!(
+            state.worktree_sessions.get(&worktree_id),
+            Some(&id),
+            "the worktree -> session mapping must survive a failed removal"
+        );
     }
 
     fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
