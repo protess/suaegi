@@ -83,11 +83,12 @@ pub fn build_spawn(
                 // `--`로 이후 인자를 옵션 파싱에서 제외시킨다. 프롬프트가 `-`로
                 // 시작하면(예: "-fix this") 이게 없을 때 claude/codex가 이를
                 // 알 수 없는 플래그로 파싱해 시작 에러를 내거나 조용히
-                // 오동작한다. claude와 codex 둘 다 clap 기반 파서를 쓰며 `--`
-                // 뒤는 항상 위치 인자로 취급함을 실측으로 확인했다(둘 다
-                // "unknown option"/"unexpected argument" 대신 값으로 받아
-                // 프롬프트로 넘어감) — codex는 에러 메시지에서 직접
-                // `-- -x` 형태를 제안하기도 한다.
+                // 오동작한다. codex는 clap 기반 파서, claude CLI는 Node.js
+                // 기반(Commander) 파서로 서로 다르지만, 둘 다 `--` 뒤는 항상
+                // 위치 인자로 취급함을 실측으로 확인했다(둘 다 "unknown
+                // option"/"unexpected argument" 대신 값으로 받아 프롬프트로
+                // 넘어감) — codex는 에러 메시지에서 직접 `-- -x` 형태를
+                // 제안하기도 한다.
                 args.push("--".to_string());
                 args.push(prompt.to_string());
             }

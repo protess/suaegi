@@ -313,6 +313,7 @@ impl TerminalSession {
     /// 테스트 전용 관찰창: 현재 PTY 크기를 grid 크기와 독립적으로 조회한다.
     /// resize()의 pty/grid 원자성을 외부에서 검증하려면 둘을 각자 읽을 방법이
     /// 있어야 한다 — snapshot()은 grid 크기만 준다.
+    #[doc(hidden)]
     pub fn pty_size(&self) -> Result<(u16, u16), TermError> {
         self.pty.size()
     }
@@ -320,6 +321,7 @@ impl TerminalSession {
     /// 테스트 전용 관찰창: 라이터 스레드가 이미 끝났는지. 프로덕션 코드는 이
     /// 값에 의존하지 않는다 — "자식이 죽으면 라이터도 곧 끝난다"를 세션을
     /// 계속 들고 있는 상태에서 외부에서 검증하기 위한 창일 뿐이다.
+    #[doc(hidden)]
     pub fn writer_thread_is_finished(&self) -> bool {
         self.writer_thread
             .lock()
@@ -384,6 +386,12 @@ impl Drop for TerminalSession {
         // (`JOIN_DEADLINE` 주석 참고).
         // Windows: 자손 프로세스를 확실히 죽일 방법이 없어(job object는 post-MVP)
         // 리더가 EOF를 못 볼 수 있으므로 join하지 않고 분리한다.
+        // 리더와 라이터 각각에 새로 `JOIN_DEADLINE`을 주면 둘 다 막힌 최악의
+        // 경우 UI 스레드가 그 두 배(4초)를 먹는다. 첫 조인 시작 시각을 기준으로
+        // 남은 예산을 두 번째 조인에 넘겨, 전체 Drop이 `JOIN_DEADLINE` 하나로
+        // 묶이게 한다.
+        #[cfg(unix)]
+        let join_budget_start = Instant::now();
         #[cfg(unix)]
         if let Ok(mut handle) = self.reader_thread.lock() {
             if let Some(handle) = handle.take() {
@@ -394,13 +402,15 @@ impl Drop for TerminalSession {
         if let Ok(mut handle) = self.reader_thread.lock() {
             let _ = handle.take(); // 분리 (join하면 영원히 멈출 수 있다)
         }
-        // 라이터도 같은 이유로 unix에서만(그리고 같은 데드라인으로) join한다.
+        // 라이터도 같은 이유로 unix에서만 join하되, 리더 조인이 이미 써버린
+        // 시간만큼 데드라인을 줄여 총 예산이 `JOIN_DEADLINE`을 넘지 않게 한다.
         // Windows에서는 자손이 의사 콘솔을 붙들고 있으면 write_all이 블로킹된
         // 채로 남을 수 있다.
         #[cfg(unix)]
         if let Ok(mut handle) = self.writer_thread.lock() {
             if let Some(handle) = handle.take() {
-                join_with_deadline(handle, JOIN_DEADLINE);
+                let remaining = JOIN_DEADLINE.saturating_sub(join_budget_start.elapsed());
+                join_with_deadline(handle, remaining);
             }
         }
         #[cfg(not(unix))]

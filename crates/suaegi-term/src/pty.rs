@@ -201,6 +201,7 @@ impl PtySession {
 
     /// 현재 PTY 크기 (rows, cols). 주로 테스트에서 PTY와 grid 크기가
     /// 일치하는지 독립적으로 확인하는 용도.
+    #[doc(hidden)]
     pub fn size(&self) -> Result<(u16, u16), TermError> {
         let master = self.master.lock().expect("pty master mutex poisoned");
         let size = master
