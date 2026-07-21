@@ -334,13 +334,33 @@ impl AppState {
     /// `op`가 해당 repo에 대해 마지막으로 발급된 목록 요청보다 오래됐으면 버린다.
     /// 생성/삭제 직후 재조회한 최신 목록이, 그 전에 발급됐던 목록의 뒤늦은 응답에
     /// 덮어써지는 것을 막는다.
+    ///
+    /// 이 앱을 거치지 않고 밖에서(다른 터미널, 다른 도구) worktree가
+    /// 지워졌을 수도 있다 — `RemoveWorktreeRequested` 경로를 타지 않았으므로
+    /// 그 세션은 아무도 닫지 않는다. 새 목록에서 사라진 worktree를 여기서
+    /// 찾아 세션을 닫는다(Reaper로) — 그러지 않으면 PTY/스레드/pane/구독이
+    /// 그 세션의 `Arc`를 계속 붙들고 영원히 산다.
     pub fn apply_worktree_listing(&mut self, repo: RepoId, op: OpId, entries: Vec<WorktreeEntry>) {
         if let Some(latest) = self.latest_list_op.get(&repo) {
             if op.0 < latest.0 {
                 return;
             }
         }
+        let still_present: HashSet<WorktreeId> =
+            entries.iter().map(|e| worktree_id_for(&e.path)).collect();
+        let vanished_sessions: Vec<SessionId> = self
+            .worktrees_by_repo
+            .get(&repo)
+            .into_iter()
+            .flatten()
+            .map(|e| worktree_id_for(&e.path))
+            .filter(|id| !still_present.contains(id))
+            .filter_map(|id| self.worktree_sessions.get(&id).copied())
+            .collect();
         self.worktrees_by_repo.insert(repo, entries);
+        for session_id in vanished_sessions {
+            self.close_session(session_id);
+        }
     }
 
     pub fn worktree_names(&self, repo: &RepoId) -> Vec<String> {
@@ -1418,5 +1438,56 @@ mod tests {
             "the repo added via a real update() dispatch must have reached disk"
         );
         assert_eq!(reloaded.load.state.repos[0].display_name, "persisted-repo");
+    }
+
+    // ---- pr4 적대적 리뷰 항목 2: worktree가 이 앱을 거치지 않고 밖에서
+    // 지워지면(다른 터미널의 `git worktree remove`, 파일 관리자로 디렉토리
+    // 삭제 등) `RemoveWorktreeRequested`/`WorktreeRemoved` 경로를 전혀 타지
+    // 않는다. 다음 재조회(`apply_worktree_listing`)가 그 worktree를 빼고
+    // 도착했을 때 세션을 닫지 않으면 PTY/스레드/reaper 클론이 영원히 산다 ----
+
+    #[test]
+    fn a_worktree_that_vanished_externally_has_its_session_closed_on_the_next_listing() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        let repo_id = RepoId("/tmp/r2".into());
+
+        assert!(
+            state.session_store().is_running(id),
+            "sanity: the session must be alive before the worktree disappears"
+        );
+
+        // 다음 목록 응답엔 그 worktree가 없다 — 밖에서 지워졌다는 뜻이다.
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        state.apply_worktree_listing(repo_id, OpId(2), Vec::new());
+
+        assert!(
+            !state.session_store().is_running(id),
+            "a session for a worktree that vanished externally must be closed, not leaked"
+        );
+        assert!(
+            !state.worktree_sessions.contains_key(&worktree_id),
+            "the worktree -> session mapping must be cleared along with the session"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || state
+                .session_store()
+                .reaper_retired_count()
+                == 1),
+            "the session must actually reach the reaper, not just be dropped from bookkeeping"
+        );
+    }
+
+    #[test]
+    fn a_worktree_that_still_appears_in_the_next_listing_keeps_its_session() {
+        let (mut state, id, _worktree_id, _pane) = state_with_one_open_session();
+        let repo_id = RepoId("/tmp/r2".into());
+
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        state.apply_worktree_listing(repo_id, OpId(2), vec![entry_at("/tmp/accepted", "accepted")]);
+
+        assert!(
+            state.session_store().is_running(id),
+            "a worktree that is still listed must not have its session torn down"
+        );
     }
 }
