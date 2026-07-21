@@ -637,10 +637,17 @@ impl AppState {
         }
     }
 
-    /// 세션을 스토어에서 닫고(Reaper로 은퇴) worktree ↔ 세션 매핑을 정리한다.
-    /// pane_grid 쪽 정리(닫을 pane 자체를 지우는 것)는 호출자(`PaneCloseRequested`
-    /// 핸들러) 몫이다 — pane_grid `close()`는 마지막 pane을 지울 수 없어서 그
-    /// 결정은 세션 정리와 분리해 둬야 한다.
+    /// 세션을 스토어에서 닫고(Reaper로 은퇴) 그 세션에 딸린 상태를 **전부**
+    /// 정리한다 — worktree ↔ 세션 매핑, 제목, 유실 경고, 그리고 그 세션을 가리키던
+    /// pane까지.
+    ///
+    /// **pane 정리가 여기 있는 이유.** 원래는 호출자 몫이었고 대화형 경로
+    /// (`PaneCloseRequested`)만 그걸 지켰다. 비대화형 경로(사라진 worktree 청소,
+    /// `WorktreeRemoved` 성공)는 pane을 남겼고, 그 pane은 죽은 `SessionId`를
+    /// 가리킨 채 영원히 빈 터미널로 남아 포커스까지 가져갔다. Plan 4가 그 pane을
+    /// 죽은 `text()`에서 **포커스 가능한 위젯**으로 바꾸면서 증상이 커졌다.
+    /// "호출자가 알아서 한다"는 계약은 네 곳 중 두 곳이 어겼으니 지켜지지 않는
+    /// 계약이다 — 세션 소멸과 pane 소멸을 한 함수로 묶어 어길 수 없게 한다.
     fn close_session(&mut self, id: SessionId) {
         self.session_store.close(id);
         if let Some(worktree_id) = self.session_worktrees.remove(&id) {
@@ -650,6 +657,38 @@ impl AppState {
         if self.last_input_loss == Some(id) {
             // 사라진 세션의 유실 경고를 남겨두면 지울 방법이 없다.
             self.last_input_loss = None;
+        }
+        self.close_panes_for_session(id);
+    }
+
+    /// `id`를 가리키던 pane을 pane_grid에서 지운다.
+    ///
+    /// **마지막 pane은 `close()`로 지울 수 없다** — pane_grid는 pane이 0개인
+    /// 상태로 존재할 수 없어서 형제가 없는 pane에 대해 `close()`가 `None`을
+    /// 돌려준다. 그래서 그 경우만 워크벤치 전체를 빈 상태(`panes = None`)로
+    /// 되돌린다.
+    fn close_panes_for_session(&mut self, id: SessionId) {
+        let Some(panes) = &mut self.panes else {
+            return;
+        };
+        let doomed: Vec<pane_grid::Pane> = panes
+            .iter()
+            .filter(|(_, session)| **session == id)
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in doomed {
+            if panes.len() <= 1 {
+                self.panes = None;
+                self.focused_pane = None;
+                return;
+            }
+            if let Some((_, sibling)) = panes.close(pane) {
+                // 포커스가 방금 사라진 pane에 있었을 때만 옮긴다. 다른 pane에
+                // 있었다면 그 포커스는 그대로 유효하다.
+                if self.focused_pane == Some(pane) {
+                    self.focused_pane = Some(sibling);
+                }
+            }
         }
     }
 
@@ -936,10 +975,9 @@ impl AppState {
                             BranchDeletion::Deleted | BranchDeletion::NotRequested => None,
                         };
                         // git이 worktree 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
-                        // (`RemoveWorktreeRequested`의 문서 참고). pane_grid의
-                        // pane 자체는 `PaneCloseRequested`가 올 때까지 그대로
-                        // 둔다(닫는 UX는 이 태스크 범위 밖 — 워크벤치가 "세션이
-                        // 종료됨"을 그리는 건 Plan 4).
+                        // (`RemoveWorktreeRequested`의 문서 참고). 그 세션을
+                        // 가리키던 pane도 `close_session`이 같이 지운다 — 남겨두면
+                        // 죽은 id를 가리키는 빈 터미널이 포커스를 먹는다.
                         if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
                             self.close_session(session_id);
                         }
@@ -1102,19 +1140,10 @@ impl AppState {
                 iced::Task::none()
             }
             Message::PaneCloseRequested(pane) => {
-                if let Some(panes) = &mut self.panes {
-                    if panes.len() <= 1 {
-                        // pane_grid는 형제가 없는 마지막 pane을 `close()`로
-                        // 지울 수 없다 — 워크벤치 전체를 빈 상태로 되돌린다.
-                        if let Some(&session_id) = panes.get(pane) {
-                            self.close_session(session_id);
-                        }
-                        self.panes = None;
-                        self.focused_pane = None;
-                    } else if let Some((session_id, sibling)) = panes.close(pane) {
-                        self.close_session(session_id);
-                        self.focused_pane = Some(sibling);
-                    }
+                // pane 자체를 지우는 것도 `close_session`이 한다 — 대화형/비대화형
+                // 경로가 갈라져서 pane이 새던 것이 이 수렴의 이유다.
+                if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
+                    self.close_session(session_id);
                 }
                 iced::Task::none()
             }
@@ -1308,6 +1337,121 @@ mod tests {
             "the underlying session must actually be closed, not merely detached from the pane"
         );
         assert!(!state.worktree_sessions.contains_key(&worktree_id));
+    }
+
+    /// 세션 둘, pane 둘. 비대화형 종료가 **형제 pane과 포커스를 어떻게 남기는지**
+    /// 보려면 마지막 pane이 아닌 pane을 닫아봐야 한다 — 마지막 pane 경로는
+    /// `panes = None`으로 빠져나가 아무것도 증명하지 못한다.
+    fn state_with_two_open_sessions() -> (AppState, RepoId, [(SessionId, WorktreeId); 2]) {
+        let repo_id = RepoId("/tmp/two".into());
+        let mut state = AppState::default();
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_worktree_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/wt-a", "a"), entry_at("/tmp/wt-b", "b")],
+        );
+
+        let mut opened = Vec::new();
+        for path in ["/tmp/wt-a", "/tmp/wt-b"] {
+            let worktree_id = WorktreeId(path.to_string());
+            let id = state.session_store.next_id();
+            state.pending_session_starts.insert(worktree_id.clone(), id);
+            let _ = state.update(Message::SessionStarted {
+                id,
+                worktree_id: worktree_id.clone(),
+                result: Ok(StartedSession::new(SessionStore::spawn_throwaway_for_test())),
+            });
+            opened.push((id, worktree_id));
+        }
+        assert_eq!(
+            state.panes().expect("two sessions must open panes").len(),
+            2,
+            "precondition: each session got its own pane"
+        );
+        let opened: [(SessionId, WorktreeId); 2] = opened.try_into().expect("exactly two");
+        (state, repo_id, opened)
+    }
+
+    /// 앱 밖에서(다른 터미널에서) worktree가 지워지면 목록 갱신이 그 세션을
+    /// 거둔다. **그때 pane도 같이 가야 한다** — 남으면 죽은 `SessionId`를 가리키는
+    /// 빈 터미널이 되고, Plan 4 이후로는 그게 포커스까지 가져간다.
+    #[test]
+    fn a_vanished_worktree_takes_its_pane_with_it() {
+        let (mut state, repo_id, [(id_a, _wt_a), (id_b, _wt_b)]) = state_with_two_open_sessions();
+
+        // /tmp/wt-a가 새 목록에서 사라졌다.
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        state.apply_worktree_listing(repo_id, OpId(2), vec![entry_at("/tmp/wt-b", "b")]);
+
+        let panes = state.panes().expect("the surviving session keeps its pane");
+        assert_eq!(panes.len(), 1, "the vanished session's pane must be gone");
+        let survivors: Vec<SessionId> = panes.iter().map(|(_, id)| *id).collect();
+        assert_eq!(
+            survivors,
+            vec![id_b],
+            "and the pane that remains must be the one that still has a live session"
+        );
+        assert!(!state.session_store().is_running(id_a));
+        assert_eq!(
+            state.focused_session(),
+            Some(id_b),
+            "focus must land on a session that exists, not on a dead id"
+        );
+    }
+
+    /// `WorktreeRemoved` 성공 경로도 같은 계약을 진다. 이쪽은 앱이 직접 지운
+    /// 경우라 `apply_worktree_listing`을 기다리지 않고 즉시 정리한다.
+    #[test]
+    fn a_removed_worktree_takes_its_pane_with_it() {
+        let (mut state, repo_id, [(id_a, wt_a), (id_b, _wt_b)]) = state_with_two_open_sessions();
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(9),
+            repo_id,
+            worktree_id: wt_a,
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::NotRequested,
+            }),
+        });
+
+        let panes = state.panes().expect("the surviving session keeps its pane");
+        assert_eq!(panes.len(), 1, "the removed session's pane must be gone");
+        assert_eq!(
+            panes.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            vec![id_b]
+        );
+        assert!(!state.session_store().is_running(id_a));
+        assert_eq!(state.focused_session(), Some(id_b));
+    }
+
+    /// 마지막 pane을 비대화형으로 닫는 경로. pane_grid는 pane 0개로 존재할 수
+    /// 없으므로 `close()`가 아니라 워크벤치 전체 리셋으로 빠져야 한다 —
+    /// `PaneCloseRequested`만 알던 규칙이 이제 모든 경로에 적용된다.
+    #[test]
+    fn removing_the_last_worktree_resets_the_workbench() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        assert!(state.panes().is_some(), "precondition");
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(9),
+            repo_id: RepoId("/tmp/r2".into()),
+            worktree_id,
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::NotRequested,
+            }),
+        });
+
+        assert!(
+            state.panes().is_none(),
+            "the last pane cannot be closed — the workbench must reset"
+        );
+        assert_eq!(
+            state.focused_session(),
+            None,
+            "focus must not survive the pane it pointed at"
+        );
+        assert!(!state.session_store().is_running(id));
     }
 
     // ---- Plan 4 Task 7: 터미널 위젯 배선 ----
