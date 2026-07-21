@@ -202,7 +202,10 @@ mod tests {
         let spawn = build_spawn(AgentKind::Custom, None, None, PathBuf::from("/tmp"), 24, 80);
         assert!(!spawn.program.is_empty());
         #[cfg(unix)]
-        assert!(spawn.args.iter().any(|a| a == "-l"), "expected a login shell");
+        assert!(
+            spawn.args.iter().any(|a| a == "-l"),
+            "expected a login shell"
+        );
     }
 
     #[test]

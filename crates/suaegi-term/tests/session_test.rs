@@ -54,8 +54,7 @@ fn generation_increases_when_output_arrives() {
 #[test]
 fn exit_code_is_reported_after_child_finishes() {
     let session = TerminalSession::start(spec(platform::exit_with(7))).unwrap();
-    assert!(wait_until(Duration::from_secs(10), || session.exit_code()
-        == Some(7)));
+    assert!(wait_until(Duration::from_secs(10), || session.exit_code() == Some(7)));
     assert!(!session.is_running());
 }
 
@@ -242,8 +241,7 @@ fn device_query_is_answered_back_to_the_pty() {
     let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
     assert!(
         wait_until(Duration::from_secs(10), || snapshot_contains(
-            &session,
-            "ANSWERED"
+            &session, "ANSWERED"
         )),
         "device query reply never reached the child"
     );

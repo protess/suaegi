@@ -102,10 +102,7 @@ fn title_set_and_reset_are_distinguishable() {
     let changes = grid.take_title_changes();
     assert_eq!(
         changes,
-        vec![
-            TitleChange::Set("my-title".to_string()),
-            TitleChange::Reset
-        ],
+        vec![TitleChange::Set("my-title".to_string()), TitleChange::Reset],
         "empty title must surface as Reset, not Set(\"\")"
     );
     assert!(grid.take_title_changes().is_empty(), "take must drain");
@@ -127,7 +124,10 @@ fn snapshot_rows_always_match_reported_size() {
     // 렌더러가 size를 믿고 인덱싱하므로 둘은 항상 일관돼야 한다
     let grid = TerminalGrid::new(GridSize { rows: 5, cols: 10 }, 100);
     for size in [(3, 8), (12, 30), (5, 10)] {
-        grid.resize(GridSize { rows: size.0, cols: size.1 });
+        grid.resize(GridSize {
+            rows: size.0,
+            cols: size.1,
+        });
         let snap = grid.snapshot();
         assert_eq!(snap.rows.len(), snap.size.rows);
         assert!(snap.rows.iter().all(|r| r.len() == snap.size.cols));
@@ -140,5 +140,8 @@ fn scrollback_retains_lines_beyond_the_viewport() {
     for i in 0..10 {
         grid.feed(format!("line{i}\r\n").as_bytes());
     }
-    assert!(grid.snapshot().history_size > 0, "scrollback should retain lines");
+    assert!(
+        grid.snapshot().history_size > 0,
+        "scrollback should retain lines"
+    );
 }

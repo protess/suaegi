@@ -64,7 +64,10 @@ fn cwd_is_applied() {
     let out = read_to_end_with_timeout(reader, Duration::from_secs(10));
     let expected: PathBuf = dir.path().canonicalize().unwrap();
     let expected_tail = expected.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(out.contains(&expected_tail), "expected {expected_tail:?} in {out:?}");
+    assert!(
+        out.contains(&expected_tail),
+        "expected {expected_tail:?} in {out:?}"
+    );
     drop(session);
 }
 

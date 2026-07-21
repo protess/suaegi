@@ -92,7 +92,11 @@ impl EventListener for GridEventProxy {
         match event {
             // 장치 질의 응답 등 — PTY로 되돌려 쓰지 않으면 질의한 프로그램이 멈춘다
             Event::PtyWrite(text) => {
-                self.0.pty_writes.lock().expect("pty write mutex").push(text);
+                self.0
+                    .pty_writes
+                    .lock()
+                    .expect("pty write mutex")
+                    .push(text);
             }
             // 빈 타이틀은 리셋이다 — Set("")로 두면 UI가 이전 타이틀을 지울지
             // 빈 문자열을 표시할지 구분할 수 없다
@@ -102,7 +106,11 @@ impl EventListener for GridEventProxy {
                 } else {
                     TitleChange::Set(title)
                 };
-                self.0.title_changes.lock().expect("title mutex").push(change);
+                self.0
+                    .title_changes
+                    .lock()
+                    .expect("title mutex")
+                    .push(change);
             }
             Event::ResetTitle => {
                 self.0
