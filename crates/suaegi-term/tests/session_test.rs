@@ -1,5 +1,6 @@
 mod platform;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use suaegi_term::grid::TitleChange;
 use suaegi_term::pty::PtySpawn;
@@ -134,25 +135,48 @@ fn dropping_the_session_kills_the_process_group() {
     );
 }
 
-/// 두 큐 설계의 핵심 보장: UI 쓰기 큐가 포화돼도 PTY 리더는 멈추지 않는다.
-/// 자식이 stdin을 전혀 읽지 않으면서 stdout은 계속 내보내게 만들어, 라이터
-/// 스레드가 커널 PTY 입력 버퍼가 찬 뒤 블로킹 `write()`에 갇히는 동안에도
-/// 리더 스레드(별도 스레드, 별도 스레드가 소비하는 출력 파이프)는 계속
-/// 진행해야 한다는 것을 증명한다. `write()`가 실제로 `false`를 반환하는지
-/// 먼저 확인해 포화가 실제로 일어났음을 검증하고(그렇지 않으면 이 테스트는
-/// 공허하게 통과한다), 그 이후에도 generation이 계속 오르는지 본다.
+/// 가장 높은 `REPLY-<n>` 마커의 `n`을 뷰포트에서 찾는다. 마커가 없으면 0.
+#[cfg(unix)]
+fn max_reply_index(session: &TerminalSession) -> u64 {
+    let snap = session.snapshot();
+    (0..snap.size.rows)
+        .filter_map(|r| snap.row_text(r).strip_prefix("REPLY-").map(str::to_string))
+        .filter_map(|n| n.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// 두 큐 설계의 핵심 보장: UI 쓰기 큐가 포화돼도 리더는 장치 응답을
+/// 블로킹 없이 넘길 수 있어야 하고, 그래야 PTY 출력 소비도 멈추지 않는다.
+/// 자식이 `\033[c`(DA1) 질의를 반복해서 보내고 그 응답이 돌아올 때까지
+/// 기다렸다가만 다음 마커를 찍게 만든다 — 이러면 마커 진행 자체가 "리더가
+/// 응답을 큐에 실제로 올려보냈다"는 증거가 된다. `tick`만 반복 출력하는
+/// 자식으로는 리더가 응답 큐를 한 번도 건드리지 않아 큐 설계와 무관하게
+/// 통과해버린다(실측: 두 큐를 하나의 공유 바운드 채널로 합쳐도 이전 버전은
+/// 계속 통과했다) — 그래서 반드시 응답 왕복이 있어야 한다.
+///
+/// `write()`가 실제로 `false`를 반환하는지 먼저 확인해 포화가 실제로
+/// 일어났음을 검증하고, 그 뒤로도 관찰 구간 내내 큐를 계속 채워 넣으면서
+/// (한 번 포화됐다가 라이터가 서서히 비워내면 낡은 설계도 운 좋게 통과할 수
+/// 있다) 마커가 계속 증가하는지 본다.
 #[cfg(unix)]
 #[test]
 fn saturated_write_queue_does_not_stall_the_reader() {
-    let script = "while true; do printf 'tick\\n'; done";
+    let script = "stty -icanon min 1 time 0 -echo; i=0; \
+                   while true; do \
+                     printf '\\033[c'; \
+                     dd bs=1 count=5 >/dev/null 2>&1; \
+                     i=$((i+1)); \
+                     printf 'REPLY-%d\\n' \"$i\"; \
+                   done";
     let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
 
-    // 리더가 확실히 살아 움직이는 상태에서 시작한다
+    // 리더가 실제로 질의/응답 왕복을 수행하는 상태에서 시작한다 — 그렇지
+    // 않으면 이 테스트는 공허하게 통과한다.
     assert!(
-        wait_until(Duration::from_secs(10), || snapshot_contains(
-            &session, "tick"
-        )),
-        "child never produced output before saturation attempt"
+        wait_until(Duration::from_secs(10), || max_reply_index(&session) >= 1),
+        "child never completed a device-query/reply round trip before \
+         saturation attempt; this test would be vacuous"
     );
 
     // 큐를 포화시킨다. try_send는 논블로킹이므로 이 루프 자체는 빠르게 끝난다;
@@ -171,18 +195,39 @@ fn saturated_write_queue_does_not_stall_the_reader() {
          which would make the rest of this test vacuous"
     );
 
-    // 포화 이후에도 리더 스레드는 살아서 진행해야 한다: generation이 계속
-    // 오르고 세션이 여전히 running이어야 한다 (라이터가 막힌 것이지 죽은 게
-    // 아니다, 그리고 리더는 라이터와 완전히 독립적이어야 한다).
-    let gen_at_saturation = session.generation();
+    // 관찰 구간 내내 큐를 항상 가득 찬 상태로 유지해야 한다 — 한 번만
+    // 채우고 라이터가 서서히 비우게 두면, 큐 하나만 쓰는 설계에서도 응답이
+    // (뒤에서긴 하지만) 결국 차례가 와 통과해버릴 수 있다. 별도 스레드가
+    // sleep 없이 계속 `write()`를 재시도해 빈 슬롯이 나는 즉시 다시 채운다.
+    // 리더는 이 배경 스레드와 완전히 독립적으로, 계속 응답을 넘기고 PTY를
+    // 읽어야 한다 — 두 큐를 분리한 이유 그 자체다.
+    let replies_before = max_reply_index(&session);
+    let stop = AtomicBool::new(false);
+    let progressed = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut i = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                session.write(format!("flood-{i}\n").into_bytes());
+                i = i.wrapping_add(1);
+            }
+        });
+
+        let progressed = wait_until(Duration::from_secs(5), || {
+            max_reply_index(&session) > replies_before
+        });
+        stop.store(true, Ordering::Relaxed);
+        progressed
+    });
     assert!(
-        wait_until(Duration::from_secs(5), || session.generation()
-            > gen_at_saturation),
-        "reader appears stalled after the UI write queue saturated"
+        progressed,
+        "child made no further device-reply round trips while the UI write \
+         queue stayed continuously saturated — the reader appears stalled \
+         trying to hand off a reply"
     );
     assert!(
         session.is_running(),
-        "session should still be running — the writer is blocked, not the child"
+        "session should still be running — the writer is contending for \
+         pty bandwidth, not dead"
     );
 }
 
