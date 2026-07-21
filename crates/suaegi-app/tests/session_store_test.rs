@@ -279,7 +279,8 @@ fn production_stores_never_populate_reaped_at() {
 
     store.close(id);
     assert!(
-        wait_until(Duration::from_secs(10), || store.reaper_retired_count() == 1),
+        wait_until(Duration::from_secs(10), || store.reaper_retired_count()
+            == 1),
         "the session must still actually reach the reaper"
     );
     // retired_count로 이미 reap이 끝났다고 확인했으니, 더 기다려도 안 채워질

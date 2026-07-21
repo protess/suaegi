@@ -378,7 +378,9 @@ impl SessionStore {
         monitor: &Mutex<PresenceMonitor>,
         probe: &dyn ProcessProbe,
     ) -> AgentPresence {
-        let mut guard = monitor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.probe(session, probe)
     }
 
@@ -567,7 +569,6 @@ impl SessionStore {
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
-
 
     /// 어디에도 슬롯으로 등록되지 않은, 진짜로 살아있는 `TerminalSession`
     /// 하나. `workbench.rs`의 구독 동일성 테스트와 `state.rs`의

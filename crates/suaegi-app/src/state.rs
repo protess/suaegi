@@ -698,9 +698,9 @@ impl AppState {
                         // 경우도 "성공"으로 조용히 넘기면 사용자가 브랜치가
                         // 남아 있다는 걸 알 방법이 없다.
                         self.last_error = match outcome.branch_deletion {
-                            BranchDeletion::Failed(msg) => {
-                                Some(format!("worktree removed, but branch deletion failed: {msg}"))
-                            }
+                            BranchDeletion::Failed(msg) => Some(format!(
+                                "worktree removed, but branch deletion failed: {msg}"
+                            )),
                             BranchDeletion::Deleted | BranchDeletion::NotRequested => None,
                         };
                         // git이 worktree 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
@@ -1240,8 +1240,10 @@ mod tests {
 
     #[test]
     fn a_successful_branch_deletion_clears_a_stale_error() {
-        let mut state = AppState::default();
-        state.last_error = Some("stale error from a previous op".to_string());
+        let mut state = AppState {
+            last_error: Some("stale error from a previous op".to_string()),
+            ..AppState::default()
+        };
         let repo_id = RepoId("/tmp/r".into());
         let worktree_id = WorktreeId("/tmp/r/wt".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
@@ -1483,7 +1485,11 @@ mod tests {
         let repo_id = RepoId("/tmp/r2".into());
 
         state.note_list_issued(repo_id.clone(), OpId(2));
-        state.apply_worktree_listing(repo_id, OpId(2), vec![entry_at("/tmp/accepted", "accepted")]);
+        state.apply_worktree_listing(
+            repo_id,
+            OpId(2),
+            vec![entry_at("/tmp/accepted", "accepted")],
+        );
 
         assert!(
             state.session_store().is_running(id),
