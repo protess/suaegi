@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +35,9 @@ pub struct LoadOutcome {
     pub source: LoadSource,
 }
 
-const BACKUP_SLOTS: usize = 5;
+/// 백업 슬롯 개수. `Store` 밖에서 존재 여부를 확인할 때(예: suaegi-app의
+/// LoadOrigin 판별)도 같은 개수를 알아야 하므로 public.
+pub const BACKUP_SLOTS: usize = 5;
 
 pub struct Store {
     data_file: PathBuf,
@@ -80,13 +82,12 @@ impl Store {
         self.backup_min_interval = interval;
     }
 
-    fn backup_path(&self, slot: usize) -> PathBuf {
-        let name = self
-            .data_file
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        self.data_file.with_file_name(format!("{name}.bak.{slot}"))
+    /// `<name>.bak.<slot>` 명명 규칙. public이라 다른 크레이트가 이 규칙을
+    /// 다시 베끼지 않고 같은 계산을 재사용할 수 있다 (예: suaegi-app이 로드
+    /// *전에* 본파일/백업 존재 여부를 확인해 LoadOrigin을 판별할 때).
+    pub fn backup_path(data_file: &Path, slot: usize) -> PathBuf {
+        let name = data_file.file_name().unwrap_or_default().to_string_lossy();
+        data_file.with_file_name(format!("{name}.bak.{slot}"))
     }
 
     /// schema_version만 먼저 확인 — 미래 스키마 JSON은 전체 구조가 파싱되더라도
@@ -130,7 +131,7 @@ impl Store {
         // SkippedUnchanged로 무시되지 않게 한다 (손상 영구화 방지).
         self.last_written_hash = None;
         for slot in 0..BACKUP_SLOTS {
-            if let Ok(text) = fs::read_to_string(self.backup_path(slot)) {
+            if let Ok(text) = fs::read_to_string(Self::backup_path(&self.data_file, slot)) {
                 match Self::parse_trusted(&text) {
                     Ok(state) => {
                         return LoadOutcome {
@@ -160,21 +161,21 @@ impl Store {
         if !self.data_file.exists() {
             return Ok(());
         }
-        let bak0 = self.backup_path(0);
+        let bak0 = Self::backup_path(&self.data_file, 0);
         if let Ok(modified) = fs::metadata(&bak0).and_then(|m| m.modified()) {
             match SystemTime::now().duration_since(modified) {
                 Ok(age) if age < self.backup_min_interval => return Ok(()),
                 Ok(_) | Err(_) => {} // 오래됐거나 미래 mtime → 회전 진행
             }
         }
-        let oldest = self.backup_path(BACKUP_SLOTS - 1);
+        let oldest = Self::backup_path(&self.data_file, BACKUP_SLOTS - 1);
         if oldest.exists() {
             fs::remove_file(&oldest)?;
         }
         for slot in (0..BACKUP_SLOTS - 1).rev() {
-            let from = self.backup_path(slot);
+            let from = Self::backup_path(&self.data_file, slot);
             if from.exists() {
-                fs::rename(&from, self.backup_path(slot + 1))?;
+                fs::rename(&from, Self::backup_path(&self.data_file, slot + 1))?;
             }
         }
         fs::copy(&self.data_file, &bak0)?;

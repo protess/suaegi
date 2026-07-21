@@ -1,4 +1,5 @@
 pub mod background;
+pub mod persistence_thread;
 pub mod state;
 
 use iced::widget::{center, text};
