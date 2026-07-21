@@ -19,6 +19,21 @@ enum Request {
     OverrideFutureSchemaGuard,
 }
 
+/// 앱 데이터 파일의 기본 위치. OS별 config 디렉터리(macOS:
+/// `~/Library/Application Support`, Linux: `~/.config`) 아래 `suaegi/data.json`.
+/// `dirs::config_dir()`가 없는 드문 환경에서는 홈 디렉터리 아래 `.suaegi`로
+/// 대체한다(`suaegi-core::domain`이 `workspace_root` 기본값을 계산할 때 쓰는
+/// 것과 같은 폴백 패턴).
+pub fn default_data_file() -> PathBuf {
+    match dirs::config_dir() {
+        Some(config) => config.join("suaegi").join("data.json"),
+        None => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".suaegi")
+            .join("data.json"),
+    }
+}
+
 pub struct PersistenceBoot {
     pub handle: PersistenceHandle,
     pub load: LoadDiagnostics,

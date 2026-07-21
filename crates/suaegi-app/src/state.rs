@@ -1,14 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use futures::StreamExt;
 use iced::widget::pane_grid;
-use suaegi_core::domain::{PersistedState, Repo, RepoId, Worktree, WorktreeId};
+use suaegi_core::domain::{
+    PersistedState, Repo, RepoId, SessionState, Settings, Worktree, WorktreeId, SCHEMA_VERSION,
+};
 use suaegi_git::worktree::{CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::AgentKind;
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::presence::AgentPresence;
 
-use crate::persistence_thread::{LoadOrigin, SaveReport, SaveStatus};
+use crate::persistence_thread::{
+    LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
+};
 use crate::session_store::{SessionId, SessionStore, StartedSession};
 
 /// 비동기 작업 하나를 식별한다. 결과가 순서를 바꿔 도착해도 대상을 잃지 않게 한다.
@@ -57,10 +62,8 @@ pub enum Message {
     },
     /// UI 선택 표시만 한다. worktree 선택으로 세션을 시작하는 것은 Task 5의 몫이다.
     WorktreeSelected(WorktreeId),
-    /// 영속화 스레드(Task 2)의 저장 결과. **지금은 아무것도 이 메시지를 보내지
-    /// 않는다** — `PersistenceHandle`을 부팅 시 스폰하고 `results` 스트림을
-    /// 여기로 연결하는 건 Task 8(통합)의 몫이다. 상태 표시줄(`status_line`)이
-    /// 미리 반응할 수 있도록 자리만 만들어 둔다.
+    /// 영속화 스레드(Task 2)의 저장 결과. `AppState::boot`이 `PersistenceHandle`을
+    /// 스폰하며 `results` 스트림을 `Task::stream(...)`으로 여기로 연결한다.
     Saved(SaveReport),
 
     // ---- Task 5: session_store.rs의 비동기 결과. `AppState`가 `SessionStore`를
@@ -127,11 +130,16 @@ pub struct AppState {
     next_op_id: u64,
     workspace_root: PathBuf,
 
-    /// 사이드바 상태 표시줄이 읽는 영속화 진단 정보. 부팅 시 `PersistenceHandle`이
-    /// 채우는 게 정상 경로지만, 그 배선은 Task 8 몫이라 지금은 `Fresh`/`None`
-    /// 기본값으로만 존재한다 — 헛경고를 내지 않기 위한 안전한 기본값이다.
+    /// 사이드바 상태 표시줄이 읽는 영속화 진단 정보. `AppState::boot`이
+    /// `PersistenceHandle::spawn`의 `LoadDiagnostics`로 채운다. 기본값
+    /// (`Fresh`/`None`)은 플레인 `AppState::default()`(테스트 전반에서 쓰는)가
+    /// 헛경고를 내지 않기 위한 안전한 값이다.
     load_origin: LoadOrigin,
     last_save_status: Option<SaveStatus>,
+    /// `None`이면 저장이 배선되지 않은 상태(테스트, 또는 미래에 실패한 부팅) —
+    /// `persist()`는 조용히 아무것도 하지 않는다. 실 앱 경로에서는 `boot()`이
+    /// 항상 `Some`을 채운다.
+    persistence: Option<PersistenceHandle>,
 
     // ---- Task 6: 세션 생명주기 + 워크벤치 배선 ----
     session_store: SessionStore,
@@ -148,6 +156,15 @@ pub struct AppState {
     /// 세션 시작을 요청했지만 아직 `SessionStarted`가 도착하지 않은 worktree.
     /// 없으면 같은 worktree를 두 번 빠르게 클릭했을 때 세션이 두 개 뜬다.
     pending_session_starts: HashMap<WorktreeId, SessionId>,
+    /// 제거 요청을 보냈지만 `WorktreeRemoved` 응답이 아직 안 온 worktree.
+    /// `RemoveWorktreeRequested`가 세션을 닫는 건 그 시점에 `worktree_sessions`에
+    /// 이미 올라온 세션뿐이다 — 시작 요청이 in flight인 채로(`pending_session_starts`)
+    /// 제거가 시작되면, git 삭제가 끝나 `worktrees_by_repo`가 갱신되기 전까지는
+    /// `worktree_still_exists`가 여전히 `true`를 돌려줘 그 사이 도착하는
+    /// `SessionStarted`가 산 슬롯으로 받아들여지고, 그 세션은 아무도 닫지 않아
+    /// PTY와 스레드가 샌다. 이 집합이 그 창을 막는다: `worktree_still_exists`는
+    /// 여기 있는 worktree를 항상 "없다"고 답한다.
+    pending_worktree_removals: HashSet<WorktreeId>,
     /// pane 타이틀바에 쓰는 표시용 이름. 세션 시작을 요청한 시점에 미리
     /// 채워둔다 — `SessionStarted`가 도착하기 전에도(또는 실패해도) 어떤
     /// worktree를 위한 시도였는지 사용자에게 보여줄 수 있다.
@@ -178,12 +195,14 @@ impl Default for AppState {
             workspace_root: PersistedState::default().settings.workspace_root,
             load_origin: LoadOrigin::Fresh,
             last_save_status: None,
+            persistence: None,
             session_store: SessionStore::new(),
             panes: None,
             focused_pane: None,
             worktree_sessions: HashMap::new(),
             session_worktrees: HashMap::new(),
             pending_session_starts: HashMap::new(),
+            pending_worktree_removals: HashSet::new(),
             session_titles: HashMap::new(),
             next_presence_seq: 0,
         }
@@ -200,6 +219,112 @@ pub(crate) fn worktree_id_for(path: &Path) -> WorktreeId {
 }
 
 impl AppState {
+    /// 부팅 경로. `PersistenceHandle::spawn`이 창이 뜨기 전에 동기로 1회 로드를
+    /// 끝내고(`docs` Global Constraints — UI를 막지 않는다), 그 결과로 초기
+    /// `AppState`를 만든다. 반환하는 `Task`는 두 가지를 한다: (1) 복원된 repo마다
+    /// 최신 worktree 목록을 git에서 다시 받아온다(디스크에 저장된 목록은 앱이
+    /// 닫힌 사이 바뀌었을 수 있는 스냅샷일 뿐이라 git이 항상 최종 권위다),
+    /// (2) 저장 결과 채널(`results`)을 `Message::Saved`로 흘려보내 상태
+    /// 표시줄이 실제로 반응하게 한다 — 이 배선이 없으면 `Message::Saved`는
+    /// 영영 도착하지 않는 메시지로 남는다.
+    pub fn boot() -> (AppState, iced::Task<Message>) {
+        let boot = PersistenceHandle::spawn(crate::persistence_thread::default_data_file());
+        let mut state = AppState::from_load(boot.load);
+        state.persistence = Some(boot.handle);
+
+        let refresh_tasks: Vec<iced::Task<Message>> = state
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|repo_id| state.refresh_worktrees(repo_id))
+            .collect();
+
+        let saved_task = iced::Task::stream(boot.results.map(Message::Saved));
+
+        let mut tasks = refresh_tasks;
+        tasks.push(saved_task);
+        (state, iced::Task::batch(tasks))
+    }
+
+    /// `PersistenceHandle::spawn`이 돌려주는 `LoadDiagnostics`로 초기 상태를
+    /// 채운다. `state.rs`/`sidebar.rs` 테스트가 실제 부팅 경로(손으로 필드를
+    /// 세우는 `AppState::fresh()` 등의 테스트 헬퍼가 아니라)를 태워
+    /// `LoadOrigin`이 상태 표시줄까지 실제로 흘러가는지 검증할 때도 이 함수를
+    /// 그대로 쓴다.
+    pub(crate) fn from_load(load: LoadDiagnostics) -> AppState {
+        let mut state = AppState::default();
+        state.repos = load.state.repos;
+        state.workspace_root = load.state.settings.workspace_root;
+        state.load_origin = load.origin;
+        // 디스크에 저장된 worktree 목록을 그대로 신뢰하지 않고 화면에 먼저
+        // 보여주기 위한 최선의 추정치로만 쓴다 — `boot()`이 곧바로 git 재조회를
+        // 발급해 정정한다(위 문서 참고). `latest_list_op`는 일부러 세우지 않는다:
+        // 재조회가 발급하는 첫 `OpId`가 무엇이든 이 씨딩보다 새것으로 취급돼야
+        // 하고, `apply_worktree_listing`은 `latest_list_op`에 없는 repo의 응답을
+        // 무조건 받아들이므로 그냥 두면 된다.
+        let mut worktrees_by_repo: HashMap<RepoId, Vec<WorktreeEntry>> = HashMap::new();
+        for worktree in load.state.worktrees {
+            worktrees_by_repo
+                .entry(worktree.repo_id.clone())
+                .or_default()
+                .push(WorktreeEntry {
+                    path: worktree.path,
+                    branch: Some(worktree.branch),
+                    head: None,
+                    is_main: false,
+                });
+        }
+        state.worktrees_by_repo = worktrees_by_repo;
+        state
+    }
+
+    /// 지금 화면에 있는 repo/worktree/선택 상태를 `PersistedState`로 스냅샷
+    /// 뜬다. worktree 쪽은 git 목록(`WorktreeEntry`)에서 도메인 `Worktree`를
+    /// 새로 합성한다 — 생성 시각/생성 에이전트 같은 메타데이터는 이 씨딩
+    /// 시점에 알 수 없으므로 기본값을 쓴다(세션 레이아웃 복원은 Plan 5).
+    fn persisted_snapshot(&self) -> PersistedState {
+        let worktrees = self
+            .worktrees_by_repo
+            .iter()
+            .flat_map(|(repo_id, entries)| {
+                entries.iter().map(move |entry| Worktree {
+                    id: worktree_id_for(&entry.path),
+                    repo_id: repo_id.clone(),
+                    path: entry.path.clone(),
+                    branch: entry.branch.clone().unwrap_or_default(),
+                    display_name: entry
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "worktree".to_string()),
+                    created_with_agent: None,
+                    created_at_unix_ms: 0,
+                })
+            })
+            .collect();
+        PersistedState {
+            schema_version: SCHEMA_VERSION,
+            repos: self.repos.clone(),
+            worktrees,
+            session: SessionState {
+                active_worktree_id: self.selected_worktree.clone(),
+            },
+            settings: Settings {
+                workspace_root: self.workspace_root.clone(),
+            },
+        }
+    }
+
+    /// 영속화 대상 상태(repo/worktree/선택)가 바뀌었을 때 부른다. 배선이 안 된
+    /// 상태(`persistence == None`, 테스트 기본값)에서는 조용히 아무것도 하지
+    /// 않는다.
+    fn persist(&self) {
+        if let Some(handle) = &self.persistence {
+            handle.save(self.persisted_snapshot());
+        }
+    }
+
     /// 목록 요청을 발급한 시점에 호출한다. 이후 그보다 오래된 `OpId`로 도착하는
     /// 응답은 `apply_worktree_listing`이 버린다.
     pub fn note_list_issued(&mut self, repo: RepoId, op: OpId) {
@@ -352,10 +477,31 @@ impl AppState {
     /// `accept_started`가 늦게 도착한 시작 결과를 받아들일지 판단하는 데 쓴다.
     /// 세션 스토어는 어떤 worktree가 살아 있는지 모르므로(`session_store.rs`
     /// 문서 참고) 호출자인 여기서 판단해 넘겨준다.
+    ///
+    /// `pending_worktree_removals`를 먼저 본다: 제거가 진행 중인 동안은
+    /// `worktrees_by_repo`가 아직 예전 값을 들고 있을 수 있다(git 삭제가 끝나고
+    /// 목록을 다시 받아올 때까지 갱신되지 않는다) — 그 lag를 `worktrees_by_repo`
+    /// 만으로 판단하면 제거 중인 worktree로 걸어들어오는 `SessionStarted`가
+    /// "아직 있다"고 오판되어 산 슬롯으로 받아들여지고, 그 세션은 아무도 닫지
+    /// 않아 PTY와 스레드가 샌다.
     fn worktree_still_exists(&self, id: &WorktreeId) -> bool {
+        if self.pending_worktree_removals.contains(id) {
+            return false;
+        }
         self.worktrees_by_repo
             .values()
             .any(|entries| entries.iter().any(|e| worktree_id_for(&e.path) == *id))
+    }
+
+    /// `WorktreeRemoved`의 성공 경로에서, 재조회 응답(`WorktreesListed`)이
+    /// 도착하기 전에도 곧바로 목록에서 지운다. 재조회에만 맡기면 "git 삭제는
+    /// 끝났지만 목록은 아직 갱신 전"인 창이 남아 `worktree_still_exists`가 그
+    /// 창 동안은 여전히 `pending_worktree_removals`에만 의존하게 된다 — 이중
+    /// 방어로 그 창을 최대한 좁힌다.
+    fn remove_worktree_entry(&mut self, repo_id: &RepoId, worktree_id: &WorktreeId) {
+        if let Some(entries) = self.worktrees_by_repo.get_mut(repo_id) {
+            entries.retain(|entry| worktree_id_for(&entry.path) != *worktree_id);
+        }
     }
 
     /// 첫 세션이면 `pane_grid::State`를 새로 만든다(pane_grid는 pane 없이
@@ -419,6 +565,7 @@ impl AppState {
                     }
                     let repo_id = repo.id.clone();
                     self.upsert_repo(repo);
+                    self.persist();
                     self.refresh_worktrees(repo_id)
                 }
                 Err(err) => {
@@ -434,6 +581,7 @@ impl AppState {
                 Ok(entries) => {
                     self.last_error = None;
                     self.apply_worktree_listing(repo_id, request, entries);
+                    self.persist();
                     iced::Task::none()
                 }
                 Err(err) => {
@@ -502,6 +650,11 @@ impl AppState {
                 if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
                     self.close_session(session_id);
                 }
+                // 아직 시작 중인(`pending_session_starts`) 세션은 위에서 못 잡는다
+                // — `worktree_sessions`엔 `SessionStarted`가 도착해야 올라가기
+                // 때문이다. 그 경합을 `worktree_still_exists`가 알아채도록
+                // 표시해 둔다(위 `pending_worktree_removals` 문서 참고).
+                self.pending_worktree_removals.insert(worktree_id.clone());
                 let op = self.next_op();
                 crate::git_tasks::remove_worktree(
                     op,
@@ -513,19 +666,31 @@ impl AppState {
                 )
             }
             Message::WorktreeRemoved {
-                repo_id, result, ..
-            } => match result {
-                Ok(_outcome) => {
-                    self.last_error = None;
-                    self.refresh_worktrees(repo_id)
+                repo_id,
+                worktree_id,
+                result,
+                ..
+            } => {
+                self.pending_worktree_removals.remove(&worktree_id);
+                match result {
+                    Ok(_outcome) => {
+                        self.last_error = None;
+                        // 재조회 응답을 기다리지 않고 곧바로 지운다 — 그 사이
+                        // 도착하는 `worktree_still_exists` 판단이 새 목록이
+                        // 반영되기 전 낡은 목록으로 "아직 있다"고 답하지 않게 한다.
+                        self.remove_worktree_entry(&repo_id, &worktree_id);
+                        self.persist();
+                        self.refresh_worktrees(repo_id)
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err);
+                        iced::Task::none()
+                    }
                 }
-                Err(err) => {
-                    self.last_error = Some(err);
-                    iced::Task::none()
-                }
-            },
+            }
             Message::WorktreeSelected(id) => {
                 self.selected_worktree = Some(id.clone());
+                self.persist();
                 if let Some(&session_id) = self.worktree_sessions.get(&id) {
                     // 이미 열려 있다 — 새 세션을 띄우지 않고 그 pane에 포커스만
                     // 옮긴다. pane_grid는 pane → 값 매핑만 들고 있으므로 여기서
@@ -717,6 +882,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn entry(name: &str) -> WorktreeEntry {
         WorktreeEntry {
@@ -969,5 +1135,150 @@ mod tests {
             None,
             "a success after a failure must clear the stale error banner"
         );
+    }
+
+    // ---- Task 8, Step 1: worktree 생성/삭제 실패가 UI 상태에 남는지. 손으로
+    // `last_error`를 세우지 않고, 실제 `update()` 디스패치를 통해 검증한다 ----
+
+    #[test]
+    fn a_failed_worktree_creation_is_visible_as_an_error() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::WorktreeCreated {
+            request: OpId(1),
+            repo_id: RepoId("/tmp/r".into()),
+            result: Err("branch already exists".to_string()),
+        });
+        assert_eq!(state.last_error(), Some("branch already exists"));
+    }
+
+    #[test]
+    fn a_failed_worktree_removal_is_visible_as_an_error() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(1),
+            repo_id: RepoId("/tmp/r".into()),
+            worktree_id: WorktreeId("/tmp/r/wt".into()),
+            result: Err("worktree has uncommitted changes".to_string()),
+        });
+        assert_eq!(state.last_error(), Some("worktree has uncommitted changes"));
+    }
+
+    fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    // ---- Task 6 리뷰에서 넘어온 수정: 세션 시작이 진행 중인 worktree를
+    // 제거하면(제거가 끝나기 전에 SessionStarted가 도착하면) 그 세션은
+    // reaper로 가야 한다 — 산 슬롯으로 받아들여지면 아무도 닫지 않는 PTY와
+    // 스레드가 샌다 ----
+
+    #[test]
+    fn a_session_started_while_its_worktree_removal_is_in_flight_is_retired_not_leaked() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/race-repo".into());
+        state.upsert_repo(Repo {
+            id: repo_id.clone(),
+            path: PathBuf::from("/tmp/race-repo"),
+            display_name: "race-repo".to_string(),
+            worktree_base_ref: None,
+        });
+        let e = entry_at("/tmp/race-repo/wt", "feature");
+        let worktree_id = worktree_id_for(&e.path);
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_worktree_listing(repo_id.clone(), OpId(1), vec![e.clone()]);
+
+        // WorktreeSelected로 세션 시작을 건다 — 아직 SessionStarted는 안 왔다.
+        let _ = state.update(Message::WorktreeSelected(worktree_id.clone()));
+        let session_id = *state
+            .pending_session_starts
+            .get(&worktree_id)
+            .expect("a start must be pending");
+
+        // 같은 worktree를 곧바로 지운다. 세션은 아직 `pending_session_starts`에만
+        // 있고 `worktree_sessions`엔 없으므로, 이 핸들러가 세션을 직접 닫는
+        // 기존 경로(`worktree_sessions.get`)는 아무것도 못 잡는다.
+        let _ = state.update(Message::RemoveWorktreeRequested {
+            repo_id: repo_id.clone(),
+            worktree_id: worktree_id.clone(),
+            worktree_path: e.path.clone(),
+            branch: e.branch.clone(),
+        });
+
+        // git 삭제는 실제로 돌지 않았다(테스트 스레드엔 iced executor가 없다) —
+        // `worktrees_by_repo`는 아직 그대로다. 이 상태에서도 새는지가 이 버그의
+        // 핵심이었다: 목록만 보고 판단하면 여기서 "아직 있다"고 잘못 답한다.
+        assert!(
+            state
+                .worktrees_for(&repo_id)
+                .iter()
+                .any(|w| worktree_id_for(&w.path) == worktree_id),
+            "the git removal has not completed in this test, so the stale listing must still show the entry"
+        );
+
+        // 이제야 SessionStarted가 도착한다.
+        let session = SessionStore::spawn_throwaway_for_test();
+        let _ = state.update(Message::SessionStarted {
+            id: session_id,
+            worktree_id: worktree_id.clone(),
+            result: Ok(StartedSession::new(session)),
+        });
+
+        assert!(
+            !state.worktree_sessions.contains_key(&worktree_id),
+            "a session racing an in-flight removal must not be accepted into a live slot"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || state
+                .session_store()
+                .reaper_retired_count()
+                == 1),
+            "the session must have been retired to the reaper instead of leaking"
+        );
+    }
+
+    // ---- Task 8: persist()가 실제로 배선됐는지. `PersistenceHandle`을 손으로
+    // 만든 임시 파일에 꽂아 넣고, git 성공 메시지를 실제로 디스패치한 뒤
+    // 디스크에서 다시 읽어 확인한다 — `update()`의 핸들러가 `self.persist()`
+    // 호출을 잃으면(mutation) 이 테스트가 잡는다. ----
+
+    #[test]
+    fn a_successful_repo_probe_persists_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        let mut state = AppState {
+            persistence: Some(boot.handle),
+            ..AppState::default()
+        };
+
+        let repo = Repo {
+            id: RepoId("/tmp/persisted-repo".into()),
+            path: PathBuf::from("/tmp/persisted-repo"),
+            display_name: "persisted-repo".to_string(),
+            worktree_base_ref: None,
+        };
+        let _ = state.update(Message::RepoProbed {
+            request: OpId(1),
+            requested_path: PathBuf::from("/tmp/persisted-repo"),
+            result: Ok((repo, None)),
+        });
+
+        // 핸들을 놓아 워커가 Disconnected를 보게 하고 밀린 저장을 flush한다.
+        state.persistence.take();
+
+        let reloaded = crate::persistence_thread::PersistenceHandle::spawn(file);
+        assert_eq!(
+            reloaded.load.state.repos.len(),
+            1,
+            "the repo added via a real update() dispatch must have reached disk"
+        );
+        assert_eq!(reloaded.load.state.repos[0].display_name, "persisted-repo");
     }
 }

@@ -68,3 +68,76 @@
    계속 보고, 손상/파싱 실패(`Err(false)`)는 지금처럼 그냥 건너뛴다. 회귀 테스트:
    `a_future_schema_backup_also_blocks_saves`(가드가 서야 함),
    `a_merely_corrupt_backup_does_not_block_saves`(쓰레기 백업은 막지 않아야 함).
+
+## Plan 4로 넘기는 것 (터미널 커스텀 위젯)
+
+Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 단색
+모노스페이스 텍스트로 세션 → 스냅샷 → 구독 → 화면 사슬이 실제로 도는 것만
+증명한다. 다음은 전부 Plan 4 몫이다:
+
+10. **색/커서/폰트 속성.** 스냅샷 셀은 `fg`/`bg`/`flags`(alacritty_terminal의
+    `Color`/`Flags`)를 이미 들고 있지만 지금은 버려지고 단색으로만 그린다.
+
+11. **키 입력 → PTY.** 지금 워크벤치는 완전히 읽기 전용이다. `Widget::update`가
+    포커스를 `operation::Focusable`로만 받으므로(`Widget::on_event`가 아니다,
+    `canvas`로는 불가능) 커스텀 위젯이 필요하다. `TerminalSession::write`가
+    돌려주는 `bool`(입력 유실 여부)을 피드백하는 UI도 이때 같이 들어간다.
+
+12. **마우스(선택/스크롤/마우스 리포팅) + pane_grid와의 합성.** 터미널 본문이
+    마우스 이벤트를 소비해야 하는데 `pane_grid`도 같은 영역에 `on_click`과
+    분할 히트테스트를 건다. 이 설계에서 가장 깨지기 쉬운 가정이므로 Plan 4에서
+    가장 먼저 스파이크할 것(계획 문서에 이미 명시돼 있다).
+
+13. **리사이즈.** 세션은 지금 고정 80×50으로 스폰된다(`session_store.rs`의
+    `DEFAULT_ROWS`/`DEFAULT_COLS`). pane 크기에 맞춘 실제 리사이즈는 커스텀
+    위젯이 크기를 알 수 있어야 가능하다.
+
+## Plan 5로 넘기는 것
+
+14. **세션 레이아웃 복원.** `PersistedState.session.active_worktree_id`는
+    Task 8에서 배선했다 — worktree를 선택할 때마다 `AppState::persist()`가
+    실제로 디스크에 쓴다(`state.rs`의 `Message::WorktreeSelected` 핸들러).
+    하지만 부팅 시(`AppState::boot`/`from_load`)에는 읽지 않는다 — 재시작 후
+    어느 worktree가 선택돼 있었는지, 어떤 pane 분할이 열려 있었는지 복원하는
+    UI는 Plan 5 몫이다.
+
+15. **worktree 메타데이터가 재조회 때마다 유실된다.** `AppState::persisted_snapshot`
+    (`state.rs`)이 저장하는 `Worktree.created_at_unix_ms`/`created_with_agent`는
+    `worktrees_by_repo`(git이 돌려주는 `WorktreeEntry`)에서 매번 새로 합성한
+    자리표시자(`0`/`None`)다 — 실제 생성 시각·생성 에이전트를 추적하는 곳이
+    Plan 3엔 없다. git이 그 정보를 안 주므로, 어딘가(아마 세션 시작 시점)에서
+    직접 기록해 둬야 한다. 세션 레이아웃 복원이 이 메타데이터를 쓰게 되는
+    시점에 같이 처리한다.
+
+16. **에이전트 상태 3색(working/waiting/done).** 지금 사이드바 배지는
+    "에이전트가 떠 있는가"만 안다(`AgentPresence`). hook 서버가 붙는 Plan 5의
+    몫이다(계획 문서에 이미 명시돼 있다).
+
+## Task 8에서 남긴 것
+
+17. **future-schema 저장 가드가 부팅 시점엔 조용하다.** `PersistenceHandle::spawn`이
+    반환하는 `LoadDiagnostics.save_blocked`는 `AppState::boot`이 지금 아무데도
+    쓰지 않는다 — 가드가 서 있어도 사용자가 뭔가를 바꿔 첫 `persist()` 호출이
+    실패할 때까지는(그제서야 `SaveStatus::Failed`가 상태 표시줄에 뜬다) 조용하다.
+    Task 0이 막으려 한 게 바로 이 케이스(손상된 본파일 + 미래 스키마 백업)인데,
+    사용자는 앱을 열고 몇 걸음 걷기 전까지는 "저장이 막혀 있다"는 걸 모른다.
+    부팅 직후에 바로 보여줄지, 그냥 첫 실패 시 알리는 지금 방식으로 충분한지는
+    UX 판단이 필요해 코드를 바꾸지 않고 남겨둔다.
+
+18. **앱 데이터 파일 위치.** `crates/suaegi-app/src/persistence_thread.rs`의
+    `default_data_file()`이 `dirs::config_dir()/suaegi/data.json`(macOS:
+    `~/Library/Application Support/suaegi/data.json`)으로 정했다 —
+    `workspace_root`(worktree들이 실제로 생기는 곳, 기본값
+    `~/suaegi-workspaces`)와는 다른 위치다. 여태 이 결정이 어디에도 문서화돼
+    있지 않았다.
+
+19. **Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**
+    담당 에이전트는 마우스/키보드로 앱 창을 직접 조작할 수 있는 수단이 없었고
+    (합성 클릭은 이 플랜의 좌표 계산이 멀티 모니터 환경에서 엉뚱한 창을 때린
+    전례가 있어 명시적으로 금지돼 있다), 그래서 실제로 확인한 건 앱이
+    뜨는지·부팅 시 repo/worktree가 복원되는지(데이터 파일을 직접 심어
+    재현)뿐이다. **사람이 직접 확인해야 할 것**: worktree 생성 버튼 클릭 →
+    실제 세션이 셸 출력을 보여주는지, 두 번째 worktree로 분할했을 때 양쪽이
+    독립적으로 도는지, worktree 여러 개를 빠르게 닫아도 UI가 멈추지 않는지
+    (reaper 검증 — `SessionStore`의 각 로직은 단위 테스트로 실측했지만 실제
+    `pane_grid` UI에서 연타했을 때의 체감은 다른 문제다).

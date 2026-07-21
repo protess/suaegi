@@ -191,8 +191,9 @@ fn status_line(state: &AppState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence_thread::SaveReport;
+    use crate::persistence_thread::{LoadDiagnostics, SaveReport};
     use crate::state::OpId;
+    use suaegi_core::domain::PersistedState;
 
     fn repo(name: &str) -> Repo {
         Repo {
@@ -273,10 +274,61 @@ mod tests {
         assert!(status_line(&AppState::recovered(0)).is_some());
     }
 
+    /// Task 8: `PersistenceHandle::spawn`이 만드는 `LoadDiagnostics`가 실제로
+    /// `AppState::from_load`(부팅이 쓰는 바로 그 함수)를 거쳐 상태 표시줄까지
+    /// 흘러가는지. 위 테스트는 손으로 만든 `AppState::fresh()`류 헬퍼로
+    /// `status_line`의 순수 매핑만 검증하지만, `from_load`가 `load.origin`을
+    /// `state.load_origin`에 대입하는 걸 빠뜨리는 mutation은 그걸로는 못
+    /// 잡는다 — 이 테스트가 그 배선 자체를 태운다. **`Fresh`는 절대 경고를
+    /// 내면 안 된다**: 신규 설치가 데이터 손실처럼 보이면 안 되기 때문이다.
+    #[test]
+    fn load_diagnostics_reach_the_status_line_through_the_real_boot_wiring_for_all_four_origins() {
+        let cases = [
+            (LoadOrigin::Fresh, false),
+            (LoadOrigin::Loaded, false),
+            (LoadOrigin::Recovered { slot: 2 }, true),
+            (LoadOrigin::RecoveryFailed, true),
+        ];
+        for (origin, expects_warning) in cases {
+            let load = LoadDiagnostics {
+                state: PersistedState::default(),
+                origin,
+                save_blocked: false,
+            };
+            let state = AppState::from_load(load);
+            assert_eq!(
+                status_line(&state).is_some(),
+                expects_warning,
+                "origin {origin:?} must {} a status-line warning",
+                if expects_warning {
+                    "produce"
+                } else {
+                    "not produce"
+                }
+            );
+        }
+    }
+
     #[test]
     fn a_failed_save_is_visible_in_the_status_line() {
         assert!(status_line(&AppState::with_save_error("disk full"))
             .unwrap()
+            .contains("disk full"));
+    }
+
+    /// 위 테스트는 손으로 만든 `with_save_error` 헬퍼로 `status_line`의 순수
+    /// 매핑만 본다. 이 테스트는 실제 `Message::Saved` 디스패치(`AppState::boot`가
+    /// `results` 스트림을 연결하면 실제로 도착하는 바로 그 메시지)를 태워
+    /// `last_save_status`에 반영되는 배선 자체를 검증한다.
+    #[test]
+    fn a_failed_save_status_reaches_the_status_line_through_real_dispatch() {
+        let mut state = AppState::fresh();
+        let _ = state.update(Message::Saved(SaveReport {
+            seq: 1,
+            status: SaveStatus::Failed("disk full".to_string()),
+        }));
+        assert!(status_line(&state)
+            .expect("a failed save must surface a warning")
             .contains("disk full"));
     }
 

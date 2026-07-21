@@ -18,6 +18,9 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# 부팅 시 데이터 파일의 기본 위치(OS별 config dir) 계산에 쓴다 — suaegi-core도
+# 같은 크레이트를 홈 디렉터리 기본값 계산에 쓴다.
+dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

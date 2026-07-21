@@ -9,7 +9,7 @@ pub mod state;
 pub mod workbench;
 
 use iced::widget::row;
-use iced::{Element, Length, Size};
+use iced::{Element, Length, Size, Subscription};
 
 pub use state::{AppState, Message, OpId};
 
@@ -28,17 +28,24 @@ impl AppState {
             .height(Length::Fill)
             .into()
     }
+
+    /// `workbench::subscription`(세션별 generation 피드)과
+    /// `presence_poll::subscription`(티어링된 존재 폴링 타이머)을 하나로
+    /// 묶는다. 둘 다 앱 전체에 딱 하나씩만 존재해야 하는 구독이므로
+    /// `run()`이 이 함수 하나만 `.subscription(...)`에 건다 — 둘을 따로
+    /// 걸면 나중에 셋째가 생겼을 때 배선 지점이 두 곳으로 늘어난다.
+    pub fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            workbench::subscription(self),
+            presence_poll::subscription(self),
+        ])
+    }
 }
 
 pub fn run() -> iced::Result {
-    // `workbench::subscription` and `presence_poll::subscription` both exist
-    // and are ready to plug in, but batching them into one
-    // `AppState::subscription` function and wiring `.subscription(...)` here
-    // is Task 8's job (boot-time integration). Adding either alone now would
-    // just mean Task 8 has to replace this line anyway once the other shows
-    // up — so the seam is left here instead of half-wired.
-    iced::application(AppState::new, AppState::update, AppState::view)
+    iced::application(AppState::boot, AppState::update, AppState::view)
         .title(AppState::title)
+        .subscription(AppState::subscription)
         .window_size(Size {
             width: 1280.0,
             height: 800.0,
