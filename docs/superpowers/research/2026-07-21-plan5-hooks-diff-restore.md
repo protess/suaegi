@@ -86,21 +86,76 @@ stdin으로 **JSON 객체 하나**가 온다(개행 구분 아님).
 - `last_assistant_message`는 배지 툴팁에 공짜로 쓸 수 있다
 - **`background_tasks`가 중요하다** — 백그라운드 작업이 도는 중에 `done`으로 넘기지 않으려면 필요
 
-### 1.4 상태 매핑
+### 1.4 상태 매핑 — **대화형 PTY로 전부 실측함**
+
+앞선 조사가 "`PermissionRequest`를 관측하지 못했다"고 한 것은 **print 모드의 산물이었다.**
+실제 PTY(`pexpect`, `--permission-mode default`)에서 **발화한다.**
+
+```json
+// PermissionRequest — 실측 캡처
+{"session_id":"108cff5e-...","cwd":"...","prompt_id":"6a015051-...",
+ "permission_mode":"default","hook_event_name":"PermissionRequest",
+ "tool_name":"Bash","tool_input":{"command":"touch probe-marker-1.txt","description":"..."},
+ "permission_suggestions":[{"type":"addDirectories","directories":["..."],"destination":"session"},
+                           {"type":"setMode","mode":"acceptEdits","destination":"session"}]}
+
+// Notification — 6초 뒤에 온다
+{"...","hook_event_name":"Notification","message":"Claude needs your permission",
+ "notification_type":"permission_prompt"}
+```
+
+순서: `PreToolUse` → **20ms 뒤** `PermissionRequest` → **6초 뒤** `Notification` → 사람이 답 →
+`PostToolUse`.
 
 | 이벤트 | 상태 |
 |---|---|
-| `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `PreToolUse`(일반 도구) | working |
-| `PermissionRequest`, `PreToolUse` where `tool_name == AskUserQuestion` | **waiting** |
-| `Stop`, `StopFailure` | done |
-| `SubagentStart`/`SubagentStop`/`TeammateIdle` | working을 수정, done을 만들지는 않음 |
+| `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `PreToolUse` | working |
+| **`PermissionRequest`** | **waiting** |
+| `Stop`/`StopFailure` **AND `background_tasks`가 비었을 때** | done |
+| `Stop` + `background_tasks`가 비지 않음 | **working 유지** |
+
+**`AskUserQuestion` 특수 처리는 필요 없다 — 앞선 조사가 틀렸다.**
+실측 결과 이 도구는 자동 허용이 **아니고** 온전한 `PermissionRequest`를 낸다
+(`tool_name`은 정확히 `"AskUserQuestion"`, `permission_suggestions`는 없음).
+따라서 `waiting`은 규칙 하나로 끝난다: `PermissionRequest`가 들어가고
+`PostToolUse`/`Stop`이 나온다. Orca의 특수 케이스를 베낄 이유가 없다.
+
+**`notification_type`으로 매칭한다** — 영어 `message` 문자열이 아니다. 그리고 `Notification`은
+`PermissionRequest`보다 **6초 늦으므로** 배지 신호로 쓰면 그만큼 지연된다.
+
+**`PermissionRequest`에는 `tool_use_id`도 `agent_id`도 없다**(전 실행에서 확인). 도구 호출과
+엮으려면 바로 앞 `PreToolUse`와 (`tool_name` + 동일한 `tool_input`)로 조인해야 한다.
+`permission_suggestions`는 **선택적**이다(Bash엔 있고 AskUserQuestion엔 없다) — 필수로 두지 말 것.
 
 **`StopFailure`가 필수인 이유** (Orca `hook-settings.ts:30-63` 주석): API/모델 오류 시 Claude가
 정상 `Stop` 훅을 건너뛴다. 이게 없으면 **pane이 영원히 도는 스피너로 남는다.**
 
-**`AskUserQuestion` 특수 처리가 필수인 이유**: 이 도구는 자동 허용이라 사람을 기다리는 동안
-`PermissionRequest`가 아니라 `PreToolUse`를 낸다. Orca는 `Notification` 훅을 **일부러 등록하지
-않고** 이 방식을 쓴다(`agent-hook-listener.ts:2600-2607`).
+### 1.4.1 `Stop`은 "끝났다"가 아니다 — done 규칙을 바꾼다
+
+Agent 도구는 기본이 **백그라운드 실행**이라(`PostToolUse.tool_response`가
+`{"isAsync":true,"status":"async_launched",...}`), 서브에이전트가 도는 중에 `Stop`이 먼저 온다.
+`Stop`만 보고 done을 찍으면 **done↔working이 반복해서 깜빡인다.**
+
+`Stop`이 `background_tasks`를 나른다:
+```json
+"background_tasks":[{"id":"a0f7...","type":"subagent","status":"running",
+                     "description":"...","agent_type":"Explore"}]
+```
+마지막 `Stop`에서는 `[]`다. → **done = `Stop` AND `background_tasks`가 빔.**
+`session_crons` 배열도 같이 있고 같은 취급이 필요해 보인다(관측 시 항상 비어 있었다).
+
+### 1.4.2 서브에이전트 — 리드와 구별 가능, 단 함정 둘
+
+**리드 이벤트는 `agent_id`를 아예 갖지 않고**, 서브에이전트 이벤트는 `agent_id`와 `agent_type`을
+둘 다 갖는다. 도구 이름은 `Task`가 아니라 **`Agent`**다.
+
+**함정 1 — 서브에이전트 완료가 합성 `UserPromptSubmit`을 주입한다.** 프롬프트가
+`<task-notification>` XML 덩어리다. `UserPromptSubmit`에 working을 찍으면 **사람이 치지도 않은
+프롬프트**로 보인다. 프롬프트가 `<task-notification>`으로 시작하는지로 걸러낸다.
+
+**함정 2 — 유령 `SubagentStop`.** `agent_type: ""`이고 스폰을 본 적 없는 `agent_id`로 온다
+(내부 헬퍼 에이전트). Task 호출이 전혀 없던 순수 Bash 실행에서도 `Stop` 이후에 하나 발화했다.
+**관측한 Task마다 SubagentStop이 하나씩 대응한다고 가정하지 말 것.**
 
 **구조적으로 관측 불가능한 것**: "에이전트가 끝났다"와 "사람 입력을 기다리며 놀고 있다"는
 `Stop` 이후 같은 상태다. 둘의 구분은 프로토콜 사실이 아니라 **UI 정책 결정**이다.
@@ -116,7 +171,19 @@ stdin으로 **JSON 객체 하나**가 온다(개행 구분 아님).
 > **따라서 훅 명령은 빠르고 fire-and-forget이어야 하고, 항상 exit 0이어야 하고, stdin을 비워야
 > 한다. suaegi의 HTTP 서버가 멈췄다고 사용자의 에이전트가 멎으면 안 된다.**
 
-`"async": true`가 스키마에 있고 블로킹을 아예 피할 수 있다 — **미검증, 스파이크 대상.**
+**`"async": true`는 동작하고 블로킹을 없앤다 — 실측함.** 15초 자는 훅으로 A/B:
+
+| | 동기 | `async: true` |
+|---|---|---|
+| 턴 지연 | **18.4s** | **3.0s** |
+| 훅 완료 | 턴 전에 | 턴 **후에**, 그래도 전달됨 |
+
+9개 이벤트 전부에 `async`를 걸어도 전부 같은 순서로 발화했고(`PermissionRequest`·`Notification`
+포함) 도구도 정상 실행됐다. → **출시 설정은 전 이벤트 async로 간다.**
+
+**대가를 문서에 남긴다**: async는 훅이 결정(거부/수정)을 돌려줄 능력을 포기한다. suaegi의 훅은
+fire-and-forget 관찰자라 비용이 0이지만, 나중에 누가 같은 async 설정에 차단형 결정 훅을 추가하고
+왜 무시되는지 의아해하지 않도록 적어둔다.
 
 ---
 
@@ -318,12 +385,26 @@ float 잡음이 저장을 계속 흔드는 걸 막는다(우리 `Store::save`가
 
 ## 7. 미검증 — 추측으로 메우지 말 것
 
-1. **`PermissionRequest`와 `Notification`이 발화하는 걸 관측하지 못했다.** print 모드가 권한을
-   자동 해결한다. **`waiting` 상태 전체가 여기 달렸다 — 대화형 PTY 테스트가 최우선.**
-2. **`AskUserQuestion`의 정확한 도구 이름 문자열.** 매칭에 쓸 값이라 추측 불가
-3. **서브에이전트 이벤트의 `agent_id`** — 문서는 있다고 하나 단일 턴 테스트로는 미확인
-4. **Codex 페이로드 모양** — 설정 스키마와 이벤트 이름은 확인했지만 실제 페이로드는 미캡처.
+~~1~2~3~5~~ → **전부 대화형 PTY로 실측 완료**(§1.4). `PermissionRequest`·`Notification` 발화,
+`AskUserQuestion`의 정확한 이름과 그것이 자동 허용이 **아니라는** 것, `agent_id`의 리드/서브
+구별, `async: true`의 비블로킹 — 넷 다 확인됐고 그중 둘은 앞선 조사의 전제를 뒤집었다.
+
+남은 것:
+
+1. **Codex 페이로드 모양** — 설정 스키마와 이벤트 이름은 확인했지만 실제 페이로드는 미캡처.
    Claude와 바이트 단위로 같다고 가정하지 말 것
-5. **`"async": true`** — 턴 블로킹을 피할 수 있는지 미검증. fire-and-forget curl보다 나을 수 있다
-6. **`-z`만으로 비ASCII 경로 이스케이프가 억제되는지** — 한글 파일명으로 실측할 것
-7. 이 문서의 Orca 줄 번호 중 일부는 위임 읽기에서 왔다 — Rust 인용보다 한 단계 덜 단단하다
+2. **`-z`만으로 비ASCII 경로 이스케이프가 억제되는지** — 한글 파일명으로 실측할 것
+3. **`Notification`의 유휴 타임아웃 변형** — `permission_prompt`만 관측했다. 실행이 그만큼
+   놀지 않았다
+4. **async `PreToolUse`의 `permissionDecision` 출력이 조용히 버려지는지** — 미검증(그럴 것으로 본다)
+5. 이 문서의 Orca 줄 번호 중 일부는 위임 읽기에서 왔다 — Rust 인용보다 한 단계 덜 단단하다
+
+### 7.1 신뢰 대화상자 — Plan 5가 반드시 다뤄야 하는 첫 실행 상태
+
+검증 중에 걸렸다: **사용자가 신뢰하지 않은 디렉터리에서 `claude`를 띄우면 "이 폴더의 파일을
+신뢰합니까?" 대화상자가 먼저 뜨고, 그 전에는 `SessionStart` 말고 아무 훅도 발화하지 않는다.**
+첫 프롬프트가 그대로 먹혔다.
+
+suaegi는 **새로 만든 worktree에서** 에이전트를 띄우므로 이 상태에 항상 부딪힌다. 배지가
+`SessionStart` 이후 영원히 멈춰 보일 것이다. Plan 5는 이걸 감지해 사용자에게 알리거나,
+신뢰를 미리 심는 방법을 정해야 한다.
