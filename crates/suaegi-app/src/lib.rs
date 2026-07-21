@@ -6,6 +6,7 @@ pub mod reaper;
 pub mod session_store;
 pub mod sidebar;
 pub mod state;
+pub mod terminal;
 pub mod workbench;
 
 use iced::widget::row;

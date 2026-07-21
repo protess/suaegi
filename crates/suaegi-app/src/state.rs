@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
+use iced::advanced::clipboard;
 use iced::widget::pane_grid;
 use suaegi_core::domain::{
     PersistedState, Repo, RepoId, SessionState, Settings, Worktree, WorktreeId, SCHEMA_VERSION,
@@ -9,12 +10,65 @@ use suaegi_core::domain::{
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::AgentKind;
 use suaegi_term::grid::TerminalSnapshot;
+use suaegi_term::input_types::{CopyTargets, WriteOutcome};
 use suaegi_term::presence::AgentPresence;
 
 use crate::persistence_thread::{
     LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
 };
 use crate::session_store::{SessionId, SessionStore, StartedSession};
+use crate::terminal::contract::TermCommand;
+
+/// 포커스 전환이 내야 할 `FOCUS_IN_OUT` 리포트를 **순서대로**.
+///
+/// **순서가 계약이다**: 이전 세션에 focus-out을 먼저, 그다음 새 세션에 focus-in.
+/// 뒤집으면 두 세션이 동시에 자기가 포커스를 쥐고 있다고 믿는 창이 생기고, 그
+/// 창에서 셸이 그린 것(예: 포커스에 따라 커서 모양을 바꾸는 TUI)이 어긋난다.
+///
+/// **순수 함수로 뽑은 이유**는 이것이 헤드리스로 확인할 수 있는 유일한 형태이기
+/// 때문이다: `report_focus`가 실제로 바이트를 내는 것은 셸이 `FOCUS_IN_OUT`을
+/// 켰을 때뿐이라(평범한 셸은 켜지 않는다) 바이트를 관찰해 순서를 볼 수 없다.
+/// 순서 결정을 값으로 만들면 그 결정만은 정확히 검사할 수 있다.
+fn focus_reports(previous: Option<SessionId>, next: Option<SessionId>) -> Vec<(SessionId, bool)> {
+    // 같은 pane을 다시 눌렀다. 리포트를 또 내면 셸이 focus-in을 두 번 받는다.
+    if previous == next {
+        return Vec::new();
+    }
+    let mut reports = Vec::new();
+    if let Some(previous) = previous {
+        reports.push((previous, false));
+    }
+    if let Some(next) = next {
+        reports.push((next, true));
+    }
+    reports
+}
+
+/// 추출된 선택 텍스트를 **요청된 클립보드에만** 쓴다.
+///
+/// 기본값은 호출부가 정한다: 명시적 복사는 양쪽(`CopyTargets::EXPLICIT`),
+/// 드래그 완료는 primary에만(`DRAG_COMPLETE`) — X11/Wayland의 중클릭 붙여넣기
+/// 관례다. Primary는 macOS/Windows에서 no-op이므로 양쪽에 쓰는 것이 안전하다.
+fn clipboard_writes(targets: CopyTargets, text: String) -> iced::Task<Message> {
+    iced::Task::batch(clipboard_kinds(targets).into_iter().map(|kind| match kind {
+        clipboard::Kind::Standard => iced::clipboard::write(text.clone()),
+        clipboard::Kind::Primary => iced::clipboard::write_primary(text.clone()),
+    }))
+}
+
+/// 어느 클립보드에 쓸 것인가. **`Task`는 들여다볼 수 없으므로** 결정을 값으로
+/// 뽑아야 검사할 수 있다 — 그리고 이건 검사할 값이 있는 결정이다: 드래그 완료가
+/// standard까지 쓰면 사용자가 복사한 적 없는 텍스트가 시스템 클립보드를 덮어쓴다.
+fn clipboard_kinds(targets: CopyTargets) -> Vec<clipboard::Kind> {
+    let mut kinds = Vec::new();
+    if targets.standard {
+        kinds.push(clipboard::Kind::Standard);
+    }
+    if targets.primary {
+        kinds.push(clipboard::Kind::Primary);
+    }
+    kinds
+}
 
 /// 비동기 작업 하나를 식별한다. 결과가 순서를 바꿔 도착해도 대상을 잃지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,6 +164,31 @@ pub enum Message {
     /// 타이틀바 닫기 버튼. 마지막 pane이면 pane_grid 자체를 비운다(pane_grid는
     /// 마지막 pane을 `close()`로 지울 수 없다 — 형제가 없기 때문).
     PaneCloseRequested(pane_grid::Pane),
+
+    // ---- Plan 4 Task 7: 터미널 위젯 배선 ----
+    /// 터미널 위젯이 발행한 커맨드. 위젯은 세션을 **절대 만지지 않는다** —
+    /// 여기가 세션에 닿는 유일한 지점이고, 그 경계가 위젯 테스트 가능성의
+    /// 근거다. 실행 스레드는 Task 0.8의 정책 표를 따른다.
+    Terminal {
+        id: SessionId,
+        command: TermCommand,
+    },
+    /// 리사이즈 워커의 완료. 합치기의 in-flight 가드를 풀고, 대기 중이던
+    /// 최신 리사이즈가 있으면 이어서 보낸다. **실패해도 반드시 온다** —
+    /// 안 오면 그 세션은 다시는 리사이즈되지 않는다.
+    ResizeApplied {
+        id: SessionId,
+        seq: u64,
+        result: Result<(), String>,
+    },
+    /// 선택 추출 워커의 완료. `text: None`은 **조용한 취소**다(epoch 불일치
+    /// 또는 선택 없음) — 오류를 띄우지 않는다. `Some`이면 요청된
+    /// Standard/Primary에 **정확히 그것만** 쓴다.
+    SelectionExtracted {
+        id: SessionId,
+        targets: CopyTargets,
+        text: Option<String>,
+    },
 }
 
 pub struct AppState {
@@ -177,6 +256,13 @@ pub struct AppState {
     /// 비교(`generation >= slot.presence_generation`)가 항상 최신 값을
     /// 받아들이도록 단조 증가를 보장한다.
     next_presence_seq: u64,
+
+    // ---- Plan 4 Task 7: 터미널 입력 유실 피드백 ----
+    /// 가장 최근에 **입력을 유실한** 세션. `WriteOutcome::Dropped`(쓰기 큐 상한
+    /// 256에 못 넣었다 = 사용자가 친 것이 사라졌다)에서만 세운다.
+    /// **`Suppressed`는 여기 오지 않는다** — 모드상 보낼 바이트가 없었을 뿐
+    /// 유실이 아니고, 그걸 경고로 띄우면 정상 동작이 오류로 보인다.
+    last_input_loss: Option<SessionId>,
 }
 
 impl Default for AppState {
@@ -205,6 +291,7 @@ impl Default for AppState {
             pending_worktree_removals: HashSet::new(),
             session_titles: HashMap::new(),
             next_presence_seq: 0,
+            last_input_loss: None,
         }
     }
 }
@@ -550,16 +637,200 @@ impl AppState {
         }
     }
 
-    /// 세션을 스토어에서 닫고(Reaper로 은퇴) worktree ↔ 세션 매핑을 정리한다.
-    /// pane_grid 쪽 정리(닫을 pane 자체를 지우는 것)는 호출자(`PaneCloseRequested`
-    /// 핸들러) 몫이다 — pane_grid `close()`는 마지막 pane을 지울 수 없어서 그
-    /// 결정은 세션 정리와 분리해 둬야 한다.
+    /// 세션을 스토어에서 닫고(Reaper로 은퇴) 그 세션에 딸린 상태를 **전부**
+    /// 정리한다 — worktree ↔ 세션 매핑, 제목, 유실 경고, 그리고 그 세션을 가리키던
+    /// pane까지.
+    ///
+    /// **pane 정리가 여기 있는 이유.** 원래는 호출자 몫이었고 대화형 경로
+    /// (`PaneCloseRequested`)만 그걸 지켰다. 비대화형 경로(사라진 worktree 청소,
+    /// `WorktreeRemoved` 성공)는 pane을 남겼고, 그 pane은 죽은 `SessionId`를
+    /// 가리킨 채 영원히 빈 터미널로 남아 포커스까지 가져갔다. Plan 4가 그 pane을
+    /// 죽은 `text()`에서 **포커스 가능한 위젯**으로 바꾸면서 증상이 커졌다.
+    /// "호출자가 알아서 한다"는 계약은 네 곳 중 두 곳이 어겼으니 지켜지지 않는
+    /// 계약이다 — 세션 소멸과 pane 소멸을 한 함수로 묶어 어길 수 없게 한다.
     fn close_session(&mut self, id: SessionId) {
         self.session_store.close(id);
         if let Some(worktree_id) = self.session_worktrees.remove(&id) {
             self.worktree_sessions.remove(&worktree_id);
         }
         self.session_titles.remove(&id);
+        if self.last_input_loss == Some(id) {
+            // 사라진 세션의 유실 경고를 남겨두면 지울 방법이 없다.
+            self.last_input_loss = None;
+        }
+        self.close_panes_for_session(id);
+    }
+
+    /// `id`를 가리키던 pane을 pane_grid에서 지운다.
+    ///
+    /// **마지막 pane은 `close()`로 지울 수 없다** — pane_grid는 pane이 0개인
+    /// 상태로 존재할 수 없어서 형제가 없는 pane에 대해 `close()`가 `None`을
+    /// 돌려준다. 그래서 그 경우만 워크벤치 전체를 빈 상태(`panes = None`)로
+    /// 되돌린다.
+    fn close_panes_for_session(&mut self, id: SessionId) {
+        let Some(panes) = &mut self.panes else {
+            return;
+        };
+        let doomed: Vec<pane_grid::Pane> = panes
+            .iter()
+            .filter(|(_, session)| **session == id)
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in doomed {
+            if panes.len() <= 1 {
+                self.panes = None;
+                self.focused_pane = None;
+                return;
+            }
+            if let Some((_, sibling)) = panes.close(pane) {
+                // 포커스가 방금 사라진 pane에 있었을 때만 옮긴다. 다른 pane에
+                // 있었다면 그 포커스는 그대로 유효하다.
+                if self.focused_pane == Some(pane) {
+                    self.focused_pane = Some(sibling);
+                }
+            }
+        }
+    }
+
+    // ---- Plan 4 Task 7: 터미널 위젯 → 세션 배선 ----
+
+    /// 세션 없이 pane 레이아웃만 갖춘 상태. `workbench::view`의 pane_grid 설정
+    /// (`spacing`/`on_resize` leeway/`TitleBar`)을 **실제 pane_grid에 이벤트를
+    /// 흘려** 확인하려면 pane이 둘 이상 필요한데, 그 확인은 세션과 무관하다 —
+    /// `session_store().snapshot(id)`는 모르는 id에 빈 스냅샷을 돌려주므로 PTY를
+    /// 하나도 띄우지 않고 뷰를 만들 수 있다.
+    #[cfg(test)]
+    pub(crate) fn with_panes_for_test(panes: pane_grid::State<SessionId>) -> Self {
+        let mut state = Self::default();
+        state.set_panes_for_test(panes);
+        state
+    }
+
+    /// 이미 세션이 들어 있는 상태에 pane 레이아웃만 얹는다. `with_panes_for_test`는
+    /// **새 상태를 만들어 돌려주므로** 먼저 채워둔 세션 스토어를 버린다 — 세션이
+    /// 필요한 테스트는 반드시 이쪽을 쓴다.
+    #[cfg(test)]
+    pub(crate) fn set_panes_for_test(&mut self, panes: pane_grid::State<SessionId>) {
+        self.panes = Some(panes);
+    }
+
+    /// 지금 포커스된 pane의 세션.
+    pub(crate) fn focused_session(&self) -> Option<SessionId> {
+        let pane = self.focused_pane?;
+        self.panes.as_ref()?.get(pane).copied()
+    }
+
+    /// 입력을 유실한 세션이 있으면 그것. 사이드바/타이틀바가 읽는다.
+    pub(crate) fn last_input_loss(&self) -> Option<SessionId> {
+        self.last_input_loss
+    }
+
+    /// 쓰기 결과를 상태로 옮긴다. **세 결과를 구별하는 것이 요점이다** —
+    /// `bool`이었다면 "모드상 보낼 것 없음"과 "큐가 차서 유실"이 같은 값으로
+    /// 뭉개져 유실이 조용히 지나간다.
+    fn note_write(&mut self, id: SessionId, outcome: WriteOutcome) {
+        match outcome {
+            WriteOutcome::Queued => {}
+            // 유실이 아니다. 피드백을 내지 않는다.
+            WriteOutcome::Suppressed => {}
+            WriteOutcome::Dropped => self.last_input_loss = Some(id),
+        }
+    }
+
+    /// pane 포커스 전환. **`FOCUS_IN_OUT` 바이트의 권위는 여기다** — 위젯의
+    /// `Focusable`은 `Shell`도 메시지 채널도 받지 못해 바이트를 낼 수 없다
+    /// (`iced_core/src/widget/operation/focusable.rs:7-16`).
+    fn focus_pane(&mut self, pane: pane_grid::Pane) -> iced::Task<Message> {
+        let previous = self.focused_session();
+        let next = self.panes.as_ref().and_then(|p| p.get(pane)).copied();
+        self.focused_pane = Some(pane);
+
+        for (id, focused) in focus_reports(previous, next) {
+            if let Some(session) = self.session_store.session(id) {
+                let outcome = session.report_focus(focused);
+                self.note_write(id, outcome);
+            }
+        }
+
+        match next {
+            // `operation::focus`는 매칭되지 않는 focusable을 전부 unfocus시키므로
+            // 상호배타가 공짜다(`focusable.rs:45-47`).
+            Some(id) => iced::widget::operation::focus(crate::terminal::widget_id_for(id)),
+            None => iced::Task::none(),
+        }
+    }
+
+    /// 위젯이 발행한 커맨드를 세션에 적용한다. 실행 스레드는 Task 0.8의 정책
+    /// 표를 따른다: `Key`/`Paste`/`Mouse`/`Scroll`은 UI 스레드에서 곧바로(그리드가
+    /// 짧은 term 락으로 인코딩 후 `try_send`), `Resize`와 선택 추출은 워커로.
+    fn dispatch_term_command(
+        &mut self,
+        id: SessionId,
+        command: TermCommand,
+    ) -> iced::Task<Message> {
+        // 닫히는 중인 세션의 커맨드는 조용히 버린다 — 위젯이 그리는 프레임과
+        // 세션이 사라지는 시점 사이에 항상 창이 있다.
+        let Some(session) = self.session_store.session(id) else {
+            return iced::Task::none();
+        };
+
+        match command {
+            TermCommand::Key(input) => {
+                let outcome = session.send_key(&input);
+                self.note_write(id, outcome);
+                iced::Task::none()
+            }
+            TermCommand::Paste(text) => {
+                let outcome = session.send_paste(&text);
+                self.note_write(id, outcome);
+                iced::Task::none()
+            }
+            // 워커로 보내면 순서가 뒤집혀 스크롤이 튄다. 짧은 락이라 직접 한다.
+            TermCommand::Scroll(scroll) => {
+                session.scroll_display(scroll);
+                iced::Task::none()
+            }
+            TermCommand::Resize { rows, cols, seq } => {
+                self.session_store.request_resize(id, rows, cols, seq).1
+            }
+            TermCommand::Mouse(intent) => match session.send_mouse(&intent) {
+                Err(error) => {
+                    // **억제와 다르게 취급한다.** 조용히 버리면 상태기계 버그가
+                    // 정상 억제로 위장된다(위젯의 held 전이 표가 깨졌다는 뜻이다).
+                    eprintln!("terminal mouse intent rejected (session {}): {error}", id.0);
+                    debug_assert!(
+                        false,
+                        "MouseEncodeError must not occur on well-formed input: {error}"
+                    );
+                    iced::Task::none()
+                }
+                Ok(result) => {
+                    self.note_write(id, result.write);
+                    // **다시 그리라고만 하면 옛 스냅샷을 옛 선택으로 다시 그린다.**
+                    // 선택 변경을 화면에 반영하려면 새 스냅샷을 찍어야 한다 —
+                    // `send_mouse`가 redraw일 때 generation을 이미 올려둔다.
+                    let redraw = if result.redraw {
+                        let generation = session.generation();
+                        self.session_store.request_snapshot(id, generation).1
+                    } else {
+                        iced::Task::none()
+                    };
+                    let copy = match result.copy {
+                        Some(request) => self.session_store.request_extraction(id, request).1,
+                        None => iced::Task::none(),
+                    };
+                    iced::Task::batch([redraw, copy])
+                }
+            },
+            TermCommand::CopySelection { to } => {
+                // `request_copy`가 락 안에서 현재 epoch를 읽는다. 선택이 없거나
+                // 드래그가 아직 진행 중이면 `None` — **조용한 취소**다.
+                match session.request_copy(to) {
+                    Some(request) => self.session_store.request_extraction(id, request).1,
+                    None => iced::Task::none(),
+                }
+            }
+        }
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -704,10 +975,9 @@ impl AppState {
                             BranchDeletion::Deleted | BranchDeletion::NotRequested => None,
                         };
                         // git이 worktree 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
-                        // (`RemoveWorktreeRequested`의 문서 참고). pane_grid의
-                        // pane 자체는 `PaneCloseRequested`가 올 때까지 그대로
-                        // 둔다(닫는 UX는 이 태스크 범위 밖 — 워크벤치가 "세션이
-                        // 종료됨"을 그리는 건 Plan 4).
+                        // (`RemoveWorktreeRequested`의 문서 참고). 그 세션을
+                        // 가리키던 pane도 `close_session`이 같이 지운다 — 남겨두면
+                        // 죽은 id를 가리키는 빈 터미널이 포커스를 먹는다.
                         if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
                             self.close_session(session_id);
                         }
@@ -833,9 +1103,28 @@ impl AppState {
                 .session_store
                 .apply_snapshot(id, generation, snapshot)
                 .unwrap_or_else(iced::Task::none),
-            Message::PaneClicked(pane) => {
-                self.focused_pane = Some(pane);
-                iced::Task::none()
+            Message::PaneClicked(pane) => self.focus_pane(pane),
+
+            Message::Terminal { id, command } => self.dispatch_term_command(id, command),
+
+            Message::ResizeApplied { id, seq, result } => {
+                if let Err(e) = result {
+                    // 리사이즈 실패는 입력 유실이 아니다 — 경고 UI를 띄우지
+                    // 않는다. (`resize`는 rows/cols가 0이면 아무것도 안 하고 Ok다.)
+                    eprintln!("terminal resize failed (session {}): {e}", id.0);
+                }
+                self.session_store.resize_completed(id, seq)
+            }
+
+            Message::SelectionExtracted { id, targets, text } => {
+                let next = self.session_store.extraction_completed(id);
+                // `None`은 조용한 취소다(epoch 불일치 또는 선택 없음). 오류가
+                // 아니므로 아무것도 띄우지 않는다.
+                let write = match text {
+                    Some(text) => clipboard_writes(targets, text),
+                    None => iced::Task::none(),
+                };
+                iced::Task::batch([next, write])
             }
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
                 if let Some(panes) = &mut self.panes {
@@ -851,19 +1140,10 @@ impl AppState {
                 iced::Task::none()
             }
             Message::PaneCloseRequested(pane) => {
-                if let Some(panes) = &mut self.panes {
-                    if panes.len() <= 1 {
-                        // pane_grid는 형제가 없는 마지막 pane을 `close()`로
-                        // 지울 수 없다 — 워크벤치 전체를 빈 상태로 되돌린다.
-                        if let Some(&session_id) = panes.get(pane) {
-                            self.close_session(session_id);
-                        }
-                        self.panes = None;
-                        self.focused_pane = None;
-                    } else if let Some((session_id, sibling)) = panes.close(pane) {
-                        self.close_session(session_id);
-                        self.focused_pane = Some(sibling);
-                    }
+                // pane 자체를 지우는 것도 `close_session`이 한다 — 대화형/비대화형
+                // 경로가 갈라져서 pane이 새던 것이 이 수렴의 이유다.
+                if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
+                    self.close_session(session_id);
                 }
                 iced::Task::none()
             }
@@ -1059,6 +1339,401 @@ mod tests {
         assert!(!state.worktree_sessions.contains_key(&worktree_id));
     }
 
+    /// 세션 둘, pane 둘. 비대화형 종료가 **형제 pane과 포커스를 어떻게 남기는지**
+    /// 보려면 마지막 pane이 아닌 pane을 닫아봐야 한다 — 마지막 pane 경로는
+    /// `panes = None`으로 빠져나가 아무것도 증명하지 못한다.
+    fn state_with_two_open_sessions() -> (AppState, RepoId, [(SessionId, WorktreeId); 2]) {
+        let repo_id = RepoId("/tmp/two".into());
+        let mut state = AppState::default();
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_worktree_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/wt-a", "a"), entry_at("/tmp/wt-b", "b")],
+        );
+
+        let mut opened = Vec::new();
+        for path in ["/tmp/wt-a", "/tmp/wt-b"] {
+            let worktree_id = WorktreeId(path.to_string());
+            let id = state.session_store.next_id();
+            state.pending_session_starts.insert(worktree_id.clone(), id);
+            let _ = state.update(Message::SessionStarted {
+                id,
+                worktree_id: worktree_id.clone(),
+                result: Ok(StartedSession::new(SessionStore::spawn_throwaway_for_test())),
+            });
+            opened.push((id, worktree_id));
+        }
+        assert_eq!(
+            state.panes().expect("two sessions must open panes").len(),
+            2,
+            "precondition: each session got its own pane"
+        );
+        let opened: [(SessionId, WorktreeId); 2] = opened.try_into().expect("exactly two");
+        (state, repo_id, opened)
+    }
+
+    /// 앱 밖에서(다른 터미널에서) worktree가 지워지면 목록 갱신이 그 세션을
+    /// 거둔다. **그때 pane도 같이 가야 한다** — 남으면 죽은 `SessionId`를 가리키는
+    /// 빈 터미널이 되고, Plan 4 이후로는 그게 포커스까지 가져간다.
+    #[test]
+    fn a_vanished_worktree_takes_its_pane_with_it() {
+        let (mut state, repo_id, [(id_a, _wt_a), (id_b, _wt_b)]) = state_with_two_open_sessions();
+
+        // /tmp/wt-a가 새 목록에서 사라졌다.
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        state.apply_worktree_listing(repo_id, OpId(2), vec![entry_at("/tmp/wt-b", "b")]);
+
+        let panes = state.panes().expect("the surviving session keeps its pane");
+        assert_eq!(panes.len(), 1, "the vanished session's pane must be gone");
+        let survivors: Vec<SessionId> = panes.iter().map(|(_, id)| *id).collect();
+        assert_eq!(
+            survivors,
+            vec![id_b],
+            "and the pane that remains must be the one that still has a live session"
+        );
+        assert!(!state.session_store().is_running(id_a));
+        assert_eq!(
+            state.focused_session(),
+            Some(id_b),
+            "focus must land on a session that exists, not on a dead id"
+        );
+    }
+
+    /// `WorktreeRemoved` 성공 경로도 같은 계약을 진다. 이쪽은 앱이 직접 지운
+    /// 경우라 `apply_worktree_listing`을 기다리지 않고 즉시 정리한다.
+    #[test]
+    fn a_removed_worktree_takes_its_pane_with_it() {
+        let (mut state, repo_id, [(id_a, wt_a), (id_b, _wt_b)]) = state_with_two_open_sessions();
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(9),
+            repo_id,
+            worktree_id: wt_a,
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::NotRequested,
+            }),
+        });
+
+        let panes = state.panes().expect("the surviving session keeps its pane");
+        assert_eq!(panes.len(), 1, "the removed session's pane must be gone");
+        assert_eq!(
+            panes.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            vec![id_b]
+        );
+        assert!(!state.session_store().is_running(id_a));
+        assert_eq!(state.focused_session(), Some(id_b));
+    }
+
+    /// 마지막 pane을 비대화형으로 닫는 경로. pane_grid는 pane 0개로 존재할 수
+    /// 없으므로 `close()`가 아니라 워크벤치 전체 리셋으로 빠져야 한다 —
+    /// `PaneCloseRequested`만 알던 규칙이 이제 모든 경로에 적용된다.
+    #[test]
+    fn removing_the_last_worktree_resets_the_workbench() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        assert!(state.panes().is_some(), "precondition");
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(9),
+            repo_id: RepoId("/tmp/r2".into()),
+            worktree_id,
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::NotRequested,
+            }),
+        });
+
+        assert!(
+            state.panes().is_none(),
+            "the last pane cannot be closed — the workbench must reset"
+        );
+        assert_eq!(
+            state.focused_session(),
+            None,
+            "focus must not survive the pane it pointed at"
+        );
+        assert!(!state.session_store().is_running(id));
+    }
+
+    // ---- Plan 4 Task 7: 터미널 위젯 배선 ----
+
+    /// 포커스 리포트의 **순서**가 계약이다. 바이트 자체는 헤드리스로 볼 수 없다
+    /// (`report_focus`는 셸이 `FOCUS_IN_OUT`을 켰을 때만 바이트를 내고 평범한
+    /// 셸은 켜지 않는다) — 순서 결정을 값으로 뽑아 그것을 검사한다.
+    #[test]
+    fn focus_out_precedes_focus_in() {
+        let a = SessionId(1);
+        let b = SessionId(2);
+
+        assert_eq!(
+            focus_reports(Some(a), Some(b)),
+            vec![(a, false), (b, true)],
+            "the OLD session must be told it lost focus BEFORE the new one is \
+             told it gained focus"
+        );
+    }
+
+    #[test]
+    fn focus_reports_cover_the_edges() {
+        let a = SessionId(1);
+        let b = SessionId(2);
+
+        assert_eq!(
+            focus_reports(None, Some(a)),
+            vec![(a, true)],
+            "the first focus has no predecessor to notify"
+        );
+        assert_eq!(
+            focus_reports(Some(a), None),
+            vec![(a, false)],
+            "losing focus with no successor still notifies the old session"
+        );
+        assert_eq!(
+            focus_reports(Some(a), Some(a)),
+            vec![],
+            "re-clicking the focused pane must not re-send focus-in"
+        );
+        assert_eq!(focus_reports(None, None), vec![]);
+        // 대조군: 위의 빈 결과들이 "이 함수가 늘 비어 있다"가 아님을 고정한다.
+        assert_eq!(focus_reports(Some(a), Some(b)), vec![(a, false), (b, true)]);
+    }
+
+    /// `WriteOutcome`이 셋인 이유 전체가 여기 걸려 있다. `bool`이었다면 "모드상
+    /// 보낼 것 없음"과 "큐가 차서 유실"이 같은 값으로 뭉개져 유실이 조용히
+    /// 지나간다.
+    #[test]
+    fn only_a_dropped_write_surfaces_as_input_loss() {
+        let id = SessionId(3);
+
+        let mut state = AppState::default();
+        state.note_write(id, WriteOutcome::Queued);
+        assert_eq!(
+            state.last_input_loss(),
+            None,
+            "a queued write is not a loss"
+        );
+
+        let mut state = AppState::default();
+        state.note_write(id, WriteOutcome::Suppressed);
+        assert_eq!(
+            state.last_input_loss(),
+            None,
+            "Suppressed means the mode had nothing to send — not a loss, and \
+             surfacing it would report normal operation as an error"
+        );
+
+        // 대조군: 실제 유실은 반드시 보여야 한다. 이게 없으면 위의 두 단언이
+        // "이 함수가 아무것도 안 한다"로도 설명된다.
+        let mut state = AppState::default();
+        state.note_write(id, WriteOutcome::Dropped);
+        assert_eq!(
+            state.last_input_loss(),
+            Some(id),
+            "control: a dropped write IS lost user input and must surface"
+        );
+    }
+
+    #[test]
+    fn closing_a_session_clears_its_input_loss_warning() {
+        let (mut state, id, _worktree_id, pane) = state_with_one_open_session();
+        state.note_write(id, WriteOutcome::Dropped);
+        assert_eq!(state.last_input_loss(), Some(id), "precondition");
+
+        let _ = state.update(Message::PaneCloseRequested(pane));
+
+        assert_eq!(
+            state.last_input_loss(),
+            None,
+            "a warning about a session that no longer exists can never be dismissed"
+        );
+    }
+
+    /// 위젯이 그리는 프레임과 세션이 사라지는 시점 사이에는 항상 창이 있다.
+    /// 그 창에 도착한 커맨드로 패닉하면 안 된다.
+    #[test]
+    fn a_command_for_an_unknown_session_is_dropped_silently() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::Terminal {
+            id: SessionId(999),
+            command: TermCommand::Resize {
+                rows: 25,
+                cols: 100,
+                seq: 1,
+            },
+        });
+        assert_eq!(state.last_input_loss(), None);
+    }
+
+    /// 앱 배선까지 포함한 seq 가드. 코얼레서 단위 테스트가 규칙을 고정하고,
+    /// 이 테스트는 **`Message::Terminal`에서 거기까지 실제로 이어져 있는지**를
+    /// 본다 — 둘 중 하나만으로는 배선이 끊겨도 통과한다.
+    #[test]
+    fn the_resize_seq_guard_is_wired_through_the_message_path() {
+        use crate::session_store::ResizeDecision;
+
+        let (mut state, id, _worktree_id, _pane) = state_with_one_open_session();
+
+        // **첫 리사이즈는 반드시 메시지로 넣는다.** 여기서 `request_resize`를
+        // 직접 부르면 `Message::Terminal`의 `TermCommand::Resize` 팔이 통째로
+        // 죽어도 테스트가 통과한다 — 실제로 그랬다.
+        let _ = state.update(Message::Terminal {
+            id,
+            command: TermCommand::Resize {
+                rows: 30,
+                cols: 120,
+                seq: 10,
+            },
+        });
+
+        // 워커가 seq 10을 끝냈다고 알린다. **이 완료가 받아들여진다는 것 자체가
+        // 배선의 증거다** — 코얼레서는 `in_flight == Some(10)`일 때만 가드를
+        // 푼다(`ResizeCoalescer::completed`). 팔이 죽어 있었다면 seq 10은
+        // in-flight가 된 적이 없어 이 완료는 아무 일도 하지 않는다.
+        let _ = state.update(Message::ResizeApplied {
+            id,
+            seq: 10,
+            result: Ok(()),
+        });
+
+        // 뒤늦게 도착한 낡은 seq는 버려진다. 팔이 죽어 있었다면 코얼레서의
+        // `last_seq`가 아직 0이라 seq 4가 여기서 `Dispatch`된다.
+        assert_eq!(
+            state.session_store.request_resize(id, 10, 40, 4).0,
+            ResizeDecision::Discard,
+            "a resize older than the one that already went through the message path \
+             must be discarded — if this dispatches, Message::Terminal never reached \
+             the coalescer"
+        );
+
+        // 대조군 둘을 겸한다. (1) 가드가 모든 것을 버리는 게 아니라 더 새로운
+        // seq는 통과시킨다. (2) `Coalesce`가 아니라 `Dispatch`라는 것은 위의
+        // `ResizeApplied`가 in-flight 가드를 실제로 풀었다는 뜻이고, 그건 seq
+        // 10이 메시지 경로를 타고 in-flight가 됐을 때만 성립한다.
+        let fresh = state.session_store.request_resize(id, 31, 124, 11).0;
+        assert!(
+            matches!(fresh, ResizeDecision::Dispatch { seq: 11, .. }),
+            "control: a newer resize must still dispatch (and Dispatch rather than \
+             Coalesce proves seq 10 held the in-flight guard); got {fresh:?}"
+        );
+    }
+
+    /// 드래그 완료가 standard까지 쓰면 사용자가 복사한 적 없는 텍스트가 시스템
+    /// 클립보드를 덮어쓴다. 명시적 복사(단축키)만 양쪽에 쓴다.
+    #[test]
+    fn each_copy_target_writes_exactly_where_it_was_asked_to() {
+        use clipboard::Kind;
+
+        assert_eq!(
+            clipboard_kinds(CopyTargets::EXPLICIT),
+            vec![Kind::Standard, Kind::Primary],
+            "an explicit copy goes to both"
+        );
+        assert_eq!(
+            clipboard_kinds(CopyTargets::DRAG_COMPLETE),
+            vec![Kind::Primary],
+            "a finished drag goes to primary ONLY — X11/Wayland middle-click \
+             convention, and it must not clobber the system clipboard"
+        );
+        assert_eq!(
+            clipboard_kinds(CopyTargets {
+                standard: true,
+                primary: false
+            }),
+            vec![Kind::Standard]
+        );
+        assert_eq!(
+            clipboard_kinds(CopyTargets {
+                standard: false,
+                primary: false
+            }),
+            vec![],
+            "asking for nothing writes nothing"
+        );
+    }
+
+    /// 추출은 세션당 **직렬**이다(`selection_to_string()`이 선택 범위 전체를
+    /// 훑는다). 도는 동안 온 요청은 최신 하나로 대기했다가 완료 후에 나간다.
+    #[test]
+    fn selection_extraction_is_serialized_per_session() {
+        use suaegi_term::input_types::CopyRequest;
+
+        let (mut state, id, _worktree_id, _pane) = state_with_one_open_session();
+        let store = &mut state.session_store;
+
+        let first = CopyRequest {
+            epoch: 1,
+            to: CopyTargets::EXPLICIT,
+        };
+        assert!(
+            store.request_extraction(id, first).0,
+            "the first extraction must dispatch"
+        );
+
+        let second = CopyRequest {
+            epoch: 2,
+            to: CopyTargets::DRAG_COMPLETE,
+        };
+        assert!(
+            !store.request_extraction(id, second).0,
+            "a second extraction must NOT run concurrently with the first"
+        );
+
+        assert_eq!(
+            store.extraction_state(id),
+            Some((true, Some(second))),
+            "precondition: one running, one queued"
+        );
+
+        // 완료하면 대기하던 것이 나간다 — 버려지지 않는다. 사용자가 누른 복사가
+        // "마침 다른 추출이 돌고 있었다"는 이유로 사라지면 안 된다.
+        let _ = state.update(Message::SelectionExtracted {
+            id,
+            targets: CopyTargets::EXPLICIT,
+            text: None,
+        });
+
+        // **대기열이 비었는지를 직접 본다.** `request_extraction`의 `bool`을
+        // 프록시로 쓰면 안 된다 — "대기하던 것이 나갔다"와 "완료 처리가 아예
+        // 안 돼서 영원히 막혔다"가 둘 다 `false`라 구별되지 않는다(mutation으로
+        // 확인: `extraction_completed`를 `Task::none()`으로 바꿔도 통과했다).
+        assert_eq!(
+            state.session_store.extraction_state(id),
+            Some((true, None)),
+            "the queued request must have been dispatched (pending drained) and now be \
+             in flight — a still-Some pending means the completion was dropped and this \
+             session can never extract again"
+        );
+
+        // 대기하던 요청이 지금 in-flight이므로 새 요청은 다시 대기한다.
+        let third = CopyRequest {
+            epoch: 3,
+            to: CopyTargets::EXPLICIT,
+        };
+        assert!(
+            !state.session_store.request_extraction(id, third).0,
+            "the queued extraction is now running, so the next one queues behind it"
+        );
+    }
+
+    /// `text: None`은 **조용한 취소**다(epoch 불일치 또는 선택 없음). 오류 배너를
+    /// 띄우거나 입력 유실로 보고하면 정상 동작이 고장으로 보인다.
+    #[test]
+    fn an_empty_extraction_result_is_a_silent_cancellation() {
+        let (mut state, id, _worktree_id, _pane) = state_with_one_open_session();
+
+        let _ = state.update(Message::SelectionExtracted {
+            id,
+            targets: CopyTargets::EXPLICIT,
+            text: None,
+        });
+
+        assert_eq!(state.last_error(), None, "a cancelled copy is not an error");
+        assert_eq!(
+            state.last_input_loss(),
+            None,
+            "and it is not lost input either"
+        );
+    }
+
     fn snapshot_with_text(line: &str) -> TerminalSnapshot {
         use alacritty_terminal::term::cell::Flags;
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -1083,6 +1758,8 @@ mod tests {
             cursor: None,
             display_offset: 0,
             history_size: 0,
+            mode: alacritty_terminal::term::TermMode::empty(),
+            selection: None,
         }
     }
 
