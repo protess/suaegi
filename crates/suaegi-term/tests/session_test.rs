@@ -230,6 +230,67 @@ fn saturated_write_queue_does_not_stall_the_reader() {
     );
 }
 
+/// 프로세스의 RSS(KB). `/proc` 없는 macOS도 지원해야 하므로 `ps`를 쓴다.
+#[cfg(unix)]
+fn process_rss_kb() -> u64 {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .expect("ps should run");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// 이 테스트가 방지하는 정확한 실패 경로: 자식이 stdin을 전혀 읽지 않으면서
+/// 장치 질의(DA1)를 계속 쏟아낸다. 커널 PTY 입력 버퍼가 차면 라이터의 블로킹
+/// `pty.write`가 파킹되고, 그 뒤로도 리더는 계속 응답을 만들어 큐에 넣으려
+/// 한다. 언바운드 큐였다면 여기서 메모리가 자식의 출력 속도로 무한히 자란다.
+/// 바운드 큐 + `try_send` 드롭으로 이를 막았다는 것을,
+/// (a) 리더가 여전히 진행 중이고(응답 큐 상태와 무관하게 PTY 출력을 계속
+///     소비해 generation이 계속 오른다), (b) 세션 프로세스의 RSS가 관찰 구간
+///     동안 유의미하게 자라지 않는다는 두 가지로 확인한다.
+#[cfg(unix)]
+#[test]
+fn flooding_unread_device_queries_does_not_grow_memory_unbounded() {
+    let script = "while true; do printf '\\033[c'; done";
+    let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
+
+    // 리더가 최소 한 번은 PTY 출력을 소비했는지 확인한다 — 그렇지 않으면
+    // 아래 관찰이 공허하게 통과한다.
+    assert!(
+        wait_until(Duration::from_secs(10), || session.generation() > 0),
+        "reader never observed any output from the flooding child"
+    );
+
+    let rss_before = process_rss_kb();
+    let generation_before = session.generation();
+
+    // 커널 tty 입력 버퍼가 채워지고 라이터가 블로킹 write에 파킹될 시간을 준다.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rss_after = process_rss_kb();
+    let generation_after = session.generation();
+
+    assert!(
+        generation_after > generation_before,
+        "reader appears stalled while flooded with unread device queries"
+    );
+    assert!(
+        session.is_running(),
+        "session should still be alive while flooded"
+    );
+    let grew_kb = rss_after.saturating_sub(rss_before);
+    assert!(
+        grew_kb < 25_000,
+        "RSS grew by {grew_kb}KB while flooding unread device queries \
+         (before={rss_before}KB, after={rss_after}KB) — the reply queue \
+         appears unbounded"
+    );
+}
+
 /// 장치 질의(DA1) 응답이 PTY로 되돌아가야 한다. 응답에는 개행이 없으므로
 /// **먼저 라인 디시플린을 비정규 모드로 바꿔야** 한다 — 그러지 않으면 `dd`든
 /// `read`든 개행이 올 때까지 커널에서 블로킹된다.

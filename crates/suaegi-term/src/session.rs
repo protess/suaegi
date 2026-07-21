@@ -13,6 +13,16 @@ const NO_EXIT: i64 = i64::MIN;
 /// UI 입력 큐 상한. 무제한 채널은 자식이 읽기를 멈췄을 때 메모리를 무한히 먹는다.
 /// 가득 차면 UI 입력은 버린다 (입력 유실 < 앱 다운).
 const WRITE_QUEUE_CAPACITY: usize = 256;
+/// 장치 응답 큐 상한. 이전에는 언바운드였다: 자식이 장치 질의(`\033[c` 등)를
+/// 계속 쏟아내면서 자기 stdin을 읽지 않으면, 커널 PTY 입력 버퍼가 차서 라이터의
+/// 블로킹 `pty.write`가 파킹되고, 그동안 리더는 계속 응답을 큐에 밀어넣어 자식의
+/// 출력 속도로 메모리가 무한히 자란다. 여기서 지켜야 할 진짜 불변식은 "리더는
+/// 절대 블로킹하지 않는다"이고, 큰 바운드 큐 + 가득 차면 드롭(`try_send`)도 이를
+/// 만족한다 — 자기 tty를 읽지 않으면서 질의만 쏟아내는 프로그램은 이미 고장난
+/// 것이고, 그 응답을 버리는 게 세션을 죽이는 것보다 낫다. 4096개는 응답 하나당
+/// 많아야 수십 바이트인 걸 감안하면 정상적인 시동 핸드셰이크(여러 질의가
+/// 몰리는 vim/neovim류)를 넉넉히 흡수하면서도(약 수백 KB) 상한을 유지한다.
+const REPLY_QUEUE_CAPACITY: usize = 4096;
 /// 라이터 스레드가 UI 큐를 기다리는 간격. 이 주기마다 장치 응답 큐를 먼저 비운다.
 const WRITER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -51,7 +61,7 @@ impl TerminalSession {
         // 하나의 큐를 공유하면 UI 입력이 큐를 채운 사이 리더가 응답 송신에서
         // 블로킹돼 PTY 출력 소비가 멈추는 교착이 생긴다.
         let (ui_tx, ui_rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CAPACITY);
-        let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Vec<u8>>(REPLY_QUEUE_CAPACITY);
 
         // 라이터 스레드: PTY write도 블로킹이므로 UI가 직접 부르지 않게 분리한다.
         // 매 주기마다 장치 응답을 먼저 비워 UI 입력 뒤에 밀리지 않게 한다.
@@ -118,10 +128,15 @@ impl TerminalSession {
                                 grid.feed(&buf[..n]);
                                 // 터미널이 만든 응답을 PTY로 돌려보내지 않으면
                                 // 장치 질의를 보낸 프로그램이 영원히 기다린다.
-                                // 전용 언바운드 큐라 여기서 블로킹되지 않는다.
+                                // try_send는 절대 블로킹하지 않는다 — 큐가 가득
+                                // 찼다면(라이터가 막혀 못 비우는 중) 이 응답은
+                                // 버린다. 자기 tty를 읽지 않으면서 질의만
+                                // 쏟아내는 프로그램에 대한 유일한 안전한 대응이다.
                                 for reply in grid.take_pty_writes() {
-                                    if reader_reply_tx.send(reply.into_bytes()).is_err() {
-                                        break;
+                                    match reader_reply_tx.try_send(reply.into_bytes()) {
+                                        Ok(()) => {}
+                                        Err(mpsc::TrySendError::Full(_)) => {}
+                                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                                     }
                                 }
                                 generation.fetch_add(1, Ordering::Release);
