@@ -17,6 +17,8 @@ futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# hook 서버가 pane 키 헤더를 엄격히 디코딩한다 (URL_SAFE_NO_PAD)
+base64 = { workspace = true }
 thiserror = { workspace = true }
 # 부팅 시 데이터 파일의 기본 위치(OS별 config dir) 계산에 쓴다 — suaegi-core도
 # 같은 크레이트를 홈 디렉터리 기본값 계산에 쓴다.

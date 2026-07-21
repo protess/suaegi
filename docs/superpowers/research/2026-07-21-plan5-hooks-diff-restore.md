@@ -36,6 +36,22 @@
 
 ## 1. Claude Code hook 프로토콜 (실측)
 
+> ### ⚠️ print 모드(`claude -p`) 캡처를 배지 설계에 쓰지 말 것
+>
+> **이 문서에서 틀린 것으로 밝혀진 주장은 전부 print 모드 캡처에서 나왔다.** 한 번에
+> 하나씩 고치지 말고 규칙으로 기억한다: **배지에 관한 사실은 대화형 PTY로 재확인한다.**
+> 지금까지 확인된 발산(전부 실측):
+>
+> | | print 모드 | 대화형 PTY |
+> |---|---|---|
+> | 신뢰 게이트 | **아예 우회한다.** 훅이 전부 발화하고 `.claude.json`에 항목조차 안 생긴다 | 신뢰 전에는 **훅이 하나도 안 온다**(§7.1) |
+> | API 오류 | `Stop`도 `StopFailure`도 **안 온다**(`SessionEnd`뿐) | 백오프 재시도 후 `StopFailure`가 t+210s에(§1.6.2) |
+> | `SessionStart` | `model` 없음 | `model` 있음(§1.6.4) |
+> | `PermissionRequest` | 관측 안 됨 → 앞선 조사가 "안 온다"고 결론 | **발화한다**(§1.4) |
+>
+> 넷 다 같은 방향이다: **print 모드는 사람이 기다리는 상태를 만들지 않으므로, 사람을
+> 기다리는 것에 관한 신호를 관측할 수 없다.** 배지가 재는 것이 정확히 그것이다.
+
 ### 1.1 이 기계의 활성 설정은 `~/.claude/settings.json`이 아니다
 
 `CLAUDE_CONFIG_DIR=/Users/james/.config/claude-musinsa`가 설정돼 있다. 활성 파일은
@@ -115,8 +131,9 @@ stdin으로 **JSON 객체 하나**가 온다(개행 구분 아님).
 |---|---|
 | `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `PreToolUse` | working |
 | **`PermissionRequest`** | **waiting** |
-| `Stop`/`StopFailure` **AND `background_tasks`가 비었을 때** | done |
+| `Stop` **AND `background_tasks`가 비었을 때** | done |
 | `Stop` + `background_tasks`가 비지 않음 | **working 유지** |
+| **`StopFailure`** | **done (무조건)** — §1.6.2 참고. 이 이벤트엔 `background_tasks`가 **없다** |
 
 **`AskUserQuestion` 특수 처리는 필요 없다 — 앞선 조사가 틀렸다.**
 실측 결과 이 도구는 자동 허용이 **아니고** 온전한 `PermissionRequest`를 낸다
@@ -156,6 +173,8 @@ Agent 도구는 기본이 **백그라운드 실행**이라(`PostToolUse.tool_res
 **함정 1 — 서브에이전트 완료가 합성 `UserPromptSubmit`을 주입한다.** 프롬프트가
 `<task-notification>` XML 덩어리다. `UserPromptSubmit`에 working을 찍으면 **사람이 치지도 않은
 프롬프트**로 보인다. 프롬프트가 `<task-notification>`으로 시작하는지로 걸러낸다.
+**접두사는 §1.6.5에서 실측했다** — 정확히 `<task-notification>\n`으로 시작한다.
+(다만 Plan 5는 배지 결과가 같다는 이유로 이 필터를 넣지 않기로 했다. 필요해지면 §1.6.5를 쓴다.)
 
 **함정 2 — 유령 `SubagentStop`.** `agent_type: ""`이고 스폰을 본 적 없는 `agent_id`로 온다
 (내부 헬퍼 에이전트). Task 호출이 전혀 없던 순수 Bash 실행에서도 `Stop` 이후에 하나 발화했다.
@@ -190,6 +209,146 @@ fire-and-forget 관찰자라 비용이 0이지만, 나중에 누가 같은 async
 왜 무시되는지 의아해하지 않도록 적어둔다.
 
 ---
+
+### 1.6 나머지 이벤트 페이로드 (Plan 5 Task 2에서 실측 캡처)
+
+§1.3이 캡처한 것은 `SessionStart`·`PreToolUse`·`Stop`·`PermissionRequest` 넷뿐이었다.
+나머지를 **대화형 PTY로 캡처**했다(2.1.216). 경로만 `<...>`로 줄였고 나머지는 원문이다.
+
+#### 1.6.1 `UserPromptSubmit` — 프롬프트 필드 이름은 `prompt`
+
+```json
+{"session_id":"...","transcript_path":"<...>","cwd":"<...>","prompt_id":"...",
+ "permission_mode":"acceptEdits","hook_event_name":"UserPromptSubmit",
+ "prompt":"Use the Bash tool to run: echo probe-pty"}
+```
+
+#### 1.6.2 `StopFailure` — **`background_tasks`가 없다**
+
+upstream을 강제로 500으로 만들어 캡처했다.
+
+```json
+{"session_id":"...","transcript_path":"<...>","cwd":"<...>","prompt_id":"...",
+ "hook_event_name":"StopFailure","error":"server_error",
+ "last_assistant_message":"API Error: 500 ... This is a server-side issue, usually temporary ..."}
+```
+
+**`background_tasks`도 `session_crons`도 `permission_mode`도 없다** — `Stop`보다 훨씬 얇다.
+따라서 "`background_tasks`가 비었을 때만 done"을 이 이벤트에 적용하면 **영원히 done이 될 수
+없다.** 필드가 가끔 빠지는 게 아니라 **구조적으로 없다**는 것이 핵심이다.
+
+**API 오류는 빨리 실패하지 않는다.** 화면에 "attempt 7/10"이 뜨며 백오프로 재시도하고,
+그동안 **훅이 하나도 오지 않는다**. `StopFailure`는 t+210s에 도착했다:
+
+```
+  t+30s .. t+180s -> ['SessionStart','UserPromptSubmit']   (침묵)
+  t+210s          -> ['SessionStart','UserPromptSubmit','StopFailure']
+```
+
+→ `HOOK_STALE_AFTER`는 이 창보다 길어야 한다. 짧으면 **정상 재시도 중에** 배지가
+`Unknown`으로 튄다. **print 모드에서는 같은 오류에 `Stop`도 `StopFailure`도 오지 않았다**
+(`SessionStart`·`UserPromptSubmit`·`SessionEnd`뿐) — 배지 설계에 print 모드 캡처를 쓰면 안 되는
+또 하나의 이유.
+
+#### 1.6.3 `PostToolUseFailure` — `PostToolUse` **대신** 발화한다
+
+```json
+{"...","hook_event_name":"PostToolUseFailure","tool_name":"Bash",
+ "tool_input":{"command":"cat /definitely/not/a/real/path","description":"..."},
+ "tool_use_id":"toolu_017tHDmYr3...",
+ "error":"Exit code 1\ncat: /definitely/not/a/real/path: No such file or directory",
+ "is_interrupt":false,"duration_ms":508}
+```
+
+실패한 도구 호출은 `PostToolUseFailure` **하나만** 낸다 — 둘이 같이 오지 않는다.
+`is_interrupt`가 **사용자 중단**과 **진짜 도구 실패**를 가른다.
+
+#### 1.6.4 `SessionEnd` / `SubagentStop` / `SessionStart`
+
+```json
+{"...","hook_event_name":"SessionEnd","reason":"other"}
+
+{"...","agent_id":"a22e0af17822ae8e3","agent_type":"","hook_event_name":"SubagentStop",
+ "stop_hook_active":false,"agent_transcript_path":"<...>","background_tasks":[],"session_crons":[]}
+```
+
+유령 `SubagentStop`(§1.4.2)이 **Bash만 쓴 턴에서 재확인됐다** — `agent_type: ""`, 스폰을 본 적
+없는 `agent_id`. 독립적인 두 번째 관측이므로 "`SubagentStop`은 무시한다"는 규칙은 확정이다.
+
+`SessionStart`는 **대화형에서만** `model`을 나른다(`"model":"claude-haiku-4-5-20251001"`).
+print 모드 캡처(§1.3)엔 없다.
+
+#### 1.6.5 `<task-notification>` 합성 프롬프트 — 접두사 실측
+
+서브에이전트를 **기다리지 말라고** 지시해 진짜 백그라운드로 띄웠을 때 재현됐다
+(앞선 시도는 서브에이전트가 턴 안에서 인라인으로 끝나 재현되지 않았다).
+
+```
+<task-notification>
+<task-id>a4e08ab6a082be2c1</task-id>
+<tool-use-id>toolu_01ESsZ7C9u73btL85zFULhHJ</tool-use-id>
+<output-file><...>/tasks/a4e08ab6a082be2c1.output</output-file>
+<status>completed</status>
+<summary>Agent "Read and summarize all file*.txt files" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background
+children of its own. The user can send it another message and resume it, so the
+same task-id may notify more than once.</note>
+<result>...
+```
+
+프롬프트는 정확히 `<task-notification>\n`으로 시작한다 — 접두사 검사가 유효하다.
+**`<note>`가 중요하다**: 같은 `task-id`가 **여러 번** 통지할 수 있으므로 task-id로 중복을
+제거하는 설계를 하면 안 된다.
+
+#### 1.6.6 `Stop` + 비지 않은 `background_tasks` — 실물 캡처
+
+§1.4.1의 규칙을 뒷받침하는 **실제 이벤트 순서**다. 한 턴에서 `Stop`이 **두 번** 나온다:
+
+```
+SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop,   ← ① 서브에이전트가 도는 중
+  PreToolUse, PostToolUse, ... (서브에이전트의 도구 호출 8개), SubagentStop, ...
+UserPromptSubmit(<task-notification>), Stop, SubagentStop         ← ② 진짜 끝
+```
+
+```json
+// ① Stop — background_tasks가 비지 않았다
+"background_tasks":[{"id":"a4e08ab6a082be2c1","type":"subagent","status":"running",
+                     "description":"Read and summarize all file*.txt files",
+                     "agent_type":"general-purpose"}]
+// ② Stop — 비었다
+"background_tasks":[]
+```
+
+①에서 done을 찍었다면 배지가 done으로 갔다가 뒤따르는 도구 호출 8개에 다시 working으로
+돌아온다. **`done = Stop AND background_tasks가 빔`이 실측으로 확인됐다.**
+
+### 1.7 주입 형태 — 실측 (Plan 5 Task 3)
+
+§1.2가 `--settings`만 실측했고 **worktree의 `.claude/settings.local.json`은 "금지" 행으로만
+적혀 있었다**(근거: "사용자 저장소를 오염시킨다"). 그 판단은 **suaegi가 `claude`를 직접
+띄운다는 전제**에서 나온 것인데, 구현 중 그 전제가 틀렸음이 드러났다 — 모든 세션이 평범한
+로그인 셸이라 `--settings`를 넘길 argv가 없다. 그래서 플랜은 worktree 주입으로 뒤집었고
+(Global Constraint #1), 아래는 그 방식이 **실제로 동작하는지** 확인한 결과다.
+
+**§1.2의 표에서 그 행은 이제 유효하지 않다** — 그 표만 보고 판단하면 반대 결론이 난다.
+
+셋 다 2.1.216에서 확인:
+
+1. **worktree의 `.claude/settings.local.json`이 적용된다.** 그 디렉터리를 cwd로
+   `claude -p`를 돌려 `SessionStart`·`PreToolUse`·`PostToolUse`·`Stop`이 전부 발화했다.
+2. **도구 이벤트에 `matcher`가 필요 없다.** 없이도 `PreToolUse`/`PostToolUse`가 발화한다.
+   (필요한데 빠뜨렸다면 **조용히 영영 발화하지 않았을** 종류의 실수다.)
+3. **앱이 심은 env가 훅 프로세스까지 도달한다.** 훅 스크립트에서 `SUAEGI_PANE_KEY`와
+   `SUAEGI_SPAWN_NONCE`를 그대로 읽었다. 상관관계 설계 전체가 이 사실에 걸려 있다.
+4. **복합 셸 커맨드가 `command` 필드로 받아들여진다.** 존재 가드가 필요해
+   `if [ -x '<path>' ]; then '<path>'; else cat >/dev/null 2>&1; fi; exit 0`을 넣는데,
+   9개 이벤트 전부에 이 형태로 걸고 한 턴에 6회 발화를 확인했다.
+
+기록해 둘 정확한 모양(`matcher` 없음, `async`는 훅 객체에):
+
+```json
+{"hooks":{"<Event>":[{"hooks":[{"type":"command","command":"<cmd>","async":true}]}]}}
+```
 
 ## 2. 상관관계 — Orca의 기제 (그리고 우리가 쓸 것)
 
@@ -405,10 +564,35 @@ float 잡음이 저장을 계속 흔드는 걸 막는다(우리 `Store::save`가
 
 ### 7.1 신뢰 대화상자 — Plan 5가 반드시 다뤄야 하는 첫 실행 상태
 
-검증 중에 걸렸다: **사용자가 신뢰하지 않은 디렉터리에서 `claude`를 띄우면 "이 폴더의 파일을
-신뢰합니까?" 대화상자가 먼저 뜨고, 그 전에는 `SessionStart` 말고 아무 훅도 발화하지 않는다.**
-첫 프롬프트가 그대로 먹혔다.
+**대화형 PTY로 다시 측정했고, 앞선 서술이 틀렸다.** 신뢰 전에는 **`SessionStart`를 포함해
+아무 훅도 발화하지 않는다**:
 
-suaegi는 **새로 만든 worktree에서** 에이전트를 띄우므로 이 상태에 항상 부딪힌다. 배지가
-`SessionStart` 이후 영원히 멈춰 보일 것이다. Plan 5는 이걸 감지해 사용자에게 알리거나,
-신뢰를 미리 심는 방법을 정해야 한다.
+```
+before trust : (NONE)
+after  trust : ['SessionStart']
+after prompt : ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','SubagentStop']
+```
+45초를 답하지 않고 기다려도(t+15/30/45s) 아무것도 오지 않았다 — "느릴 뿐"이 아니다.
+
+**왜 처음에 틀렸나: print 모드는 신뢰 게이트를 아예 우회한다.** `claude -p`를 신뢰 안 된
+디렉터리에서 돌리면 훅 6개가 전부 발화하고 `.claude.json`에 항목조차 안 생긴다 — 게이트에
+도달하지 않는다. §1.3의 캡처가 print 모드였다.
+
+**주입 방식과 무관하다.** `--settings`(argv)로 준 대조군도 결과가 **동일**하다:
+```
+--settings, before trust : (NONE)
+--settings, after  trust : ['SessionStart']
+```
+→ 훅을 worktree의 `.claude/settings.local.json`으로 옮기는 것은 **신뢰 축에서 회귀가 아니다.**
+
+**신뢰 상태의 위치**: `$CLAUDE_CONFIG_DIR/.claude.json`의
+`projects["<절대경로>"].hasTrustDialogAccepted`. 사전 신뢰 심기는 기계적으로는 키 하나
+쓰기지만 **Global Constraint #1(사용자 Claude 설정을 건드리지 않는다)에 정면으로 걸린다** —
+알려진 유일한 방법이 그것뿐이라는 사실까지 follow-up에 남긴다.
+
+suaegi는 **새로 만든 worktree에서** 에이전트를 띄우므로 이 상태에 항상 부딪힌다.
+배지는 훅을 **하나도** 못 받은 채 `Unknown`에 머문다 — 0.3 표의 `Agent(_)` + 훅 없음 행이다.
+(이 문단은 원래 "`SessionStart` 이후 멈춘다"고 썼는데 **틀렸다**. 위 측정대로 `SessionStart`도
+오지 않는다. **"`SessionStart`는 봤는데 그 뒤로 조용하다"를 감지 신호로 쓰면 영영 발화하지
+않는다** — 그런 휴리스틱을 짜지 말 것.)
+Plan 5는 이걸 감지해 사용자에게 알리거나, 신뢰를 미리 심는 방법을 정해야 한다.

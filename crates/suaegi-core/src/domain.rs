@@ -48,10 +48,56 @@ pub struct Worktree {
     pub created_at_unix_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `pane_grid::Axis`의 serde 거울. iced 타입은 `Serialize`를 갖지 않고, 갖게
+/// 만들 수도 없다(외래 타입) — 그리고 **`suaegi-core`는 iced를 모른다.**
+/// 값이 둘뿐이라 거울의 유지 비용이 사실상 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// `pane_grid::Configuration<T>`의 serde 거울. 저장할 때 `State::layout()`의
+/// `Node`를 걸으며 만들고, 복원할 때 `Configuration`으로 되돌린다.
+///
+/// **잎이 `SessionId`가 아니라 `WorktreeId`인 것이 핵심이다.** `SessionId`는
+/// 실행마다 매기는 카운터라 재시작을 넘지 못하고, `pane_grid::Pane`/`Split`의
+/// 내부 `usize`는 비공개라 애초에 직렬화할 수 없다. worktree id는 경로에서
+/// 나오므로 앱을 껐다 켜도 같다 — 훅 상관관계(`PaneKey`)와 레이아웃 복원이
+/// **같은 키**를 쓴다.
+///
+/// **`suaegi-app`이 아니라 여기 사는 이유**: [`SessionState`]가 이걸 필드로
+/// 담고, `SessionState`는 `suaegi-core`의 타입이다. 반대 방향 의존은 없다
+/// (`suaegi-app → suaegi-term → suaegi-core`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedPane {
+    Split {
+        axis: PersistedAxis,
+        ratio: f32,
+        a: Box<PersistedPane>,
+        b: Box<PersistedPane>,
+    },
+    Leaf(WorktreeId),
+}
+
+/// **`Eq`가 없는 이유**: [`PersistedPane`]의 `ratio: f32`가 `Eq`를 막는다
+/// (Task 0이 미리 경고해 둔 그대로다). 이를 담는 [`PersistedState`]에서도 같이
+/// 뗐다 — `assert_eq!`는 `PartialEq`만 요구하므로 호출부는 그대로 컴파일된다.
+///
+/// **`SCHEMA_VERSION`은 올리지 않는다.** 영속화 가드가
+/// `schema_version > SCHEMA_VERSION`에서만 발동하므로 `#[serde(default)]` 필드
+/// 추가는 공짜지만(구버전은 모르는 키를 무시한다), 버전을 올리면 구버전이
+/// 가드에 걸려 **저장을 아예 거부한다.**
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     #[serde(default)]
     pub active_worktree_id: Option<WorktreeId>,
+    /// 마지막으로 화면에 있던 pane 트리. `None`이면 복원할 레이아웃이 없다
+    /// (첫 실행, 또는 세션을 하나도 열지 않고 껐다).
+    #[serde(default)]
+    pub panes: Option<PersistedPane>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +113,8 @@ impl Settings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Eq`가 없는 이유는 [`SessionState`] 참고(`PersistedPane::Split::ratio`가 f32다).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedState {
     pub schema_version: u32,
     #[serde(default)]
@@ -118,6 +165,17 @@ mod tests {
             }],
             session: SessionState {
                 active_worktree_id: Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
+                panes: Some(PersistedPane::Split {
+                    axis: PersistedAxis::Vertical,
+                    ratio: 0.375,
+                    a: Box::new(PersistedPane::Leaf(WorktreeId("/tmp/ws/demo/a".into()))),
+                    b: Box::new(PersistedPane::Split {
+                        axis: PersistedAxis::Horizontal,
+                        ratio: 0.5,
+                        a: Box::new(PersistedPane::Leaf(WorktreeId("/tmp/ws/demo/b".into()))),
+                        b: Box::new(PersistedPane::Leaf(WorktreeId("/tmp/ws/demo/c".into()))),
+                    }),
+                }),
             },
             settings: Settings {
                 workspace_root: PathBuf::from("/tmp/ws"),
@@ -134,6 +192,51 @@ mod tests {
         assert_eq!(d.schema_version, SCHEMA_VERSION);
         assert!(d.repos.is_empty() && d.worktrees.is_empty());
         assert_eq!(d.session, SessionState::default());
+    }
+
+    /// Plan 5의 하드 제약 하나: **레이아웃 필드를 더하면서 `SCHEMA_VERSION`을
+    /// 올리지 않는다.** 영속화 가드가 `schema_version > SCHEMA_VERSION`에서만
+    /// 발동하므로, 값이 1로 남아 있는 한 구버전 앱도 이 파일을 열어 계속 저장할
+    /// 수 있다. 올리는 순간 구버전은 **저장을 아예 거부한다** — 그 회귀를
+    /// 컴파일이 아니라 테스트로 잡는다(상수 변경은 조용히 통과하기 때문).
+    #[test]
+    fn adding_the_layout_field_did_not_bump_the_schema_version() {
+        assert_eq!(
+            SCHEMA_VERSION, 1,
+            "bumping this makes every older build refuse to save at all"
+        );
+        let json = serde_json::to_string(&PersistedState::default()).unwrap();
+        let probe: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            probe["schema_version"], 1,
+            "what we actually write must still be readable by a build that only knows v1"
+        );
+    }
+
+    /// Plan 4 이전 빌드가 쓴 파일에는 `panes` 키가 아예 없다. `#[serde(default)]`가
+    /// 그걸 `None`으로 채워야 한다 — 아니면 기존 사용자의 파일이 전부 손상으로
+    /// 판정돼 백업 폴백으로 떨어진다.
+    #[test]
+    fn a_file_written_before_layout_persistence_still_loads() {
+        let legacy = r#"{
+            "schema_version": 1,
+            "session": { "active_worktree_id": "/tmp/ws/demo/fix-bug" },
+            "settings": { "workspace_root": "/tmp/ws" }
+        }"#;
+        let state: PersistedState =
+            serde_json::from_str(legacy).expect("a pre-Plan-5 file must still parse");
+        assert_eq!(
+            state.session.panes, None,
+            "a missing layout means 'nothing to restore', not a parse failure"
+        );
+        // 대조군: 같은 역직렬화가 실제로 내용을 읽고 있다는 것 — 위의 None이
+        // "전부 기본값으로 뭉갰다"로도 설명되면 안 된다.
+        assert_eq!(
+            state.session.active_worktree_id,
+            Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
+            "control: the fields that WERE present must have been read"
+        );
+        assert_eq!(state.settings.workspace_root, PathBuf::from("/tmp/ws"));
     }
 
     #[test]

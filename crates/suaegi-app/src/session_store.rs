@@ -228,6 +228,10 @@ pub fn blank_snapshot() -> TerminalSnapshot {
 pub struct SessionStore {
     slots: HashMap<SessionId, SessionSlot>,
     reaper: Reaper,
+    /// 마지막 `start()`가 PTY에 실제로 심은 환경 변수. 테스트가 프로덕션 경로를
+    /// 그대로 태우고 결과를 관측하기 위한 유일한 창이다.
+    #[cfg(test)]
+    last_spawn_env: Option<Vec<(String, String)>>,
     /// `close()`/`accept_started`의 거절 경로로 넘어간 세션이 **실제로 어느
     /// 스레드에서** 떨어졌는지. 오직 Reaper의 콜백만 채운다 — 그 콜백이
     /// 실행되는 스레드가 곧 소멸자가 실행된 스레드라는 증거다.
@@ -258,7 +262,15 @@ impl SessionStore {
             track_reaped_at: false,
             retired_count: Arc::new(AtomicU64::new(0)),
             next_id: 0,
+            #[cfg(test)]
+            last_spawn_env: None,
         }
+    }
+
+    /// 마지막 `start()`가 PTY에 실제로 심은 env.
+    #[cfg(test)]
+    pub(crate) fn last_spawn_env(&self) -> Option<&[(String, String)]> {
+        self.last_spawn_env.as_deref()
     }
 
     /// 호출자가 미리 발급받을 `SessionId`. `start`는 이 id를 그대로 받아
@@ -272,16 +284,21 @@ impl SessionStore {
 
     /// 블로킹 스레드에서 `TerminalSession::start`(fork/exec)를 수행하고 결과를
     /// 메시지로 돌려준다. 실패도 맥락(`id`, `worktree_id`)을 나른다.
+    /// `env`는 PTY에 그대로 얹힌다. Plan 5의 훅 상관관계 변수
+    /// (`SUAEGI_PANE_KEY`/`SPAWN_NONCE`/`HOOK_PORT`/`HOOK_TOKEN`)가 여기로 들어온다 —
+    /// **`session_store`도 `suaegi-term`도 그 의미를 모른다.** 그냥 env다.
+    /// 토큰이 argv가 아니라 env로 가는 것이 요점이다(argv는 `ps`에 보인다).
     pub fn start(
         &mut self,
         id: SessionId,
         worktree: &Worktree,
         agent: AgentKind,
         prompt: Option<String>,
+        env: Vec<(String, String)>,
     ) -> Task<Message> {
         let worktree_id = worktree.id.clone();
         let cwd = worktree.path.clone();
-        let spawn = build_spawn(
+        let mut spawn = build_spawn(
             agent,
             None,
             prompt.as_deref(),
@@ -289,6 +306,15 @@ impl SessionStore {
             DEFAULT_ROWS,
             DEFAULT_COLS,
         );
+        spawn.env.extend(env);
+        // **프로덕션 경로에서 실제로 심긴 env를 관측할 수 있게 한다.**
+        // `spawn_env()`를 따로 테스트하는 것만으로는 그 값이 정말 PTY까지
+        // 갔는지 알 수 없다 — 그 공백이 복원된 세션에 훅 env가 하나도 심기지
+        // 않는 버그를 통과시켰다.
+        #[cfg(test)]
+        {
+            self.last_spawn_env = Some(spawn.env.clone());
+        }
         background::blocking(move |mut sender| {
             let spec = SessionSpec {
                 pty: spawn,

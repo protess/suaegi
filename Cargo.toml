@@ -21,3 +21,6 @@ alacritty_terminal = "0.25.1"
 crossbeam-channel = "0.5"
 iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "lazy"] }
 futures = "0.3"
+# hook 헤더의 pane 키 인코딩. 손으로 짜지 않는 이유는 **엄격 디코딩**이 요구사항이라서다
+# (URL_SAFE_NO_PAD). 관대한 디코더는 패딩 유무가 어긋나도 통과시켜 버린다.
+base64 = "0.22"
