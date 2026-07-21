@@ -38,10 +38,40 @@ pub(crate) enum LeafOutcome {
 /// 변경 없음을 스킵하는데, `0.5000001`과 `0.4999998`이 매번 다른 JSON이 되면
 /// 그 스킵이 무력해져 사용자가 아무것도 안 해도 디스크 쓰기가 계속 난다.
 pub(crate) fn quantize_ratio(ratio: f32) -> f32 {
+    // **비유한 값은 여기서 끝낸다 — 이것이 데이터 파일 전체를 날리는 경로다.**
+    //
+    // `serde_json`은 비유한 float을 `null`로 쓰고, `null`은 `f32`로 **역직렬화되지
+    // 않는다.** 그러면 우리가 쓴 파일을 우리가 다시 못 읽고, `parse_trusted`가
+    // 문서 전체를 거절하므로 repo·worktree 메타데이터·설정이 **같이** 사라진다.
+    // 게다가 저장할 때마다 백업이 회전하므로 몇 시간이면 백업 슬롯 다섯 개가
+    // 전부 그 손상된 파일로 덮인다.
+    //
+    // **손상된 파일이 없어도 도달한다**: iced가
+    // `(position / rectangle.height).clamp(0.0, 1.0)`으로 비율을 만드는데
+    // (`iced_widget-0.14.2/src/pane_grid.rs:656-670`), 높이 0짜리 분할 영역에
+    // 커서가 경계에 있으면 `0.0/0.0` = NaN이고 **Rust의 `f32::clamp`는 NaN을
+    // 그대로 돌려준다.** 실측으로 `"ratio":null` → 재파싱 실패까지 확인했다.
+    //
+    // 이 크레이트는 이미 같은 방어를 한다(`terminal/state.rs`, `terminal/mouse.rs`) —
+    // 이 파일만 예외였다.
+    if !ratio.is_finite() {
+        return 0.5;
+    }
+    let ratio = ratio.clamp(0.0, 1.0);
     if (ratio - 0.5).abs() <= 0.005 {
         0.5
     } else {
         (ratio * 1000.0).round() / 1000.0
+    }
+}
+
+/// 복원 시 읽어 들이는 비율의 방어. 저장 경로가 막혀도 **이미 디스크에 있는**
+/// 파일이나 손으로 편집한 파일이 비유한 값을 담고 있을 수 있다.
+fn safe_ratio(ratio: f32) -> f32 {
+    if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
     }
 }
 
@@ -134,7 +164,9 @@ pub(crate) fn to_configuration(
             let b = to_configuration(b, outcomes, seen);
             collapse(a, b, |a, b| Configuration::Split {
                 axis: grid_axis(*axis),
-                ratio: *ratio,
+                // 디스크의 값을 그대로 믿지 않는다 — 손상·수동 편집으로 비유한
+                // 값이 들어 있으면 pane_grid의 레이아웃 계산이 NaN으로 오염된다.
+                ratio: safe_ratio(*ratio),
                 a: Box::new(a),
                 b: Box::new(b),
             })
@@ -151,6 +183,28 @@ fn collapse<T>(a: Option<T>, b: Option<T>, split: impl FnOnce(T, T) -> T) -> Opt
         (Some(x), None) | (None, Some(x)) => Some(x),
         // 서브트리 전체 소멸.
         (None, None) => None,
+    }
+}
+
+/// 저장된 트리에서 잎 하나를 지운다. [`collapse`]와 **같은 규칙**으로 접히므로
+/// 형제 승격과 빈 서브트리 소멸이 복원 경로와 일치한다.
+///
+/// **쓰이는 곳이 하나뿐이라는 것이 중요하다**: 권위 있는 목록이 worktree의
+/// 소멸을 확인했을 때. 세션 시작 실패로는 부르지 않는다 — 그것은 일시적
+/// 실패이지 사라졌다는 증거가 아니다.
+pub(crate) fn without_leaf(node: &PersistedPane, gone: &WorktreeId) -> Option<PersistedPane> {
+    match node {
+        PersistedPane::Leaf(worktree) => (worktree != gone).then(|| node.clone()),
+        PersistedPane::Split { axis, ratio, a, b } => {
+            let a = without_leaf(a, gone);
+            let b = without_leaf(b, gone);
+            collapse(a, b, |a, b| PersistedPane::Split {
+                axis: *axis,
+                ratio: *ratio,
+                a: Box::new(a),
+                b: Box::new(b),
+            })
+        }
     }
 }
 
@@ -469,6 +523,69 @@ mod tests {
     }
 
     // ---- ratio 양자화 ----
+
+    /// **비유한 비율은 데이터 파일 전체를 파괴한다.** `serde_json`은 그것을
+    /// `null`로 쓰고, `null`은 `f32`로 역직렬화되지 않는다 — 우리가 쓴 파일을
+    /// 우리가 못 읽고, 문서 전체가 거절되므로 repo·설정까지 같이 사라진다.
+    ///
+    /// **손상된 파일 없이도 도달한다**: iced가 높이 0인 분할에서
+    /// `(0.0/0.0).clamp(0.0,1.0)`을 만들고 `f32::clamp`는 NaN을 통과시킨다.
+    #[test]
+    fn a_non_finite_ratio_never_reaches_the_serializer() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0 / 0.0] {
+            let q = quantize_ratio(bad);
+            assert!(
+                q.is_finite(),
+                "quantize_ratio({bad}) produced {q}, which serde_json writes as null and \
+                 then refuses to read back — that loses the entire data file, not just \
+                 the layout"
+            );
+            assert!((0.0..=1.0).contains(&q), "and it must be a legal ratio");
+        }
+    }
+
+    /// 파괴 사슬 전체를 **실제 직렬화로** 고정한다. 위 단언은 `is_finite`만 보므로
+    /// serde의 동작이 바뀌면 조용히 무의미해질 수 있다.
+    #[test]
+    fn a_tree_built_from_a_nan_resize_still_round_trips_through_json() {
+        let tree = PersistedPane::Split {
+            axis: PersistedAxis::Vertical,
+            ratio: quantize_ratio(0.0 / 0.0),
+            a: Box::new(leaf("a")),
+            b: Box::new(leaf("b")),
+        };
+        let json = serde_json::to_string(&tree).expect("serializes");
+        assert!(
+            !json.contains("null"),
+            "a null ratio is what makes the file unreadable; got {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PersistedPane>(&json).expect("must reparse"),
+            tree,
+            "the file we write must be a file we can read back"
+        );
+    }
+
+    /// 디스크에 **이미** 비유한 값이 있는 경우(손으로 편집했거나 이 수정 이전
+    /// 빌드가 썼거나). 복원이 그걸 그대로 pane_grid에 넣으면 레이아웃 계산이
+    /// NaN으로 오염된다.
+    #[test]
+    fn a_non_finite_ratio_read_from_disk_is_repaired_on_restore() {
+        let tree = PersistedPane::Split {
+            axis: PersistedAxis::Vertical,
+            ratio: f32::NAN,
+            a: Box::new(leaf("a")),
+            b: Box::new(leaf("b")),
+        };
+        let config = build(&tree, &started(&["a", "b"])).expect("both started");
+        match config {
+            Configuration::Split { ratio, .. } => assert!(
+                ratio.is_finite(),
+                "a corrupt ratio on disk must be repaired, not fed into pane_grid"
+            ),
+            Configuration::Pane(_) => panic!("expected a split"),
+        }
+    }
 
     #[test]
     fn ratios_near_the_middle_snap_to_exactly_one_half() {

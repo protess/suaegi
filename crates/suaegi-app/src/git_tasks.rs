@@ -145,12 +145,37 @@ pub fn list_worktrees(request: OpId, repo: Repo) -> Task<Message> {
         Message::WorktreesListed {
             request,
             repo_id,
-            result: match result {
-                Ok(entries) => WorktreeListing::Authoritative(entries),
-                Err(err) => WorktreeListing::Degraded(err),
-            },
+            result: listing_from(result),
         }
     })
+}
+
+/// git 결과 → [`WorktreeListing`]. **이 크레이트에서 `Authoritative`가 만들어지는
+/// 유일한 지점**이라 순수 함수로 뽑아 직접 검사한다.
+pub fn listing_from(result: Result<Vec<WorktreeEntry>, String>) -> WorktreeListing {
+    #[allow(clippy::let_and_return)]
+    let listing = match result {
+        // **빈 목록은 증거가 아니다.** `git worktree list`는 유효한
+        // 저장소에서 **항상 최소한 main 체크아웃 하나**를 낸다. 따라서
+        // 0개는 "전부 지워졌다"가 아니라 "porcelain을 못 읽었다"는 뜻이다 —
+        // `list_worktrees`의 파서는 `worktree ` 접두사에만 append하고
+        // "아무것도 파싱하지 못했다" 가지가 없어서, exit 0인 낯선 출력이
+        // 그대로 `Ok(vec![])`이 된다.
+        //
+        // 그걸 `Authoritative`로 올리면 모든 worktree가 사라진 것으로
+        // 판정돼 세션과 pane이 전부 닫히고, 그 상태가 곧바로 저장된다 —
+        // **성공했지만 이해하지 못한 스캔 한 번이 복원된 레이아웃을
+        // 지운다.** exit 코드가 0이라는 것과 결과를 신뢰할 수 있다는 것은
+        // 다른 문장이다.
+        Ok(entries) if entries.is_empty() => WorktreeListing::Degraded(
+            "git worktree list returned no entries; a valid repository always \
+                     lists at least its main worktree, so this scan is not trustworthy"
+                .to_string(),
+        ),
+        Ok(entries) => WorktreeListing::Authoritative(entries),
+        Err(err) => WorktreeListing::Degraded(err),
+    };
+    listing
 }
 
 pub fn create_worktree(
@@ -225,4 +250,44 @@ pub fn remove_worktree(
             result,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str) -> WorktreeEntry {
+        WorktreeEntry {
+            path: PathBuf::from(path),
+            branch: Some("b".to_string()),
+            head: None,
+            is_main: false,
+        }
+    }
+
+    /// **exit 0이라는 것과 결과를 믿을 수 있다는 것은 다른 문장이다.**
+    /// `list_worktrees`의 porcelain 파서는 "아무것도 파싱하지 못했다" 가지가
+    /// 없어서 낯선 성공 출력이 그대로 `Ok(vec![])`이 된다. 그것을 권위로 올리면
+    /// 세션과 pane이 전부 닫히고 그 상태가 저장된다.
+    #[test]
+    fn an_empty_successful_listing_is_not_treated_as_authoritative() {
+        assert!(
+            matches!(listing_from(Ok(Vec::new())), WorktreeListing::Degraded(_)),
+            "a valid repository always lists at least its main worktree, so zero entries \
+             means the scan was not understood — never that everything was deleted"
+        );
+    }
+
+    #[test]
+    fn a_real_listing_and_a_real_failure_are_classified_as_before() {
+        // 대조군: 진짜 목록은 여전히 권위다.
+        match listing_from(Ok(vec![entry("/tmp/wt")])) {
+            WorktreeListing::Authoritative(entries) => assert_eq!(entries.len(), 1),
+            WorktreeListing::Degraded(e) => panic!("a real listing must stay authoritative: {e}"),
+        }
+        match listing_from(Err("git exploded".to_string())) {
+            WorktreeListing::Degraded(e) => assert_eq!(e, "git exploded"),
+            WorktreeListing::Authoritative(_) => panic!("a failure must never be authoritative"),
+        }
+    }
 }

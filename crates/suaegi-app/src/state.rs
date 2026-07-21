@@ -18,11 +18,12 @@ use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::{CopyTargets, WriteOutcome};
 use suaegi_term::presence::AgentPresence;
 
+use crate::agent_status::server::HookServer;
 use crate::agent_status::contract::{
     hook_outcome, reduce, BadgeInput, BadgeState, HookEvent, HookOutcome, HookState, Hydration,
-    HydrationStep, PaneKey, SpawnNonce, LAYOUT_SAVE_DEBOUNCE,
+    HydrationStep, PaneKey, SpawnNonce, LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
 };
-use crate::layout::{leaves_in_order, to_configuration, to_persisted, LeafOutcome};
+use crate::layout::{leaves_in_order, to_configuration, to_persisted, without_leaf, LeafOutcome};
 use crate::persistence_thread::{
     LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
 };
@@ -297,6 +298,11 @@ pub enum Message {
     LayoutPersistDue {
         generation: u64,
     },
+    /// 복원 워치독의 만료. 결과가 영영 오지 않는 잎이 하이드레이션 게이트를
+    /// 영구히 닫아두는 것을 막는다.
+    RestoreWatchdog {
+        generation: u64,
+    },
 }
 
 pub struct AppState {
@@ -390,6 +396,22 @@ pub struct AppState {
     /// worktree별 생성 메타데이터(Task 6). `persisted_snapshot`이 자리표시자
     /// 대신 읽는다.
     worktree_meta: HashMap<WorktreeId, WorktreeMeta>,
+    /// **디스크에서 읽은 원본 레이아웃. 저하된 복원이 이것을 덮지 못하게 한다.**
+    ///
+    /// 세션 시작 실패는 **일시적**이다(PTY 스폰 실패, 부팅 중 자원 경합). 그런데
+    /// 실패한 잎은 살아 있는 트리에서 접혀 사라지고, 게이트가 열리는 순간 그
+    /// 접힌 모양이 디스크에 저장된다 — **한 번의 스폰 실패가 멀쩡한 pane을
+    /// 영구히 지운다.** 분할의 양쪽이 다 실패하면 저장된 레이아웃 전체가 빈
+    /// 값으로 덮인다.
+    ///
+    /// 그래서 `Some`인 동안 `persisted_snapshot`은 **살아 있는 트리가 아니라
+    /// 이것을** 쓴다. 두 가지만 이 보존을 끝낸다:
+    /// - **사용자가 레이아웃을 편집하면** `None`이 된다(그때부터 화면이 진실이다).
+    /// - **권위 있는 목록이 worktree의 소멸을 확인하면** 그 잎만 지운다.
+    ///
+    /// 게이트를 저하된 완료에서도 여는 것은 옳지만, **저하된 재구성을 저장하는
+    /// 것은 옳지 않다** — 이 필드가 그 둘을 가른다.
+    preserved_layout: Option<PersistedPane>,
     // ---- Plan 5 Task 3: 에이전트 상태 배지 ----
     /// worktree(= `PaneKey`)별 배지 장부. `reduce`의 입력 중 훅에서 오는 절반을
     /// 여기 모으고, 나머지 절반(presence)은 `session_store`에서 읽는다.
@@ -397,8 +419,15 @@ pub struct AppState {
     /// 훅 서버의 포트·토큰. `None`이면 서버가 안 떴다는 뜻이고, 그때는 **배지 없이
     /// 계속 간다** — 훅은 편의 기능이지 세션의 전제가 아니다.
     hook_endpoint: Option<(u16, String)>,
+    /// 서버 핸들. **앱이 소유해야 한다** — 떨구면 포트가 닫히고, 버린 이벤트
+    /// 카운터를 읽을 곳도 여기뿐이다.
+    hook_server: Option<HookServer>,
+    /// 마지막으로 반영한 `dropped()` 값. 늘어났으면 배지를 무효화한다.
+    hook_drops_seen: u64,
     /// 훅 스크립트의 설치 경로. 부팅 시 한 번 설치하고 worktree 설정이 이걸 가리킨다.
     hook_script: Option<PathBuf>,
+    /// 복원 시도의 세대. 워치독 대조에 쓴다.
+    restore_generation: u64,
     /// 레이아웃 저장 디바운스의 세대. 리사이즈 메시지마다 올리고, 타이머가
     /// 터졌을 때 값이 그대로면 그때 저장한다.
     ///
@@ -444,6 +473,9 @@ impl PaneBadge {
 /// 진행 중인 복원의 장부. 잎마다 종단 결과가 하나씩 모이고, `pending`이 비면
 /// 트리를 짓는다.
 struct LayoutRestore {
+    /// 이 복원 시도의 세대. 워치독이 **자기가 걸린 그 복원**만 끝내도록 한다 —
+    /// 늦게 도착한 워치독이 그 사이 시작된 새 복원을 잘라버리면 안 된다.
+    generation: u64,
     tree: PersistedPane,
     /// 아직 종단 결과가 오지 않은 잎 → 그 잎을 위해 발급한 세션 id.
     pending: HashMap<WorktreeId, SessionId>,
@@ -482,7 +514,11 @@ impl Default for AppState {
             badges: HashMap::new(),
             // 서버 없이도 앱은 완전히 동작한다 — 배지만 `Unknown`에 머문다.
             hook_endpoint: None,
+            hook_server: None,
+            hook_drops_seen: 0,
             hook_script: None,
+            preserved_layout: None,
+            restore_generation: 0,
             hydration: Hydration::opened(),
             pending_restore_tree: None,
             restore: None,
@@ -511,11 +547,17 @@ impl AppState {
     /// (2) 저장 결과 채널(`results`)을 `Message::Saved`로 흘려보내 상태
     /// 표시줄이 실제로 반응하게 한다 — 이 배선이 없으면 `Message::Saved`는
     /// 영영 도착하지 않는 메시지로 남는다.
-    pub fn boot() -> (AppState, iced::Task<Message>) {
+    /// `hook_server`는 **`begin_layout_restore()`보다 먼저** 자리를 잡아야 한다.
+    /// 복원이 시작하는 세션도 `start_session_for`를 지나며 그 자리에서 `SUAEGI_*`
+    /// env를 심기 때문이다 — 나중에 붙이면 재시작 직후의 모든 pane이 훅 없이
+    /// 떠서 배지가 영원히 `Unknown`이다. 그래서 `run()`이 붙여주는 것이 아니라
+    /// **인자로 받는다**: 순서를 호출부의 규율이 아니라 타입으로 강제한다.
+    pub fn boot(hook_server: Option<HookServer>) -> (AppState, iced::Task<Message>) {
         let boot = PersistenceHandle::spawn(crate::persistence_thread::default_data_file());
         let mut state = AppState::from_load(boot.load);
         state.persistence = Some(boot.handle);
         state.install_hooks();
+        state.attach_hook_server(hook_server);
 
         let repo_ids: Vec<RepoId> = state.repos.iter().map(|repo| repo.id.clone()).collect();
         // **여기서 게이트를 닫는다.** 이 줄 이후 `persist()`는 부팅이 끝날
@@ -635,8 +677,21 @@ impl AppState {
     /// 지금 화면의 pane 트리를 저장 가능한 모양으로. 세션이 하나도 없으면
     /// `None`이다.
     fn persisted_layout(&self) -> Option<PersistedPane> {
+        // 복원이 저하됐고 사용자가 아직 레이아웃을 건드리지 않았다면, 디스크에
+        // 남길 진실은 화면이 아니라 **원본**이다(위 `preserved_layout` 참고).
+        if let Some(preserved) = &self.preserved_layout {
+            return Some(preserved.clone());
+        }
         let panes = self.panes.as_ref()?;
         to_persisted(panes.layout(), panes, &self.session_worktrees)
+    }
+
+    /// 사용자가 레이아웃을 바꿨다 — 이제부터 화면이 진실이다.
+    ///
+    /// **권위 있는 소멸 정리에서는 부르지 않는다.** 그건 사용자의 편집이 아니라
+    /// 외부 사실이고, 그 경우엔 보존된 트리에서 해당 잎만 지운다.
+    fn note_user_layout_edit(&mut self) {
+        self.preserved_layout = None;
     }
 
     /// 영속화 대상 상태(repo/worktree/선택/레이아웃)가 바뀌었을 때 부른다.
@@ -685,7 +740,10 @@ impl AppState {
             return iced::Task::none();
         };
 
+        self.restore_generation += 1;
+        let generation = self.restore_generation;
         let mut restore = LayoutRestore {
+            generation,
             pending: HashMap::new(),
             outcomes: HashMap::new(),
             tree,
@@ -724,7 +782,45 @@ impl AppState {
         }
 
         self.restore = Some(restore);
+        // **결과가 영영 오지 않는 잎에 대한 유일한 방어.**
+        // `SessionStore::start`는 워커 스레드에서 `try_send`로 결과를 보내는데,
+        // `TerminalSession::start`가 **패닉하면** 그 스레드가 죽고 메시지는
+        // 영영 오지 않는다. 그러면 그 잎이 `pending`에 남아 `finish_restore`가
+        // 돌지 않고, 하이드레이션 게이트가 **프로세스가 끝날 때까지** 닫힌 채라
+        // 사용자의 모든 조작이 저장되지 않는다 — 조용히.
+        //
+        // "저하된 완료도 완료다"를 **도착하지 않는 결과까지** 확장한 것이다.
+        tasks.push(iced::Task::future(async move {
+            tokio::time::sleep(RESTORE_WATCHDOG).await;
+            Message::RestoreWatchdog { generation }
+        }));
         iced::Task::batch(tasks)
+    }
+
+    /// 워치독 만료. 아직 그 세대의 복원이 진행 중이면 남은 잎을 전부 실패로
+    /// 확정하고 트리를 짓는다.
+    fn expire_restore(&mut self, generation: u64) {
+        let stale = self
+            .restore
+            .as_ref()
+            .is_none_or(|restore| restore.generation != generation);
+        if stale {
+            // 이미 정상적으로 끝났거나 다른 세대의 복원이 돌고 있다.
+            return;
+        }
+        let restore = self.restore.take();
+        if let Some(mut restore) = restore {
+            let stranded: Vec<WorktreeId> = restore.pending.keys().cloned().collect();
+            for worktree_id in stranded {
+                restore.pending.remove(&worktree_id);
+                restore.outcomes.insert(worktree_id, LeafOutcome::Failed);
+            }
+            eprintln!(
+                "suaegi: layout restore timed out; {} leaf/leaves never reported",
+                restore.outcomes.len()
+            );
+            self.finish_restore(Some(restore));
+        }
     }
 
     /// 잎 하나의 종단 결과를 장부에 적고, 마지막 하나였으면 트리를 짓는다.
@@ -755,6 +851,10 @@ impl AppState {
     fn finish_restore(&mut self, restore: Option<LayoutRestore>) {
         self.restore = None;
         let config = restore.and_then(|restore| {
+            // **원본을 보존한다.** 아래에서 짓는 트리는 실패한 잎이 접힌 저하된
+            // 모양이고, 게이트가 곧 열리며 저장이 풀린다 — 보존하지 않으면 그
+            // 저하된 모양이 디스크의 멀쩡한 레이아웃을 덮는다.
+            self.preserved_layout = Some(restore.tree.clone());
             to_configuration(&restore.tree, &restore.outcomes, &mut HashSet::new())
         });
 
@@ -811,6 +911,12 @@ impl AppState {
             created_with_agent: created.created_with_agent,
             created_at_unix_ms: created.created_at_unix_ms,
         };
+        // **세션을 띄울 때마다 주입한다.** 생성 시점에만 쓰면 이 기능보다 **먼저
+        // 만들어진 worktree**는 설정 파일을 영영 못 받고, 파일이 지워진 경우도
+        // 복구되지 않는다 — 그러면 그 pane의 배지는 영구히 `Unknown`이다.
+        // 멱등하고 파일 하나짜리 쓰기이므로 매번 해도 싸다.
+        self.inject_into_worktree(&entry.path);
+
         // **스폰마다 새 nonce를 발급하고 배지를 리셋한다.** 같은 worktree의 옛
         // 세션이 남긴 훅이 새 세션의 배지를 덮지 못하게 하는 지점이 여기다 —
         // 이 값을 env로 심고, 되돌아온 이벤트의 nonce가 다르면 버린다.
@@ -899,6 +1005,15 @@ impl AppState {
         for id in &vanished {
             // 사라진 worktree의 메타데이터를 남겨두면 맵이 앱 수명 내내 자란다.
             self.worktree_meta.remove(id);
+            // 세션이 없던 worktree라면 `close_session`이 지나가지 않으므로
+            // 여기서도 지운다 — 안 그러면 맵이 앱 수명 내내 자란다.
+            self.badges.remove(id);
+            // **소멸이 확인된 잎만** 보존된 레이아웃에서 지운다. 이것이 저장된
+            // 트리에서 잎을 자동으로 없앨 수 있는 **유일한** 경로다 — 시작
+            // 실패는 증거가 아니다.
+            if let Some(preserved) = &self.preserved_layout {
+                self.preserved_layout = without_leaf(preserved, id);
+            }
         }
         for session_id in vanished_sessions {
             self.close_session(session_id);
@@ -1005,19 +1120,71 @@ impl AppState {
     /// 공용 git 디렉터리에 살아서, 여기서 쓰면 사용자의 저장소 **전체**에 영구적인
     /// 무시 규칙이 생기고 `git worktree remove` 뒤에도 남는다. 우리가 만든
     /// `.claude/`를 diff에서 빼는 일은 diff 패널이 자기 수집 단계에서 한다.
+    /// 이 worktree를 **suaegi가 만들었는가.** `workspace_root` 아래 있으면
+    /// 우리 것이다.
+    ///
+    /// 밖에서 발견된 worktree(사용자가 직접 만든 것, 다른 도구가 만든 것)에는
+    /// **쓰지 않는다** — 우리 소유가 아닌 디렉터리에 우리 파일을 남기는 일이다.
+    /// 그 대가는 그런 worktree의 배지가 `Unknown`에 머무는 것이고, 그쪽이 옳다.
+    fn is_suaegi_worktree(&self, path: &Path) -> bool {
+        path.starts_with(&self.workspace_root)
+    }
+
     fn inject_into_worktree(&self, worktree_path: &Path) {
         let Some(script) = &self.hook_script else {
             return;
         };
+        if !self.is_suaegi_worktree(worktree_path) {
+            return;
+        }
         if let Err(e) = crate::agent_status::inject::write_worktree_settings(worktree_path, script) {
             eprintln!("suaegi: could not write hook settings into the worktree: {e}");
         }
     }
 
-    /// 훅 서버가 뜬 뒤 그 좌표를 심는다. `run()`이 `boot()`보다 **먼저** 서버를
-    /// 띄우므로(세션 스폰이 포트를 알아야 한다) 별도 진입점으로 둔다.
-    pub fn attach_hook_server(&mut self, port: u16, token: String) {
-        self.hook_endpoint = Some((port, token));
+    /// 서버 핸들을 넘겨받는다. **앱이 서버를 소유해야 하는 이유가 둘이다**:
+    /// 떨구면 포트가 닫히고, 버린 이벤트 카운터(`dropped()`)를 읽을 곳이
+    /// 필요하다.
+    fn attach_hook_server(&mut self, server: Option<HookServer>) {
+        if let Some(server) = server {
+            self.hook_endpoint = Some((server.port(), server.token().to_string()));
+            self.hook_server = Some(server);
+        }
+    }
+
+    /// 훅 이벤트가 버려졌는지 확인하고, 버려졌으면 **모든 pane의 훅 상태를
+    /// 무효화한다.**
+    ///
+    /// 큐가 가득 차면 정책상 **새 이벤트가 버려진다**(drop-newest). 버려진 것이
+    /// 마지막 `PermissionRequest`나 `Stop`이면 그 배지는 **영원히 틀린 채로
+    /// 남는다** — 폴링은 계속 `Agent`를 보고, 잃어버린 `Waiting`은 재구성할 수
+    /// 없으며, 후속 훅이 아예 없을 수도 있다. "다음 이벤트가 곧 고친다"는
+    /// 항상 참이 아니다.
+    ///
+    /// **어느 pane의 이벤트가 버려졌는지는 알 수 없으므로**(버린 쪽은 pane을
+    /// 모른다) 전부 `Unknown`으로 되돌린다. 틀린 상태를 자신 있게 보여주는 것보다
+    /// "모른다"가 정직하다.
+    fn note_hook_drops(&mut self) {
+        let Some(server) = &self.hook_server else {
+            return;
+        };
+        // 카운터 읽기와 판단을 나눈다 — 판단 쪽만 테스트에서 직접 구동할 수
+        // 있어야 한다(채널을 실제로 넘치게 하려면 HTTP 요청 수백 개가 든다).
+        let dropped = server.dropped();
+        self.apply_hook_drops(dropped);
+    }
+
+    fn apply_hook_drops(&mut self, dropped: u64) {
+        if dropped <= self.hook_drops_seen {
+            return;
+        }
+        self.hook_drops_seen = dropped;
+        for badge in self.badges.values_mut() {
+            badge.hook = None;
+        }
+        self.last_error = Some(format!(
+            "hook events were dropped ({dropped} total); agent badges reset to unknown"
+        ));
     }
 
     /// worktree 하나의 배지. 훅(장부)과 폴링(세션 스토어)을 `reduce`로 합성한다 —
@@ -1051,6 +1218,8 @@ impl AppState {
     /// 새 세션의 배지를 덮는 것을 막는 유일한 방어다.
     fn apply_hook(&mut self, event: &HookEvent) {
         let worktree_id = &event.pane_key.0;
+        // presence를 **먼저** 읽는다(아래에서 `badges`를 가변 대여하므로).
+        let presence = self.worktree_presence(worktree_id);
         let Some(badge) = self.badges.get_mut(worktree_id) else {
             // 우리가 스폰한 적 없는 pane의 이벤트다.
             return;
@@ -1063,6 +1232,22 @@ impl AppState {
             HookOutcome::Ignore => {}
             HookOutcome::Reset => badge.hook = None,
             HookOutcome::Set(state) => badge.hook = Some((state, Instant::now())),
+        }
+        // **훅이 바뀌면 "유지할 값"도 같이 갱신한다.**
+        //
+        // `previous`는 확정되지 않은 `NoAgent` 구간에서 리듀서가 드는 값이다.
+        // 폴링에서만 갱신하면 **폴 사이에 도착한 훅이 반영되지 않아**, 훅 직후
+        // `NoAgent`가 한 번 오면 한 틱 낡은 값을 든다 — 일하는 중인 pane이
+        // 잠깐 `Unknown`으로 보인다. 훅과 폴링은 같은 배지의 두 입력이므로
+        // 어느 쪽이 움직이든 갱신돼야 한다.
+        if !matches!(presence, AgentPresence::NoAgent) {
+            badge.previous = reduce(&BadgeInput {
+                presence,
+                hook: badge.hook,
+                previous: badge.previous,
+                no_agent_streak: badge.no_agent_streak,
+                now: Instant::now(),
+            });
         }
     }
 
@@ -1286,6 +1471,15 @@ impl AppState {
         self.session_store.close(id);
         if let Some(worktree_id) = self.session_worktrees.remove(&id) {
             self.worktree_sessions.remove(&worktree_id);
+            // **배지 장부도 같이 간다.** 남겨두면 세션이 사라진 뒤에도 마지막
+            // 훅 상태가 살아 있는데, presence는 세션이 없으므로 `Unknown`으로
+            // 떨어지고 — 리듀서의 `Unknown` 팔은 훅을 그대로 신뢰한다. 마지막
+            // 훅이 `Waiting`이었다면 **`Waiting`은 나이로 감쇠하지 않으므로**
+            // 사이드바 행(git 목록으로 그려지므로 세션과 무관하게 살아남는다)에
+            // 주황색 "사람을 기다림" 표시가 영구히 박힌다.
+            // 지우면 `worktree_badge`가 `None` 가지를 타 `Unknown`이 된다 —
+            // 세션이 없을 때 정직한 답이다. 맵이 무한히 자라는 것도 같이 막는다.
+            self.badges.remove(&worktree_id);
             // **복원 중이라면 이 잎의 결과를 되물러야 한다.** 복원이 끝나기
             // 전에 worktree가 밖에서 지워지면(권위 있는 재조회가 그걸 본다)
             // 이미 `Started`로 적힌 잎이 죽은 세션을 가리키게 되고, 그대로
@@ -1761,6 +1955,8 @@ impl AppState {
                                         LeafOutcome::Started(id),
                                     );
                                 } else {
+                                    // 복원 밖에서 열린 pane = 사용자의 편집이다.
+                                    self.note_user_layout_edit();
                                     self.open_pane_for_session(id);
                                     self.persist();
                                 }
@@ -1823,6 +2019,7 @@ impl AppState {
                 if let Some(panes) = &mut self.panes {
                     panes.drop(pane, target);
                 }
+                self.note_user_layout_edit();
                 // 드롭은 트리를 바꾼다. 플랜의 트리거 목록에는 없지만 "pane
                 // 열기/닫기"와 같은 종류의 변경이고, 저장하지 않으면 사용자가
                 // 옮겨놓은 배치가 재시작에 사라진다.
@@ -1831,9 +2028,19 @@ impl AppState {
             }
             Message::PaneDragged(_) => iced::Task::none(),
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                // **비유한 비율을 pane_grid에 넣지 않는다.** iced가 0 높이 분할에서
+                // `0.0/0.0`을 만들 수 있고 `f32::clamp`는 NaN을 통과시킨다.
+                // 저장 경로(`quantize_ratio`)가 이미 막지만, 오염된 값을 살아 있는
+                // 레이아웃에 먼저 들이면 그 프레임의 계산이 전부 NaN이 된다.
+                let ratio = if ratio.is_finite() {
+                    ratio.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
                 if let Some(panes) = &mut self.panes {
                     panes.resize(split, ratio);
                 }
+                self.note_user_layout_edit();
                 // **곧바로 저장하지 않는다** — 드래그 한 번에 이 메시지가 수십 번
                 // 온다. 디바운스의 이유는 `schedule_layout_save` 참고.
                 self.schedule_layout_save()
@@ -1842,6 +2049,8 @@ impl AppState {
                 // pane 자체를 지우는 것도 `close_session`이 한다 — 대화형/비대화형
                 // 경로가 갈라져서 pane이 새던 것이 이 수렴의 이유다.
                 if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
+                    // 사용자가 직접 닫았다 — 이제 화면이 진실이다.
+                    self.note_user_layout_edit();
                     self.close_session(session_id);
                     self.persist();
                 }
@@ -1858,6 +2067,8 @@ impl AppState {
                 iced::Task::none()
             }
             Message::PresenceTick => {
+                // 이 틱이 앱에서 가장 규칙적으로 도는 지점이라 여기서 확인한다.
+                self.note_hook_drops();
                 let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
                 task
             }
@@ -1923,6 +2134,10 @@ impl AppState {
                 self.note_hydration(step);
                 iced::Task::none()
             }
+            Message::RestoreWatchdog { generation } => {
+                self.expire_restore(generation);
+                iced::Task::none()
+            }
             Message::LayoutPersistDue { generation } => {
                 // **최신 세대만 저장한다.** 드래그 중에 걸린 앞선 타이머들이
                 // 여기서 전부 걸러진다. 세대가 그대로라는 것은 이 타이머가 걸린
@@ -1972,7 +2187,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use suaegi_core::domain::PersistedAxis;
-    use crate::agent_status::contract::{HookEventName, NO_AGENT_CONFIRMATIONS};
+    use crate::agent_status::contract::{HookEventName, HOOK_STALE_AFTER, NO_AGENT_CONFIRMATIONS};
 
     fn entry(name: &str) -> WorktreeEntry {
         WorktreeEntry {
@@ -3245,6 +3460,278 @@ mod tests {
         );
     }
 
+    // ---- 저하된 복원이 디스크의 좋은 레이아웃을 덮지 않는가 ----
+    //
+    // **기존 복원 테스트는 전부 이걸 못 잡는다.** 메모리상의 접힌 모양과
+    // 게이트가 열리는 것만 단언하고, 영속화를 붙여 저장을 일으킨 뒤 파일을
+    // 다시 읽지 않기 때문이다 — 즉 이름이 가리키는 바로 그 성질을 검사하지
+    // 않는다. 아래 둘이 그 공백을 메운다.
+
+    /// 저장된 레이아웃을 디스크에 심고 복원을 시작한다. `restoring_state`와 달리
+    /// **영속화가 배선돼 있어** 게이트가 열릴 때 실제로 저장이 일어난다.
+    fn restoring_state_with_disk(
+        file: &Path,
+        tree: PersistedPane,
+        listed: &[&str],
+    ) -> AppState {
+        let mut disk = PersistedState::default();
+        disk.session.panes = Some(tree.clone());
+        {
+            let mut store = suaegi_core::persistence::Store::new(file.to_path_buf());
+            store.save(&disk).expect("seeding the good file must succeed");
+        }
+
+        let mut state = restoring_state(tree, listed);
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.to_path_buf());
+        state.persistence = Some(boot.handle);
+        state
+    }
+
+    /// **일시적인 시작 실패가 저장된 pane을 영구히 지우면 안 된다.**
+    /// PTY 스폰 실패는 흔하고 되돌릴 수 있는 일이다 — 다음 실행에서 성공할 수도
+    /// 있는 것을 디스크에서 없애버리면 사용자는 되찾을 방법이 없다.
+    #[test]
+    fn a_transient_start_failure_does_not_erase_the_saved_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let saved = split(
+            PersistedAxis::Vertical,
+            0.25,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state =
+            restoring_state_with_disk(&file, saved.clone(), &["/tmp/wt-a", "/tmp/wt-b"]);
+
+        deliver_start(&mut state, "/tmp/wt-a", false); // 일시적 실패
+        deliver_start(&mut state, "/tmp/wt-b", true);
+
+        // 화면은 저하된다 — 그건 옳다.
+        assert_eq!(
+            restored_shape(&state),
+            "wt-b",
+            "precondition: the live layout collapses around the leaf that failed"
+        );
+        assert!(
+            state.hydration.is_open(),
+            "precondition: degraded completion still opens the gate"
+        );
+
+        // **디스크는 저하되면 안 된다.**
+        assert_eq!(
+            flush_and_reload(state, &file).session.panes,
+            Some(saved),
+            "one failed PTY spawn must NOT delete a valid pane from the saved layout — \
+             the user has no way to get it back, and the failure may well be transient"
+        );
+    }
+
+    /// 최악의 경우: 분할의 **양쪽이 다** 실패한다. 저하된 재구성을 저장하면
+    /// 저장된 레이아웃 전체가 빈 값으로 덮인다.
+    #[test]
+    fn a_restore_in_which_everything_fails_does_not_wipe_the_saved_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let saved = split(
+            PersistedAxis::Horizontal,
+            0.6,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state =
+            restoring_state_with_disk(&file, saved.clone(), &["/tmp/wt-a", "/tmp/wt-b"]);
+
+        deliver_start(&mut state, "/tmp/wt-a", false);
+        deliver_start(&mut state, "/tmp/wt-b", false);
+
+        assert_eq!(restored_shape(&state), "-", "precondition: nothing came up");
+        assert!(state.hydration.is_open(), "precondition: the gate still opens");
+
+        assert_eq!(
+            flush_and_reload(state, &file).session.panes,
+            Some(saved),
+            "a boot where every session failed to start must leave the saved layout \
+             untouched — overwriting it with nothing is unrecoverable data loss"
+        );
+    }
+
+    /// **대조군: 사용자가 레이아웃을 편집하면 화면이 진실이 된다.** 보존이 영원히
+    /// 붙어 있으면 사용자가 pane을 닫아도 다시 살아 돌아온다.
+    #[test]
+    fn once_the_user_edits_the_layout_the_live_tree_is_what_gets_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let saved = split(
+            PersistedAxis::Vertical,
+            0.25,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state =
+            restoring_state_with_disk(&file, saved.clone(), &["/tmp/wt-a", "/tmp/wt-b"]);
+        deliver_start(&mut state, "/tmp/wt-a", true);
+        deliver_start(&mut state, "/tmp/wt-b", true);
+
+        // 사용자가 pane 하나를 닫는다.
+        let pane = *state
+            .panes()
+            .expect("two panes")
+            .iter()
+            .find(|(_, id)| state.session_worktrees.get(id) == Some(&wt("/tmp/wt-a")))
+            .map(|(pane, _)| pane)
+            .expect("wt-a has a pane");
+        let _ = state.update(Message::PaneCloseRequested(pane));
+
+        assert_eq!(
+            flush_and_reload(state, &file).session.panes,
+            Some(leaf("/tmp/wt-b")),
+            "control: a deliberate close must reach disk — preservation protects against \
+             degraded restores, not against the user"
+        );
+    }
+
+    /// 복원이 **끝난 뒤에** 일어난 시작 실패도 저장된 레이아웃을 건드리면 안 된다.
+    ///
+    /// 복원 중의 실패는 `preserved_layout`이 아직 `None`이라 구조적으로 안전하지만
+    /// (보존은 모든 잎이 결정된 뒤에 세워진다), 복원이 끝난 뒤 사용자가 연
+    /// worktree의 스폰이 실패하는 창은 **다르다** — 그때는 보존이 살아 있다.
+    /// 규칙은 창과 무관하게 하나다: **시작 실패는 소멸의 증거가 아니다.**
+    #[test]
+    fn a_start_failure_after_the_restore_still_does_not_prune_the_saved_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let saved = split(
+            PersistedAxis::Vertical,
+            0.25,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state =
+            restoring_state_with_disk(&file, saved.clone(), &["/tmp/wt-a", "/tmp/wt-b"]);
+        deliver_start(&mut state, "/tmp/wt-a", true);
+        deliver_start(&mut state, "/tmp/wt-b", true);
+        assert!(
+            state.preserved_layout.is_some(),
+            "precondition: the restore finished and the original is preserved"
+        );
+
+        // 복원 밖에서 세션 하나가 실패한다(사용자가 연 worktree의 스폰 실패).
+        let failed_id = state.session_store.next_id();
+        let _ = state.update(Message::SessionStarted {
+            id: failed_id,
+            worktree_id: wt("/tmp/wt-a"),
+            result: Err("pty spawn failed".to_string()),
+        });
+
+        // **메모리 상태를 직접 본다.** 실패 핸들러 자체는 저장하지 않으므로
+        // 디스크만 보면 손상이 아직 안 보인다 — 그래도 손상은 이미 일어났고,
+        // 다음 사용자 조작이 그것을 디스크로 옮긴다.
+        assert_eq!(
+            state.preserved_layout,
+            Some(saved.clone()),
+            "the failed spawn must not have touched the preserved tree in memory"
+        );
+
+        // 그리고 실제로 다음 저장이 일어나면 원본이 그대로 나가야 한다.
+        state.persist();
+        assert_eq!(
+            flush_and_reload(state, &file).session.panes,
+            Some(saved),
+            "a failed spawn is never evidence that a worktree is gone, whichever window \
+             it happens in — only an authoritative listing may remove a leaf"
+        );
+    }
+
+    /// **권위 있는 소멸만이 저장된 잎을 자동으로 지운다.** 시작 실패와 달리
+    /// 이건 증거다.
+    #[test]
+    fn an_authoritative_disappearance_does_prune_the_preserved_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let saved = split(
+            PersistedAxis::Vertical,
+            0.25,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state =
+            restoring_state_with_disk(&file, saved, &["/tmp/wt-a", "/tmp/wt-b"]);
+        deliver_start(&mut state, "/tmp/wt-a", true);
+        deliver_start(&mut state, "/tmp/wt-b", true);
+
+        // git이 wt-a가 사라졌다고 **권위 있게** 알린다. 헬퍼가 아니라 실제
+        // 메시지를 태운다 — `persist()`는 `update`의 핸들러에 있으므로
+        // 헬퍼로는 저장이 일어나지 않아 이 단언이 무엇도 검사하지 못한다.
+        let repo_id = RepoId("/tmp/restore-repo".into());
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        let _ = state.update(Message::WorktreesListed {
+            request: OpId(2),
+            repo_id,
+            result: WorktreeListing::Authoritative(vec![entry_at("/tmp/wt-b", "wt-b")]),
+        });
+
+        assert_eq!(
+            flush_and_reload(state, &file).session.panes,
+            Some(leaf("/tmp/wt-b")),
+            "a worktree confirmed gone by an authoritative listing IS removed from the \
+             saved layout — otherwise a deleted worktree haunts the layout forever"
+        );
+    }
+
+    /// **실제 경로로** 확인한다: 리사이즈 메시지가 NaN을 나르고, 그것이 저장돼
+    /// 디스크에 닿은 뒤, 그 파일이 **다시 읽히는지**. 순수 함수만 검사하면
+    /// 이 버그의 요점(순수 함수는 멀쩡해 보인다)을 그대로 놓친다.
+    #[test]
+    fn a_nan_resize_does_not_render_the_data_file_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let (mut state, _id, _wt, _pane) = state_with_two_open_sessions_wired(&file);
+        state.upsert_repo(some_repo("survivor"));
+
+        let split_id = *state
+            .panes()
+            .expect("two panes")
+            .layout()
+            .splits()
+            .next()
+            .expect("one split");
+        // iced가 높이 0인 분할 영역에서 실제로 만들어내는 값이다.
+        let _ = state.update(Message::PaneResized(pane_grid::ResizeEvent {
+            split: split_id,
+            ratio: 0.0 / 0.0,
+        }));
+        let _ = state.update(Message::LayoutPersistDue { generation: 1 });
+
+        // **살아 있는 트리도 깨끗해야 한다.** 저장 경로(`quantize_ratio`)가
+        // 어차피 고치므로 디스크만 보면 이 clamp가 없어도 통과한다 — 그러면
+        // 오염된 비율이 그 프레임의 레이아웃 계산에 그대로 들어간다.
+        fn ratios_are_finite(node: &pane_grid::Node) -> bool {
+            match node {
+                pane_grid::Node::Pane(_) => true,
+                pane_grid::Node::Split { ratio, a, b, .. } => {
+                    ratio.is_finite() && ratios_are_finite(a) && ratios_are_finite(b)
+                }
+            }
+        }
+        assert!(
+            ratios_are_finite(state.panes().expect("panes").layout()),
+            "a NaN ratio must never enter the live pane_grid — every layout computation              in that frame becomes NaN"
+        );
+
+        let reloaded = flush_and_reload(state, &file);
+        assert_eq!(
+            reloaded.repos.len(),
+            1,
+            "the whole document must survive — a null ratio makes parse_trusted reject \
+             the file, taking repos, worktree metadata and settings with it, and the \
+             backup rotation then overwrites every slot with the corrupt copy"
+        );
+        assert!(
+            reloaded.session.panes.is_some(),
+            "and the layout itself must still be there"
+        );
+    }
+
     // ---- 하이드레이션 게이트: 저장을 막는가 ----
 
     fn wired_state(file: &Path) -> AppState {
@@ -4104,6 +4591,448 @@ mod tests {
             second > first,
             "a re-spawn must get a NEW nonce ({first:?} -> {second:?}) — reusing it lets the \
              previous process's late hooks drive the new session's badge"
+        );
+    }
+
+    /// 버려진 훅 이벤트가 **틀린 배지를 남긴다.** 버려진 것이 마지막
+    /// `PermissionRequest`나 `Stop`이면 폴링은 계속 `Agent`를 보고, 잃어버린
+    /// `Waiting`은 재구성할 수 없다 — "다음 이벤트가 곧 고친다"는 항상 참이 아니다.
+    #[test]
+    fn dropped_hook_events_invalidate_the_badges_they_may_have_belonged_to() {
+        let mut state = state_with_badge("/tmp/wt-a", 1);
+        state
+            .badges
+            .insert(wt("/tmp/wt-b"), PaneBadge::new(SpawnNonce(1)));
+        for w in ["/tmp/wt-a", "/tmp/wt-b"] {
+            let _ = state.update(Message::HookArrived(hook(
+                w,
+                1,
+                HookEventName::PermissionRequest,
+            )));
+        }
+        assert!(
+            state.badges.values().all(|b| b.hook.is_some()),
+            "precondition: both panes have a hook state"
+        );
+
+        // 드롭이 없으면 아무것도 무효화하지 않는다.
+        state.apply_hook_drops(0);
+        assert!(
+            state.badges.values().all(|b| b.hook.is_some()),
+            "control: with no drops the badges must be left alone"
+        );
+
+        state.apply_hook_drops(3);
+        assert!(
+            state.badges.values().all(|b| b.hook.is_none()),
+            "once events have been dropped we no longer know these badges are right — \
+             the dropping side does not know which pane it dropped, so all of them go to \
+             Unknown. Confidently showing a wrong state is worse than admitting we lost it"
+        );
+        assert!(
+            state.last_error().is_some_and(|e| e.contains("dropped")),
+            "and the loss must be surfaced, not silent"
+        );
+
+        // 같은 값으로 다시 불러도 이미 반영했으므로 재무효화하지 않는다.
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PreToolUse,
+        )));
+        state.apply_hook_drops(3);
+        assert!(
+            state.badges[&wt("/tmp/wt-a")].hook.is_some(),
+            "an already-accounted-for drop count must not keep wiping fresh hook state"
+        );
+    }
+
+    /// **닫힌 pane의 배지가 `Waiting`에 굳으면 안 된다.**
+    ///
+    /// 세션이 사라지면 presence는 `Unknown`으로 떨어지고, 리듀서의 `Unknown` 팔은
+    /// 훅을 그대로 신뢰한다. 마지막 훅이 `Waiting`이었다면 **`Waiting`은 나이로
+    /// 감쇠하지 않으므로** 사이드바 행(git 목록으로 그려져 세션과 무관하게
+    /// 살아남는다)에 주황색 표시가 영구히 박힌다. `Exited` 행은 이걸 못 막는다 —
+    /// presence가 `Exited`로 관측될 일이 아예 없기 때문이다.
+    #[test]
+    fn closing_a_pane_does_not_strand_its_badge_on_waiting() {
+        let (mut state, _id, worktree_id, pane) = state_with_one_open_session();
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(1)));
+        let _ = state.update(Message::HookArrived(HookEvent {
+            pane_key: PaneKey(worktree_id.clone()),
+            spawn_nonce: SpawnNonce(1),
+            claude_session_id: "s".into(),
+            event: HookEventName::PermissionRequest,
+            tool_name: None,
+            agent_id: None,
+            background_tasks_empty: None,
+        }));
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Waiting,
+            "precondition: the badge is Waiting while the session lives"
+        );
+
+        let _ = state.update(Message::PaneCloseRequested(pane));
+
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Unknown,
+            "with the session gone the honest answer is Unknown — leaving Waiting puts a \
+             permanent orange 'needs you' marker on a worktree nobody is working in, and \
+             nothing can ever clear it because Waiting does not decay with age"
+        );
+        assert!(
+            !state.badges.contains_key(&worktree_id),
+            "and the ledger entry must be gone, not merely ignored — otherwise `badges` \
+             grows for the lifetime of the app"
+        );
+    }
+
+    /// **세션이 없는 worktree**의 배지도 정리돼야 한다.
+    ///
+    /// 세션이 있으면 `close_session`이 지우므로 이 경로가 죽어 있어도 티가 나지
+    /// 않는다(mutation으로 확인: 세션이 있는 픽스처에서는 뮤턴트가 살아남았다).
+    /// 세션 없이 배지만 남은 경우가 이 줄이 유일하게 책임지는 상황이다.
+    #[test]
+    fn a_vanished_worktree_with_no_session_still_drops_its_badge_ledger() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/r-prune".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/wt-ghost", "ghost")],
+        );
+        let worktree_id = wt("/tmp/wt-ghost");
+        // 배지만 있고 세션은 없다 — 세션이 이미 닫힌 뒤 목록이 갱신되는 순서다.
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(1)));
+        assert!(
+            !state.worktree_sessions.contains_key(&worktree_id),
+            "precondition: no session, so close_session cannot do the cleanup for us"
+        );
+
+        state.note_list_issued(repo_id.clone(), OpId(2));
+        state.apply_authoritative_listing(repo_id, OpId(2), Vec::new());
+
+        assert!(
+            !state.badges.contains_key(&worktree_id),
+            "the vanish path removes worktree_meta for exactly this reason; badges must \
+             follow or the map grows for the lifetime of the app"
+        );
+    }
+
+    // ---- 복원 워치독: 도착하지 않는 결과 ----
+
+    /// **결과가 영영 오지 않는 잎**(세션 스폰 워커가 패닉하면 그렇게 된다)이
+    /// 하이드레이션 게이트를 프로세스 수명 내내 닫아두면, 사용자의 **모든**
+    /// 조작이 조용히 저장되지 않는다.
+    #[test]
+    fn a_leaf_whose_outcome_never_arrives_cannot_wedge_the_gate_forever() {
+        let tree = split(
+            PersistedAxis::Vertical,
+            0.25,
+            leaf("/tmp/wt-a"),
+            leaf("/tmp/wt-b"),
+        );
+        let mut state = restoring_state(tree, &["/tmp/wt-a", "/tmp/wt-b"]);
+        let generation = state
+            .restore
+            .as_ref()
+            .expect("a restore is in flight")
+            .generation;
+
+        // wt-a만 보고한다. wt-b의 워커는 죽었다고 하자 — 아무것도 오지 않는다.
+        deliver_start(&mut state, "/tmp/wt-a", true);
+        assert!(
+            !state.hydration.is_open(),
+            "precondition: one leaf is still outstanding, so the gate is shut"
+        );
+
+        // 워치독이 만료된다(타이머 자체는 기다리지 않고 메시지를 직접 태운다).
+        let _ = state.update(Message::RestoreWatchdog { generation });
+
+        assert!(
+            state.hydration.is_open(),
+            "the watchdog must complete the restore so saving is possible again — a leaf \
+             with no path to completion otherwise disables persistence for the entire \
+             process, silently"
+        );
+        assert_eq!(
+            restored_shape(&state),
+            "wt-a",
+            "and the leaves that did report must still be honoured"
+        );
+    }
+
+    /// 낡은 워치독이 그 사이 시작된 **다른** 복원을 잘라버리면 안 된다.
+    #[test]
+    fn a_stale_watchdog_does_not_cut_short_a_later_restore() {
+        let mut state = restoring_state(leaf("/tmp/wt-a"), &["/tmp/wt-a"]);
+        let first = state
+            .restore
+            .as_ref()
+            .expect("restore in flight")
+            .generation;
+
+        // 낡은 세대의 워치독이 뒤늦게 도착한다.
+        let _ = state.update(Message::RestoreWatchdog {
+            generation: first.wrapping_sub(1),
+        });
+
+        assert!(
+            state.restore.is_some(),
+            "a watchdog from an earlier restore must not terminate the current one"
+        );
+        assert!(!state.hydration.is_open(), "so the gate stays shut");
+
+        // 대조군: 맞는 세대는 실제로 끝낸다.
+        let _ = state.update(Message::RestoreWatchdog {
+            generation: first,
+        });
+        assert!(state.hydration.is_open(), "control: the matching generation completes it");
+    }
+
+    // ---- presence → 배지 장부 ----
+
+    /// **확정되지 않은 `NoAgent`는 이전 배지를 그대로 든다.** 셸이 exec하는 동안
+    /// 포그라운드를 잠깐 쥐는 전이라 한 틱에 반응하면 배지가 깜빡인다.
+    ///
+    /// `repeated_no_agent_polls_eventually_confirm_done`은 이걸 검사하지 못한다 —
+    /// 거기서는 훅이 `None`이고 `previous`가 내내 `Unknown`이라, 미만 구간이
+    /// `Unknown`을 하드코딩해도 통과한다(공허하게 참이다). 실제로 **유지되는
+    /// 값이 있을 때** 유지되는지를 봐야 한다.
+    #[test]
+    fn an_unconfirmed_no_agent_streak_holds_the_working_badge() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(1)));
+
+        let _ = state.update(Message::PresenceReady {
+            id,
+            generation: 1,
+            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+        });
+        let _ = state.update(Message::HookArrived(hook(
+            worktree_id.0.as_str(),
+            1,
+            HookEventName::PreToolUse,
+        )));
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Working,
+            "precondition: the agent is working"
+        );
+
+        for _ in 0..(NO_AGENT_CONFIRMATIONS - 1) {
+            let _ = state.update(Message::PresenceReady {
+                id,
+                generation: 1,
+                presence: AgentPresence::NoAgent,
+            });
+        }
+
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Working,
+            "below the threshold the badge must HOLD at Working — if `previous` is never \
+             updated the whole anti-flicker mechanism is dead and this reads Unknown"
+        );
+    }
+
+    /// **훅이 나이로 감쇠하는 전이는 폴링만이 본다.** 훅 도착 시점에 갱신하는
+    /// 것만으로는 부족하다: `Working`이 [`HOOK_STALE_AFTER`]를 넘겨 `Unknown`이
+    /// 되는 것은 시간이 흐른 결과라 새 훅 이벤트가 없고, 그래서 **폴링 쪽
+    /// 갱신이 없으면 `previous`가 낡은 `Working`에 머문다** — 그 뒤 `NoAgent`가
+    /// 오면 오래전에 죽은 것을 "일하는 중"으로 든다.
+    #[test]
+    fn a_presence_poll_refreshes_the_held_badge_after_the_hook_goes_stale() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        let mut badge = PaneBadge::new(SpawnNonce(1));
+        // 이미 오래된 `Working` 훅. 훅 경로는 다시 지나지 않는다.
+        badge.hook = Some((
+            HookState::Working,
+            Instant::now() - (HOOK_STALE_AFTER + Duration::from_secs(60)),
+        ));
+        badge.previous = BadgeState::Working;
+        state.badges.insert(worktree_id.clone(), badge);
+
+        let _ = state.update(Message::PresenceReady {
+            id,
+            generation: 1,
+            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+        });
+        assert_eq!(
+            state.badges[&worktree_id].previous,
+            BadgeState::Unknown,
+            "the poll must re-evaluate the age rule and refresh what will be held"
+        );
+
+        let _ = state.update(Message::PresenceReady {
+            id,
+            generation: 1,
+            presence: AgentPresence::NoAgent,
+        });
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Unknown,
+            "so an unconfirmed NoAgent holds Unknown, not a Working badge that expired              four minutes ago"
+        );
+    }
+
+    /// **`Unknown` 관측은 streak를 리셋하지 않는다.** `ps`가 간헐적으로 실패해
+    /// `NoAgent`/`Unknown`이 번갈아 오면, 리셋하는 구현에서는 임계에 영영 닿지
+    /// 못해 pane이 `Done`으로 정착하지 못한다(굶는다).
+    #[test]
+    fn interleaved_unknown_polls_do_not_starve_the_no_agent_streak() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(1)));
+
+        // **마지막 관측이 `NoAgent`여야 한다.** `Unknown`으로 끝내면 배지는
+        // 정당하게 `Unknown`이고(마지막에 아는 것이 없다), 그러면 이 테스트는
+        // streak가 아니라 그 사실을 검사하게 된다.
+        for i in 0..NO_AGENT_CONFIRMATIONS {
+            if i > 0 {
+                // 관측 실패가 사이사이 끼어든다.
+                let _ = state.update(Message::PresenceReady {
+                    id,
+                    generation: 1,
+                    presence: AgentPresence::Unknown,
+                });
+            }
+            let _ = state.update(Message::PresenceReady {
+                id,
+                generation: 1,
+                presence: AgentPresence::NoAgent,
+            });
+        }
+
+        assert_eq!(
+            state.badges[&worktree_id].no_agent_streak,
+            NO_AGENT_CONFIRMATIONS,
+            "an Unknown observation means 'we could not tell', not 'the agent is back' — \
+             resetting on it lets a flaky ps starve the streak forever"
+        );
+        assert_eq!(
+            state.worktree_badge(&worktree_id),
+            BadgeState::Done,
+            "so the pane still settles on Done"
+        );
+    }
+
+    // ---- 주입: 복원된 세션도 훅 env를 받는가 ----
+
+    /// **`spawn_env()`를 따로 테스트하는 것으로는 부족하다.** 그 함수는 늘 옳았고,
+    /// 버그는 호출 시점에 `hook_endpoint`가 아직 `None`이라 **아예 불리지 않은
+    /// 것**이었다. 그래서 여기서는 세션에 실제로 심긴 env를 본다.
+    #[test]
+    fn a_restored_session_is_spawned_with_the_hook_environment() {
+        let mut state = AppState::default();
+        // 서버가 세션 시작 **전에** 붙어 있어야 한다 — `boot()`이 강제하는 순서다.
+        state.hook_endpoint = Some((51234, "tok-abc".to_string()));
+
+        let repo_id = RepoId("/tmp/r-env".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id,
+            OpId(1),
+            vec![entry_at("/nonexistent-suaegi-env-test", "e")],
+        );
+        state.pending_restore_tree = Some(leaf("/nonexistent-suaegi-env-test"));
+        state.hydration = Hydration::new([]);
+
+        let _ = state.begin_layout_restore();
+
+        let env = state
+            .session_store()
+            .last_spawn_env()
+            .expect("the restore must have spawned a session")
+            .to_vec();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            get("SUAEGI_HOOK_PORT"),
+            Some("51234".to_string()),
+            "a session started by layout RESTORE must receive the hook port — if the \
+             endpoint is attached after boot(), every pane after a restart comes up with \
+             no hook environment and its badge is Unknown forever"
+        );
+        assert_eq!(get("SUAEGI_HOOK_TOKEN"), Some("tok-abc".to_string()));
+        assert_eq!(get("SUAEGI_SPAWN_NONCE").is_some(), true);
+        assert!(
+            get("SUAEGI_PANE_KEY").is_some_and(|k| !k.contains('/')),
+            "and the pane key must be planted already base64url-encoded"
+        );
+    }
+
+    /// 이 기능보다 **먼저 만들어진** worktree도 설정 파일을 받아야 한다 —
+    /// 생성 시점에만 쓰면 기존 worktree의 배지는 영구히 없다.
+    #[test]
+    fn starting_a_session_injects_settings_into_a_pre_existing_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let worktree = workspace.join("repo").join("wt-old");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let mut state = AppState::default();
+        state.workspace_root = workspace;
+        state.hook_script = Some(dir.path().join("hook.sh"));
+        let repo_id = RepoId("/tmp/r-old".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id,
+            OpId(1),
+            vec![entry_at(worktree.to_str().unwrap(), "wt-old")],
+        );
+
+        let settings = worktree.join(".claude").join("settings.local.json");
+        assert!(!settings.exists(), "precondition: it was never created");
+
+        let _ = state.update(Message::WorktreeSelected(worktree_id_for(&worktree)));
+
+        assert!(
+            settings.exists(),
+            "a worktree that predates this feature must get its settings when a session \
+             starts — otherwise its badge can never work, and installing the shared \
+             script at boot does not repair it"
+        );
+    }
+
+    /// **밖에서 발견된 worktree에는 쓰지 않는다.** 우리 소유가 아닌 디렉터리에
+    /// 우리 파일을 남기는 일이다.
+    #[test]
+    fn a_worktree_outside_our_workspace_is_never_written_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join("someone-elses-repo");
+        std::fs::create_dir_all(&foreign).unwrap();
+
+        let mut state = AppState::default();
+        state.workspace_root = dir.path().join("our-workspace");
+        state.hook_script = Some(dir.path().join("hook.sh"));
+        let repo_id = RepoId("/tmp/r-foreign".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id,
+            OpId(1),
+            vec![entry_at(foreign.to_str().unwrap(), "theirs")],
+        );
+
+        let _ = state.update(Message::WorktreeSelected(worktree_id_for(&foreign)));
+
+        assert!(
+            !foreign.join(".claude").exists(),
+            "we must not leave our config inside a directory we do not own — the cost is \
+             that such a worktree's badge stays Unknown, and that is the right trade"
         );
     }
 

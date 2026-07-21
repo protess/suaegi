@@ -429,27 +429,63 @@ mod tests {
         assert_eq!(panel_state_for(Ok(CompareOutcome::Cancelled)), None);
     }
 
-    /// 대조군: 취소가 아닌 결과는 **전부** 상태를 만든다. 위 테스트가
-    /// "무조건 None"으로 퇴화하는 것을 막는다.
+    /// 취소가 아닌 결과는 전부 상태를 만든다 — 그리고 **어떤 상태인지까지**
+    /// 고정한다.
+    ///
+    /// 처음엔 `.is_some()`만 봤다. 그건 "`Ok`인지만 보고 안을 열지 않는" 모양이라
+    /// **변형끼리 뒤바뀌어도 통과한다** — 리뷰에서 `TooLarge` → `Failed` 치환이
+    /// 살아남아 드러났다. 표로 정확한 매핑을 못 박으면 그 부류가 통째로 죽는다.
     #[test]
-    fn every_non_cancelled_outcome_produces_a_state() {
+    fn every_non_cancelled_outcome_maps_to_its_exact_state() {
+        let file = changed("a.txt", ChangeStatus::Added);
         let cases = vec![
-            Ok(compare(vec![changed("a.txt", ChangeStatus::Added)])),
-            Ok(compare(vec![])),
-            Ok(CompareOutcome::NoMergeBase),
-            Ok(CompareOutcome::UnbornHead),
-            Ok(CompareOutcome::InvalidBase),
-            Err(DiffFailure::Failed("boom".into())),
-            Err(DiffFailure::TooLarge {
-                limit: 6 * 1024 * 1024,
-            }),
+            (
+                Ok(compare(vec![file.clone()])),
+                PanelState::Ready(vec![file]),
+            ),
+            (Ok(compare(vec![])), PanelState::Empty),
+            (Ok(CompareOutcome::NoMergeBase), PanelState::NoMergeBase),
+            (Ok(CompareOutcome::UnbornHead), PanelState::UnbornHead),
+            (Ok(CompareOutcome::InvalidBase), PanelState::InvalidBase),
+            (
+                Err(DiffFailure::Failed("boom".into())),
+                PanelState::Failed("boom".into()),
+            ),
+            (
+                Err(DiffFailure::TooLarge {
+                    limit: 6 * 1024 * 1024,
+                }),
+                PanelState::TooLarge {
+                    limit: 6 * 1024 * 1024,
+                },
+            ),
         ];
-        for case in cases {
-            assert!(
-                panel_state_for(case.clone()).is_some(),
-                "{case:?} must produce a panel state"
+        for (input, expected) in cases {
+            assert_eq!(
+                panel_state_for(input.clone()),
+                Some(expected),
+                "wrong panel state for {input:?}"
             );
         }
+    }
+
+    /// `TooLarge`의 문구는 **바이트를 MB로 바꿔서** 보여줘야 한다. 변환을
+    /// 빠뜨리면 화면에 "over 6291456 MB"가 뜬다. `git_tasks`가 6MB 초과 비교마다
+    /// 이 상태를 내므로 도달 가능하다.
+    #[test]
+    fn the_too_large_message_reports_megabytes_not_bytes() {
+        let message = status_message(&PanelState::TooLarge {
+            limit: 6 * 1024 * 1024,
+        })
+        .unwrap();
+        assert!(
+            message.contains("6 MB"),
+            "the limit must be shown in MB: {message}"
+        );
+        assert!(
+            !message.contains("6291456"),
+            "raw bytes leaked into the message: {message}"
+        );
     }
 
     /// 성공했지만 변경이 없는 것은 **실패가 아니다.** 둘을 뭉개면 "작업이 아직

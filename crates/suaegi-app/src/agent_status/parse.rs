@@ -34,6 +34,9 @@ pub enum Status {
     MethodNotAllowed = 405,
     RequestTimeout = 408,
     PayloadTooLarge = 413,
+    /// 동시 연결 상한을 넘었다. **즉시** 돌려주고 끊는다 — 여기서 기다리면
+    /// 상한이 지키려던 것을 그대로 내주는 셈이다.
+    ServiceUnavailable = 503,
 }
 
 impl Status {
@@ -51,6 +54,7 @@ impl Status {
             Status::MethodNotAllowed => "Method Not Allowed",
             Status::RequestTimeout => "Request Timeout",
             Status::PayloadTooLarge => "Payload Too Large",
+            Status::ServiceUnavailable => "Service Unavailable",
         }
     }
 }

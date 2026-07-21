@@ -33,7 +33,11 @@ async fn ready(r: &GitRunner, wt: &std::path::Path, base: &str) -> BranchCompare
 async fn compare_reports_committed_changes() {
     let (_repo, _ws, wt) = setup().await;
     std::fs::write(wt.join("new.txt"), "new\n").unwrap();
-    std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+    // **비대칭이어야 한다.** 원본이 "hello\n" 한 줄이므로 두 줄로 바꾸면
+    // 추가 2 / 삭제 1이 된다. 1/1로 두면 numstat 파서가 두 칸을 **맞바꿔도**
+    // 단언이 움직이지 않는다 — 실제로 그 상태로 통과하고 있었고, 화면에는
+    // 모든 파일의 `+a -d`가 뒤집혀 나갔다.
+    std::fs::write(wt.join("README.md"), "changed\nplus\n").unwrap();
     fixture::run(&wt, &["add", "."]);
     fixture::run(&wt, &["commit", "-m", "change"]);
 
@@ -50,8 +54,12 @@ async fn compare_reports_committed_changes() {
     assert_eq!(paths, vec!["README.md", "new.txt"]);
     let readme = cmp.files.iter().find(|f| f.path == "README.md").unwrap();
     assert_eq!(readme.status, ChangeStatus::Modified);
-    assert_eq!(readme.additions, Some(1));
-    assert_eq!(readme.deletions, Some(1));
+    assert_eq!(readme.additions, Some(2), "additions and deletions are swapped");
+    assert_eq!(readme.deletions, Some(1), "additions and deletions are swapped");
+    // 새 파일도 비대칭이다(추가만 있고 삭제가 없다). 두 방향에서 고정한다.
+    let created = cmp.files.iter().find(|f| f.path == "new.txt").unwrap();
+    assert_eq!(created.additions, Some(1));
+    assert_eq!(created.deletions, Some(0));
 }
 
 #[tokio::test]
@@ -300,6 +308,31 @@ async fn file_diff_synthesizes_patch_for_untracked() {
         panic!("expected Patch, got {diff:?}");
     };
     assert!(patch.contains("+wip"));
+}
+
+/// **변경 없는 tracked 파일은 빈 patch다.** `--no-index` 합성은 실제 untracked
+/// 일 때만 해야 한다.
+///
+/// 가드를 지우면 이 파일이 `new file mode` + 전부 `+`인 patch로 그려진다 —
+/// 바뀐 게 없는 파일이 통째로 새로 추가된 것처럼 보인다.
+///
+/// **프로덕션에서 도달 가능하다**: 비교 결과는 `PanelState::Ready`에 캐시되므로,
+/// 목록을 받은 뒤 에이전트가 되돌린 파일을 사용자가 고르면 정확히 이 경로다.
+#[tokio::test]
+async fn an_unchanged_tracked_file_yields_an_empty_patch_not_a_synthesized_one() {
+    let (_repo, _ws, wt) = setup().await;
+    // README는 merge base와 동일하다 — 아무것도 하지 않는다.
+    let r = GitRunner::new();
+    let diff = file_diff(&r, &wt, "main", "README.md", &ChangeStatus::Modified)
+        .await
+        .unwrap();
+    let FileDiff::Patch(patch) = diff else {
+        panic!("expected Patch, got {diff:?}");
+    };
+    assert!(
+        patch.is_empty(),
+        "an unchanged tracked file must not be synthesized as a new file: {patch:?}"
+    );
 }
 
 /// NUL 스니핑. lossy `String`을 통과했다면 이 판정은 불가능하다.
@@ -601,6 +634,14 @@ async fn paths_escaping_the_worktree_are_rejected() {
 async fn dirty_detection() {
     let (_repo, _ws, wt) = setup().await;
     let r = GitRunner::new();
+    // **깨끗한 쪽을 먼저 고정한다.** 한 방향만 보면 `Ok(true)`를 상수로
+    // 돌려주는 구현이 그대로 통과한다 — 그러면 모든 worktree가 영원히
+    // "변경 있음"이 되고 `worktree remove`가 늘 force를 요구한다.
+    assert!(
+        !working_tree_dirty(&r, &wt).await.unwrap(),
+        "a freshly created worktree must be clean"
+    );
+
     // fixture 부산물이 untracked로 존재하므로 이 테스트는 tracked 변경으로 판별
     std::fs::write(wt.join("README.md"), "dirty\n").unwrap();
     assert!(working_tree_dirty(&r, &wt).await.unwrap());

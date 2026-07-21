@@ -228,6 +228,10 @@ pub fn blank_snapshot() -> TerminalSnapshot {
 pub struct SessionStore {
     slots: HashMap<SessionId, SessionSlot>,
     reaper: Reaper,
+    /// 마지막 `start()`가 PTY에 실제로 심은 환경 변수. 테스트가 프로덕션 경로를
+    /// 그대로 태우고 결과를 관측하기 위한 유일한 창이다.
+    #[cfg(test)]
+    last_spawn_env: Option<Vec<(String, String)>>,
     /// `close()`/`accept_started`의 거절 경로로 넘어간 세션이 **실제로 어느
     /// 스레드에서** 떨어졌는지. 오직 Reaper의 콜백만 채운다 — 그 콜백이
     /// 실행되는 스레드가 곧 소멸자가 실행된 스레드라는 증거다.
@@ -258,7 +262,15 @@ impl SessionStore {
             track_reaped_at: false,
             retired_count: Arc::new(AtomicU64::new(0)),
             next_id: 0,
+            #[cfg(test)]
+            last_spawn_env: None,
         }
+    }
+
+    /// 마지막 `start()`가 PTY에 실제로 심은 env.
+    #[cfg(test)]
+    pub(crate) fn last_spawn_env(&self) -> Option<&[(String, String)]> {
+        self.last_spawn_env.as_deref()
     }
 
     /// 호출자가 미리 발급받을 `SessionId`. `start`는 이 id를 그대로 받아
@@ -295,6 +307,14 @@ impl SessionStore {
             DEFAULT_COLS,
         );
         spawn.env.extend(env);
+        // **프로덕션 경로에서 실제로 심긴 env를 관측할 수 있게 한다.**
+        // `spawn_env()`를 따로 테스트하는 것만으로는 그 값이 정말 PTY까지
+        // 갔는지 알 수 없다 — 그 공백이 복원된 세션에 훅 env가 하나도 심기지
+        // 않는 버그를 통과시켰다.
+        #[cfg(test)]
+        {
+            self.last_spawn_env = Some(spawn.env.clone());
+        }
         background::blocking(move |mut sender| {
             let spec = SessionSpec {
                 pty: spawn,

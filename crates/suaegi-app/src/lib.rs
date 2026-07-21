@@ -57,60 +57,59 @@ impl AppState {
 /// 훅 서버의 공유 비밀. 루프백 전용이지만 **같은 기계의 다른 프로세스**가 배지를
 /// 위조하는 것은 막아야 하므로 추측 불가능해야 한다.
 ///
-/// `getrandom` 같은 의존을 새로 들이지 않고 OS 엔트로피를 직접 읽는다. 읽지 못하면
-/// 시간 기반으로 폴백하되 **그 사실을 알린다** — 조용히 약한 토큰을 쓰지 않는다.
-fn new_hook_token() -> String {
+/// **엔트로피를 못 얻으면 `None`을 돌려주고 훅 기능 전체를 끈다.** 시계에서
+/// 유도한 값은 같은 기계의 프로세스가 근사할 수 있으므로 토큰이 아니다 —
+/// 그것을 로그로 알리는 것은 안전하게 만들지 못한다. 바인딩 실패와 **똑같이**
+/// 다룬다: 배지 없이 계속 간다.
+fn new_hook_token() -> Option<String> {
     let mut bytes = [0u8; 32];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| {
-        use std::io::Read;
-        f.read_exact(&mut bytes)
-    }) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("suaegi: no OS entropy for the hook token ({e}); falling back to a clock-derived value");
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            for (i, b) in bytes.iter_mut().enumerate() {
-                *b = ((nanos >> (i % 16 * 8)) as u8) ^ (i as u8);
-            }
-        }
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut bytes)
+        })
+        .map_err(|e| {
+            eprintln!(
+                "suaegi: no OS entropy for the hook token ({e}); \
+                 agent badges are disabled (a clock-derived token is guessable)"
+            )
+        })
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn run() -> iced::Result {
     // **서버가 앱보다 먼저 뜬다.** 세션 스폰이 포트를 알아야 하므로 `boot()`
     // 이전에 바인딩한다. 실패하면 배지 없이 계속 간다 — 치명적이지 않다.
-    let hooks = agent_status::server::bind(new_hook_token())
-        .map_err(|e| eprintln!("suaegi: hook server did not start: {e} (badges stay Unknown)"))
-        .ok();
-    let (endpoint, hook_sub) = match hooks {
+    let hooks = new_hook_token().and_then(|token| {
+        agent_status::server::bind(token)
+            .map_err(|e| eprintln!("suaegi: hook server did not start: {e} (badges stay Unknown)"))
+            .ok()
+    });
+    // **서버 핸들은 `AppState`가 가져간다.** 떨구면 포트가 닫히고, 버린 이벤트
+    // 카운터를 읽을 곳도 거기뿐이다. 여기 남는 것은 구독 레시피뿐이다.
+    let (server, hook_sub) = match hooks {
         Some((server, rx)) => (
-            Some((server.port(), server.token().to_string())),
-            // **구독은 조건 없이 항상 붙인다.** 조건부로 붙였다 떼면 iced가
-            // 레시피를 떨구면서 receiver도 사라지고, 이후 빌더는 `pending`밖에
-            // 못 준다. 서버를 살려두는 것도 겸한다 — 떨구면 포트가 닫힌다.
-            Some((agent_status::subscription::HookSub::new(1, rx), server)),
+            Some(server),
+            Some(agent_status::subscription::HookSub::new(1, rx)),
         ),
         None => (None, None),
     };
 
-    let boot = move || {
-        let (mut state, task) = AppState::boot();
-        if let Some((port, token)) = endpoint.clone() {
-            state.attach_hook_server(port, token);
-        }
-        (state, task)
-    };
+    // `iced::application`은 부트 클로저를 여러 번 부르지 않지만 `Fn`을 요구하므로
+    // 한 번만 꺼낼 수 있는 자리에 담아 옮긴다.
+    let server = std::cell::RefCell::new(server);
+    // **서버를 `boot`에 넘긴다.** 복원이 시작하는 세션도 스폰 시점에 포트를
+    // 알아야 하므로, 붙이는 시점이 `begin_layout_restore()`보다 늦으면 재시작
+    // 직후의 모든 pane이 훅 없이 뜬다.
+    let boot = move || AppState::boot(server.borrow_mut().take());
 
     iced::application(boot, AppState::update, AppState::view)
         .title(AppState::title)
         .subscription(move |state: &AppState| {
             let base = AppState::subscription(state);
             match &hook_sub {
-                Some((sub, _server)) => Subscription::batch([base, sub.subscription()]),
+                Some(sub) => Subscription::batch([base, sub.subscription()]),
                 None => base,
             }
         })
