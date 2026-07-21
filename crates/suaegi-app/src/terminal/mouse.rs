@@ -171,21 +171,31 @@ fn force_local(mods: Mods) -> bool {
 /// Press. **`held`를 intent를 만들기 전에 갱신한다** — `route_mouse`가
 /// `Press(b)`에 `held == Some(b)`를 요구하고, 어긋나면 정상 입력에서
 /// `MouseEncodeError`가 튄다.
+/// **이미 버튼이 눌려 있으면 둘째 press는 아예 발행하지 않는다**(리뷰에서 발견).
+///
+/// `held`만 유지하고 인텐트는 내보내는 절충은 비대칭을 자리만 옮긴다 — 그러면
+/// 이번엔 둘째 버튼의 release가 `held`와 어긋나 버려지고, 마우스 리포팅 앱은
+/// 짝 없는 press를 받아 **드래그 상태에 갇힌다.** 터미널은 코드 클릭으로 할 일이
+/// 없으므로 제스처의 주인은 첫 버튼 하나로 못박고, 둘째 버튼은 press도 release도
+/// 내보내지 않는다 — 짝이 맞는다.
 pub fn press_intent(
     state: &mut State,
     button: TermMouseButton,
     hit: ViewportHit,
     click: ClickKind,
-) -> MouseIntent {
+) -> Option<MouseIntent> {
+    if state.held.is_some() {
+        return None;
+    }
     state.held = Some(button);
-    MouseIntent {
+    Some(MouseIntent {
         action: MouseAction::Press(button),
         hit,
         held: state.held,
         mods: state.mods,
         click,
         force_local: force_local(state.mods),
-    }
+    })
 }
 
 /// Release. **intent를 만든 뒤에 `held`를 지운다** — 놓인 버튼이 intent에
@@ -300,7 +310,9 @@ pub(crate) fn update(
                 pos: cursor_point(state),
                 kind,
             });
-            publish(shell, id, press_intent(state, button, hit, kind));
+            if let Some(intent) = press_intent(state, button, hit, kind) {
+                publish(shell, id, intent);
+            }
         }
         iced_mouse::Event::ButtonReleased(button) => {
             let Some(button) = to_button(button) else {
@@ -693,7 +705,8 @@ mod tests {
     #[test]
     fn press_sets_held_before_building_the_intent() {
         let mut state = State::default();
-        let intent = press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single);
+        let intent = press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single)
+            .expect("the first press always yields an intent");
         assert_eq!(
             intent.held,
             Some(TermMouseButton::Left),
@@ -781,7 +794,9 @@ mod tests {
         };
 
         assert!(
-            press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single).force_local
+            press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single)
+                .expect("the first press always yields an intent")
+                .force_local
         );
         assert!(motion_intent(&state, hit(), ClickKind::Single).force_local);
         assert!(wheel_intent(&state, hit(), 1, ClickKind::Single).force_local);
@@ -1022,6 +1037,35 @@ mod tests {
         );
     }
 
+    /// 두 버튼을 겹쳐 누르는 것은 평범한 OS 입력이다. 여기서 지켜야 할 것은
+    /// **먼저 누른 버튼의 release가 반드시 나간다**는 것 — 안 나가면 마우스
+    /// 리포팅 TUI가 press만 받고 영원히 눌린 상태로 남는다.
+    ///
+    /// 전체 **시퀀스**를 단언한다. 최종 상태만 보면 release가 아예 발행되지
+    /// 않아도 `held == None`이라 통과해버린다 — 빠진 것이 이벤트 하나이므로
+    /// 끝 상태로는 잡히지 않는다.
+    #[test]
+    fn chording_a_second_button_never_swallows_the_first_buttons_release() {
+        let mut state = wired_state();
+        let mut all = Vec::new();
+        all.extend(run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
+        all.extend(run(&mut state, &press(iced_mouse::Button::Right), cursor_at(1.0, 1.0)));
+        all.extend(run(&mut state, &release(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
+        all.extend(run(&mut state, &release(iced_mouse::Button::Right), cursor_at(1.0, 1.0)));
+
+        let actions: Vec<MouseAction> = intents(&all).iter().map(|i| i.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                MouseAction::Press(TermMouseButton::Left),
+                MouseAction::Release(TermMouseButton::Left),
+            ],
+            "the second press is ignored while a button is held, and the first \
+             button's release must still fire"
+        );
+        assert_eq!(state.held, None, "nothing is left held");
+    }
+
     #[test]
     fn a_full_drag_produces_press_motion_release_in_order() {
         let mut state = wired_state();
@@ -1165,7 +1209,9 @@ mod tests {
             ..State::default()
         };
         assert!(
-            !press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single).force_local,
+            !press_intent(&mut state, TermMouseButton::Left, hit(), ClickKind::Single)
+                .expect("the first press always yields an intent")
+                .force_local,
             "only shift overrides — ctrl selects block, it does not force local"
         );
     }

@@ -228,13 +228,19 @@ fn resolve_route(state: &mut GridState, intent: &MouseIntent, live: MouseRoute) 
         MouseAction::Wheel { .. } => live,
         // press가 라우트를 정하고 release까지 붙든다 — 드래그 도중 모드가 바뀌어도
         // 한 제스처가 반으로 갈리지 않는다.
-        MouseAction::Press(button) => {
-            state.pointer = Some(PointerLatch {
-                button,
-                route: live,
-            });
-            live
-        }
+        // **이미 래치가 있으면 덮어쓰지 않는다.** 덮어쓰면 원래 버튼의 release가
+        // 래치와 어긋나 제스처가 해소되지 않는다(리뷰에서 발견). 첫 버튼이 제스처의
+        // 주인이고, 둘째 press는 그 라우트를 따른다.
+        MouseAction::Press(button) => match state.pointer {
+            Some(latch) => latch.route,
+            None => {
+                state.pointer = Some(PointerLatch {
+                    button,
+                    route: live,
+                });
+                live
+            }
+        },
         MouseAction::Motion => state.pointer.map_or(live, |latch| latch.route),
         MouseAction::Release(button) => match state.pointer {
             // 눌렸던 그 버튼이 놓였다 — 래치된 라우트로 마무리하고 해제한다.
