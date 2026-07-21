@@ -392,6 +392,37 @@ mod tests {
         );
     }
 
+    /// **계수 자체를 리터럴로 고정한다.**
+    ///
+    /// 위 테스트도, `render.rs`의 DIM 테스트도 기대값을 구현과 **똑같은 식**
+    /// (`attenuate(x, DIM_FACTOR)`)으로 계산한다. 그래서 `DIM_FACTOR`를 0.66에서
+    /// 0.99로 바꿔도 크레이트 전체가 초록이었다 — 계수를 지키는 것이 아무것도
+    /// 없었다(mutation으로 확인). 여기서만 상수와 그 결과를 **손으로 적은 값**에
+    /// 묶는다.
+    #[test]
+    fn the_dim_factor_is_pinned_to_a_literal() {
+        assert_eq!(
+            DIM_FACTOR, 0.66,
+            "changing the dim factor changes how every dim cell looks — if this is \
+             intentional, update the literal below with it"
+        );
+
+        // DimRed = Red(0xcc, 0x66, 0x66) × 0.66.
+        //   0xcc/255 = 0.8 → 0.528,  0x66/255 = 0.4 → 0.264
+        let dim_red = p().named(NamedColor::DimRed);
+        for (channel, actual, expected) in [
+            ("r", dim_red.r, 0.528),
+            ("g", dim_red.g, 0.264),
+            ("b", dim_red.b, 0.264),
+        ] {
+            assert!(
+                (actual - expected as f32).abs() < 1e-6,
+                "DimRed.{channel} must be {expected}, got {actual}"
+            );
+        }
+        assert_eq!(dim_red.a, 1.0, "attenuation must not touch alpha");
+    }
+
     /// 대조군: dim이 base보다 실제로 어두운가. 위 테스트는 `DIM_FACTOR = 1.0`
     /// 이어도 통과한다.
     #[test]

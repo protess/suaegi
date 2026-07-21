@@ -793,6 +793,15 @@ impl SessionStore {
         self.slots.len()
     }
 
+    /// 추출 직렬화의 내부 상태. `request_extraction`이 돌려주는 `bool`만으로는
+    /// **"대기하던 요청이 나갔다"와 "영원히 막혔다"를 구별할 수 없다** — 둘 다
+    /// `false`다. `Task`는 들여다볼 수 없으므로 이 창을 열어 준다.
+    #[doc(hidden)]
+    pub fn extraction_state(&self, id: SessionId) -> Option<(bool, Option<CopyRequest>)> {
+        let slot = self.slots.get(&id)?;
+        Some((slot.extract_in_flight, slot.extract_pending))
+    }
+
     /// 어디에도 슬롯으로 등록되지 않은, 진짜로 살아있는 `TerminalSession`
     /// 하나. `workbench.rs`의 구독 동일성 테스트와 `state.rs`의
     /// `SessionStarted` 배선 테스트가 손으로 봉투를 만들 때 이 세션이

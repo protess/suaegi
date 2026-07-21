@@ -1568,38 +1568,51 @@ mod tests {
     /// 본다 — 둘 중 하나만으로는 배선이 끊겨도 통과한다.
     #[test]
     fn the_resize_seq_guard_is_wired_through_the_message_path() {
+        use crate::session_store::ResizeDecision;
+
         let (mut state, id, _worktree_id, _pane) = state_with_one_open_session();
 
-        let newer = state.session_store.request_resize(id, 30, 120, 10).0;
-        assert!(
-            matches!(
-                newer,
-                crate::session_store::ResizeDecision::Dispatch { seq: 10, .. }
-            ),
-            "the first resize must dispatch; got {newer:?}"
-        );
+        // **첫 리사이즈는 반드시 메시지로 넣는다.** 여기서 `request_resize`를
+        // 직접 부르면 `Message::Terminal`의 `TermCommand::Resize` 팔이 통째로
+        // 죽어도 테스트가 통과한다 — 실제로 그랬다.
+        let _ = state.update(Message::Terminal {
+            id,
+            command: TermCommand::Resize {
+                rows: 30,
+                cols: 120,
+                seq: 10,
+            },
+        });
 
-        // 워커가 끝났다고 알린 뒤, 뒤늦게 낡은 seq가 도착한다.
+        // 워커가 seq 10을 끝냈다고 알린다. **이 완료가 받아들여진다는 것 자체가
+        // 배선의 증거다** — 코얼레서는 `in_flight == Some(10)`일 때만 가드를
+        // 푼다(`ResizeCoalescer::completed`). 팔이 죽어 있었다면 seq 10은
+        // in-flight가 된 적이 없어 이 완료는 아무 일도 하지 않는다.
         let _ = state.update(Message::ResizeApplied {
             id,
             seq: 10,
             result: Ok(()),
         });
-        let stale = state.session_store.request_resize(id, 10, 40, 4).0;
+
+        // 뒤늦게 도착한 낡은 seq는 버려진다. 팔이 죽어 있었다면 코얼레서의
+        // `last_seq`가 아직 0이라 seq 4가 여기서 `Dispatch`된다.
         assert_eq!(
-            stale,
-            crate::session_store::ResizeDecision::Discard,
-            "a resize older than the one already applied must be discarded"
+            state.session_store.request_resize(id, 10, 40, 4).0,
+            ResizeDecision::Discard,
+            "a resize older than the one that already went through the message path \
+             must be discarded — if this dispatches, Message::Terminal never reached \
+             the coalescer"
         );
 
-        // 대조군.
+        // 대조군 둘을 겸한다. (1) 가드가 모든 것을 버리는 게 아니라 더 새로운
+        // seq는 통과시킨다. (2) `Coalesce`가 아니라 `Dispatch`라는 것은 위의
+        // `ResizeApplied`가 in-flight 가드를 실제로 풀었다는 뜻이고, 그건 seq
+        // 10이 메시지 경로를 타고 in-flight가 됐을 때만 성립한다.
         let fresh = state.session_store.request_resize(id, 31, 124, 11).0;
         assert!(
-            matches!(
-                fresh,
-                crate::session_store::ResizeDecision::Dispatch { seq: 11, .. }
-            ),
-            "control: a newer resize must still be applied; got {fresh:?}"
+            matches!(fresh, ResizeDecision::Dispatch { seq: 11, .. }),
+            "control: a newer resize must still dispatch (and Dispatch rather than \
+             Coalesce proves seq 10 held the in-flight guard); got {fresh:?}"
         );
     }
 
@@ -1664,6 +1677,12 @@ mod tests {
             "a second extraction must NOT run concurrently with the first"
         );
 
+        assert_eq!(
+            store.extraction_state(id),
+            Some((true, Some(second))),
+            "precondition: one running, one queued"
+        );
+
         // 완료하면 대기하던 것이 나간다 — 버려지지 않는다. 사용자가 누른 복사가
         // "마침 다른 추출이 돌고 있었다"는 이유로 사라지면 안 된다.
         let _ = state.update(Message::SelectionExtracted {
@@ -1671,6 +1690,19 @@ mod tests {
             targets: CopyTargets::EXPLICIT,
             text: None,
         });
+
+        // **대기열이 비었는지를 직접 본다.** `request_extraction`의 `bool`을
+        // 프록시로 쓰면 안 된다 — "대기하던 것이 나갔다"와 "완료 처리가 아예
+        // 안 돼서 영원히 막혔다"가 둘 다 `false`라 구별되지 않는다(mutation으로
+        // 확인: `extraction_completed`를 `Task::none()`으로 바꿔도 통과했다).
+        assert_eq!(
+            state.session_store.extraction_state(id),
+            Some((true, None)),
+            "the queued request must have been dispatched (pending drained) and now be \
+             in flight — a still-Some pending means the completion was dropped and this \
+             session can never extract again"
+        );
+
         // 대기하던 요청이 지금 in-flight이므로 새 요청은 다시 대기한다.
         let third = CopyRequest {
             epoch: 3,
