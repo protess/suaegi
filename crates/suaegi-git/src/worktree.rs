@@ -200,7 +200,13 @@ pub async fn remove_worktree(
     runner.run(repo_path, &args).await?;
     let branch_deletion = match delete_branch {
         None => BranchDeletion::NotRequested,
-        Some(branch) => match runner.run(repo_path, &["branch", "-D", branch]).await {
+        // `-d`(안전 삭제): 커밋됐지만 아직 병합 안 된 작업이 있으면 git이
+        // 거부한다. worktree가 클린해도(uncommitted 변경 없음) 그 안에서
+        // 커밋한 작업은 살아 있을 수 있다 — 이 앱의 핵심 워크플로우가 바로
+        // worktree 안에서 에이전트가 커밋하는 것이므로, `-D`(강제)는 그 커밋을
+        // reflog로만 복구 가능한 상태로 만들 수 있다. 여기엔 강제 삭제 경로를
+        // 두지 않는다 — 필요해지면 별도 파라미터로 명시적으로 받는다.
+        Some(branch) => match runner.run(repo_path, &["branch", "-d", branch]).await {
             Ok(_) => BranchDeletion::Deleted,
             // "이미 없음"은 목표 상태 달성 — 실패로 보고하면 UI가 헛경고를 띄운다
             Err(GitError::Failed { ref stderr, .. }) if stderr.contains("not found") => {

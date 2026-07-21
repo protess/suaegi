@@ -142,6 +142,50 @@ async fn removing_already_deleted_branch_counts_as_deleted() {
 }
 
 #[tokio::test]
+async fn remove_worktree_keeps_an_unmerged_branch_and_reports_the_failure() {
+    // 클린한(uncommitted 변경 없는) worktree라도 그 안에서 커밋한 작업은
+    // 아직 다른 브랜치에 병합되지 않았을 수 있다 — 이 앱의 핵심 워크플로우가
+    // worktree 안에서 에이전트가 커밋하는 것이므로, 이 경우 브랜치를 강제
+    // 삭제하면 그 커밋들이 reflog로만 복구 가능한 상태가 된다. `-d`(안전
+    // 삭제)는 git이 알아서 거부해야 하고, 그 거부가 `BranchDeletion::Failed`로
+    // 드러나야 한다 — 조용히 성공한 것처럼 보이면 안 된다.
+    let repo = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    fixture::init_repo(repo.path());
+    let r = GitRunner::new();
+    let created = add_worktree(&r, repo.path(), "fix", "main", ws.path())
+        .await
+        .unwrap();
+    // worktree 안에서 커밋 — uncommitted 변경은 없다(worktree remove에
+    // force가 필요 없다), 하지만 브랜치는 이제 main보다 앞서 있다(unmerged).
+    std::fs::write(created.path.join("work.txt"), "unmerged work").unwrap();
+    fixture::run(&created.path, &["add", "work.txt"]);
+    fixture::run(&created.path, &["commit", "-m", "unmerged work"]);
+
+    let outcome = remove_worktree(&r, repo.path(), &created.path, false, Some("fix"))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome.branch_deletion, BranchDeletion::Failed(_)),
+        "expected BranchDeletion::Failed, got {:?}",
+        outcome.branch_deletion
+    );
+    assert!(
+        !created.path.exists(),
+        "the worktree checkout itself should still be removed"
+    );
+    let br = r
+        .run(repo.path(), &["branch", "--list", "fix"])
+        .await
+        .unwrap();
+    assert!(
+        br.stdout.contains("fix"),
+        "the unmerged branch must survive a refused safe-delete"
+    );
+}
+
+#[tokio::test]
 async fn remove_dirty_worktree_requires_force() {
     let repo = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();

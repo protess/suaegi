@@ -6,7 +6,7 @@ use iced::widget::pane_grid;
 use suaegi_core::domain::{
     PersistedState, Repo, RepoId, SessionState, Settings, Worktree, WorktreeId, SCHEMA_VERSION,
 };
-use suaegi_git::worktree::{CreatedWorktree, RemoveOutcome, WorktreeEntry};
+use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::AgentKind;
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::presence::AgentPresence;
@@ -671,9 +671,19 @@ impl AppState {
             } => {
                 self.pending_worktree_removals.remove(&worktree_id);
                 match result {
-                    Ok(_outcome) => {
-                        self.last_error = None;
-                        // git이 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
+                    Ok(outcome) => {
+                        // worktree 체크아웃 자체는 지워졌지만 브랜치 삭제가
+                        // 거부됐을 수 있다(예: 아직 병합되지 않은 커밋이
+                        // 있어 `git branch -d`가 안전하게 거절한 경우) — 이
+                        // 경우도 "성공"으로 조용히 넘기면 사용자가 브랜치가
+                        // 남아 있다는 걸 알 방법이 없다.
+                        self.last_error = match outcome.branch_deletion {
+                            BranchDeletion::Failed(msg) => {
+                                Some(format!("worktree removed, but branch deletion failed: {msg}"))
+                            }
+                            BranchDeletion::Deleted | BranchDeletion::NotRequested => None,
+                        };
+                        // git이 worktree 삭제를 실제로 허용했다 — 이제야 세션을 닫는다
                         // (`RemoveWorktreeRequested`의 문서 참고). pane_grid의
                         // pane 자체는 `PaneCloseRequested`가 올 때까지 그대로
                         // 둔다(닫는 UX는 이 태스크 범위 밖 — 워크벤치가 "세션이
@@ -1167,6 +1177,66 @@ mod tests {
             result: Err("worktree has uncommitted changes".to_string()),
         });
         assert_eq!(state.last_error(), Some("worktree has uncommitted changes"));
+    }
+
+    // ---- pr4 적대적 리뷰 항목 1: worktree 자체는 지워졌지만(Ok) 브랜치가
+    // 아직 병합되지 않아 `git branch -d`가 안전하게 거절했을 수 있다
+    // (`BranchDeletion::Failed`). 이걸 `Ok(_)`로 뭉개면 사용자는 브랜치가
+    // 남아 있다는 걸 알 방법이 없다 ----
+
+    #[test]
+    fn a_refused_branch_deletion_is_visible_as_an_error_even_though_the_worktree_removal_succeeded()
+    {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/r".into());
+        let worktree_id = WorktreeId("/tmp/r/wt".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_worktree_listing(repo_id.clone(), OpId(1), vec![entry_at("/tmp/r/wt", "wt")]);
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(2),
+            repo_id: repo_id.clone(),
+            worktree_id: worktree_id.clone(),
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::Failed("not fully merged".to_string()),
+            }),
+        });
+
+        assert!(
+            state
+                .last_error()
+                .is_some_and(|e| e.contains("not fully merged")),
+            "a refused branch delete must surface, got {:?}",
+            state.last_error()
+        );
+        assert!(
+            !state
+                .worktrees_for(&repo_id)
+                .iter()
+                .any(|w| worktree_id_for(&w.path) == worktree_id),
+            "the worktree checkout itself was still removed and must drop from the list"
+        );
+    }
+
+    #[test]
+    fn a_successful_branch_deletion_clears_a_stale_error() {
+        let mut state = AppState::default();
+        state.last_error = Some("stale error from a previous op".to_string());
+        let repo_id = RepoId("/tmp/r".into());
+        let worktree_id = WorktreeId("/tmp/r/wt".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_worktree_listing(repo_id.clone(), OpId(1), vec![entry_at("/tmp/r/wt", "wt")]);
+
+        let _ = state.update(Message::WorktreeRemoved {
+            request: OpId(2),
+            repo_id,
+            worktree_id,
+            result: Ok(RemoveOutcome {
+                branch_deletion: BranchDeletion::Deleted,
+            }),
+        });
+
+        assert_eq!(state.last_error(), None);
     }
 
     // ---- 최종 리뷰 항목 2: 제거 요청이 git 결과를 기다리지 않고 세션을
