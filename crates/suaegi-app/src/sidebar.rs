@@ -134,6 +134,13 @@ fn presence_badge(presence: AgentPresence) -> Element<'static, Message> {
         .into()
 }
 
+/// git이 non-forced `worktree remove`로 main 체크아웃을 항상 거부하므로
+/// 지우는 버튼을 눌러도 안전은 하지만, 애초에 버튼을 안 보여주는 게 낫다 —
+/// 눌러도 아무 일도 안 일어나는 죽은 버튼보다 명확하다.
+fn worktree_is_removable(entry: &WorktreeEntry) -> bool {
+    !entry.is_main
+}
+
 fn worktree_row(
     repo_id: RepoId,
     entry: &WorktreeEntry,
@@ -151,21 +158,27 @@ fn worktree_row(
     let remove_path: PathBuf = entry.path.clone();
     let remove_branch = entry.branch.clone();
 
-    row![
+    let mut cells: Vec<Element<'static, Message>> = vec![
         presence_badge(presence),
         button(text(format!("{marker}{label}")))
             .on_press(Message::WorktreeSelected(worktree_id))
-            .width(Length::Fill),
-        button("remove").on_press(Message::RemoveWorktreeRequested {
-            repo_id,
-            worktree_id: remove_id,
-            worktree_path: remove_path,
-            branch: remove_branch,
-        }),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .into()
+            .width(Length::Fill)
+            .into(),
+    ];
+    if worktree_is_removable(entry) {
+        cells.push(
+            button("remove")
+                .on_press(Message::RemoveWorktreeRequested {
+                    repo_id,
+                    worktree_id: remove_id,
+                    worktree_path: remove_path,
+                    branch: remove_branch,
+                })
+                .into(),
+        );
+    }
+
+    row(cells).spacing(6).align_y(Alignment::Center).into()
 }
 
 /// `LoadOrigin::Fresh`(신규 설치)와 `Loaded`(정상 로드)는 경고가 없다.
@@ -348,6 +361,23 @@ mod tests {
         // "모른다"는 조용히 아무것도 안 보여준다 — 시끄러운 badge는 아직
         // 판정 전인 worktree 전부를 에러처럼 보이게 만든다.
         assert!(unknown_glyph.is_empty());
+    }
+
+    /// 최종 리뷰 항목 3: `list_worktrees`가 첫 엔트리에 `is_main: true`를
+    /// 세우는데(`suaegi-git`), 여기서 그걸 읽지 않으면 git이 항상 거부할
+    /// main 체크아웃에도 remove 버튼이 뜬다.
+    #[test]
+    fn the_main_worktree_checkout_is_not_removable() {
+        let main = WorktreeEntry {
+            is_main: true,
+            ..entry("main")
+        };
+        let secondary = WorktreeEntry {
+            is_main: false,
+            ..entry("feature")
+        };
+        assert!(!worktree_is_removable(&main));
+        assert!(worktree_is_removable(&secondary));
     }
 
     #[test]
