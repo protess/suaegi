@@ -60,12 +60,129 @@
    계정)로 고정해두어 protess 저장소들이 깨진다. 계정 분리 정책(예: 디렉토리별
    `includeIf` + keychain)을 정한 뒤 정리해야 한다.
 
-## suaegi-core — 미래 스키마 가드의 허점 (Plan 3 리뷰에서 발견)
+## suaegi-core — 미래 스키마 가드의 허점 (Plan 3 리뷰에서 발견) — 완료
 
-9. **미래 스키마 **백업**은 가드를 세우지 않는다** (`crates/suaegi-core/src/persistence.rs`)
-   `load_from_backups()`는 `parse_trusted`가 거부한 백업(미래 스키마 포함)을 그냥
-   건너뛰고 다음 슬롯으로 간다. 본파일이 손상됐고 백업이 더 새 버전으로 쓰였다면,
-   앱은 `LoadSource::Default`로 떨어지면서 **저장 차단을 걸지 않아** 신버전 데이터를
-   덮어쓸 수 있다. 본파일이 미래 스키마일 때만 가드가 선다.
-   수정안: 백업을 미래 스키마 때문에 거부했을 때도 가드를 세운다.
-   드문 조합(손상된 본파일 + 신버전 백업)이지만 결과가 데이터 손실이라 값이 있다.
+9. ~~**미래 스키마 **백업**은 가드를 세우지 않는다**~~ (`crates/suaegi-core/src/persistence.rs`)
+   → `981342f`로 수정. `load_from_backups()`가 이제 `parse_trusted`의 거부 사유를
+   구분한다 — 미래 스키마(`Err(true)`)면 `future_schema_guard`를 세우고 다음 슬롯을
+   계속 보고, 손상/파싱 실패(`Err(false)`)는 지금처럼 그냥 건너뛴다. 회귀 테스트:
+   `a_future_schema_backup_also_blocks_saves`(가드가 서야 함),
+   `a_merely_corrupt_backup_does_not_block_saves`(쓰레기 백업은 막지 않아야 함).
+
+## Plan 4로 넘기는 것 (터미널 커스텀 위젯)
+
+Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 단색
+모노스페이스 텍스트로 세션 → 스냅샷 → 구독 → 화면 사슬이 실제로 도는 것만
+증명한다. 다음은 전부 Plan 4 몫이다:
+
+10. **색/커서/폰트 속성.** 스냅샷 셀은 `fg`/`bg`/`flags`(alacritty_terminal의
+    `Color`/`Flags`)를 이미 들고 있지만 지금은 버려지고 단색으로만 그린다.
+
+11. **키 입력 → PTY.** 지금 워크벤치는 완전히 읽기 전용이다. `Widget::update`가
+    포커스를 `operation::Focusable`로만 받으므로(`Widget::on_event`가 아니다,
+    `canvas`로는 불가능) 커스텀 위젯이 필요하다. `TerminalSession::write`가
+    돌려주는 `bool`(입력 유실 여부)을 피드백하는 UI도 이때 같이 들어간다.
+
+12. **마우스(선택/스크롤/마우스 리포팅) + pane_grid와의 합성.** 터미널 본문이
+    마우스 이벤트를 소비해야 하는데 `pane_grid`도 같은 영역에 `on_click`과
+    분할 히트테스트를 건다. 이 설계에서 가장 깨지기 쉬운 가정이므로 Plan 4에서
+    가장 먼저 스파이크할 것(계획 문서에 이미 명시돼 있다).
+
+13. **리사이즈.** 세션은 지금 고정 80×50으로 스폰된다(`session_store.rs`의
+    `DEFAULT_ROWS`/`DEFAULT_COLS`). pane 크기에 맞춘 실제 리사이즈는 커스텀
+    위젯이 크기를 알 수 있어야 가능하다.
+
+## Plan 5로 넘기는 것
+
+14. **세션 레이아웃 복원.** `PersistedState.session.active_worktree_id`는
+    Task 8에서 배선했다 — worktree를 선택할 때마다 `AppState::persist()`가
+    실제로 디스크에 쓴다(`state.rs`의 `Message::WorktreeSelected` 핸들러).
+    하지만 부팅 시(`AppState::boot`/`from_load`)에는 읽지 않는다 — 재시작 후
+    어느 worktree가 선택돼 있었는지, 어떤 pane 분할이 열려 있었는지 복원하는
+    UI는 Plan 5 몫이다.
+
+15. **worktree 메타데이터가 재조회 때마다 유실된다.** `AppState::persisted_snapshot`
+    (`state.rs`)이 저장하는 `Worktree.created_at_unix_ms`/`created_with_agent`는
+    `worktrees_by_repo`(git이 돌려주는 `WorktreeEntry`)에서 매번 새로 합성한
+    자리표시자(`0`/`None`)다 — 실제 생성 시각·생성 에이전트를 추적하는 곳이
+    Plan 3엔 없다. git이 그 정보를 안 주므로, 어딘가(아마 세션 시작 시점)에서
+    직접 기록해 둬야 한다. 세션 레이아웃 복원이 이 메타데이터를 쓰게 되는
+    시점에 같이 처리한다.
+
+16. **에이전트 상태 3색(working/waiting/done).** 지금 사이드바 배지는
+    "에이전트가 떠 있는가"만 안다(`AgentPresence`). hook 서버가 붙는 Plan 5의
+    몫이다(계획 문서에 이미 명시돼 있다).
+
+## Task 8에서 남긴 것
+
+17. **future-schema 저장 가드가 부팅 시점엔 조용하다.** `PersistenceHandle::spawn`이
+    반환하는 `LoadDiagnostics.save_blocked`는 `AppState::boot`이 지금 아무데도
+    쓰지 않는다 — 가드가 서 있어도 사용자가 뭔가를 바꿔 첫 `persist()` 호출이
+    실패할 때까지는(그제서야 `SaveStatus::Failed`가 상태 표시줄에 뜬다) 조용하다.
+    Task 0이 막으려 한 게 바로 이 케이스(손상된 본파일 + 미래 스키마 백업)인데,
+    사용자는 앱을 열고 몇 걸음 걷기 전까지는 "저장이 막혀 있다"는 걸 모른다.
+    부팅 직후에 바로 보여줄지, 그냥 첫 실패 시 알리는 지금 방식으로 충분한지는
+    UX 판단이 필요해 코드를 바꾸지 않고 남겨둔다.
+
+18. **앱 데이터 파일 위치.** `crates/suaegi-app/src/persistence_thread.rs`의
+    `default_data_file()`이 `dirs::config_dir()/suaegi/data.json`(macOS:
+    `~/Library/Application Support/suaegi/data.json`)으로 정했다 —
+    `workspace_root`(worktree들이 실제로 생기는 곳, 기본값
+    `~/suaegi-workspaces`)와는 다른 위치다. 여태 이 결정이 어디에도 문서화돼
+    있지 않았다.
+
+19. **Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**
+    담당 에이전트는 마우스/키보드로 앱 창을 직접 조작할 수 있는 수단이 없었고
+    (합성 클릭은 이 플랜의 좌표 계산이 멀티 모니터 환경에서 엉뚱한 창을 때린
+    전례가 있어 명시적으로 금지돼 있다), 그래서 실제로 확인한 건 앱이
+    뜨는지·부팅 시 repo/worktree가 복원되는지(데이터 파일을 직접 심어
+    재현)뿐이다. **사람이 직접 확인해야 할 것**: worktree 생성 버튼 클릭 →
+    실제 세션이 셸 출력을 보여주는지, 두 번째 worktree로 분할했을 때 양쪽이
+    독립적으로 도는지, worktree 여러 개를 빠르게 닫아도 UI가 멈추지 않는지
+    (reaper 검증 — `SessionStore`의 각 로직은 단위 테스트로 실측했지만 실제
+    `pane_grid` UI에서 연타했을 때의 체감은 다른 문제다).
+
+## Plan 3 최종 리뷰에서 넘긴 것
+
+20. **앱 종료 시 세션 drop이 UI 스레드에서 일어난다.** `AppState`/`SessionStore`가
+    보통 경로(`close()` → `Reaper`)를 거치는 건 pane을 하나씩 닫을 때뿐이다.
+    창을 닫아 앱이 종료될 때는 `iced::application(...).run()`이 이벤트 루프를
+    빠져나오며 `AppState`(그리고 그 안의 `SessionStore` 슬롯들)를 제자리에서
+    drop한다 — 스토어가 마지막 클론을 들고 있으면 `Drop for TerminalSession`이
+    그 스레드(창/이벤트 루프 스레드)에서 세션당 최대 2초, 슬롯 수만큼 순차로
+    실행된다. 창이 멈춰 보이는 건 아니다(이미 닫히는 중이라 아무도 안 본다) —
+    종료가 지연될 뿐이다. 하지만 "마지막 drop은 UI 스레드 밖에서" 규칙이 지켜지지
+    않는 유일한 경로다.
+
+    깨끗한 수정은 `iced::window::close_requests()`를 구독해 첫 닫기 요청을
+    가로채고, 그 시점에 모든 세션을 `SessionStore::close()`(→ Reaper)로 은퇴시킨
+    뒤, 전부(또는 바운드된 타임아웃까지) 정리될 때까지 기다렸다가 그제서야
+    `window::close(id)`를 실제로 발행하는 것이다. 이번 리뷰에서는 이걸 구현하지
+    않았다: `Message` 변형과 구독 배선이 새로 필요하고, "창 닫기 요청을 가로채고
+    실제로 닫는" 흐름은 이 저장소의 테스트 하네스(진짜 창이 없는 plain `#[test]`)로
+    의미 있게 검증할 방법이 없다 — 마우스/키보드로 창을 조작하는 것도 이 플랜
+    범위에서 명시적으로 금지돼 있다(위 19번 참고). 검증 못 할 종료 경로 변경을
+    머지 직전에 밀어 넣는 것보다, "행이 아니라 지연된 종료"라는 지금 동작을
+    문서화해 두는 쪽을 택했다. 실제 창으로 종료를 조작해 확인할 수 있는 사람이
+    붙는 시점(또는 Plan 4/5에서 UI 자동화가 생기는 시점)에 다시 본다.
+
+## PR4 적대적 리뷰에서 넘긴 것
+
+21. **백그라운드 클로저 안의 임의 패닉은 여전히 가드를 영영 못 푼다.**
+    (`crates/suaegi-app/src/session_store.rs`) 이번 리뷰에서 `probe_with`의
+    poisoned-mutex `expect`는 락을 회수하는 쪽으로 고쳤다(패닉 원인 하나
+    제거) — 하지만 `request_presence_with`/`request_snapshot`의 백그라운드
+    스레드 클로저 안에서 그 자체가 아닌 다른 이유로 패닉이 나면(예:
+    `ProcessProbe::command_line`의 커스텀 구현이 패닉하거나,
+    `TerminalSession::snapshot()`이 그리드 인덱싱 버그로 패닉하는 경우)
+    `PresenceReady`/`SnapshotReady`가 영영 전송되지 않고 `presence_in_flight`/
+    `snapshot_in_flight` 가드가 그대로 묶여 그 세션의 배지/화면이 다시는
+    갱신되지 않는다 — 에러도 재시도도 없다. `apply_snapshot`의 가드
+    선해제(이번 리뷰에서 고침)는 "결과가 도착했는데 stale"인 경우만
+    구한다 — 결과가 아예 전송되지 않는 이 경우는 못 막는다. 모든 백그라운드
+    클로저를 `catch_unwind`로 감싸거나 타임아웃/재시도 메커니즘을 넣는
+    건 이번 항목이 요구한 "cheap hardening" 범위를 넘는 elaborate
+    machinery라 지금은 하지 않았다. `PsProbe`(실제 `ps` 호출)와
+    `TerminalSession::snapshot()`은 알려진 패닉 경로가 없어 지금 당장의
+    실사용 위험은 낮지만, 커스텀 `ProcessProbe` 구현이 늘어나거나
+    `snapshot()`이 더 복잡해지면 재검토한다.
