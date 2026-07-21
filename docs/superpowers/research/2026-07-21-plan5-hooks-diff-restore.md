@@ -405,9 +405,31 @@ float 잡음이 저장을 계속 흔드는 걸 막는다(우리 `Store::save`가
 
 ### 7.1 신뢰 대화상자 — Plan 5가 반드시 다뤄야 하는 첫 실행 상태
 
-검증 중에 걸렸다: **사용자가 신뢰하지 않은 디렉터리에서 `claude`를 띄우면 "이 폴더의 파일을
-신뢰합니까?" 대화상자가 먼저 뜨고, 그 전에는 `SessionStart` 말고 아무 훅도 발화하지 않는다.**
-첫 프롬프트가 그대로 먹혔다.
+**대화형 PTY로 다시 측정했고, 앞선 서술이 틀렸다.** 신뢰 전에는 **`SessionStart`를 포함해
+아무 훅도 발화하지 않는다**:
+
+```
+before trust : (NONE)
+after  trust : ['SessionStart']
+after prompt : ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','SubagentStop']
+```
+45초를 답하지 않고 기다려도(t+15/30/45s) 아무것도 오지 않았다 — "느릴 뿐"이 아니다.
+
+**왜 처음에 틀렸나: print 모드는 신뢰 게이트를 아예 우회한다.** `claude -p`를 신뢰 안 된
+디렉터리에서 돌리면 훅 6개가 전부 발화하고 `.claude.json`에 항목조차 안 생긴다 — 게이트에
+도달하지 않는다. §1.3의 캡처가 print 모드였다.
+
+**주입 방식과 무관하다.** `--settings`(argv)로 준 대조군도 결과가 **동일**하다:
+```
+--settings, before trust : (NONE)
+--settings, after  trust : ['SessionStart']
+```
+→ 훅을 worktree의 `.claude/settings.local.json`으로 옮기는 것은 **신뢰 축에서 회귀가 아니다.**
+
+**신뢰 상태의 위치**: `$CLAUDE_CONFIG_DIR/.claude.json`의
+`projects["<절대경로>"].hasTrustDialogAccepted`. 사전 신뢰 심기는 기계적으로는 키 하나
+쓰기지만 **Global Constraint #1(사용자 Claude 설정을 건드리지 않는다)에 정면으로 걸린다** —
+알려진 유일한 방법이 그것뿐이라는 사실까지 follow-up에 남긴다.
 
 suaegi는 **새로 만든 worktree에서** 에이전트를 띄우므로 이 상태에 항상 부딪힌다. 배지가
 `SessionStart` 이후 영원히 멈춰 보일 것이다. Plan 5는 이걸 감지해 사용자에게 알리거나,
