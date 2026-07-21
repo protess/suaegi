@@ -104,7 +104,16 @@ pub fn subscription(state: &AppState) -> Subscription<Message> {
 fn feed_stream(feed: &TermFeed) -> impl Stream<Item = Message> {
     let id = feed.id;
     let session = Arc::clone(&feed.session);
-    stream::unfold(session.generation(), move |last_seen| {
+    // 씨드를 `session.generation()`으로 읽으면(그 값을 읽는 시점 자체가
+    // `TerminalSession::start`의 블로킹 스폰과 이 구독의 첫 poll 사이 어딘가라
+    // 레이스다) 그 사이 이미 나온 출력이 씨드 값에 흡수돼 사라진다 — 셸이
+    // 프롬프트를 찍고 조용히 기다리기만 하면(또는 명령이 그 창 안에서 바로
+    // 종료하면) 그 이후로는 `generation()`이 다시 안 바뀌므로 이 pane은
+    // 영원히 빈 채로 남는다. `blank_snapshot()`의 generation과 같은 `0`으로
+    // 고정해서 씨딩하면, 첫 poll 시점까지 실제로 있었던 모든 출력(언제
+    // 일어났든)이 항상 `current != 0`으로 잡힌다 — `generation`은 단조 증가고
+    // 실제 출력 없이는 결코 0에서 움직이지 않으므로 오탐은 없다.
+    stream::unfold(0u64, move |last_seen| {
         let session = Arc::clone(&session);
         async move {
             loop {
@@ -133,6 +142,39 @@ mod tests {
 
     fn start_throwaway_session() -> Arc<TerminalSession> {
         Arc::new(SessionStore::spawn_throwaway_for_test())
+    }
+
+    /// 뭔가를 한 번 찍고("hello") 그다음엔 아무 출력 없이 그대로 대기하는
+    /// 세션 — 프롬프트를 찍고 조용히 기다리는 실제 셸을 흉내낸다.
+    fn start_session_that_prints_then_goes_quiet() -> TerminalSession {
+        use suaegi_term::pty::PtySpawn;
+        use suaegi_term::session::SessionSpec;
+
+        #[cfg(unix)]
+        let (program, args) = (
+            "sh".to_string(),
+            vec!["-c".to_string(), "printf 'hello\\n'; sleep 5".to_string()],
+        );
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "echo hello && ping -n 6 127.0.0.1 > nul".to_string(),
+            ],
+        );
+        TerminalSession::start(SessionSpec {
+            pty: PtySpawn {
+                program,
+                args,
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+            scrollback: 200,
+        })
+        .expect("test session must start")
     }
 
     /// 해시 입력 바이트를 그대로 기록한다. "우연히 같은 u64"가 아니라
@@ -180,5 +222,52 @@ mod tests {
             session: start_throwaway_session(),
         };
         assert_ne!(recorded(&a), recorded(&b));
+    }
+
+    /// 최종 리뷰 항목 1: 구독이 붙기 **전에** 이미 도착한 출력이 첫 poll에서
+    /// 잡히는지. 씨드를 스폰 시점의 `session.generation()`으로 읽으면(고쳐지기
+    /// 전 동작) 이 출력이 씨드 값에 흡수돼 `feed_stream`이 다시는
+    /// `SessionDirty`를 내지 않는다 — 프롬프트를 찍고 조용히 기다리는 셸의
+    /// pane이 영원히 빈 채로 남는 버그였다.
+    #[tokio::test]
+    async fn output_that_arrives_before_the_subscription_starts_still_reaches_the_cache() {
+        use futures::StreamExt;
+
+        let session = Arc::new(start_session_that_prints_then_goes_quiet());
+
+        // 구독을 붙이기 전에, 출력이 실제로 도착할 때까지(generation이
+        // 움직일 때까지) 기다린다 — "구독 시작 전에 출력이 이미 왔다"는
+        // 전제 자체를 확실히 한다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while session.generation() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never produced its initial output"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let feed = TermFeed {
+            id: SessionId(1),
+            session,
+        };
+        let stream = feed_stream(&feed);
+        tokio::pin!(stream);
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect(
+                "feed_stream must report output that already arrived before subscription, \
+                 not hang forever waiting for a *new* change",
+            )
+            .expect("the stream must not end");
+
+        assert!(matches!(
+            msg,
+            Message::SessionDirty {
+                id: SessionId(1),
+                ..
+            }
+        ));
     }
 }
