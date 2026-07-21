@@ -1,4 +1,4 @@
-use suaegi_term::grid::{GridSize, TerminalGrid, TitleChange};
+use suaegi_term::grid::{GridSize, TerminalGrid, TitleChange, TITLE_CHANGES_CAPACITY};
 
 #[test]
 fn plain_text_lands_in_the_grid() {
@@ -106,6 +106,37 @@ fn title_set_and_reset_are_distinguishable() {
         "empty title must surface as Reset, not Set(\"\")"
     );
     assert!(grid.take_title_changes().is_empty(), "take must drain");
+}
+
+/// `take_title_changes`를 아무도 부르지 않으면(UI가 폴링을 놓쳤거나 죽었으면)
+/// 타이틀 이스케이프를 반복하는 자식이 벡터를 무한정 키울 수 있다 — 상한이
+/// 없으면 이 테스트는 `TITLE_CHANGES_CAPACITY`의 몇 배를 흘려보낸 뒤에도
+/// 그만큼(또는 그 이상)이 그대로 쌓여 있는 것으로 실패해야 한다.
+#[test]
+fn title_changes_are_capped_and_keep_the_most_recent() {
+    let grid = TerminalGrid::new(GridSize { rows: 10, cols: 40 }, 100);
+    let flood = TITLE_CHANGES_CAPACITY * 4;
+    for i in 0..flood {
+        grid.feed(format!("\x1b]0;title-{i}\x07").as_bytes());
+    }
+    let changes = grid.take_title_changes();
+    assert_eq!(
+        changes.len(),
+        TITLE_CHANGES_CAPACITY,
+        "title_changes must be capped at TITLE_CHANGES_CAPACITY, not grow with the flood"
+    );
+    // 가장 오래된 건 버려지고 최신 항목들이 남아야 한다
+    assert_eq!(
+        changes.last(),
+        Some(&TitleChange::Set(format!("title-{}", flood - 1))),
+        "the most recent title change must be preserved"
+    );
+    let oldest_kept = flood - TITLE_CHANGES_CAPACITY;
+    assert_eq!(
+        changes.first(),
+        Some(&TitleChange::Set(format!("title-{oldest_kept}"))),
+        "the oldest surviving entry must be exactly capacity entries behind the newest"
+    );
 }
 
 #[test]

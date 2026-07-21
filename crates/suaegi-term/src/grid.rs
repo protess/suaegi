@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -74,11 +75,21 @@ pub enum TitleChange {
     Reset,
 }
 
+/// `title_changes` 상한. `pty_writes`와 달리 리더가 매 피드마다 자동으로 비우지
+/// 않는다 — 오직 UI가 `take_title_changes`를 불러야 비워진다. UI가 폴링을
+/// 멈추거나 죽은 채로 세션이 계속 살아 있으면, 타이틀 이스케이프를 반복하는
+/// 자식(예: 프롬프트마다 타이틀을 바꾸는 셸)이 이 벡터를 무한정 키운다. 256개면
+/// 정상 동작(보통 프레임마다 비워 한 자릿수만 쌓임)보다 훨씬 넉넉하면서도
+/// 상한을 유지한다. 초과분은 **가장 오래된 것부터** 버린다 — UI가 결국 다시
+/// 폴링하기 시작하면 보게 될 값은 최신 타이틀이므로, 보존할 가치가 있는 건
+/// 오래된 기록이 아니라 최근 변경들이다.
+pub const TITLE_CHANGES_CAPACITY: usize = 256;
+
 /// 터미널의 부수 효과를 모으는 공유 상태. `send_event`가 `&self`라서 내부는 Mutex.
 #[derive(Debug, Default)]
 struct GridEventState {
     pty_writes: Mutex<Vec<String>>,
-    title_changes: Mutex<Vec<TitleChange>>,
+    title_changes: Mutex<VecDeque<TitleChange>>,
 }
 
 /// 로컬 뉴타입. `impl EventListener for Arc<..>`는 외래 트레이트 + 외래 타입이라
@@ -106,20 +117,24 @@ impl EventListener for GridEventProxy {
                 } else {
                     TitleChange::Set(title)
                 };
-                self.0
-                    .title_changes
-                    .lock()
-                    .expect("title mutex")
-                    .push(change);
+                self.push_title_change(change);
             }
             Event::ResetTitle => {
-                self.0
-                    .title_changes
-                    .lock()
-                    .expect("title mutex")
-                    .push(TitleChange::Reset);
+                self.push_title_change(TitleChange::Reset);
             }
             _ => {}
+        }
+    }
+}
+
+impl GridEventProxy {
+    /// `TITLE_CHANGES_CAPACITY`를 넘으면 가장 오래된 항목부터 버린다 —
+    /// 근거는 상수 선언부의 주석 참고.
+    fn push_title_change(&self, change: TitleChange) {
+        let mut changes = self.0.title_changes.lock().expect("title mutex");
+        changes.push_back(change);
+        if changes.len() > TITLE_CHANGES_CAPACITY {
+            changes.pop_front();
         }
     }
 }
@@ -249,6 +264,6 @@ impl TerminalGrid {
 
     pub fn take_title_changes(&self) -> Vec<TitleChange> {
         let mut changes = self.proxy.0.title_changes.lock().expect("title mutex");
-        std::mem::take(&mut *changes)
+        std::mem::take(&mut *changes).into()
     }
 }
