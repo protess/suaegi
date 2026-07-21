@@ -1292,6 +1292,59 @@ mod tests {
         );
     }
 
+    /// 두 버튼이 겹쳐 눌려도 **첫 버튼의 release가 래치를 해소해야 한다.**
+    ///
+    /// 둘째 press가 래치를 덮어쓰면 첫 버튼의 release가 래치와 어긋나(`_ => live`)
+    /// 래치가 남는다. 그러면 `request_copy`가 "아직 선택을 만드는 중"이라고 보고
+    /// **영원히 `None`**을 돌려줘, 단축키 복사가 그 세션 내내 죽는다. 래치는
+    /// 관찰창이 없으므로 그 효과로 확인한다.
+    ///
+    /// 위젯은 이제 겹친 press를 아예 발행하지 않으므로 이 경로는 **깊이 방어**다.
+    /// 그래도 `handle_mouse`는 공개 API라 직접 부르는 호출자에게는 여전히 닿는다.
+    #[test]
+    fn a_chorded_press_does_not_strand_the_pointer_latch() {
+        let grid = grid_with_scrollback();
+        let left = Some(TermMouseButton::Left);
+        let right = Some(TermMouseButton::Right);
+
+        grid.handle_mouse(&intent(
+            MouseAction::Press(TermMouseButton::Left),
+            (0, 0),
+            Side::Left,
+            left,
+        ))
+        .expect("left press routes");
+        // 좌버튼을 쥔 채 우버튼을 누른다. 그 자체로는 모순 없는 intent다.
+        grid.handle_mouse(&intent(
+            MouseAction::Press(TermMouseButton::Right),
+            (0, 1),
+            Side::Left,
+            right,
+        ))
+        .expect("right press routes");
+
+        // 선택을 만드는 중이므로 아직 복사할 수 없다 — 대조군.
+        assert_eq!(
+            grid.request_copy(CopyTargets::EXPLICIT),
+            None,
+            "the gesture is still in progress"
+        );
+
+        grid.handle_mouse(&intent(
+            MouseAction::Release(TermMouseButton::Left),
+            (0, 3),
+            Side::Right,
+            left,
+        ))
+        .expect("left release routes");
+
+        assert!(
+            grid.request_copy(CopyTargets::EXPLICIT).is_some(),
+            "the first button's release must resolve the latch — otherwise \
+             shortcut copy is dead for the rest of the session"
+        );
+    }
+
     /// 리포트로 래치된 드래그는 선택을 건드리지 않는다 — 그동안 단축키 복사를
     /// 막으면 마우스 모드 TUI 위에서 버튼을 붙들고 있는 내내 복사가 죽는다.
     #[test]
