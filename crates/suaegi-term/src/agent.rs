@@ -80,6 +80,15 @@ pub fn build_spawn(
         Some(def) => {
             let mut args: Vec<String> = def.launch_args.iter().map(|s| s.to_string()).collect();
             if let (PromptInjection::Argv, Some(prompt)) = (def.prompt_injection, prompt) {
+                // `--`로 이후 인자를 옵션 파싱에서 제외시킨다. 프롬프트가 `-`로
+                // 시작하면(예: "-fix this") 이게 없을 때 claude/codex가 이를
+                // 알 수 없는 플래그로 파싱해 시작 에러를 내거나 조용히
+                // 오동작한다. claude와 codex 둘 다 clap 기반 파서를 쓰며 `--`
+                // 뒤는 항상 위치 인자로 취급함을 실측으로 확인했다(둘 다
+                // "unknown option"/"unexpected argument" 대신 값으로 받아
+                // 프롬프트로 넘어감) — codex는 에러 메시지에서 직접
+                // `-- -x` 형태를 제안하기도 한다.
+                args.push("--".to_string());
                 args.push(prompt.to_string());
             }
             (def.launch_program.to_string(), args)
@@ -176,6 +185,26 @@ mod tests {
         assert_eq!(spawn.program, "claude");
         assert!(spawn.args.iter().any(|a| a == "fix the bug"));
         assert_eq!(spawn.cwd, Some(PathBuf::from("/tmp")));
+    }
+
+    /// `-`로 시작하는 프롬프트가 claude/codex에 의해 플래그로 오인되면 안
+    /// 된다. `--` 분리자가 있으면 위치 인자로 전달된다(실측 확인 — 두 CLI
+    /// 모두 clap 기반이며 `--` 뒤는 언제나 값으로 처리한다).
+    #[test]
+    fn prompt_starting_with_a_dash_is_separated_from_flags() {
+        let spawn = build_spawn(
+            AgentKind::Claude,
+            None,
+            Some("-i am not a flag"),
+            PathBuf::from("/tmp"),
+            24,
+            80,
+        );
+        assert_eq!(
+            spawn.args,
+            vec!["--".to_string(), "-i am not a flag".to_string()],
+            "expected a `--` separator immediately before the prompt"
+        );
     }
 
     #[test]
