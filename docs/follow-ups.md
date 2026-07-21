@@ -44,6 +44,20 @@
    조치로는 못 막는다. CI를 붙일 때 **PTY를 여는 테스트를 직렬화**하거나(전용 게이트,
    또는 `--test-threads` 제한) 시스템 pty 풀 상한을 확인한다.
 
+4c. **`suaegi-git` 테스트는 개발자의 전역 gitignore를 읽는다 — 고쳤지만 함정을 기록해 둔다.**
+   Plan 5에서 발견: git이 파일을 **나열하는지**에 의존하는 테스트는 그 개발자의
+   `~/.config/git/ignore` 내용만큼만 신뢰할 수 있다. 실제로 이 기계의 1번 줄이
+   `**/.claude/settings.local.json`이라, 우리 주입 파일을 걸러내는 필터를 **삭제해도**
+   테스트가 통과했다.
+
+   **함정**: `GIT_CONFIG_GLOBAL`로는 안 고쳐진다. `core.excludesFile`이 설정 파일과 무관하게
+   `$XDG_CONFIG_HOME/git/ignore`를 기본값으로 쓰기 때문에, 그 레버를 당긴 사람은
+   **격리됐다고 잘못 결론 내린다.** `GitRunner`는 실제 앱에서 `GIT_CONFIG_GLOBAL`을 설정하면
+   안 되므로(사용자 설정을 존중해야 한다) 러너를 바꾸는 것도 답이 아니다.
+
+   **수정**: 공용 픽스처(`crates/suaegi-git/tests/fixture/mod.rs`)가 테스트 저장소에
+   `core.excludesFile=/dev/null`을 설정한다. 새 테스트는 이 픽스처를 쓰면 자동으로 격리된다.
+
 5. **`CACHE_REVALIDATE_AFTER` 경계 미테스트** (`crates/suaegi-term/src/presence.rs`)
    20회 히트 후 재검증 경로에 테스트가 없다. 폴링 주기를 소유하는 Plan 3에서
    이 상수가 의미를 갖게 되므로 그때 단위 테스트를 추가한다.
