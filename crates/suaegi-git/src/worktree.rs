@@ -77,14 +77,19 @@ pub async fn add_worktree(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".to_string());
     let parent = workspace_root.join(&repo_dir_name);
-    std::fs::create_dir_all(&parent)?;
+    tokio::fs::create_dir_all(&parent).await?;
     // WorktreeId의 근간이 되는 경로이므로 항상 canonical 절대 경로로
-    let parent = parent.canonicalize()?;
+    let parent = tokio::fs::canonicalize(&parent).await?;
 
     let mut chosen: Option<(String, PathBuf)> = None;
     for name in candidate_names(&sanitized) {
         let path = parent.join(&name);
-        if path.exists() || branch_exists(runner, repo_path, &name).await? {
+        // Path::exists()와 동일하게 권한 에러 등은 "존재하지 않음"으로 취급
+        // (unwrap_or(false)) — try_exists()의 Err를 그대로 전파하면 기존
+        // exists() 동작(모든 에러를 false로 뭉갬)과 달라진다.
+        if tokio::fs::try_exists(&path).await.unwrap_or(false)
+            || branch_exists(runner, repo_path, &name).await?
+        {
             continue;
         }
         chosen = Some((name, path));
@@ -117,8 +122,8 @@ pub async fn add_worktree(
         let _ = runner
             .run(repo_path, &["worktree", "remove", "--force", &path_str])
             .await;
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            let _ = tokio::fs::remove_dir_all(&path).await;
         }
         let _ = runner.run(repo_path, &["worktree", "prune"]).await;
         let _ = runner.run(repo_path, &["branch", "-D", &branch]).await;
