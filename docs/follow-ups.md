@@ -31,6 +31,19 @@
    지금은 무해하지만, CI를 붙일 때 `cargo-nextest`의 per-test timeout이나 잡 레벨
    타임아웃을 반드시 함께 설정한다.
 
+4b. **PTY를 여는 테스트가 전체 스위트 부하에서 여전히 플레이키하다.**
+   `55c4abd`의 `openpty` 재시도가 대부분을 잡았지만, 동시에 도는 프로세스가 많으면 여전히 난다.
+   특징이 일정하다: **전체 스위트에서만, 매번 다른 테스트 이름으로, 재실행하면 통과.**
+   관측된 것 — `pty_test` 전반, `session_test`,
+   `suaegi-app`의 `state::tests::accepting_a_started_session_registers_it_and_opens_a_pane`,
+   `presence_poll::tests::the_guard_clears_when_the_result_arrives_so_the_next_tick_dispatches`.
+   마지막 것은 픽스처가 실제 `TerminalSession::start`를 부르므로 같은 원인으로 보이나,
+   그 실행의 패닉 메시지를 남기지 못해 **확정은 아니다.**
+
+   Darwin의 `openpty`가 프로세스를 넘나들며 경쟁하므로(자세한 건 `55c4abd`) 프로세스 내부
+   조치로는 못 막는다. CI를 붙일 때 **PTY를 여는 테스트를 직렬화**하거나(전용 게이트,
+   또는 `--test-threads` 제한) 시스템 pty 풀 상한을 확인한다.
+
 5. **`CACHE_REVALIDATE_AFTER` 경계 미테스트** (`crates/suaegi-term/src/presence.rs`)
    20회 히트 후 재검증 경로에 테스트가 없다. 폴링 주기를 소유하는 Plan 3에서
    이 상수가 의미를 갖게 되므로 그때 단위 테스트를 추가한다.
