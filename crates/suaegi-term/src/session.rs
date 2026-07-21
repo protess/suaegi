@@ -118,15 +118,12 @@ impl TerminalSession {
                         // select가 어느 쪽을 깨우든 응답 우선순위는 유지된다.
                         let oper = select.select();
                         if oper.index() == reply_idx {
-                            match oper.recv(&reply_rx) {
-                                Ok(bytes) => {
-                                    if writer_pty.write(&bytes).is_err() {
-                                        break;
-                                    }
+                            // 리더가 select 대기 중에 사라졌다면 Err(_) — 다음
+                            // 반복의 위쪽 드레인 루프가 Disconnected로 잡아 끝낸다.
+                            if let Ok(bytes) = oper.recv(&reply_rx) {
+                                if writer_pty.write(&bytes).is_err() {
+                                    break;
                                 }
-                                // 리더가 select 대기 중에 사라졌다 — 다음 반복의
-                                // 위쪽 드레인 루프가 Disconnected로 잡아 끝낸다.
-                                Err(_) => {}
                             }
                         } else if oper.index() == ui_idx {
                             match oper.recv(&ui_rx) {

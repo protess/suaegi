@@ -182,7 +182,9 @@ impl PtySession {
     /// 일치하는지 독립적으로 확인하는 용도.
     pub fn size(&self) -> Result<(u16, u16), TermError> {
         let master = self.master.lock().expect("pty master mutex poisoned");
-        let size = master.get_size().map_err(|e| TermError::Pty(e.to_string()))?;
+        let size = master
+            .get_size()
+            .map_err(|e| TermError::Pty(e.to_string()))?;
         Ok((size.rows, size.cols))
     }
 
