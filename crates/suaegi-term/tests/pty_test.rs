@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use suaegi_term::pty::{PtyReader, PtySession, PtySpawn};
+use suaegi_term::pty::{KillOutcome, PtyReader, PtySession, PtySpawn};
 
 fn spec(cmd: (String, Vec<String>)) -> PtySpawn {
     PtySpawn {
@@ -113,12 +113,80 @@ fn try_wait_is_none_while_running_then_some() {
     assert_eq!(code, Some(0));
 }
 
+/// 회귀 테스트: 예전에는 수확이 끝난 뒤 `try_wait`가 영원히 `Ok(None)`을
+/// 돌려줬다(fire-once) — `Ok(None)`이 "아직 실행 중"과 "이미 어딘가에서
+/// 수확됨" 둘 다를 뜻하게 되어 폴링하는 쪽이 오해할 수 있었다. 이 테스트는
+/// `try_wait` 자신이 수확한 뒤 반복 호출해도 매번 같은 코드를 돌려준다는
+/// 계약(멱등성)을 확인한다.
+#[test]
+fn try_wait_is_idempotent_after_child_exits() {
+    let (session, reader) = PtySession::spawn(spec(platform::exit_with(4))).unwrap();
+    let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first = None;
+    while Instant::now() < deadline {
+        if let Some(c) = session.try_wait().unwrap() {
+            first = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        first,
+        Some(4),
+        "first try_wait should observe the exit code"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            session.try_wait().unwrap(),
+            Some(4),
+            "try_wait must keep reporting the known code, not fall back to None"
+        );
+    }
+}
+
+/// 회귀 테스트의 다른 절반: 수확이 `try_wait` 자신이 아니라 별도의 `wait()`
+/// 호출로 먼저 끝난 경우에도, 뒤이은 `try_wait`는 알려진 코드를 돌려줘야
+/// 한다 — `Lifecycle`에 코드를 저장하는 쪽은 `wait()`와 `try_wait()` 둘 다다.
+#[test]
+fn try_wait_reports_the_code_after_wait_already_reaped() {
+    let (session, reader) = PtySession::spawn(spec(platform::exit_with(9))).unwrap();
+    let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+    assert_eq!(session.wait().unwrap(), 9);
+    assert_eq!(
+        session.try_wait().unwrap(),
+        Some(9),
+        "try_wait after an external wait() already reaped must still report the code, \
+         not None"
+    );
+}
+
 #[test]
 fn kill_terminates_a_long_running_child() {
     let (session, reader) = PtySession::spawn(spec(platform::sleep_seconds(60))).unwrap();
-    session.kill().unwrap();
+    assert_eq!(
+        session.kill().unwrap(),
+        KillOutcome::Signalled,
+        "kill() on a live child that hasn't started reaping must report that it \
+         actually sent the signal"
+    );
     // 죽었으면 슬레이브가 닫히며 리더가 EOF에 도달한다
     let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+}
+
+/// 이미 수확된(reaped) 자식에 대한 두 번째 `kill()` 호출은 아무것도 하지
+/// 않지만, 그 사실을 반환값으로 정직하게 알려야 한다 — 첫 kill과 똑같이
+/// `Signalled`를 돌려주면 호출자가 시그널이 다시 나갔다고 오해할 수 있다.
+#[test]
+fn kill_after_natural_exit_reports_suppressed_not_signalled() {
+    let (session, reader) = PtySession::spawn(spec(platform::exit_with(0))).unwrap();
+    let _ = read_to_end_with_timeout(reader, Duration::from_secs(10));
+    session.wait().unwrap();
+    assert_eq!(
+        session.kill().unwrap(),
+        KillOutcome::SuppressedAfterReap,
+        "kill() after the child has already been reaped must not claim it signalled"
+    );
 }
 
 /// 회귀 테스트: `wait()`가 자식 프로세스를 기다리며 파킹된 동안 다른 스레드가
@@ -164,10 +232,17 @@ fn try_wait_then_kill_do_not_deadlock_while_wait_is_parked() {
         "try_wait()/kill() did not return within the deadline — \
          likely a lock-ordering deadlock between wait() and try_wait()/kill()"
     );
-    probe
-        .join()
-        .expect("probe thread panicked")
-        .expect("kill() returned an error");
+    // 이 시점에는 스레드 A의 wait()가 이미 reaping을 세워둔 뒤라 kill()이
+    // 시그널을 보내지 않는다 — 그런데도 자식은 sleep 3s를 다 채울 때까지
+    // 진짜로 살아 있다(아래 waiter 대기가 그걸 증명한다). kill()의 반환값이
+    // 이 억제를 정직하게 알려야 한다: 무조건 `Ok(())`였다면 호출자가 "kill이
+    // 성공했으니 자식이 곧 죽는다"고 잘못 믿을 수 있었다.
+    assert_eq!(
+        probe.join().expect("probe thread panicked").unwrap(),
+        KillOutcome::SuppressedAfterReap,
+        "kill() must report that it suppressed the signal once wait() had already \
+         started reaping, not claim an unconditional success"
+    );
 
     // 정리: wait()는 자식이 자연 종료될 때까지(수확이 이미 시작된 뒤의 kill은
     // 시그널을 보내지 않는 설계이므로) 계속 진행 중일 수 있다 — 데드락이 아닌

@@ -3,34 +3,25 @@
 리뷰에서 확인됐지만 해당 플랜 범위 밖이라 미룬 것들. 각 항목은 **언제까지** 처리해야
 하는지를 함께 적는다.
 
-## Plan 3(UI 배선) 시작 전에 처리
+## Plan 3(UI 배선) 시작 전에 처리 — 완료
 
-이 셋은 지금은 잠복 상태지만, Plan 3가 `suaegi-term`을 UI 루프에 물리는 순간
-실제 버그가 된다.
+세 항목 모두 처리됐다(각각 별도 커밋, `term-hardening` 브랜치).
+자세한 내용은 `.superpowers/sdd/hardening-c-report.md` 참고.
 
-1. **`PtySession::try_wait`가 fire-once다** (`crates/suaegi-term/src/pty.rs`)
-   수확이 끝나면(`wait()`가 끝났거나 `try_wait` 자신이 수확했거나) 이후 모든
-   `try_wait`는 영원히 `Ok(None)`을 돌려준다. 즉 `Ok(None)`이 "아직 실행 중"과
-   "이미 어딘가에서 수확됨" 두 가지를 뜻하게 되어, 폴링하는 쪽에서 오해하기 쉽다.
-   수정안: `Lifecycle`에 종료 코드를 담고(`reaped: Option<i32>`) `try_wait`가
-   알려진 코드를 돌려주게 한다. 현재 저장소 안에는 영향받는 호출자가 없다.
-   → Plan 3의 폴러는 그때까지 `TerminalSession`의 원자값(`exit_code`/`is_running`)을
-   쓰고 `PtySession::try_wait`를 직접 쓰지 않는다.
+1. ~~`PtySession::try_wait`가 fire-once다~~ → `b03dabd`로 수정. `Lifecycle`에
+   `exit_code: Option<i32>`를 추가해 `wait()`/`try_wait()` 어느 쪽이 먼저
+   수확하든 이후 `try_wait` 호출이 항상 알려진 코드를 돌려주게 했다(멱등).
 
-2. **`match_agent`의 경로 세그먼트 과매칭** (`crates/suaegi-term/src/agent.rs`)
-   실행 파일 토큰에 대해 basename이 아니라 **모든 경로 세그먼트**를 검사해서,
-   `~/code/codex/run.sh`나 `/home/claude/bin/backup.sh`처럼 디렉토리 이름이
-   에이전트명과 같은 실행 파일이 에이전트로 오인된다. 세그먼트 매칭이 필요한 건
-   런처의 스크립트 인자(`node .../claude-code/cli.js`)뿐이다.
-   수정안: 실행 파일 토큰은 basename만, 런처의 두 번째 토큰은 세그먼트 전체.
-   영향은 현재 존재 감지 배지가 틀리는 정도이며, 권위 소스는 Plan 5의 hook이다.
+2. ~~`match_agent`의 경로 세그먼트 과매칭~~ → `bcd6b5b`로 수정. 실행 파일
+   토큰은 이제 basename만 검사하고, 런처의 스크립트 인자(두 번째 토큰)만
+   세그먼트 전체를 검사한다.
 
-3. **`TerminalSession::Drop`의 unix join이 멈출 수 있다** (`crates/suaegi-term/src/session.rs`)
-   `killpg(SIGKILL)`은 자식의 프로세스 그룹까지만 닿는다. `setsid()`로 그룹을
-   빠져나갔지만 상속받은 슬레이브 FD를 닫지 않은 자손이 있으면 리더가 EOF를 보지
-   못해 join이 영원히 대기한다. 코딩 에이전트에서는 드물지만, Plan 3가 Drop을 UI
-   스레드에 올리면 UI가 멈춘다.
-   수정안: 기한이 있는 join(데드라인 초과 시 detach).
+3. ~~`TerminalSession::Drop`의 unix join이 멈출 수 있다~~ → `befb642`로 수정.
+   `join_with_deadline`이 2초 데드라인까지만 폴링하고 넘기면 detach한다.
+   (macOS/Darwin에서는 `killpg` 이후 세션 리더가 죽으면 탈출한 자손이 슬레이브를
+   들고 있어도 마스터가 즉시 EOF를 본다는 걸 실측으로 확인해 — Linux와 다른
+   BSD 계열 pty 동작 — 이 시나리오 자체는 이 호스트에서 재현되지 않았다. 그래서
+   `join_with_deadline` 메커니즘 자체를 직접 단위 테스트했다.)
 
 ## CI 도입 시 처리
 
@@ -50,6 +41,16 @@
    `snapshot()`이 뷰포트 셀을 매번 복사한다(빈 셀 패딩 포함). 일반적인 터미널
    크기에서는 문제없지만 Plan 4의 렌더 경로에 놓인다. 실제 렌더 벤치마크를 보고
    판단한다 — 추측으로 최적화하지 않는다.
+
+## 결정 필요 (코드 변경 보류)
+
+8. **Windows에서 `claude.exe` 미탐지** (`crates/suaegi-term/src/agent.rs`)
+   `process_names`가 codex는 `&["codex", "codex.exe"]`로 두 형태를 다 갖고
+   있지만 claude는 `&["claude", "claude-code"]`뿐이라 `.exe` 확장자가 없다.
+   Windows에서 basename 매칭이 `claude.exe`를 놓친다(pre-existing, 이
+   브랜치의 변경으로 생긴 문제 아님). `bcd6b5b`에서 확정한 basename-only
+   매칭 규칙과 어떻게 맞물릴지(단순히 `"claude.exe"`를 추가할지, 확장자를
+   벗기는 정규화를 basename_matches에 넣을지) 별도로 결정한 뒤에 고친다.
 
 ## 개발 환경 (코드 아님)
 

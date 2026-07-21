@@ -77,6 +77,36 @@ fn resize_updates_both_pty_and_grid() {
     assert_eq!(snap.size.cols, 100);
 }
 
+/// resize()는 &self로 동시 호출될 수 있다(Sync). pty.resize와 grid.resize가
+/// 한 락으로 직렬화되지 않으면 두 호출이 인터리브돼(PTY=A, PTY=B, grid=B,
+/// grid=A) pty와 grid가 서로 다른 크기로 영구히 어긋날 수 있다. 여러 스레드가
+/// 서로 다른 크기로 동시에 resize를 반복해도, 각 라운드가 끝난 뒤에는 항상
+/// pty와 grid가 같은 크기를 보고해야 한다.
+#[test]
+fn concurrent_resizes_never_leave_the_pty_and_grid_disagreeing() {
+    let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();
+    let candidates: [(u16, u16); 4] = [(24, 80), (30, 100), (50, 132), (20, 60)];
+
+    for round in 0..100u32 {
+        std::thread::scope(|scope| {
+            for &(rows, cols) in &candidates {
+                let session = &session;
+                scope.spawn(move || {
+                    session.resize(rows, cols).unwrap();
+                });
+            }
+        });
+
+        let grid_size = session.snapshot().size;
+        let pty_size = session.pty_size().unwrap();
+        assert_eq!(
+            (grid_size.rows as u16, grid_size.cols as u16),
+            pty_size,
+            "pty and grid disagree after concurrent resize round {round}"
+        );
+    }
+}
+
 #[test]
 fn zero_size_resize_is_ignored() {
     let session = TerminalSession::start(spec(platform::echo_stdin())).unwrap();
@@ -154,17 +184,36 @@ fn max_reply_index(session: &TerminalSession) -> u64 {
 /// 통과해버린다(실측: 두 큐를 하나의 공유 바운드 채널로 합쳐도 이전 버전은
 /// 계속 통과했다) — 그래서 반드시 응답 왕복이 있어야 한다.
 ///
+/// 중요: 마커는 **DA1 응답 자체를 관찰했을 때만** 찍는다. 이전 버전은
+/// `dd bs=1 count=5`로 "아무 5바이트"만 세었는데, 플러드 중에는 그 5바이트가
+/// 플러드 페이로드(`flood-N\n`) 자체로도 채워질 수 있어 마커 진행이 "리더가
+/// 계속 읽는다"만 증명하고 "응답이 실제로 큐에 올라가 전달됐다"는 증명하지
+/// 못했다 — 응답을 조용히 드롭하는 회귀도 이 테스트를 통과시켰을 것이다.
+/// DA1 응답은 ESC(`\x1b`)로 시작하고 플러드 페이로드는 ESC를 포함하지
+/// 않으므로, 자식이 청크 단위로 읽으며 ESC가 나타날 때까지 기다렸다가만
+/// 마커를 찍게 하면 마커 진행이 곧 "특정 응답이 도착했다"는 증거가 된다.
+///
 /// `write()`가 실제로 `false`를 반환하는지 먼저 확인해 포화가 실제로
 /// 일어났음을 검증하고, 그 뒤로도 관찰 구간 내내 큐를 계속 채워 넣으면서
 /// (한 번 포화됐다가 라이터가 서서히 비워내면 낡은 설계도 운 좋게 통과할 수
 /// 있다) 마커가 계속 증가하는지 본다.
+///
+/// 압력 레짐: 이 테스트가 실제로 포화시키는 건 UI 쓰기 큐(용량 256)뿐이다.
+/// 자식은 한 번에 질의 하나만 내보내고 그 응답을 볼 때까지 다음 질의를
+/// 보내지 않으므로 응답 큐(용량 4096)에는 항상 많아야 한두 개만 쌓인다 —
+/// 즉 여기서 관찰하는 마커 정체는 문서화된 "응답 큐 포화 시 드롭" 정책이
+/// 아니라 진짜 회귀만을 의미한다.
 #[cfg(unix)]
 #[test]
 fn saturated_write_queue_does_not_stall_the_reader() {
-    let script = "stty -icanon min 1 time 0 -echo; i=0; \
+    let script = "stty -icanon min 1 time 0 -echo; \
+                   esc=$(printf '\\033'); i=0; \
                    while true; do \
                      printf '\\033[c'; \
-                     dd bs=1 count=5 >/dev/null 2>&1; \
+                     while true; do \
+                       chunk=$(dd bs=64 count=1 2>/dev/null); \
+                       case \"$chunk\" in *\"$esc\"*) break ;; esac; \
+                     done; \
                      i=$((i+1)); \
                      printf 'REPLY-%d\\n' \"$i\"; \
                    done";
@@ -227,6 +276,89 @@ fn saturated_write_queue_does_not_stall_the_reader() {
         session.is_running(),
         "session should still be running — the writer is contending for \
          pty bandwidth, not dead"
+    );
+}
+
+/// 자식이 죽으면 리더가 exit_code/running을 발행하고 자기 reply_tx 사본을
+/// drop한다. 세션(과 그 UI 송신자)을 계속 들고 있어도 라이터 스레드가 그
+/// 신호를 보고 곧 스스로 끝나야 한다 — 그러지 않으면 끝난 세션마다 20ms
+/// 주기로 깨어나는 라이터 스레드가 계속 남는다.
+#[test]
+fn writer_thread_exits_after_child_death_even_while_session_is_kept_alive() {
+    let session = TerminalSession::start(spec(platform::exit_with(0))).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || !session.is_running()));
+    assert!(
+        wait_until(Duration::from_secs(2), || session
+            .writer_thread_is_finished()),
+        "writer thread should exit shortly after the child dies, even while \
+         the session is still alive"
+    );
+}
+
+/// 프로세스의 RSS(KB). `/proc` 없는 macOS도 지원해야 하므로 `ps`를 쓴다.
+#[cfg(unix)]
+fn process_rss_kb() -> u64 {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .expect("ps should run");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// 이 테스트가 방지하는 정확한 실패 경로: 자식이 stdin을 전혀 읽지 않으면서
+/// 장치 질의(DA1)를 계속 쏟아낸다. 커널 PTY 입력 버퍼가 차면 라이터의 블로킹
+/// `pty.write`가 파킹되고, 그 뒤로도 리더는 계속 응답을 만들어 큐에 넣으려
+/// 한다. 언바운드 큐였다면 여기서 메모리가 자식의 출력 속도로 무한히 자란다.
+/// 바운드 큐 + `try_send` 드롭으로 이를 막았다는 것을,
+/// (a) 리더가 여전히 진행 중이고(응답 큐 상태와 무관하게 PTY 출력을 계속
+///     소비해 generation이 계속 오른다), (b) 세션 프로세스의 RSS가 관찰 구간
+///     동안 유의미하게 자라지 않는다는 두 가지로 확인한다.
+#[cfg(unix)]
+#[test]
+fn flooding_unread_device_queries_does_not_grow_memory_unbounded() {
+    // `-icanon`이 없으면 자식이 정규 모드에 머물러, tty 입력 큐가 차면 커널이
+    // 응답 바이트를 그냥 버린다 — 라이터가 절대 파킹되지 않고, 이 테스트가
+    // 지키려는 실패 경로(파킹된 라이터 뒤로 큐가 무한히 쌓임)가 아예 발동하지
+    // 않는다. 비정규 모드로 바꿔야 커널이 응답을 실제로 입력 큐에 채운다.
+    let script = "stty -icanon min 1 time 0 -echo; while true; do printf '\\033[c'; done";
+    let session = TerminalSession::start(spec(platform::shell_command(script))).unwrap();
+
+    // 리더가 최소 한 번은 PTY 출력을 소비했는지 확인한다 — 그렇지 않으면
+    // 아래 관찰이 공허하게 통과한다.
+    assert!(
+        wait_until(Duration::from_secs(10), || session.generation() > 0),
+        "reader never observed any output from the flooding child"
+    );
+
+    let rss_before = process_rss_kb();
+    let generation_before = session.generation();
+
+    // 커널 tty 입력 버퍼가 채워지고 라이터가 블로킹 write에 파킹될 시간을 준다.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let rss_after = process_rss_kb();
+    let generation_after = session.generation();
+
+    assert!(
+        generation_after > generation_before,
+        "reader appears stalled while flooded with unread device queries"
+    );
+    assert!(
+        session.is_running(),
+        "session should still be alive while flooded"
+    );
+    let grew_kb = rss_after.saturating_sub(rss_before);
+    // 바운드 큐는 실측상 0.1-0.2MB(100-200KB) 안에서 머문다. 언바운드 큐로
+    // 되돌리면 3초에 ~23MB 자란다(실측). 10MB는 둘 사이에 넉넉한 여유를 둔다.
+    assert!(
+        grew_kb < 10_000,
+        "RSS grew by {grew_kb}KB while flooding unread device queries \
+         (before={rss_before}KB, after={rss_after}KB) — the reply queue \
+         appears unbounded"
     );
 }
 

@@ -67,7 +67,17 @@ impl PresenceMonitor {
         }
         if !session.is_running() {
             self.cached_agent = None;
-            return AgentPresence::Exited { code: -1 };
+            // session.rs의 리더 스레드는 exit_code를 저장한 *다음* running을
+            // false로 저장한다(release 순서, session.rs:140-142). 그러므로
+            // 우리가 방금 위에서 !is_running()을 관찰했다는 것은 exit_code
+            // 저장도 이미 끝났다는 뜻이다 — 여기서 다시 읽으면 항상 최신
+            // 코드를 얻는다. 위쪽의 첫 exit_code() 호출 결과(None)를 그대로
+            // 재사용해 -1로 단정하면, 두 저장이 그 두 읽기 "사이"에 모두
+            // 끝나버리는 좁은 창에서 실제 코드가 이미 발행됐는데도 -1을
+            // 영구적으로 보고하게 된다 — 이 재읽기가 그 경쟁을 없앤다.
+            return AgentPresence::Exited {
+                code: session.exit_code().unwrap_or(-1),
+            };
         }
 
         #[cfg(unix)]
