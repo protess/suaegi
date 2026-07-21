@@ -14,3 +14,7 @@
 //! | (미생성) `inject` | Task 3 — `--settings` JSON·훅 스크립트 생성, `reduce` 구현 |
 
 pub mod contract;
+pub mod inject;
+pub mod parse;
+pub mod server;
+pub mod subscription;

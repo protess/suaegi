@@ -7,6 +7,7 @@ use suaegi_core::domain::{Repo, RepoId};
 use suaegi_git::worktree::WorktreeEntry;
 use suaegi_term::presence::AgentPresence;
 
+use crate::agent_status::contract::BadgeState;
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
 use crate::state::{worktree_id_for, AppState, Message};
 
@@ -105,29 +106,41 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
         let worktree_id = worktree_id_for(&entry.path);
         let is_selected = state.selected_worktree() == Some(&worktree_id);
         let presence = state.worktree_presence(&worktree_id);
-        rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, presence));
+        let badge = state.worktree_badge(&worktree_id);
+        rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, badge, presence));
     }
 
     container(rows).width(Length::Fill).into()
 }
 
-/// 존재 배지: 세션이 없거나 아직 판정 전이면(`Unknown`) 아무 표시도 없다 —
-/// "모른다"를 굳이 시끄럽게 알릴 필요는 없다. `Agent`는 채워진 점,
-/// `Exited`/`NoAgent`(에이전트가 foreground를 내줬거나 셸로 돌아간 경우)는
-/// 옅게 구분한다. `working|waiting|done` 3색 상태는 Plan 5(hook 서버)의
-/// 몫이다 — 여기서는 "에이전트가 떠 있는지"만 안다.
+/// 에이전트 상태 배지. **`Unknown`은 `Working`과 시각적으로 구별한다** — "모른다"와
+/// "바쁘다"는 다른 상태이고, 사용자가 그 둘을 구별할 수 있어야 한다. 같은 글리프를
+/// 옅게만 쓰면 색 대비가 약한 화면에서 구별이 사라지므로 **글리프도 색도** 다르다.
+///
+/// **오류 스타일링만 `AgentPresence`를 직접 읽는다.** `BadgeState`에는 일부러 오류
+/// 변형이 없다 — 리듀서 반환에 변형을 더하면 배지 상태와 프로세스 사실이 두 곳에서
+/// 관리된다. 리듀서는 "무슨 상태인가"만 답하고, "어떻게 끝났는가"는 여기서 본다.
+///
 /// `Element`는 직접 검사할 수 없으므로 매핑 자체를 순수 함수로 뽑아 테스트한다.
-fn badge_glyph(presence: AgentPresence) -> (&'static str, Color) {
-    match presence {
-        AgentPresence::Agent(_) => ("●", Color::from_rgb8(0x2e, 0xa0, 0x43)),
-        AgentPresence::Exited { .. } => ("×", Color::from_rgb8(0xc0, 0x39, 0x2b)),
-        AgentPresence::NoAgent => ("○", Color::from_rgb8(0x88, 0x88, 0x88)),
-        AgentPresence::Unknown => ("", Color::TRANSPARENT),
+fn badge_glyph(badge: BadgeState, presence: AgentPresence) -> (&'static str, Color) {
+    // 0이 아닌 종료 코드는 상태와 무관하게 오류로 보여야 한다.
+    if let AgentPresence::Exited { code } = presence {
+        if code != 0 {
+            return ("×", Color::from_rgb8(0xc0, 0x39, 0x2b));
+        }
+    }
+    match badge {
+        BadgeState::Working => ("●", Color::from_rgb8(0x2e, 0xa0, 0x43)),
+        // 사람을 기다린다 — 이 플랜에서 사용자가 가장 알고 싶은 상태다.
+        BadgeState::Waiting => ("◆", Color::from_rgb8(0xd8, 0x8c, 0x00)),
+        BadgeState::Done => ("○", Color::from_rgb8(0x88, 0x88, 0x88)),
+        // 글리프와 색이 **둘 다** Working과 다르다.
+        BadgeState::Unknown => ("·", Color::from_rgb8(0xbb, 0xbb, 0xbb)),
     }
 }
 
-fn presence_badge(presence: AgentPresence) -> Element<'static, Message> {
-    let (label, color) = badge_glyph(presence);
+fn presence_badge(badge: BadgeState, presence: AgentPresence) -> Element<'static, Message> {
+    let (label, color) = badge_glyph(badge, presence);
     container(text(label).size(10).color(color))
         .width(Length::Fixed(10.0))
         .height(Length::Fixed(10.0))
@@ -145,6 +158,7 @@ fn worktree_row(
     repo_id: RepoId,
     entry: &WorktreeEntry,
     is_selected: bool,
+    badge: BadgeState,
     presence: AgentPresence,
 ) -> Element<'static, Message> {
     let worktree_id = worktree_id_for(&entry.path);
@@ -158,11 +172,16 @@ fn worktree_row(
     let remove_path: PathBuf = entry.path.clone();
     let remove_branch = entry.branch.clone();
 
+    let diff_id = worktree_id.clone();
     let mut cells: Vec<Element<'static, Message>> = vec![
-        presence_badge(presence),
+        presence_badge(badge, presence),
         button(text(format!("{marker}{label}")))
             .on_press(Message::WorktreeSelected(worktree_id))
             .width(Length::Fill)
+            .into(),
+        // diff 패널 토글. 같은 worktree를 다시 누르면 닫힌다.
+        button(text("diff").size(11))
+            .on_press(Message::DiffRequested { worktree: diff_id })
             .into(),
     ];
     if worktree_is_removable(entry) {
@@ -237,9 +256,13 @@ mod tests {
         state.upsert_repo(repo_a.clone());
 
         state.note_list_issued(repo_a.id.clone(), OpId(1));
-        state.apply_worktree_listing(repo_a.id.clone(), OpId(1), vec![entry("a1"), entry("a2")]);
+        state.apply_authoritative_listing(
+            repo_a.id.clone(),
+            OpId(1),
+            vec![entry("a1"), entry("a2")],
+        );
         state.note_list_issued(repo_b.id.clone(), OpId(1));
-        state.apply_worktree_listing(repo_b.id.clone(), OpId(1), vec![entry("b1")]);
+        state.apply_authoritative_listing(repo_b.id.clone(), OpId(1), vec![entry("b1")]);
 
         let groups = grouped_worktrees(&state);
         assert_eq!(groups.len(), 2);
@@ -271,7 +294,7 @@ mod tests {
         // repo는 등록돼 있지 않다 — 영속화된 worktree가 삭제된 repo를 가리키는
         // 상황을 흉내낸다.
         state.note_list_issued(gone.clone(), OpId(1));
-        state.apply_worktree_listing(gone, OpId(1), vec![entry("orphan")]);
+        state.apply_authoritative_listing(gone, OpId(1), vec![entry("orphan")]);
 
         let groups = grouped_worktrees(&state);
         assert!(
@@ -345,22 +368,61 @@ mod tests {
             .contains("disk full"));
     }
 
+    /// **`Unknown`과 `Working`은 반드시 구별된다.** "모른다"와 "바쁘다"는 다른
+    /// 상태이고, 이 구별이 사라지면 훅이 안 붙은 pane(신뢰 대화상자 대기 등)이
+    /// 열심히 일하는 것처럼 보인다.
     #[test]
-    fn presence_glyphs_distinguish_agent_from_no_agent_and_unknown() {
-        use suaegi_term::agent::AgentKind;
+    fn every_badge_state_is_visually_distinct() {
+        let agent = AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude);
+        let glyphs: Vec<(&str, Color)> = [
+            BadgeState::Working,
+            BadgeState::Waiting,
+            BadgeState::Done,
+            BadgeState::Unknown,
+        ]
+        .into_iter()
+        .map(|b| badge_glyph(b, agent))
+        .collect();
 
-        let (agent_glyph, _) = badge_glyph(AgentPresence::Agent(AgentKind::Claude));
-        let (no_agent_glyph, _) = badge_glyph(AgentPresence::NoAgent);
-        let (unknown_glyph, _) = badge_glyph(AgentPresence::Unknown);
-        let (exited_glyph, _) = badge_glyph(AgentPresence::Exited { code: 0 });
+        for (i, (glyph, color)) in glyphs.iter().enumerate() {
+            assert!(!glyph.is_empty(), "state {i} must render something");
+            for (j, (other_glyph, other_color)) in glyphs.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        glyph, other_glyph,
+                        "badge states {i} and {j} share a glyph — 'we don't know' must not \
+                         look like 'it is busy'"
+                    );
+                    assert_ne!(
+                        (color.r, color.g, color.b),
+                        (other_color.r, other_color.g, other_color.b),
+                        "badge states {i} and {j} share a colour"
+                    );
+                }
+            }
+        }
+    }
 
-        assert!(!agent_glyph.is_empty());
-        assert_ne!(agent_glyph, no_agent_glyph);
-        assert_ne!(agent_glyph, unknown_glyph);
-        assert_ne!(no_agent_glyph, exited_glyph);
-        // "모른다"는 조용히 아무것도 안 보여준다 — 시끄러운 badge는 아직
-        // 판정 전인 worktree 전부를 에러처럼 보이게 만든다.
-        assert!(unknown_glyph.is_empty());
+    /// 오류 스타일링은 **리듀서가 아니라** `AgentPresence::Exited{{code}}`에서 온다.
+    /// `BadgeState`에 오류 변형을 더하면 배지 상태와 프로세스 사실이 두 곳에서
+    /// 관리된다.
+    #[test]
+    fn a_nonzero_exit_is_styled_as_an_error_whatever_the_badge_says() {
+        let (glyph, color) = badge_glyph(BadgeState::Done, AgentPresence::Exited { code: 1 });
+        assert_eq!(glyph, "×");
+        assert_eq!((color.r, color.g, color.b), {
+            let red = Color::from_rgb8(0xc0, 0x39, 0x2b);
+            (red.r, red.g, red.b)
+        });
+
+        // 대조군: 정상 종료(0)는 오류로 보이지 않는다 — 그렇지 않으면 성공적으로
+        // 끝난 세션이 전부 빨간 ×가 된다.
+        let (ok_glyph, _) = badge_glyph(BadgeState::Done, AgentPresence::Exited { code: 0 });
+        assert_ne!(
+            ok_glyph, "×",
+            "exit code 0 is a normal finish, not a failure"
+        );
+        assert_eq!(ok_glyph, badge_glyph(BadgeState::Done, AgentPresence::NoAgent).0);
     }
 
     /// 최종 리뷰 항목 3: `list_worktrees`가 첫 엔트리에 `is_main: true`를

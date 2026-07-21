@@ -2,15 +2,18 @@ use std::path::PathBuf;
 
 use iced::Task;
 use suaegi_core::domain::{Repo, WorktreeId};
+use suaegi_git::compare::{
+    branch_compare, file_diff, ChangeStatus, CompareHandle, CompareOutcome, FileDiff,
+};
 use suaegi_git::repo_probe::probe_repo;
-use suaegi_git::runner::GitRunner;
+use suaegi_git::runner::{GitError, GitRunner};
 use suaegi_git::worktree::{
     add_worktree, list_worktrees as git_list_worktrees, remove_worktree as git_remove_worktree,
     CreatedWorktree, RemoveOutcome, WorktreeEntry,
 };
 
 use crate::background;
-use crate::state::{Message, OpId};
+use crate::state::{DiffFailure, Message, OpId, WorktreeListing};
 
 // ---- `*_now`: the real work, testable directly (no iced::Task involved) ----
 
@@ -75,6 +78,38 @@ pub async fn remove_worktree_now(
     .map_err(|e| e.to_string())
 }
 
+/// **분류된 결과는 `Ok`로 나온다.** `NoMergeBase`/`UnbornHead`/`InvalidBase`는
+/// 오류가 아니라 패널이 그릴 상태이고, `Cancelled`도 마찬가지다.
+///
+/// `Err`로 남는 것은 진짜 오류뿐인데, 그중 **출력 상한 초과만은 따로 뽑는다** —
+/// 그건 "너무 크다"는 상태이고 그리려면 `limit`이 필요하다. 여기가 타입 있는
+/// `GitError`를 아직 쥐고 있는 마지막 지점이라 이 변환의 자리는 여기다.
+pub async fn compare_worktree_now(
+    worktree_path: PathBuf,
+    base_ref: String,
+    cancel: CompareHandle,
+) -> Result<CompareOutcome, DiffFailure> {
+    let runner = GitRunner::new();
+    branch_compare(&runner, &worktree_path, &base_ref, &cancel)
+        .await
+        .map_err(|e| match e {
+            GitError::OutputTooLarge { limit } => DiffFailure::TooLarge { limit },
+            other => DiffFailure::Failed(other.to_string()),
+        })
+}
+
+pub async fn file_patch_now(
+    worktree_path: PathBuf,
+    base_ref: String,
+    path: String,
+    status: ChangeStatus,
+) -> Result<FileDiff, String> {
+    let runner = GitRunner::new();
+    file_diff(&runner, &worktree_path, &base_ref, &path, &status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---- Thin `Task<Message>` wrappers: untestable glue, kept as small as possible ----
 
 /// repo 등록. 2단계 Task로 합성한다: canonicalize(블로킹) → git probe(tokio).
@@ -101,13 +136,19 @@ pub fn add_repo(request: OpId, path: PathBuf) -> Task<Message> {
     })
 }
 
+/// **git이 성공한 목록만 `Authoritative`다.** 실패를 `Authoritative(vec![])`로
+/// 옮기면 실패한 스캔 한 번이 그 repo의 세션과 복원된 레이아웃을 전부 지운다 —
+/// 그 변환이 일어날 수 있는 유일한 지점이 여기라서 이 함수가 경계다.
 pub fn list_worktrees(request: OpId, repo: Repo) -> Task<Message> {
     let repo_id = repo.id.clone();
     Task::perform(list_worktrees_now(repo), move |result| {
         Message::WorktreesListed {
             request,
             repo_id,
-            result,
+            result: match result {
+                Ok(entries) => WorktreeListing::Authoritative(entries),
+                Err(err) => WorktreeListing::Degraded(err),
+            },
         }
     })
 }
@@ -125,6 +166,42 @@ pub fn create_worktree(
         move |result| Message::WorktreeCreated {
             request,
             repo_id,
+            result,
+        },
+    )
+}
+
+pub fn compare_worktree(
+    request: OpId,
+    worktree: WorktreeId,
+    worktree_path: PathBuf,
+    base_ref: String,
+    cancel: CompareHandle,
+) -> Task<Message> {
+    Task::perform(
+        compare_worktree_now(worktree_path, base_ref, cancel),
+        move |result| Message::DiffLoaded {
+            worktree: worktree.clone(),
+            op: request,
+            result,
+        },
+    )
+}
+
+pub fn file_patch(
+    request: OpId,
+    worktree: WorktreeId,
+    worktree_path: PathBuf,
+    base_ref: String,
+    path: String,
+    status: ChangeStatus,
+) -> Task<Message> {
+    Task::perform(
+        file_patch_now(worktree_path, base_ref, path.clone(), status),
+        move |result| Message::FileDiffLoaded {
+            worktree: worktree.clone(),
+            path: path.clone(),
+            op: request,
             result,
         },
     )

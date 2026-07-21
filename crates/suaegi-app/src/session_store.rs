@@ -272,16 +272,21 @@ impl SessionStore {
 
     /// 블로킹 스레드에서 `TerminalSession::start`(fork/exec)를 수행하고 결과를
     /// 메시지로 돌려준다. 실패도 맥락(`id`, `worktree_id`)을 나른다.
+    /// `env`는 PTY에 그대로 얹힌다. Plan 5의 훅 상관관계 변수
+    /// (`SUAEGI_PANE_KEY`/`SPAWN_NONCE`/`HOOK_PORT`/`HOOK_TOKEN`)가 여기로 들어온다 —
+    /// **`session_store`도 `suaegi-term`도 그 의미를 모른다.** 그냥 env다.
+    /// 토큰이 argv가 아니라 env로 가는 것이 요점이다(argv는 `ps`에 보인다).
     pub fn start(
         &mut self,
         id: SessionId,
         worktree: &Worktree,
         agent: AgentKind,
         prompt: Option<String>,
+        env: Vec<(String, String)>,
     ) -> Task<Message> {
         let worktree_id = worktree.id.clone();
         let cwd = worktree.path.clone();
-        let spawn = build_spawn(
+        let mut spawn = build_spawn(
             agent,
             None,
             prompt.as_deref(),
@@ -289,6 +294,7 @@ impl SessionStore {
             DEFAULT_ROWS,
             DEFAULT_COLS,
         );
+        spawn.env.extend(env);
         background::blocking(move |mut sender| {
             let spec = SessionSpec {
                 pty: spawn,
