@@ -165,6 +165,15 @@ mod tests {
 
     /// 이 검증은 foreground pgid가 관측되는 unix에서만 의미가 있다. Windows
     /// 에서는 존재 감지가 항상 `Unknown`이라 호출 횟수가 0으로 남는다.
+    ///
+    /// **반드시 `request_presence_with`(프로덕션이 실제로 부르는 경로)를
+    /// 거친다.** 예전엔 `SessionStore::probe_now_for_test`로 `probe_with`만
+    /// 우회 호출했는데, 그 헬퍼는 `request_presence`의 가드 설정·백그라운드
+    /// 스레드 디스패치를 건너뛴다 — `Arc::clone(&slot.monitor)`를 틱마다
+    /// `PresenceMonitor::default()`로 바꾸는 회귀("모니터를 매번 새로
+    /// 만든다")가 나도 이 테스트는 계속 통과했다. 지금은 `dispatch_tick`이
+    /// 부르는 것과 같은 함수를 직접 호출하므로 그 회귀가 실제로 이 테스트를
+    /// 깬다.
     #[cfg(unix)]
     #[test]
     fn the_monitor_cache_survives_across_ticks() {
@@ -180,7 +189,7 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let (state, id) = state_with_one_session();
+        let (mut state, id) = state_with_one_session();
         let session = state.session_store().sessions().next().unwrap().1;
         // foreground pgid는 PTY가 자식을 실제로 관측한 뒤에야 채워진다 —
         // 그전에 프로브하면 항상 `Unknown`이라 `after_first == 0`이 되어
@@ -189,20 +198,37 @@ mod tests {
             .foreground_pgid()
             .is_some()));
 
-        state
-            .session_store()
-            .probe_now_for_test(id, &CountingProbe(calls.clone()));
-        let after_first = calls.load(Ordering::SeqCst);
-        // 첫 프로브가 실제로 일어났는지부터 확인한다 — 0이면 그 뒤 비교는
-        // 공허하다.
-        assert!(
-            after_first > 0,
-            "the first tick must actually probe; got 0 calls"
-        );
+        let probe: Arc<dyn suaegi_term::presence::ProcessProbe + Send + Sync> =
+            Arc::new(CountingProbe(calls.clone()));
 
+        let (issued_first, _task) =
+            state
+                .session_store_mut()
+                .request_presence_with(id, 1, probe.clone());
+        assert!(issued_first, "the first tick must actually dispatch");
+        assert!(
+            wait_until(Duration::from_secs(10), || calls.load(Ordering::SeqCst) > 0),
+            "the background probe must run and call the injected probe at least once"
+        );
+        let after_first = calls.load(Ordering::SeqCst);
+
+        // 첫 결과가 실제로 도착한 걸로 치고 가드를 푼다 — 안 그러면 두 번째
+        // `request_presence_with`가 in-flight 가드에 막혀 아예 디스패치되지
+        // 않고, 그 경우 `issued_second`가 이미 이 테스트의 실패로 드러난다.
         state
-            .session_store()
-            .probe_now_for_test(id, &CountingProbe(calls.clone()));
+            .session_store_mut()
+            .apply_presence(id, 1, AgentPresence::Agent(AgentKind::Claude));
+
+        let (issued_second, _task) =
+            state
+                .session_store_mut()
+                .request_presence_with(id, 2, probe.clone());
+        assert!(issued_second, "the second tick must also dispatch");
+        // 캐시가 살아 있으면 두 번째 라운드은 pgid가 캐시에 남아 있는 동안
+        // `probe.command_line`을 다시 부르지 않는다 — 콜 카운트가 그대로여야
+        // 한다. 충분히 기다렸는데도 카운트가 그대로면 캐시가 재사용된 것,
+        // 늘었으면 매 틱 새 모니터가 만들어진(회귀) 것이다.
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             after_first,

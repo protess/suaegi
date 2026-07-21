@@ -279,6 +279,26 @@ impl SessionStore {
     }
 
     pub fn request_presence(&mut self, id: SessionId, generation: u64) -> (bool, Task<Message>) {
+        self.request_presence_with(id, generation, Arc::new(PsProbe))
+    }
+
+    /// `request_presence`가 실제로 쓰는 디스패치 경로 — 프로브만 주입 가능하게
+    /// 갈라낸 것. 프로덕션은 `request_presence`를 통해 항상 [`PsProbe`]로
+    /// 부르고, 테스트(`presence_poll`의 캐시 회귀 테스트)는 이 함수를 직접
+    /// 불러 카운팅 프로브를 꽂는다. 예전엔 프로덕션 클로저가 `&PsProbe`를
+    /// 하드코딩해서 대체할 수 없었고, 테스트는 `probe_with`만 동기적으로
+    /// 우회 호출하는 별도 헬퍼를 썼다 — 그래서 `request_presence`가 슬롯의
+    /// 모니터 대신 새 모니터를 매 틱 만드는 회귀(캐시가 매번 죽는 버그)가
+    /// 나도 그 테스트는 계속 통과했다. 지금은 프로덕션과 테스트가 이 함수
+    /// 하나(가드 설정 → 백그라운드 스레드 → `probe_with`)를 공유하므로 그
+    /// 회귀가 실제로 테스트를 깬다. `Send + Sync + 'static`인 이유: 이 호출이
+    /// 백그라운드 스레드로 넘어가기 때문이다.
+    pub fn request_presence_with(
+        &mut self,
+        id: SessionId,
+        generation: u64,
+        probe: Arc<dyn ProcessProbe + Send + Sync>,
+    ) -> (bool, Task<Message>) {
         let Some(slot) = self.slots.get_mut(&id) else {
             return (false, Task::none());
         };
@@ -289,7 +309,7 @@ impl SessionStore {
         let session = Arc::clone(&slot.session);
         let monitor = Arc::clone(&slot.monitor);
         let task = background::blocking(move |mut sender| {
-            let presence = Self::probe_with(&session, &monitor, &PsProbe);
+            let presence = Self::probe_with(&session, &monitor, probe.as_ref());
             let _ = sender.try_send(Message::PresenceReady {
                 id,
                 generation,
@@ -494,16 +514,6 @@ impl SessionStore {
         self.slots.len()
     }
 
-    /// `id`의 슬롯이 소유한 모니터로 `probe`를 동기적으로 한 번 돌린다.
-    /// `request_presence`가 쓰는 것과 **같은** [`Self::probe_with`]를 거치므로,
-    /// 이 함수를 두 번 부르면 프로덕션 경로와 똑같이 pgid 캐시가 재사용된다 —
-    /// `presence_poll`의 티어링 테스트가 실제 `ps` 대신 카운팅 프로브를 꽂아
-    /// "틱마다 모니터를 새로 만드는" 회귀를 잡는 데 쓴다.
-    #[doc(hidden)]
-    pub fn probe_now_for_test(&self, id: SessionId, probe: &dyn ProcessProbe) -> AgentPresence {
-        let slot = self.slots.get(&id).expect("session exists");
-        Self::probe_with(&slot.session, &slot.monitor, probe)
-    }
 
     /// 어디에도 슬롯으로 등록되지 않은, 진짜로 살아있는 `TerminalSession`
     /// 하나. `workbench.rs`의 구독 동일성 테스트와 `state.rs`의
