@@ -1320,4 +1320,70 @@ mod tests {
         let spawn = build_spawn(AgentKind::Codex, None, None, PathBuf::from("/tmp"), 40, 120);
         assert_eq!((spawn.rows, spawn.cols), (40, 120));
     }
+
+    /// 두 설치 게이트(`unsupported_runtimes` 배제, `required_commands` AND)는 현재
+    /// 33행이 모두 빈 값이라 프로덕션에선 도달 불가다(6a 리뷰 NOTE). 그러나 로직
+    /// 자체는 미래 에이전트가 이 필드를 채우는 순간 도달 가능해지므로, 합성
+    /// `AgentDef`로 **로직을 고정**한다 — 도달 불가 입력을 엄밀히 검증하는 것이 아니라,
+    /// 실제 에이전트가 쓰게 될 코드 경로를 미리 못 박는 것이다.
+    const GATE_DEF: AgentDef = AgentDef {
+        id: "synthetic",
+        display_name: "Synthetic",
+        launch_program: "synth",
+        launch_args: &[],
+        launch_by_platform: &[],
+        detect_cmd: "synth",
+        detect_aliases: &[],
+        // **두 개**여야 AND 게이트가 검증된다 — 하나면 `.all()`과 `.any()`가
+        // 동일해 `.all()→.any()` 변형이 안 잡힌다(회귀 메모리 §1: 두 구현이
+        // 처음 갈라지는 지점은 원소 ≥2에 하나만 존재할 때다).
+        required_commands: &["helper", "extra"],
+        unsupported_runtimes: &[Runtime::Windows],
+        expected_process: "synth",
+        package_marker: None,
+        prompt_injection: PromptInjection::None,
+        status: StatusSource::OscTitle,
+    };
+
+    /// 배제 런타임이면 primary·required가 모두 PATH에 있어도 설치로 치지 않는다.
+    #[test]
+    fn detect_installed_excludes_unsupported_runtimes() {
+        // Windows는 배제 목록에 있다 — 모든 커맨드가 있어도 false.
+        assert!(!detect_installed(
+            &GATE_DEF,
+            &FakePath(&["synth", "helper", "extra"]),
+            Runtime::Windows
+        ));
+        // 지원 런타임에선 나머지 조건이 충족되면 true.
+        assert!(detect_installed(
+            &GATE_DEF,
+            &FakePath(&["synth", "helper", "extra"]),
+            Runtime::Linux
+        ));
+    }
+
+    /// `required_commands`는 AND 게이트 — 하나라도 빠지면 설치 아님.
+    #[test]
+    fn detect_installed_requires_every_required_command() {
+        // primary + required 하나(`helper`)만 있고 다른 하나(`extra`)가 없으면
+        // false여야 한다. 이 케이스가 `.all()`(false)과 `.any()`(true)를 가른다 —
+        // 이게 있어야 `.all()→.any()` 변형이 잡힌다.
+        assert!(!detect_installed(
+            &GATE_DEF,
+            &FakePath(&["synth", "helper"]),
+            Runtime::Linux
+        ));
+        // required가 하나도 없으면 당연히 false.
+        assert!(!detect_installed(
+            &GATE_DEF,
+            &FakePath(&["synth"]),
+            Runtime::Linux
+        ));
+        // primary + required 전부 있으면 true.
+        assert!(detect_installed(
+            &GATE_DEF,
+            &FakePath(&["synth", "helper", "extra"]),
+            Runtime::Linux
+        ));
+    }
 }
