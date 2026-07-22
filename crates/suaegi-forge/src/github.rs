@@ -2,6 +2,11 @@ use crate::classify::{classify_unavailable, is_no_pull_request};
 use crate::parse::{
     parse_created_pr, summarize_checks, GhCheck, GhPrView, GhRepoView,
 };
+use crate::pr_actions::{
+    classify_merge_failure, mergeability_from_fields, CommentLookup, GhCommentRaw, GhReviewRaw,
+    MergeFailure, MergeMethod, MergeOptions, MergeOutcome, MergeabilityFields, MergeabilityState,
+    PrActions, PrComment, PrReview, ReviewThreadLookup,
+};
 use crate::provider::{
     ChecksSummary, CreateReviewInput, ForgeError, ForgeProvider, ForgeUnavailable, RepoCoords,
     Review, ReviewLookup, ReviewState,
@@ -355,4 +360,187 @@ fn read_pr_template(worktree: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// `gh pr view --json reviews` 봉투(`{ "reviews": [...] }`).
+#[derive(Debug, serde::Deserialize)]
+struct GhReviewsEnvelope {
+    #[serde(default)]
+    reviews: Vec<GhReviewRaw>,
+}
+
+/// `gh pr view --json comments` 봉투(`{ "comments": [...] }`).
+#[derive(Debug, serde::Deserialize)]
+struct GhCommentsEnvelope {
+    #[serde(default)]
+    comments: Vec<GhCommentRaw>,
+}
+
+/// merge write op은 네트워크 왕복이라 create와 같은 넉넉한 타임아웃(60초)을 쓴다.
+const MERGE_TIMEOUT: std::time::Duration = CREATE_TIMEOUT;
+
+#[async_trait]
+impl PrActions for GhForge {
+    async fn merge_pr(
+        &self,
+        repo: &RepoCoords,
+        number: u64,
+        method: MergeMethod,
+        options: MergeOptions,
+    ) -> Result<MergeOutcome, ForgeError> {
+        // **파괴적**. 이 백엔드는 auto-confirm을 하지 않는다 — UI가 먼저 확인한 뒤 부른다.
+        let repo_arg = repo.repo_arg();
+        let number_str = number.to_string();
+        let mut args: Vec<&str> = vec![
+            "pr",
+            "merge",
+            &number_str,
+            method.gh_flag(),
+            "--repo",
+            &repo_arg,
+        ];
+        if options.delete_branch {
+            args.push("--delete-branch");
+        }
+
+        let res = self
+            .runner
+            .run_with_timeout(Self::neutral_cwd(), &args, MERGE_TIMEOUT)
+            .await;
+        match res {
+            Ok(_) => Ok(MergeOutcome::Merged),
+            Err(GhError::Failed { stderr, .. }) => match classify_merge_failure(&stderr) {
+                // 확정적 거부는 데이터(Ok), 일시 실패는 에러(Err) — None vs Unavailable 규율.
+                MergeFailure::Rejected(reason) => Ok(MergeOutcome::Rejected(reason)),
+                MergeFailure::Transient(u) => Err(ForgeError::Unavailable(u)),
+            },
+            Err(e) => Err(ForgeError::Unavailable(unavailable_from_gh_error(&e))),
+        }
+    }
+
+    async fn set_auto_merge(
+        &self,
+        repo: &RepoCoords,
+        number: u64,
+        method: MergeMethod,
+    ) -> Result<(), ForgeError> {
+        let repo_arg = repo.repo_arg();
+        let number_str = number.to_string();
+        let args: Vec<&str> = vec![
+            "pr",
+            "merge",
+            &number_str,
+            "--auto",
+            method.gh_flag(),
+            "--repo",
+            &repo_arg,
+        ];
+        let res = self
+            .runner
+            .run_with_timeout(Self::neutral_cwd(), &args, MERGE_TIMEOUT)
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(GhError::Failed { stderr, .. }) => {
+                // GitHub은 이미 머지 가능한 PR에 auto-merge를 거부한다("clean status") —
+                // raw 에러 대신 실행 가능한 안내로(Orca `classifySetAutoMergeError`).
+                if stderr.to_lowercase().contains("clean status") {
+                    Err(ForgeError::Validation(
+                        "This pull request can already be merged. Use Merge instead of auto-merge."
+                            .to_string(),
+                    ))
+                } else {
+                    Err(ForgeError::Unavailable(classify_unavailable(&stderr)))
+                }
+            }
+            Err(e) => Err(ForgeError::Unavailable(unavailable_from_gh_error(&e))),
+        }
+    }
+
+    async fn pr_reviews(&self, repo: &RepoCoords, number: u64) -> ReviewThreadLookup {
+        let repo_arg = repo.repo_arg();
+        let number_str = number.to_string();
+        let res = self
+            .runner
+            .run(
+                Self::neutral_cwd(),
+                &[
+                    "pr", "view", &number_str, "--repo", &repo_arg, "--json", "reviews",
+                ],
+            )
+            .await;
+        match res {
+            Ok(out) => match serde_json::from_str::<GhReviewsEnvelope>(&out.stdout) {
+                Ok(env) => {
+                    ReviewThreadLookup::Found(env.reviews.into_iter().map(PrReview::from).collect())
+                }
+                // 성공 exit인데 JSON이 안 풀리면 **빈 Found가 아니다** — Unavailable이다.
+                Err(_) => ReviewThreadLookup::Unavailable(ForgeUnavailable::Other(
+                    "unexpected gh output".to_string(),
+                )),
+            },
+            // 일시 실패는 "리뷰 없음"(빈 Found)이 아니라 분류된 Unavailable(캐시-오염 방지).
+            Err(GhError::Failed { stderr, .. }) => {
+                ReviewThreadLookup::Unavailable(classify_unavailable(&stderr))
+            }
+            Err(e) => ReviewThreadLookup::Unavailable(unavailable_from_gh_error(&e)),
+        }
+    }
+
+    async fn pr_comments(&self, repo: &RepoCoords, number: u64) -> CommentLookup {
+        let repo_arg = repo.repo_arg();
+        let number_str = number.to_string();
+        let res = self
+            .runner
+            .run(
+                Self::neutral_cwd(),
+                &[
+                    "pr", "view", &number_str, "--repo", &repo_arg, "--json", "comments",
+                ],
+            )
+            .await;
+        match res {
+            Ok(out) => match serde_json::from_str::<GhCommentsEnvelope>(&out.stdout) {
+                Ok(env) => {
+                    CommentLookup::Found(env.comments.into_iter().map(PrComment::from).collect())
+                }
+                Err(_) => CommentLookup::Unavailable(ForgeUnavailable::Other(
+                    "unexpected gh output".to_string(),
+                )),
+            },
+            Err(GhError::Failed { stderr, .. }) => {
+                CommentLookup::Unavailable(classify_unavailable(&stderr))
+            }
+            Err(e) => CommentLookup::Unavailable(unavailable_from_gh_error(&e)),
+        }
+    }
+
+    async fn mergeability_state(&self, repo: &RepoCoords, number: u64) -> MergeabilityState {
+        let repo_arg = repo.repo_arg();
+        let number_str = number.to_string();
+        let res = self
+            .runner
+            .run(
+                Self::neutral_cwd(),
+                &[
+                    "pr",
+                    "view",
+                    &number_str,
+                    "--repo",
+                    &repo_arg,
+                    "--json",
+                    "mergeable,mergeStateStatus,reviewDecision",
+                ],
+            )
+            .await;
+        match res {
+            Ok(out) => match serde_json::from_str::<MergeabilityFields>(&out.stdout) {
+                Ok(fields) => mergeability_from_fields(&fields),
+                // 파싱 실패는 Unknown(안전) — 절대 Mergeable로 넘기지 않는다.
+                Err(_) => MergeabilityState::Unknown,
+            },
+            // 일시 실패는 Unknown이지 절대 Mergeable이 아니다.
+            Err(_) => MergeabilityState::Unknown,
+        }
+    }
 }
