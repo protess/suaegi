@@ -299,7 +299,25 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
         // `\r\n`을 먼저 접어야 CRLF가 `\r\r`이 되지 않는다.
         return text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
     }
-    let sanitized = text.replace("\x1b[201~", "");
+    wrap_bracketed_paste(text)
+}
+
+/// 텍스트를 `ESC[200~ … ESC[201~`로 감싸고 **페이로드에서 종료자를 제거한다** —
+/// [`encode_paste`]의 bracketed 가지와 같은 로직을 프롬프트 주입(라이브 모드와
+/// 무관하게 항상 감싸야 한다)이 재사용하기 위해 갈라낸 것이다.
+///
+/// 종료자 제거를 빠뜨리면 `\x1b[201~`가 든 텍스트가 괄호 밖으로 새어 **셸이
+/// 실행한다** — bracketed paste 설계 전체가 막으려는 보안 실패다.
+///
+/// **한 번의 `replace`로는 부족하다.** 단일 패스는 쪼갠 입력이 종료자를
+/// **재구성**하게 둔다: `"\x1b[2\x1b[201~01~"`에서 가운데 `\x1b[201~`를 한 번만
+/// 지우면 남은 조각이 다시 `"\x1b[201~"`로 붙어 살아난다. 그래서 더 이상 종료자가
+/// 없을 때까지 **반복 제거**한다(각 패스가 문자열을 줄이므로 유한하다).
+pub fn wrap_bracketed_paste(text: &str) -> Vec<u8> {
+    let mut sanitized = text.to_string();
+    while sanitized.contains("\x1b[201~") {
+        sanitized = sanitized.replace("\x1b[201~", "");
+    }
     let mut out = Vec::with_capacity(sanitized.len() + 12);
     out.extend_from_slice(b"\x1b[200~");
     out.extend_from_slice(sanitized.as_bytes());
@@ -1036,6 +1054,60 @@ mod tests {
             encode_paste("ls -al", TermMode::BRACKETED_PASTE),
             b"\x1b[200~ls -al\x1b[201~"
         );
+    }
+
+    /// 프롬프트 주입 경로(`wrap_bracketed_paste`)는 **모드 인자 없이** 항상
+    /// 감싸고 종료자를 제거한다 — 게이트가 이미 BRACKETED_PASTE를 확인한 뒤에만
+    /// 부르기 때문이다. `encode_paste`의 bracketed 가지와 byte-identical해야 한다.
+    #[test]
+    fn wrap_bracketed_paste_always_wraps_and_strips_terminator() {
+        assert_eq!(wrap_bracketed_paste("fix the bug"), b"\x1b[200~fix the bug\x1b[201~");
+        // 주입 텍스트에 든 종료자를 제거하지 않으면 그 뒤가 괄호 밖으로 새어
+        // 셸이 실행한다 — 프롬프트도 신뢰할 수 없는 입력이다.
+        assert_eq!(
+            wrap_bracketed_paste("a\x1b[201~rm -rf /"),
+            b"\x1b[200~arm -rf /\x1b[201~"
+        );
+        // 라이브 모드가 켜진 encode_paste와 정확히 같은 바이트여야 한다.
+        assert_eq!(
+            wrap_bracketed_paste("hello"),
+            encode_paste("hello", TermMode::BRACKETED_PASTE)
+        );
+    }
+
+    /// **HIGH 보안 회귀**: 단일 패스 strip은 쪼갠 종료자가 **재구성**되게 둔다.
+    /// `"\x1b[2\x1b[201~01~"`에서 가운데 종료자를 한 번만 지우면 남은 조각이 다시
+    /// `"\x1b[201~"`로 붙어 살아난다 — 그러면 괄호가 조기에 닫히고 이후 바이트가
+    /// 라이브 키입력이 되어 셸이 실행한다. **페이로드(여는 `200~`와 마지막 닫는
+    /// `201~` 사이)에는 어떤 종료자도 남아선 안 된다.** 이 경로는 모든 터미널
+    /// 페이스트(`send_paste`→`encode_paste`)에도 도달하므로 원시 클립보드에도 적용된다.
+    #[test]
+    fn split_terminator_cannot_be_reconstructed_by_a_single_pass() {
+        let out = wrap_bracketed_paste("\x1b[2\x1b[201~01~");
+        // 마지막 6바이트가 우리가 붙인 닫는 종료자다. 그 앞(페이로드)에는 종료자가
+        // 하나도 없어야 한다.
+        assert!(
+            out.ends_with(b"\x1b[201~"),
+            "must still end with our closing terminator: {}",
+            show(&out)
+        );
+        let payload = &out[b"\x1b[200~".len()..out.len() - b"\x1b[201~".len()];
+        let reconstructed = payload
+            .windows(6)
+            .filter(|w| *w == b"\x1b[201~".as_slice())
+            .count();
+        assert_eq!(
+            reconstructed, 0,
+            "a reconstructed terminator survived in the payload — the bracket closes early \
+             and the rest executes as keystrokes: {}",
+            show(&out)
+        );
+        // 결과적으로 전체에 종료자는 **딱 하나**(우리가 붙인 것)뿐이다.
+        let total = out
+            .windows(6)
+            .filter(|w| *w == b"\x1b[201~".as_slice())
+            .count();
+        assert_eq!(total, 1, "exactly one terminator (ours) must remain: {}", show(&out));
     }
 
     #[test]

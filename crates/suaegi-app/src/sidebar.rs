@@ -115,7 +115,26 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     )
     .width(Length::Fill)
     .text_size(12);
-    let create_row = column![agent_picker, name_row].spacing(6);
+
+    // 선택적 초기 프롬프트. 비워두면 주입 없음(기본). 채우면 새 worktree의 첫
+    // 세션에 한 번 실린다 — argv/flag 에이전트는 스폰 인자로, stdin-after-start
+    // 에이전트는 composer 준비 후 PTY로. **영속화하지 않는다**(일회성 launch 인자).
+    let repo_id_for_prompt = repo_id.clone();
+    let repo_id_for_prompt_submit = repo_id.clone();
+    let prompt_input = text_input(
+        "initial prompt (optional)",
+        state.worktree_prompt_draft(&repo_id),
+    )
+    .on_input(move |value| Message::WorktreePromptInputChanged {
+        repo_id: repo_id_for_prompt.clone(),
+        value,
+    })
+    .on_submit(Message::CreateWorktreeSubmitted {
+        repo_id: repo_id_for_prompt_submit.clone(),
+    })
+    .width(Length::Fill)
+    .size(12);
+    let create_row = column![agent_picker, prompt_input, name_row].spacing(6);
 
     let mut rows = column![header, create_row].spacing(6);
     for entry in &group.worktrees {

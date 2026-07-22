@@ -188,6 +188,10 @@ pub fn create_worktree(
     // create op와 함께 실어 보내야 응답을 기다리는 사이 사용자가 피커를 바꿔도
     // 이 worktree가 엉뚱한 에이전트로 굳지 않는다(이름 드래프트와 같은 원칙).
     selected_agent: Option<String>,
+    // 이 create를 시작할 때 입력한 일회성 초기 프롬프트(빈 값은 `None`). 에이전트
+    // 선택과 같은 이유로 op와 함께 실어 보낸다 — 성공 응답에 그대로 실려 돌아와
+    // `pending_prompts`(비영속)에 담긴다.
+    initial_prompt: Option<String>,
 ) -> Task<Message> {
     let repo_id = repo.id.clone();
     Task::perform(
@@ -196,6 +200,7 @@ pub fn create_worktree(
             request,
             repo_id,
             created_with_agent: selected_agent.clone(),
+            initial_prompt: initial_prompt.clone(),
             result,
         },
     )

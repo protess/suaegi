@@ -44,7 +44,14 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub display_name: String,
+    /// **`#[serde(default)]`가 데이터 손실 방어다.** 이 두 필드(6c에서 추가)가
+    /// 없는 옛 저장본에서, default가 없으면 `Worktree` **하나**의 역직렬화 실패가
+    /// `PersistedState` 전체를 손상 판정으로 떨어뜨려 백업 폴백으로 간다 —
+    /// 멀쩡한 repo/worktree 목록을 통째로 잃는 그 사고의 한 갈래다. default가
+    /// 있으면 옛 키 없는 객체도 `None`/`0`으로 조용히 읽힌다.
+    #[serde(default)]
     pub created_with_agent: Option<String>,
+    #[serde(default)]
     pub created_at_unix_ms: u64,
 }
 
@@ -237,6 +244,35 @@ mod tests {
             "control: the fields that WERE present must have been read"
         );
         assert_eq!(state.settings.workspace_root, PathBuf::from("/tmp/ws"));
+    }
+
+    /// 6c 이전 빌드가 쓴 worktree 객체에는 `created_with_agent`/`created_at_unix_ms`
+    /// 키가 아예 없다. `#[serde(default)]`가 그걸 `None`/`0`으로 채워야 한다 —
+    /// 아니면 이 worktree 하나의 파싱 실패가 저장 파일 전체를 손상으로 판정해
+    /// 백업 폴백으로 떨어뜨린다(data-loss 등급).
+    #[test]
+    fn a_worktree_written_before_the_agent_fields_still_loads() {
+        let legacy = r#"{
+            "id": "/tmp/ws/demo/fix-bug",
+            "repo_id": "/tmp/demo",
+            "path": "/tmp/ws/demo/fix-bug",
+            "branch": "fix-bug",
+            "display_name": "fix-bug"
+        }"#;
+        let wt: Worktree =
+            serde_json::from_str(legacy).expect("a pre-6c worktree object must still parse");
+        assert_eq!(
+            wt.created_with_agent, None,
+            "a missing agent key means 'login shell', not a parse failure"
+        );
+        assert_eq!(
+            wt.created_at_unix_ms, 0,
+            "a missing timestamp key must default to 0, not fail the whole file"
+        );
+        // 대조군: 존재하던 필드는 실제로 읽혔다 — 위의 default가 "전부 기본값으로
+        // 뭉갰다"로도 설명되면 안 된다.
+        assert_eq!(wt.branch, "fix-bug", "control: present fields must be read");
+        assert_eq!(wt.repo_id, RepoId("/tmp/demo".into()));
     }
 
     #[test]
