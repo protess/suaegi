@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use suaegi_app::reaper::Reaper;
 use suaegi_app::session_store::{blank_snapshot, SessionStore};
 use suaegi_core::domain::WorktreeId;
-use suaegi_term::agent::AgentKind;
 use suaegi_term::presence::AgentPresence;
 use suaegi_term::pty::PtySpawn;
 use suaegi_term::session::{SessionSpec, TerminalSession};
@@ -254,7 +253,7 @@ fn a_late_start_for_a_deleted_worktree_is_retired_not_orphaned() {
 fn a_stale_presence_result_does_not_overwrite_a_newer_one() {
     let mut store = SessionStore::for_test();
     let id = store.start_for_test(platform::sleep_seconds(30));
-    store.apply_presence(id, 2, AgentPresence::Agent(AgentKind::Claude));
+    store.apply_presence(id, 2, AgentPresence::Agent("claude"));
     store.apply_presence(id, 1, AgentPresence::NoAgent); // 늦게 도착한 옛 결과
     assert!(
         matches!(store.presence(id), AgentPresence::Agent(_)),

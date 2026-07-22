@@ -415,7 +415,6 @@ pub const RESTORE_WATCHDOG: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use suaegi_term::agent::AgentKind;
 
     // ---- 0.3 배지 리듀서: 결정표를 그대로 옮긴다 ----
 
@@ -511,7 +510,7 @@ mod tests {
         ];
         for (hook, age, want) in expected {
             let got = reduce(&input(
-                AgentPresence::Agent(AgentKind::Claude),
+                AgentPresence::Agent("claude"),
                 hook,
                 age,
                 // `previous`는 이 행들에 영향을 주면 안 된다 — 일부러 답과 다른
@@ -530,7 +529,7 @@ mod tests {
     fn unknown_presence_resolves_exactly_like_a_present_agent() {
         for (hook, age, label) in hook_table() {
             let with_agent = reduce(&input(
-                AgentPresence::Agent(AgentKind::Claude),
+                AgentPresence::Agent("claude"),
                 hook,
                 age,
                 BadgeState::Waiting,
@@ -565,7 +564,7 @@ mod tests {
         ] {
             assert_eq!(
                 reduce(&input(
-                    AgentPresence::Agent(AgentKind::Claude),
+                    AgentPresence::Agent("claude"),
                     Some(HookState::Waiting),
                     age,
                     BadgeState::Unknown,
@@ -579,7 +578,7 @@ mod tests {
             if age > HOOK_STALE_AFTER {
                 assert_eq!(
                     reduce(&input(
-                        AgentPresence::Agent(AgentKind::Claude),
+                        AgentPresence::Agent("claude"),
                         Some(HookState::Working),
                         age,
                         BadgeState::Unknown,
@@ -600,7 +599,7 @@ mod tests {
     #[test]
     fn the_working_staleness_boundary_is_exclusive() {
         let just_inside = reduce(&input(
-            AgentPresence::Agent(AgentKind::Claude),
+            AgentPresence::Agent("claude"),
             Some(HookState::Working),
             HOOK_STALE_AFTER,
             BadgeState::Unknown,
@@ -613,7 +612,7 @@ mod tests {
              'at least'"
         );
         let just_outside = reduce(&input(
-            AgentPresence::Agent(AgentKind::Claude),
+            AgentPresence::Agent("claude"),
             Some(HookState::Working),
             HOOK_STALE_AFTER + Duration::from_millis(1),
             BadgeState::Unknown,

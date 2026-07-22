@@ -373,7 +373,7 @@ mod tests {
     /// 열심히 일하는 것처럼 보인다.
     #[test]
     fn every_badge_state_is_visually_distinct() {
-        let agent = AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude);
+        let agent = AgentPresence::Agent("claude");
         let glyphs: Vec<(&str, Color)> = [
             BadgeState::Working,
             BadgeState::Waiting,

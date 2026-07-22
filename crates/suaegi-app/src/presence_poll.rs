@@ -71,7 +71,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use suaegi_core::domain::WorktreeId;
-    use suaegi_term::agent::AgentKind;
     use suaegi_term::presence::AgentPresence;
 
     use crate::session_store::SessionStore;
@@ -129,7 +128,7 @@ mod tests {
         active_state.session_store_mut().apply_presence(
             active_id,
             1,
-            AgentPresence::Agent(AgentKind::Claude),
+            AgentPresence::Agent("claude"),
         );
 
         assert!(tier(&active_state) < tier(&idle_state));
@@ -217,7 +216,7 @@ mod tests {
         // 않고, 그 경우 `issued_second`가 이미 이 테스트의 실패로 드러난다.
         state
             .session_store_mut()
-            .apply_presence(id, 1, AgentPresence::Agent(AgentKind::Claude));
+            .apply_presence(id, 1, AgentPresence::Agent("claude"));
 
         let (issued_second, _task) =
             state
