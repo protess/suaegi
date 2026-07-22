@@ -658,6 +658,17 @@ pub fn status_source_for(kind: AgentKind) -> StatusSource {
     }
 }
 
+/// id로 상태 신호 출처를 정한다(직접 실행 경로가 쓰는 정규 조회). 등록된 행은
+/// 그 행이 선언한 `status`를 그대로 쓴다 — v1 테이블에서는 **claude만 `Hooks`**이고
+/// 나머지 32행과 미등록/`None`(로그인 셸)은 전부 `OscTitle`이다. `status_source_for`가
+/// 좁은 enum으로 하던 결정을 id 문자열 위에서 되풀이한다(표가 유일한 진실이라
+/// 새 에이전트 추가가 여기 조건문을 건드리지 않는다).
+pub fn status_source_for_id(id: Option<&str>) -> StatusSource {
+    id.and_then(agent_def_by_id)
+        .map(|def| def.status)
+        .unwrap_or(StatusSource::OscTitle)
+}
+
 pub fn agent_def(kind: AgentKind) -> Option<&'static AgentDef> {
     let id = match kind {
         AgentKind::Claude => "claude",
@@ -760,6 +771,41 @@ pub fn spawn_for_def(
         env: Vec::new(),
         rows,
         cols,
+    }
+}
+
+/// id로 PTY 스폰 스펙을 만든다(33행 전체에 닿는 직접 실행 경로).
+///
+/// - `None`이나 **미등록** id → 로그인 셸. `build_spawn(AgentKind::Custom, None, …)`의
+///   기본 경로와 **byte-for-byte 동일**하다(같은 `login_shell()`, 빈 env, 같은 cwd) —
+///   에이전트를 안 고른 사용자는 지금까지의 동작을 그대로 받는다.
+/// - **등록된** id → 그 행을 Orca식으로 직접 띄운다(`spawn_for_def`). 프롬프트 주입은
+///   행의 `prompt_injection` 규약을 따른다(6c는 `prompt: None`으로만 부르고, stdin
+///   주입은 6b-B).
+///
+/// 설치 여부는 여기서 게이팅하지 않는다 — 그건 UI(피커)의 몫이고, 미설치 행이
+/// 흘러들어오면 exec가 실패해 세션 시작 에러로 드러난다(커스텀 커맨드가 실패할 때와 같다).
+pub fn build_spawn_by_id(
+    id: Option<&str>,
+    prompt: Option<&str>,
+    cwd: PathBuf,
+    rows: u16,
+    cols: u16,
+) -> PtySpawn {
+    match id.and_then(agent_def_by_id) {
+        Some(def) => spawn_for_def(def, prompt, cwd, rows, cols),
+        // `build_spawn`의 `None => login_shell()` 가지와 정확히 같은 스폰을 낸다.
+        None => {
+            let (program, args) = login_shell();
+            PtySpawn {
+                program,
+                args,
+                cwd: Some(cwd),
+                env: Vec::new(),
+                rows,
+                cols,
+            }
+        }
     }
 }
 
@@ -1172,6 +1218,54 @@ mod tests {
             spawn.args.iter().any(|a| a == "-l"),
             "expected a login shell"
         );
+    }
+
+    // ── id-keyed 직접 실행 (`build_spawn_by_id` / `status_source_for_id`) ────
+
+    #[test]
+    fn build_spawn_by_id_none_matches_the_login_shell_default() {
+        // 에이전트를 안 고른 경로. 기존 `AgentKind::Custom, None` 기본과 완전히 같아야 한다.
+        let by_id = build_spawn_by_id(None, None, PathBuf::from("/tmp"), 24, 80);
+        let legacy = build_spawn(AgentKind::Custom, None, None, PathBuf::from("/tmp"), 24, 80);
+        assert_eq!(by_id.program, legacy.program);
+        assert_eq!(by_id.args, legacy.args);
+        assert_eq!(by_id.cwd, legacy.cwd);
+        assert!(by_id.env.is_empty());
+        assert_eq!((by_id.rows, by_id.cols), (24, 80));
+    }
+
+    #[test]
+    fn build_spawn_by_id_unknown_id_falls_back_to_login_shell() {
+        let spawn = build_spawn_by_id(Some("no-such-agent"), None, PathBuf::from("/tmp"), 24, 80);
+        assert!(!spawn.program.is_empty());
+        #[cfg(unix)]
+        assert!(
+            spawn.args.iter().any(|a| a == "-l"),
+            "unknown id must fall back to a login shell"
+        );
+    }
+
+    #[test]
+    fn build_spawn_by_id_known_id_launches_that_agents_program() {
+        let spawn = build_spawn_by_id(Some("claude"), None, PathBuf::from("/tmp/wt"), 24, 80);
+        assert_eq!(spawn.program, "claude");
+        assert_eq!(spawn.cwd, Some(PathBuf::from("/tmp/wt")));
+        // kiro는 launch_program이 detect_cmd와 다른 행(kiro → kiro-cli) — 표를 실제로 탄다.
+        let kiro = build_spawn_by_id(Some("kiro"), None, PathBuf::from("/tmp"), 24, 80);
+        assert_eq!(kiro.program, "kiro-cli");
+    }
+
+    #[test]
+    fn status_source_for_id_routes_claude_to_hooks_others_to_osc() {
+        assert_eq!(status_source_for_id(Some("claude")), StatusSource::Hooks);
+        assert_eq!(status_source_for_id(Some("codex")), StatusSource::OscTitle);
+        assert_eq!(status_source_for_id(Some("aider")), StatusSource::OscTitle);
+        // 미등록/로그인 셸은 오늘의 Custom과 같은 OSC-title.
+        assert_eq!(
+            status_source_for_id(Some("no-such")),
+            StatusSource::OscTitle
+        );
+        assert_eq!(status_source_for_id(None), StatusSource::OscTitle);
     }
 
     // ── 감지 (`match_agent`) ───────────────────────────────────────────────

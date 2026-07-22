@@ -184,6 +184,10 @@ pub fn create_worktree(
     requested_name: String,
     base_ref: String,
     workspace_root: PathBuf,
+    // 이 create를 시작할 때 사이드바 피커가 고른 에이전트 id(`None`=로그인 셸).
+    // create op와 함께 실어 보내야 응답을 기다리는 사이 사용자가 피커를 바꿔도
+    // 이 worktree가 엉뚱한 에이전트로 굳지 않는다(이름 드래프트와 같은 원칙).
+    selected_agent: Option<String>,
 ) -> Task<Message> {
     let repo_id = repo.id.clone();
     Task::perform(
@@ -191,6 +195,7 @@ pub fn create_worktree(
         move |result| Message::WorktreeCreated {
             request,
             repo_id,
+            created_with_agent: selected_agent.clone(),
             result,
         },
     )

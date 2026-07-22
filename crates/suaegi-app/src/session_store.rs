@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use iced::Task;
 use suaegi_core::domain::{Worktree, WorktreeId};
-use suaegi_term::agent::{build_spawn, status_source_for, AgentKind, StatusSource};
+use suaegi_term::agent::{build_spawn_by_id, status_source_for_id, StatusSource};
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::CopyRequest;
 use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe, PsProbe};
@@ -168,9 +168,11 @@ pub enum StartRejected {
 pub struct SessionSlot {
     pub id: SessionId,
     pub worktree_id: WorktreeId,
-    /// 이 세션을 어느 에이전트로 띄웠나. OSC-title 상태 배선이 훅(Claude)과
-    /// OSC-title(그 외) 세션을 가르는 데 쓴다([`status_source_for`]).
-    pub agent: AgentKind,
+    /// 이 세션을 어느 에이전트로 띄웠나(레지스트리 id, `None`=로그인 셸). 상태
+    /// 배선이 훅(Claude)과 OSC-title(그 외) 세션을 가르는 데 쓴다
+    /// ([`status_source_for_id`]). 33행 전체를 표의 id로 다루므로 좁은 `AgentKind`가
+    /// 아니라 `&'static str`이다.
+    pub agent: Option<&'static str>,
     pub session: Arc<TerminalSession>,
     pub snapshot: TerminalSnapshot,
     pub snapshot_generation: u64,
@@ -195,7 +197,12 @@ pub struct SessionSlot {
 }
 
 impl SessionSlot {
-    fn new(id: SessionId, worktree_id: WorktreeId, agent: AgentKind, session: TerminalSession) -> Self {
+    fn new(
+        id: SessionId,
+        worktree_id: WorktreeId,
+        agent: Option<&'static str>,
+        session: TerminalSession,
+    ) -> Self {
         Self {
             id,
             worktree_id,
@@ -232,10 +239,12 @@ pub fn blank_snapshot() -> TerminalSnapshot {
 pub struct SessionStore {
     slots: HashMap<SessionId, SessionSlot>,
     reaper: Reaper,
-    /// 마지막 `start()`가 PTY에 실제로 심은 환경 변수. 테스트가 프로덕션 경로를
-    /// 그대로 태우고 결과를 관측하기 위한 유일한 창이다.
+    /// 마지막 `start()`가 PTY에 실제로 넘긴 스폰 스펙(program/args/cwd/env). 테스트가
+    /// 프로덕션 경로를 그대로 태우고 결과를 관측하기 위한 유일한 창이다 — 직접
+    /// 실행 경로에서 program=claude, cwd=worktree, SUAEGI_* env가 함께 심겼는지
+    /// **한 번의 관측**으로 검증한다.
     #[cfg(test)]
-    last_spawn_env: Option<Vec<(String, String)>>,
+    last_spawn: Option<PtySpawn>,
     /// `close()`/`accept_started`의 거절 경로로 넘어간 세션이 **실제로 어느
     /// 스레드에서** 떨어졌는지. 오직 Reaper의 콜백만 채운다 — 그 콜백이
     /// 실행되는 스레드가 곧 소멸자가 실행된 스레드라는 증거다.
@@ -249,11 +258,12 @@ pub struct SessionStore {
     track_reaped_at: bool,
     retired_count: Arc<AtomicU64>,
     next_id: u64,
-    /// `start()`가 발급한 세션의 `AgentKind`를 `accept_started`가 슬롯을 만들 때까지
-    /// 보관한다. 시작 결과는 비동기라 그 사이 슬롯이 없으므로, 여기 잠깐 둔다.
-    /// 시작이 거절되거나 결과가 끝내 안 와도 엔트리가 새지 않게 `accept_started`가
-    /// 반드시 `remove`한다(복원·테스트 경로처럼 `start`를 안 거친 슬롯은 기본 Custom).
-    pending_agents: HashMap<SessionId, AgentKind>,
+    /// `start()`가 발급한 세션의 에이전트 id(`None`=로그인 셸)를 `accept_started`가
+    /// 슬롯을 만들 때까지 보관한다. 시작 결과는 비동기라 그 사이 슬롯이 없으므로,
+    /// 여기 잠깐 둔다. 시작이 거절되거나 결과가 끝내 안 와도 엔트리가 새지 않게
+    /// `accept_started`가 반드시 `remove`한다(복원·테스트 경로처럼 `start`를 안 거친
+    /// 슬롯은 기본 `None`=로그인 셸/OSC-title로, 오늘의 Custom과 같다).
+    pending_agents: HashMap<SessionId, Option<&'static str>>,
 }
 
 impl Default for SessionStore {
@@ -273,14 +283,20 @@ impl SessionStore {
             next_id: 0,
             pending_agents: HashMap::new(),
             #[cfg(test)]
-            last_spawn_env: None,
+            last_spawn: None,
         }
     }
 
-    /// 마지막 `start()`가 PTY에 실제로 심은 env.
+    /// 마지막 `start()`가 PTY에 실제로 넘긴 스폰 스펙 전체.
+    #[cfg(test)]
+    pub(crate) fn last_spawn(&self) -> Option<&PtySpawn> {
+        self.last_spawn.as_ref()
+    }
+
+    /// 마지막 `start()`가 PTY에 실제로 심은 env(기존 호출자 호환).
     #[cfg(test)]
     pub(crate) fn last_spawn_env(&self) -> Option<&[(String, String)]> {
-        self.last_spawn_env.as_deref()
+        self.last_spawn.as_ref().map(|s| s.env.as_slice())
     }
 
     /// 호출자가 미리 발급받을 `SessionId`. `start`는 이 id를 그대로 받아
@@ -302,22 +318,16 @@ impl SessionStore {
         &mut self,
         id: SessionId,
         worktree: &Worktree,
-        agent: AgentKind,
+        agent_id: Option<&'static str>,
         prompt: Option<String>,
         env: Vec<(String, String)>,
     ) -> Task<Message> {
         let worktree_id = worktree.id.clone();
         let cwd = worktree.path.clone();
         // 슬롯이 생기는 `accept_started`까지 어느 에이전트였는지 기억해 둔다.
-        self.pending_agents.insert(id, agent);
-        let mut spawn = build_spawn(
-            agent,
-            None,
-            prompt.as_deref(),
-            cwd,
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
-        );
+        self.pending_agents.insert(id, agent_id);
+        let mut spawn =
+            build_spawn_by_id(agent_id, prompt.as_deref(), cwd, DEFAULT_ROWS, DEFAULT_COLS);
         spawn.env.extend(env);
         // **프로덕션 경로에서 실제로 심긴 env를 관측할 수 있게 한다.**
         // `spawn_env()`를 따로 테스트하는 것만으로는 그 값이 정말 PTY까지
@@ -325,7 +335,7 @@ impl SessionStore {
         // 않는 버그를 통과시켰다.
         #[cfg(test)]
         {
-            self.last_spawn_env = Some(spawn.env.clone());
+            self.last_spawn = Some(spawn.clone());
         }
         background::blocking(move |mut sender| {
             let spec = SessionSpec {
@@ -355,8 +365,8 @@ impl SessionStore {
         worktree_still_exists: bool,
     ) -> Result<(), StartRejected> {
         // 거절되든 받아들여지든 pending 엔트리는 여기서 소비한다(안 그러면 샌다).
-        // 복원·테스트처럼 `start`를 안 거친 경로는 Custom(= OSC-title)으로 둔다.
-        let agent = self.pending_agents.remove(&id).unwrap_or(AgentKind::Custom);
+        // 복원·테스트처럼 `start`를 안 거친 경로는 `None`(로그인 셸/OSC-title)으로 둔다.
+        let agent = self.pending_agents.remove(&id).unwrap_or(None);
         if !worktree_still_exists {
             self.retire(Arc::new(session), Some(id));
             return Err(StartRejected::WorktreeGone);
@@ -369,7 +379,7 @@ impl SessionStore {
     /// 세션의 상태 신호 출처. `None` = 그런 세션이 없다. OSC-title 배선이 이걸로
     /// 훅(Claude) 세션과 OSC-title 세션을 가른다.
     pub fn status_source(&self, id: SessionId) -> Option<StatusSource> {
-        self.slots.get(&id).map(|s| status_source_for(s.agent))
+        self.slots.get(&id).map(|s| status_source_for_id(s.agent))
     }
 
     /// 스냅샷은 UI 스레드에서 뜨지 않는다. 이미 진행 중이면 `false`를 반환하고
@@ -755,6 +765,17 @@ impl SessionStore {
     /// 않는다(플레인 `#[test]`엔 iced 실행기가 없다).
     #[doc(hidden)]
     pub fn start_for_test(&mut self, command: (String, Vec<String>)) -> SessionId {
+        self.start_for_test_with_agent(command, None)
+    }
+
+    /// `start_for_test`와 같되 슬롯에 에이전트 id를 심는다 — `status_source`가 id로
+    /// 훅/OSC-title을 가르는지 검증하는 용도.
+    #[doc(hidden)]
+    pub fn start_for_test_with_agent(
+        &mut self,
+        command: (String, Vec<String>),
+        agent: Option<&'static str>,
+    ) -> SessionId {
         let id = self.next_id();
         let spec = SessionSpec {
             pty: PtySpawn {
@@ -770,12 +791,7 @@ impl SessionStore {
         let session = TerminalSession::start(spec).expect("test session must start");
         self.slots.insert(
             id,
-            SessionSlot::new(
-                id,
-                WorktreeId("test-worktree".to_string()),
-                AgentKind::Custom,
-                session,
-            ),
+            SessionSlot::new(id, WorktreeId("test-worktree".to_string()), agent, session),
         );
         id
     }

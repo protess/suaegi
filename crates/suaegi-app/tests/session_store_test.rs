@@ -48,6 +48,37 @@ impl Drop for DropSentinel {
     }
 }
 
+/// 6c: 슬롯의 상태 신호 출처가 **에이전트 id로** 갈린다 — claude만 훅, 나머지와
+/// 로그인 셸은 OSC-title. 이게 6b-A의 훅 우선순위(claude pane이 OSC를 무시)가
+/// 직접 실행 경로에서도 유지되는 근거다.
+#[test]
+fn status_source_routes_by_agent_id() {
+    use suaegi_term::agent::StatusSource;
+
+    let mut store = SessionStore::for_test();
+    let claude = store.start_for_test_with_agent(platform::echo("c"), Some("claude"));
+    let codex = store.start_for_test_with_agent(platform::echo("x"), Some("codex"));
+    let shell = store.start_for_test(platform::echo("s")); // None = 로그인 셸
+
+    assert_eq!(
+        store.status_source(claude),
+        Some(StatusSource::Hooks),
+        "claude must route to Hooks so 6b-A precedence still applies"
+    );
+    // 대조군: 이게 없으면 위의 Hooks가 "라우팅이 옳다"가 아니라 "항상 Hooks"로도
+    // 설명된다.
+    assert_eq!(
+        store.status_source(codex),
+        Some(StatusSource::OscTitle),
+        "non-claude agents must route to OSC-title"
+    );
+    assert_eq!(
+        store.status_source(shell),
+        Some(StatusSource::OscTitle),
+        "a login shell (no agent) routes to OSC-title, matching today's Custom"
+    );
+}
+
 #[test]
 fn a_stale_snapshot_result_never_overwrites_a_newer_one() {
     let mut store = SessionStore::for_test();
