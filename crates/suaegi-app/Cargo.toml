@@ -9,6 +9,8 @@ license.workspace = true
 suaegi-core = { path = "../suaegi-core" }
 suaegi-git = { path = "../suaegi-git" }
 suaegi-term = { path = "../suaegi-term" }
+# Plan 7a: GitHub PR 상태/생성. gh CLI shell-out은 이 크레이트 뒤에서만 일어난다.
+suaegi-forge = { path = "../suaegi-forge" }
 # 스냅샷 셀이 Color/Flags/CursorShape를 재수출 없이 노출하므로 직접 의존한다
 alacritty_terminal = { workspace = true }
 iced = { workspace = true }
