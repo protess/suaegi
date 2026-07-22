@@ -53,6 +53,12 @@ pub struct Worktree {
     pub created_with_agent: Option<String>,
     #[serde(default)]
     pub created_at_unix_ms: u64,
+    /// 이 worktree의 브랜치에 연결된 GitHub PR 번호(Plan 7a, Orca `hosted-review.ts:45`).
+    /// 이 번호로 리뷰 상태를 재해석한다. **`#[serde(default)]`가 데이터 손실 방어다** —
+    /// 이 필드 없는 옛 저장본이 `None`으로 조용히 로드돼야지, 하나의 역직렬화 실패가
+    /// `PersistedState` 전체를 손상 판정으로 떨어뜨리면 안 된다(위 두 필드와 같은 등급).
+    #[serde(default)]
+    pub linked_github_pr: Option<u64>,
 }
 
 /// `pane_grid::Axis`의 serde 거울. iced 타입은 `Serialize`를 갖지 않고, 갖게
@@ -169,6 +175,7 @@ mod tests {
                 display_name: "fix-bug".into(),
                 created_with_agent: Some("claude".into()),
                 created_at_unix_ms: 1_700_000_000_000,
+                linked_github_pr: Some(42),
             }],
             session: SessionState {
                 active_worktree_id: Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
@@ -273,6 +280,49 @@ mod tests {
         // 뭉갰다"로도 설명되면 안 된다.
         assert_eq!(wt.branch, "fix-bug", "control: present fields must be read");
         assert_eq!(wt.repo_id, RepoId("/tmp/demo".into()));
+    }
+
+    /// Plan 7a 이전 빌드가 쓴 worktree 객체에는 `linked_github_pr` 키가 아예 없다.
+    /// `#[serde(default)]`가 그걸 `None`으로 채워야 한다 — 아니면 이 worktree 하나의
+    /// 파싱 실패가 저장 파일 전체를 손상으로 판정해 백업 폴백으로 떨어뜨린다(data-loss 등급).
+    #[test]
+    fn a_worktree_written_before_the_linked_pr_field_still_loads() {
+        let legacy = r#"{
+            "id": "/tmp/ws/demo/fix-bug",
+            "repo_id": "/tmp/demo",
+            "path": "/tmp/ws/demo/fix-bug",
+            "branch": "fix-bug",
+            "display_name": "fix-bug",
+            "created_with_agent": "claude",
+            "created_at_unix_ms": 1700000000000
+        }"#;
+        let wt: Worktree =
+            serde_json::from_str(legacy).expect("a pre-7a worktree object must still parse");
+        assert_eq!(
+            wt.linked_github_pr, None,
+            "a missing linked_github_pr key means 'no PR linked', not a parse failure"
+        );
+        // 대조군: 존재하던 필드는 실제로 읽혔다.
+        assert_eq!(wt.branch, "fix-bug", "control: present fields must be read");
+        assert_eq!(wt.created_with_agent, Some("claude".to_string()));
+    }
+
+    /// `linked_github_pr`가 있는 값이 JSON을 왕복해도 보존돼야 한다(재해석의 근거).
+    #[test]
+    fn linked_github_pr_round_trips() {
+        let wt = Worktree {
+            id: WorktreeId("/tmp/ws/demo/fix-bug".into()),
+            repo_id: RepoId("/tmp/demo".into()),
+            path: PathBuf::from("/tmp/ws/demo/fix-bug"),
+            branch: "fix-bug".into(),
+            display_name: "fix-bug".into(),
+            created_with_agent: None,
+            created_at_unix_ms: 0,
+            linked_github_pr: Some(1234),
+        };
+        let json = serde_json::to_string(&wt).unwrap();
+        let back: Worktree = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.linked_github_pr, Some(1234));
     }
 
     #[test]
