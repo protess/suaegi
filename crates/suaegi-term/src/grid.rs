@@ -455,6 +455,13 @@ impl TerminalGrid {
         encode::encode_paste(text, *state.term.mode())
     }
 
+    /// 지금 `BRACKETED_PASTE` 모드인가. 프롬프트 주입 게이트(app)가 composer가
+    /// 준비됐는지 판단하는 전제로 쓴다 — 값싼 락 한 번(스냅샷 190KB를 뜨지 않는다).
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        let state = self.state.lock();
+        state.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     pub fn encode_focus_locked(&self, focused: bool) -> Option<Vec<u8>> {
         let state = self.state.lock();
         encode::encode_focus(focused, *state.term.mode())

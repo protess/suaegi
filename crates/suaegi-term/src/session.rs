@@ -402,6 +402,24 @@ impl TerminalSession {
         self.enqueue(self.grid.encode_paste_locked(text))
     }
 
+    /// 지금 터미널이 `BRACKETED_PASTE` 모드인가. 프롬프트 주입 게이트가 composer
+    /// 준비 여부를 판단하는 전제다(값싼 락 한 번).
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.grid.bracketed_paste_enabled()
+    }
+
+    /// 초기 프롬프트를 **모드와 무관하게 항상 bracketed paste로 감싸** PTY에
+    /// 써넣는다(라이터 스레드가 실제 쓰기를 한다, 논블로킹). 게이트(app)가 이미
+    /// `BRACKETED_PASTE` 활성화와 조용한 창을 확인한 뒤에만 부른다 — 그래서
+    /// `send_paste`처럼 라이브 모드를 다시 읽지 않고 무조건 감싼다(관측과 쓰기
+    /// 사이 모드가 바뀌는 경쟁에서도 주입이 raw로 새지 않게). 종료자는
+    /// 페이로드에서 제거된다(`wrap_bracketed_paste`, 프롬프트도 신뢰 불가 입력).
+    /// 반환값은 큐 적재 성공 여부 — 유실돼도 사용자가 직접 타이핑하면 되므로
+    /// 호출부는 조용히 버린다.
+    pub fn inject_bracketed_paste(&self, text: &str) -> bool {
+        self.write(crate::encode::wrap_bracketed_paste(text))
+    }
+
     pub fn report_focus(&self, focused: bool) -> WriteOutcome {
         match self.grid.encode_focus_locked(focused) {
             Some(bytes) => self.enqueue(bytes),

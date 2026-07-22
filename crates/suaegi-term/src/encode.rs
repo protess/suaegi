@@ -299,6 +299,16 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
         // `\r\n`을 먼저 접어야 CRLF가 `\r\r`이 되지 않는다.
         return text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
     }
+    wrap_bracketed_paste(text)
+}
+
+/// 텍스트를 `ESC[200~ … ESC[201~`로 감싸고 **페이로드에서 종료자를 제거한다** —
+/// [`encode_paste`]의 bracketed 가지와 같은 로직을 프롬프트 주입(라이브 모드와
+/// 무관하게 항상 감싸야 한다)이 재사용하기 위해 갈라낸 것이다.
+///
+/// 종료자 제거를 빠뜨리면 `\x1b[201~`가 든 텍스트가 괄호 밖으로 새어 **셸이
+/// 실행한다** — bracketed paste 설계 전체가 막으려는 보안 실패다.
+pub fn wrap_bracketed_paste(text: &str) -> Vec<u8> {
     let sanitized = text.replace("\x1b[201~", "");
     let mut out = Vec::with_capacity(sanitized.len() + 12);
     out.extend_from_slice(b"\x1b[200~");
@@ -1035,6 +1045,25 @@ mod tests {
         assert_eq!(
             encode_paste("ls -al", TermMode::BRACKETED_PASTE),
             b"\x1b[200~ls -al\x1b[201~"
+        );
+    }
+
+    /// 프롬프트 주입 경로(`wrap_bracketed_paste`)는 **모드 인자 없이** 항상
+    /// 감싸고 종료자를 제거한다 — 게이트가 이미 BRACKETED_PASTE를 확인한 뒤에만
+    /// 부르기 때문이다. `encode_paste`의 bracketed 가지와 byte-identical해야 한다.
+    #[test]
+    fn wrap_bracketed_paste_always_wraps_and_strips_terminator() {
+        assert_eq!(wrap_bracketed_paste("fix the bug"), b"\x1b[200~fix the bug\x1b[201~");
+        // 주입 텍스트에 든 종료자를 제거하지 않으면 그 뒤가 괄호 밖으로 새어
+        // 셸이 실행한다 — 프롬프트도 신뢰할 수 없는 입력이다.
+        assert_eq!(
+            wrap_bracketed_paste("a\x1b[201~rm -rf /"),
+            b"\x1b[200~arm -rf /\x1b[201~"
+        );
+        // 라이브 모드가 켜진 encode_paste와 정확히 같은 바이트여야 한다.
+        assert_eq!(
+            wrap_bracketed_paste("hello"),
+            encode_paste("hello", TermMode::BRACKETED_PASTE)
         );
     }
 

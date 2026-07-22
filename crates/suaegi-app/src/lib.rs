@@ -5,6 +5,7 @@ pub mod git_tasks;
 pub mod layout;
 pub mod persistence_thread;
 pub mod presence_poll;
+pub mod prompt_inject;
 pub mod reaper;
 pub mod session_store;
 pub mod sidebar;

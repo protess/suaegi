@@ -22,6 +22,12 @@ pub const IDLE_TIER: std::time::Duration = std::time::Duration::from_secs(2);
 /// 지금 어느 티어로 폴링해야 하는지. 세션 하나라도 `AgentPresence::Agent`면
 /// [`ACTIVE_TIER`], 아니면(세션이 없는 경우 포함) [`IDLE_TIER`].
 pub fn tier(state: &AppState) -> std::time::Duration {
+    // 무장된 프롬프트 주입 게이트가 있으면 그동안은 빠른 티어로 돈다 — 주입
+    // 준비(BRACKETED_PASTE + 조용한 창)를 촘촘히 관측해야 스플래시 직후의 짧은
+    // 창을 놓치지 않는다. 이 창은 세션 시작 직후 몇 초뿐이라 비용이 작다.
+    if state.has_armed_prompt_gates() {
+        return ACTIVE_TIER;
+    }
     let any_agent_present = state.session_store().sessions().any(|(id, _)| {
         matches!(
             state.session_store().presence(id),

@@ -13,7 +13,7 @@ use suaegi_git::compare::{CompareOutcome, FileDiff};
 
 use crate::diff_panel::{panel_state_for, patch_state_for, DiffState};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
-use suaegi_term::agent::agent_def_by_id;
+use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::{CopyTargets, WriteOutcome};
 use suaegi_term::presence::AgentPresence;
@@ -27,6 +27,7 @@ use crate::layout::{leaves_in_order, to_configuration, to_persisted, without_lea
 use crate::persistence_thread::{
     LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
 };
+use crate::prompt_inject::{GateAction, GateObservation, PromptGate};
 use crate::session_store::{SessionId, SessionStore, StartedSession};
 use crate::terminal::contract::TermCommand;
 
@@ -199,6 +200,10 @@ pub enum Message {
         /// 생성을 시작할 때 고른 에이전트 id(`None`=로그인 셸). 성공 시
         /// [`WorktreeMeta::created_with_agent`]로 굳어 세션 시작 때 그 에이전트를 띄운다.
         created_with_agent: Option<String>,
+        /// 생성 제출 시점의 초기 프롬프트(빈 문자열은 `None`). create op와 함께
+        /// 실려 와, 성공 시 `pending_prompts`(메모리, 비영속)에 담겼다가 그
+        /// worktree의 **첫** 세션 시작 때 한 번 소비된다.
+        initial_prompt: Option<String>,
         result: Result<CreatedWorktree, String>,
     },
     WorktreeRemoved {
@@ -220,6 +225,13 @@ pub enum Message {
     WorktreeAgentSelected {
         repo_id: RepoId,
         choice: AgentChoice,
+    },
+    /// 사이드바 초기-프롬프트 입력창의 변경. `CreateWorktreeSubmitted`가 이 드래프트를
+    /// 스냅샷해 새 worktree의 **일회성** 시작 프롬프트로 실어 보낸다 — 영속화하지
+    /// 않는다(복원된 세션은 낡은 프롬프트를 다시 주입하면 안 된다).
+    WorktreePromptInputChanged {
+        repo_id: RepoId,
+        value: String,
     },
     CreateWorktreeSubmitted {
         repo_id: RepoId,
@@ -375,6 +387,9 @@ pub struct AppState {
     /// 무시한 사용자는 오늘의 동작을 그대로 받는다. `AgentChoice::LOGIN_SHELL`을
     /// 고르면 엔트리를 지운다(= 없음과 같다).
     worktree_agent_draft: HashMap<RepoId, AgentChoice>,
+    /// repo별 "초기 프롬프트" 입력창의 임시 값. 비었으면 주입 없음(기본). 이름
+    /// 드래프트와 같은 수명 — `CreateWorktreeSubmitted`가 스냅샷하고 성공 시 지운다.
+    worktree_prompt_draft: HashMap<RepoId, String>,
     /// PATH에서 설치가 확인된 에이전트 id(피커에 나열). **부팅 때 한 번** 스캔한다
     /// (`detect_installed`는 에이전트마다 PATH를 훑으므로 프레임마다 하면 비싸다).
     /// 앱 실행 중 새로 설치한 에이전트는 재부팅 전까지 안 보인다 — v1 한계.
@@ -425,6 +440,21 @@ pub struct AppState {
     /// 채워둔다 — `SessionStarted`가 도착하기 전에도(또는 실패해도) 어떤
     /// worktree를 위한 시도였는지 사용자에게 보여줄 수 있다.
     session_titles: HashMap<SessionId, String>,
+
+    // ---- Plan 6b-B: 초기 프롬프트 주입 ----
+    /// worktree별 **일회성** 초기 프롬프트. `WorktreeCreated`가 담고, 그 worktree의
+    /// **첫** `start_session_for`가 `remove`로 소비한다 — 그래서 세션을 닫았다
+    /// 다시 열거나 재시작 후 복원해도 다시 주입되지 않는다. **영속화하지 않는다.**
+    pending_prompts: HashMap<WorktreeId, String>,
+    /// stdin-after-start 세션의 주입 대기 프롬프트. `start_session_for`가 시작을
+    /// **요청**할 때 담고, `SessionStarted`가 세션이 **실제로 살아난** 뒤 게이트로
+    /// 옮긴다(`prompt_gates`). 시작이 실패/거절되면 여기서 지워 새지 않게 한다.
+    /// 왜 게이트를 바로 안 무장하고 여기 잠깐 두는가: 세션 슬롯은 `accept_started`
+    /// 전엔 없으므로, 게이트를 그 전에 무장하면 poll이 세션을 못 찾는다.
+    pending_injections: HashMap<SessionId, String>,
+    /// 무장된 주입 게이트. stdin-after-start 세션이 composer 준비(BRACKETED_PASTE +
+    /// 조용한 창)에 이르면 프롬프트를 한 번 써넣고 사라진다. `PresenceTick`이 폴링한다.
+    prompt_gates: HashMap<SessionId, PromptGate>,
 
     // ---- Task 7: 존재 폴링 ----
     /// `SessionStore::request_presence`에 넘길, 계속 증가하는 시퀀스. 프레즌스
@@ -566,6 +596,7 @@ impl Default for AppState {
             // 기본은 빈 목록 = 피커에 로그인 셸만. 실제 앱 경로(`boot`)만 PATH를
             // 스캔한다 — 손으로 세우는 테스트 상태는 스캔 비용을 치르지 않는다.
             worktree_agent_draft: HashMap::new(),
+            worktree_prompt_draft: HashMap::new(),
             installed_agents: Vec::new(),
             selected_worktree: None,
             last_error: None,
@@ -584,6 +615,9 @@ impl Default for AppState {
             pending_session_starts: HashMap::new(),
             pending_worktree_removals: HashSet::new(),
             session_titles: HashMap::new(),
+            pending_prompts: HashMap::new(),
+            pending_injections: HashMap::new(),
+            prompt_gates: HashMap::new(),
             next_presence_seq: 0,
             last_input_loss: None,
             // 부팅을 거치지 않는 경로는 하이드레이션할 것이 없다 — 열어둔다.
@@ -1015,14 +1049,30 @@ impl AppState {
         // id로 만든다 — 표에 없는 값(제거된 에이전트, 손상된 저장본)은 `None`으로
         // 떨어져 로그인 셸이 된다(오늘의 기본과 동일). 고른 게 없으면 `None` →
         // 로그인 셸이라 기존 동작이 그대로다.
-        let agent_id: Option<&'static str> = worktree
+        let agent_def = worktree
             .created_with_agent
             .as_deref()
-            .and_then(agent_def_by_id)
-            .map(|def| def.id);
-        let task = self
-            .session_store
-            .start(session_id, &worktree, agent_id, None, env);
+            .and_then(agent_def_by_id);
+        let agent_id: Option<&'static str> = agent_def.map(|def| def.id);
+
+        // **일회성 초기 프롬프트를 여기서 소비한다.** `pending_prompts`에서 빼므로
+        // 세션을 닫았다 다시 열거나 재시작 후 복원해도 다시 주입되지 않는다 —
+        // 이 값은 영속화되지 않고 오직 이 첫 시작에만 실린다.
+        let prompt = self.pending_prompts.remove(id);
+
+        // argv/flag 에이전트는 프롬프트가 스폰 시점에 argv로 들어간다
+        // (`build_spawn_by_id` → `apply_prompt_injection`). stdin-after-start
+        // 에이전트는 argv로는 no-op이라, 세션이 살아난 뒤 게이트로 PTY에 써넣어야
+        // 한다 — 그 프롬프트를 세션이 실제로 시작될 때까지 여기 잠깐 둔다.
+        if let (Some(prompt), Some(PromptInjection::StdinAfterStart)) =
+            (prompt.as_ref(), agent_def.map(|def| def.prompt_injection))
+        {
+            self.pending_injections.insert(session_id, prompt.clone());
+        }
+
+        let task =
+            self.session_store
+                .start(session_id, &worktree, agent_id, prompt, env);
         Some((session_id, task))
     }
 
@@ -1161,6 +1211,14 @@ impl AppState {
             .get(repo)
             .copied()
             .unwrap_or(AgentChoice::LOGIN_SHELL)
+    }
+
+    /// 이 repo의 초기-프롬프트 입력창 값. 비었으면 빈 문자열(주입 없음).
+    pub(crate) fn worktree_prompt_draft(&self, repo: &RepoId) -> &str {
+        self.worktree_prompt_draft
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     pub(crate) fn selected_worktree(&self) -> Option<&WorktreeId> {
@@ -1415,6 +1473,71 @@ impl AppState {
         }
     }
 
+    /// 무장된 프롬프트 게이트를 한 틱 전진시킨다. composer 준비(BRACKETED_PASTE +
+    /// 조용한 창)에 이른 stdin-after-start 세션에 프롬프트를 **한 번** 써넣는다.
+    /// 하드 타임아웃이 지났거나 사용자가 이미 타이핑했으면(게이트가 이미 제거됨)
+    /// 조용히 아무 일도 하지 않는다.
+    ///
+    /// **관측을 먼저 모으고(불변 차용) 게이트를 전진시킨 뒤(가변) 쓴다** — 세
+    /// 단계를 섞으면 `session_store`(불변)와 `prompt_gates`(가변)를 동시에 빌려
+    /// 컴파일이 안 된다.
+    fn poll_prompt_injections(&mut self) {
+        if self.prompt_gates.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        // 1) 살아 있는 세션마다 관측을 모은다(스냅샷을 뜨지 않는 값싼 조회).
+        let observations: Vec<(SessionId, GateObservation)> = self
+            .prompt_gates
+            .keys()
+            .copied()
+            .filter_map(|id| {
+                let session = self.session_store.session(id)?;
+                Some((
+                    id,
+                    GateObservation {
+                        now,
+                        bracketed_paste: session.bracketed_paste_enabled(),
+                        generation: session.generation(),
+                    },
+                ))
+            })
+            .collect();
+        // 2) 게이트를 전진시키고, 주입할 것과 끝난 것을 가른다.
+        let mut injects: Vec<(SessionId, String)> = Vec::new();
+        let mut finished: Vec<SessionId> = Vec::new();
+        for (id, obs) in observations {
+            if let Some(gate) = self.prompt_gates.get_mut(&id) {
+                match gate.poll(obs) {
+                    GateAction::Inject => {
+                        injects.push((id, gate.prompt().to_string()));
+                        finished.push(id);
+                    }
+                    GateAction::Wait => {}
+                }
+            }
+        }
+        // 끝난(주입한) 게이트를 제거한다. 하드 타임아웃으로 포기한 게이트는
+        // `Wait`를 내지만 내부적으로 `Finished`라 이후 poll이 no-op이고, 세션이
+        // 닫힐 때 `close_session`이 거둔다.
+        for id in finished {
+            self.prompt_gates.remove(&id);
+        }
+        // 3) 프롬프트를 PTY에 써넣는다(항상 bracketed paste로 감싸 raw 유출 방지).
+        for (id, prompt) in injects {
+            if let Some(session) = self.session_store.session(id) {
+                session.inject_bracketed_paste(&prompt);
+            }
+        }
+    }
+
+    /// 무장된 프롬프트 게이트가 하나라도 있는가. presence 폴링 티어를 그동안
+    /// [`ACTIVE_TIER`](crate::presence_poll::ACTIVE_TIER)로 올려, 조용한 창을 더
+    /// 촘촘히 관측한다(주입 창은 짧고 정확도가 중요하다).
+    pub(crate) fn has_armed_prompt_gates(&self) -> bool {
+        !self.prompt_gates.is_empty()
+    }
+
     /// 타이틀에서 추론한 상태를 배지 장부에 반영한다. `apply_hook`의 꼬리와 같은
     /// 규칙으로 `hook` 슬롯과 `previous`를 갱신한다 — 타이틀-파생 상태는 훅과 같은
     /// "가장 최근 상태 신호 + 시각" 슬롯을 쓴다.
@@ -1626,6 +1749,10 @@ impl AppState {
     /// 계약이다 — 세션 소멸과 pane 소멸을 한 함수로 묶어 어길 수 없게 한다.
     fn close_session(&mut self, id: SessionId) {
         self.session_store.close(id);
+        // 무장된(또는 대기 중인) 주입은 세션과 함께 사라진다 — 닫힌 세션에
+        // 프롬프트를 써넣을 수는 없고, 남겨두면 맵이 무한히 자란다.
+        self.prompt_gates.remove(&id);
+        self.pending_injections.remove(&id);
         if let Some(worktree_id) = self.session_worktrees.remove(&id) {
             self.worktree_sessions.remove(&worktree_id);
             // **배지 장부도 같이 간다.** 남겨두면 세션이 사라진 뒤에도 마지막
@@ -1784,11 +1911,19 @@ impl AppState {
 
         match command {
             TermCommand::Key(input) => {
+                // **사용자가 타이핑을 시작했으면 주입을 취소한다.** 사용자가 이미
+                // 뭔가 치고 있는데 프롬프트가 끼어들면 그가 친 것과 뒤섞인다 —
+                // mis-injection is worse than none.
+                self.prompt_gates.remove(&id);
+                self.pending_injections.remove(&id);
                 let outcome = session.send_key(&input);
                 self.note_write(id, outcome);
                 iced::Task::none()
             }
             TermCommand::Paste(text) => {
+                // 사용자가 직접 붙여넣는 것도 타이핑과 같다 — 주입을 취소한다.
+                self.prompt_gates.remove(&id);
+                self.pending_injections.remove(&id);
                 let outcome = session.send_paste(&text);
                 self.note_write(id, outcome);
                 iced::Task::none()
@@ -1918,6 +2053,16 @@ impl AppState {
                 }
                 iced::Task::none()
             }
+            Message::WorktreePromptInputChanged { repo_id, value } => {
+                // 빈 값이면 엔트리를 지운다(= 주입 없음, 기본). 맵을 불필요하게
+                // 키우지 않는다.
+                if value.is_empty() {
+                    self.worktree_prompt_draft.remove(&repo_id);
+                } else {
+                    self.worktree_prompt_draft.insert(repo_id, value);
+                }
+                iced::Task::none()
+            }
             Message::CreateWorktreeSubmitted { repo_id } => {
                 let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
                     return iced::Task::none();
@@ -1932,6 +2077,13 @@ impl AppState {
                     .worktree_agent_selection(&repo_id)
                     .0
                     .map(|id| id.to_string());
+                // 제출 시점의 초기 프롬프트도 함께 스냅샷한다(빈 값은 `None`) —
+                // 응답을 기다리는 사이 입력창이 바뀌어도 이 worktree엔 영향 없다.
+                let initial_prompt = self
+                    .worktree_prompt_draft
+                    .get(&repo_id)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 // repo 등록 시 감지한 HEAD 브랜치를 기본 base ref로 쓴다. probe가
                 // 실패했거나 HEAD를 못 읽었으면 "main"으로 최선을 다해 추정한다 —
                 // 정확한 기본 브랜치 선택 UI는 이 태스크 범위 밖이다.
@@ -1947,11 +2099,13 @@ impl AppState {
                     base_ref,
                     self.workspace_root.clone(),
                     selected_agent,
+                    initial_prompt,
                 )
             }
             Message::WorktreeCreated {
                 repo_id,
                 created_with_agent,
+                initial_prompt,
                 result,
                 ..
             } => match result {
@@ -1965,6 +2119,9 @@ impl AppState {
                     // 로그인 셸 기본에서 시작). 성공 경로에서만 지운다 — 실패하면
                     // 사용자가 재시도할 때 고른 에이전트가 유지된다.
                     self.worktree_agent_draft.remove(&repo_id);
+                    // 초기-프롬프트 입력창도 초기화(같은 이유). 스냅샷된 값은 이미
+                    // `initial_prompt`에 실려 있으므로 여기서 지워도 잃지 않는다.
+                    self.worktree_prompt_draft.remove(&repo_id);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -1974,8 +2131,9 @@ impl AppState {
                     // 적용되게 하는 유일한 지점이다 — 우리는 `claude`를 직접
                     // 실행하지 않으므로 `--settings`를 넘길 argv가 없다.
                     self.inject_into_worktree(&created.path);
+                    let created_id = worktree_id_for(&created.path);
                     self.worktree_meta.insert(
-                        worktree_id_for(&created.path),
+                        created_id.clone(),
                         WorktreeMeta {
                             // 6c: 생성 시점에 고른 에이전트를 여기 굳힌다. `None`이면
                             // (피커를 안 건드림) 로그인 셸로 뜬다 — 예전과 동일.
@@ -1985,6 +2143,12 @@ impl AppState {
                             created_at_unix_ms: now_ms,
                         },
                     );
+                    // **일회성 프롬프트를 메모리에만 담는다**(`WorktreeMeta`가 아니라).
+                    // 이 worktree의 첫 세션 시작이 소비한다. 영속화되지 않으므로
+                    // 재시작 후 복원된 세션은 낡은 프롬프트를 다시 주입하지 않는다.
+                    if let Some(prompt) = initial_prompt {
+                        self.pending_prompts.insert(created_id, prompt);
+                    }
                     self.refresh_worktrees(repo_id)
                 }
                 Err(err) => {
@@ -2115,6 +2279,7 @@ impl AppState {
                             // 이미 다른 곳에서 소비됐다 — 정상 경로에서는 밟지
                             // 않지만(봉투는 한 번만 만들어진다), 방어적으로
                             // 무시한다.
+                            self.pending_injections.remove(&id);
                             self.session_titles.remove(&id);
                             // **그래도 잎은 결정해야 한다** — 여기서 빠져나가면
                             // 그 잎이 `pending`에 남아 게이트가 영원히 닫힌다.
@@ -2131,6 +2296,13 @@ impl AppState {
                             Ok(()) => {
                                 self.worktree_sessions.insert(worktree_id.clone(), id);
                                 self.session_worktrees.insert(id, worktree_id.clone());
+                                // **세션이 실제로 살아났다 — 이제 주입 게이트를
+                                // 무장한다.** 슬롯이 이 시점에 생기므로(`accept_started`)
+                                // 다음 `PresenceTick`부터 poll이 세션을 찾을 수 있다.
+                                // 게이트의 하드 타임아웃 시계는 첫 poll부터 잰다.
+                                if let Some(prompt) = self.pending_injections.remove(&id) {
+                                    self.prompt_gates.insert(id, PromptGate::new(prompt));
+                                }
                                 if restoring {
                                     self.note_restore_outcome(
                                         &worktree_id,
@@ -2145,7 +2317,8 @@ impl AppState {
                             }
                             Err(_) => {
                                 // worktree가 그새 삭제됐다 — 세션은 이미 reaper로
-                                // 갔다(`accept_started`). 타이틀만 정리한다.
+                                // 갔다(`accept_started`). 타이틀·주입 대기를 정리한다.
+                                self.pending_injections.remove(&id);
                                 self.session_titles.remove(&id);
                                 self.note_restore_outcome(
                                     &worktree_id,
@@ -2155,6 +2328,7 @@ impl AppState {
                         }
                     }
                     Err(err) => {
+                        self.pending_injections.remove(&id);
                         self.session_titles.remove(&id);
                         self.last_error = Some(err);
                         self.note_restore_outcome(&worktree_id, LeafOutcome::Failed);
@@ -2254,6 +2428,9 @@ impl AppState {
                 // 비-Claude(OscTitle) 세션의 상태는 터미널 타이틀에서 온다. presence와
                 // 같은 티어로 폴링한다 — 나이 기반 배지 규칙과 결이 맞는다.
                 self.poll_title_status();
+                // 무장된 stdin-after-start 주입 게이트를 같은 틱에 전진시킨다 —
+                // 앱에서 가장 규칙적으로 도는 지점이다.
+                self.poll_prompt_injections();
                 let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
                 task
             }
@@ -3034,6 +3211,7 @@ mod tests {
             request: OpId(1),
             repo_id: RepoId("/tmp/r".into()),
             created_with_agent: None,
+            initial_prompt: None,
             result: Err("branch already exists".to_string()),
         });
         assert_eq!(state.last_error(), Some("branch already exists"));
@@ -5294,6 +5472,180 @@ mod tests {
         );
     }
 
+    // ── 6b-B: 초기 프롬프트 주입 ──────────────────────────────────────────
+
+    /// (a) argv 에이전트(claude) + 프롬프트 → 프롬프트가 **스폰 인자**에 들어간다.
+    /// 그리고 `pending_prompts`가 소비돼(one-shot) 재시작해도 다시 실리지 않는다.
+    /// argv 경로는 게이트를 무장하지 **않는다**(주입이 이미 argv로 끝났다).
+    #[test]
+    fn an_argv_agent_launches_with_the_initial_prompt_in_spawn_args() {
+        let mut state = AppState::default();
+        let path = "/nonexistent-suaegi-argv-prompt";
+        let repo_id = RepoId("/tmp/r-argv".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id, OpId(1), vec![entry_at(path, "feat")]);
+        state.worktree_meta.insert(
+            wt(path),
+            WorktreeMeta {
+                created_with_agent: Some("claude".to_string()),
+                created_at_unix_ms: 1,
+            },
+        );
+        // 이 worktree엔 일회성 프롬프트가 걸려 있다(create가 담아둔 것).
+        state
+            .pending_prompts
+            .insert(wt(path), "fix the flaky test".to_string());
+
+        let _ = state.update(Message::WorktreeSelected(wt(path)));
+
+        let spawn = state
+            .session_store()
+            .last_spawn()
+            .expect("selecting the worktree must have started a session")
+            .clone();
+        assert_eq!(spawn.program, "claude");
+        assert!(
+            spawn.args.iter().any(|a| a == "fix the flaky test"),
+            "an argv agent must carry the prompt as a spawn argument, got {:?}",
+            spawn.args
+        );
+        assert!(
+            !state.pending_prompts.contains_key(&wt(path)),
+            "the one-shot prompt must be consumed so a restart never re-injects it"
+        );
+        // argv 경로는 stdin 게이트를 쓰지 않는다.
+        assert!(
+            state.pending_injections.is_empty() && state.prompt_gates.is_empty(),
+            "an argv agent injects at spawn — it must not arm the stdin gate"
+        );
+    }
+
+    /// stdin-after-start 에이전트(aider)는 프롬프트를 argv로 받지 않는다 —
+    /// bare로 뜨고 대신 주입이 **대기**한다(`pending_injections`). 세션이 실제로
+    /// 살아난 뒤에야 게이트로 옮겨진다(`SessionStarted`).
+    #[test]
+    fn a_stdin_agent_launches_bare_and_queues_the_injection_instead_of_argv() {
+        let mut state = AppState::default();
+        let path = "/nonexistent-suaegi-stdin-prompt";
+        let repo_id = RepoId("/tmp/r-stdin".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id, OpId(1), vec![entry_at(path, "feat")]);
+        state.worktree_meta.insert(
+            wt(path),
+            WorktreeMeta {
+                created_with_agent: Some("aider".to_string()),
+                created_at_unix_ms: 1,
+            },
+        );
+        state
+            .pending_prompts
+            .insert(wt(path), "write the tests".to_string());
+
+        let _ = state.update(Message::WorktreeSelected(wt(path)));
+
+        let spawn = state
+            .session_store()
+            .last_spawn()
+            .expect("selecting the worktree must have started a session")
+            .clone();
+        assert_eq!(spawn.program, "aider");
+        assert!(
+            !spawn.args.iter().any(|a| a == "write the tests"),
+            "a stdin-after-start agent must launch bare — the prompt must NOT be in argv, \
+             got {:?}",
+            spawn.args
+        );
+        assert!(
+            !state.pending_prompts.contains_key(&wt(path)),
+            "the one-shot prompt is consumed at start"
+        );
+        assert_eq!(
+            state.pending_injections.values().collect::<Vec<_>>(),
+            vec![&"write the tests".to_string()],
+            "the prompt must be queued for post-spawn injection, keyed by the new session"
+        );
+    }
+
+    /// 초기 프롬프트는 **영속화되지 않는다.** 생성 시 담긴 프롬프트는 메모리
+    /// (`pending_prompts`)에만 살고, 디스크로 나가는 스냅샷에는 그 문자열이
+    /// 어디에도 없어야 한다 — 복원된 세션이 낡은 프롬프트를 다시 주입하면 안 된다.
+    #[test]
+    fn the_initial_prompt_is_carried_in_memory_but_never_persisted() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/r-persist".into());
+        state.upsert_repo(some_repo("r-persist"));
+
+        let _ = state.update(Message::WorktreeCreated {
+            request: OpId(1),
+            repo_id,
+            created_with_agent: Some("aider".to_string()),
+            initial_prompt: Some("SECRET-PROMPT-TOKEN".to_string()),
+            result: Ok(CreatedWorktree {
+                path: PathBuf::from("/tmp/wt-persist"),
+                branch: "feat".into(),
+                display_name: "feat".into(),
+            }),
+        });
+
+        // 메모리에는 담겼다(첫 세션 시작이 쓸 값).
+        assert_eq!(
+            state.pending_prompts.get(&wt("/tmp/wt-persist")),
+            Some(&"SECRET-PROMPT-TOKEN".to_string()),
+            "the prompt must be held in memory for the first session start"
+        );
+        // 그러나 디스크로 나가는 스냅샷 어디에도 그 문자열이 없어야 한다.
+        let json = serde_json::to_string(&state.persisted_snapshot()).unwrap();
+        assert!(
+            !json.contains("SECRET-PROMPT-TOKEN"),
+            "the one-shot prompt must never reach persisted state: {json}"
+        );
+    }
+
+    /// 사용자가 타이핑을 시작하면 무장된 주입이 **취소된다** — 이미 치고 있는데
+    /// 프롬프트가 끼어들면 입력이 뒤섞인다. 실제 취소는 `dispatch_term_command`의
+    /// `Key`/`Paste` 팔에 있으므로, 살아 있는 세션(guard를 통과해야 팔에 닿는다)이
+    /// 필요하다.
+    #[test]
+    fn user_typing_cancels_a_pending_injection() {
+        use suaegi_term::input_types::{KeyInput, KeyLocation, Mods, TermKey};
+
+        let mut state = AppState::default();
+        // 살아 있는 세션을 하나 만든다(해가 없는 sleep). 그런 뒤 그 세션에 주입을
+        // 무장한 상태를 손으로 세운다.
+        #[cfg(unix)]
+        let cmd = ("sleep".to_string(), vec!["5".to_string()]);
+        #[cfg(windows)]
+        let cmd = (
+            "cmd".to_string(),
+            vec!["/C".to_string(), "ping -n 6 127.0.0.1 > nul".to_string()],
+        );
+        let session_id = state
+            .session_store_mut()
+            .start_for_test_with_agent(cmd, Some("aider"));
+        state
+            .prompt_gates
+            .insert(session_id, PromptGate::new("the prompt".to_string()));
+        state
+            .pending_injections
+            .insert(session_id, "the prompt".to_string());
+
+        // 사용자가 키를 하나 친다 → 주입 취소.
+        let key = KeyInput {
+            key: TermKey::Char('h'),
+            physical_latin: None,
+            location: KeyLocation::Standard,
+            mods: Mods::default(),
+            text: Some("h".to_string()),
+            repeat: false,
+        };
+        let _ = state.dispatch_term_command(session_id, crate::terminal::contract::TermCommand::Key(key));
+        assert!(
+            !state.pending_injections.contains_key(&session_id)
+                && !state.prompt_gates.contains_key(&session_id),
+            "typing must cancel both the queued injection and any armed gate"
+        );
+    }
+
     /// 이 기능보다 **먼저 만들어진** worktree도 설정 파일을 받아야 한다 —
     /// 생성 시점에만 쓰면 기존 worktree의 배지는 영구히 없다.
     #[test]
@@ -5414,6 +5766,7 @@ mod tests {
             request: OpId(1),
             repo_id,
             created_with_agent: None,
+            initial_prompt: None,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-new"),
                 branch: "new".into(),
@@ -5447,6 +5800,7 @@ mod tests {
             request: OpId(1),
             repo_id,
             created_with_agent: Some("claude".to_string()),
+            initial_prompt: None,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-claude"),
                 branch: "new".into(),
