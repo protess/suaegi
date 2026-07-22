@@ -23,10 +23,11 @@ pub mod palette;
 pub mod render;
 pub mod state;
 
+use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{operation, tree, Tree};
 use iced::advanced::{mouse as iced_mouse, renderer, text, widget, Clipboard, Shell};
-use iced::{Element, Event, Font, Length, Pixels, Rectangle, Size, Theme};
+use iced::{Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Theme};
 
 use suaegi_term::grid::TerminalSnapshot;
 
@@ -121,6 +122,38 @@ impl<'a> Terminal<'a> {
     }
 }
 
+/// 이 pane의 IME 전략. 포커스가 있을 때만 IME를 켜고, 조합창을 터미널 커서 셀에
+/// 놓는다. 메트릭이나 커서가 없으면(측정 실패·커서 숨김) 위젯 좌상단으로 폴백한다
+/// — 조합은 되고 위치만 대략이다. preedit는 내용만 넘긴다: 런타임이 그걸 over-the-spot
+/// 오버레이로 그려 조합 중 글자가 보인다(인라인 렌더링은 follow-up).
+fn ime_strategy(state: &State, bounds: Rectangle, snapshot: &TerminalSnapshot) -> InputMethod {
+    if !state.focused {
+        return InputMethod::Disabled;
+    }
+    let cursor = match (state.metrics, snapshot.cursor) {
+        (Some(m), Some(cur)) => Rectangle::new(
+            Point::new(
+                bounds.x + cur.col as f32 * m.width(),
+                bounds.y + cur.row as f32 * m.height(),
+            ),
+            Size::new(m.width(), m.height()),
+        ),
+        _ => Rectangle::new(bounds.position(), Size::new(1.0, bounds.height)),
+    };
+    InputMethod::Enabled {
+        cursor,
+        purpose: input_method::Purpose::Normal,
+        preedit: state
+            .ime_preedit
+            .as_ref()
+            .map(|content| input_method::Preedit {
+                content: content.clone(),
+                selection: None,
+                text_size: None,
+            }),
+    }
+}
+
 impl<Renderer> iced::advanced::Widget<Published, Theme, Renderer> for Terminal<'_>
 where
     Renderer: text::Renderer<Font = Font>,
@@ -204,6 +237,12 @@ where
             self.snapshot.size,
             shell,
         );
+
+        // IME 전략을 **매 update마다** 낸다 — `Shell`의 input_method는 프레임마다
+        // `Disabled`로 리셋되므로, 요청하지 않으면 런타임이 창의 IME를 꺼
+        // (`set_ime_allowed(false)`) 조합 자체가 안 일어난다. 포커스가 없으면
+        // `Disabled`를 내 이 pane이 IME를 가로채지 않게 한다.
+        shell.request_input_method(&ime_strategy(state, layout.bounds(), self.snapshot));
     }
 
     fn draw(
