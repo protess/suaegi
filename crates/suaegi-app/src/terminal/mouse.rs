@@ -304,6 +304,19 @@ pub(crate) fn update(
     let Event::Mouse(mouse_event) = event else {
         return;
     };
+
+    // **우리 bounds 밖의 좌클릭 press = 포커스가 다른 곳으로 갔다는 신호**(사이드바
+    // 입력창, 다른 pane 등). 캡처 여부와 무관하게 우리를 unfocus한다 — 안 그러면
+    // 포커스된 채로 남아, 그 입력창의 **첫 키가 이 터미널로도 샌다**(iced가 포커스된
+    // 터미널을 먼저 라우팅해 `is_event_captured`로도 못 막는다 — 실측 확인). 좌표만
+    // 읽고 우리 포커스만 끄므로 캡처 게이트보다 앞에 둬도 안전하다. 우리 bounds
+    // 안이면 건드리지 않는다(그쪽은 아래 정상 경로 + `PaneClicked`가 포커스를 준다).
+    if let iced_mouse::Event::ButtonPressed(iced_mouse::Button::Left) = *mouse_event {
+        if state.focused && cursor.position_in(bounds).is_none() {
+            state.focused = false;
+        }
+    }
+
     // 다른 위젯이 이미 가져간 이벤트는 건드리지 않는다. **캡처는 단락이 아니라
     // 플래그이므로** 이 검사가 없으면 같은 이벤트를 두 번 처리할 수 있다.
     //
@@ -983,6 +996,29 @@ mod tests {
         Event::Mouse(iced_mouse::Event::CursorMoved {
             position: Point::ORIGIN,
         })
+    }
+
+    /// **위젯 밖 좌클릭 press는 터미널을 unfocus한다.** 사이드바 입력창을 클릭하면
+    /// 포커스가 그쪽으로 가야 하고, 안 그러면 그 입력의 **첫 키가 이 터미널로도
+    /// 샌다**(실사용에서 발견한 버그). "버그가 있었다면 이 단언이 움직였을까"에
+    /// yes — unfocus 줄을 지우면 `focused`가 true로 남는다.
+    #[test]
+    fn a_left_press_outside_bounds_unfocuses_the_terminal() {
+        let mut state = wired_state();
+        state.focused = true;
+        let outside = iced_mouse::Cursor::Available(Point::new(-500.0, -500.0));
+        run(&mut state, &press(iced_mouse::Button::Left), outside);
+        assert!(!state.focused, "위젯 밖 좌클릭은 터미널을 unfocus해야 한다");
+    }
+
+    /// 대조: 위젯 **안** 좌클릭은 포커스를 유지한다 — 밖-클릭 규칙이 정상 클릭까지
+    /// 삼키지 않는다(그 pane은 `PaneClicked`로 활성이 된다).
+    #[test]
+    fn a_left_press_inside_bounds_keeps_focus() {
+        let mut state = wired_state();
+        state.focused = true;
+        run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        assert!(state.focused, "위젯 안쪽 좌클릭은 포커스를 유지해야 한다");
     }
 
     #[test]

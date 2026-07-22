@@ -8,6 +8,17 @@ use iced::{Alignment, Color, Element, Length};
 use suaegi_core::domain::{Repo, RepoId};
 use suaegi_forge::{ChecksSummary, ReviewState};
 use suaegi_git::worktree::WorktreeEntry;
+
+/// 사이드바 create 입력의 **안정적 위젯 id**. 이 입력에 `operation::focus`를 걸면
+/// 비매칭 focusable(터미널 pane)이 전부 unfocus된다 — 사이드바에 타이핑할 때 키가
+/// 활성 터미널로 새지 않게 하는 상호배타의 열쇠다(포커스된 터미널이 그대로 남아
+/// 키를 먹던 버그의 수정).
+pub fn name_input_id(repo_id: &RepoId) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("suaegi-wt-name-{}", repo_id.0))
+}
+pub fn prompt_input_id(repo_id: &RepoId) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("suaegi-wt-prompt-{}", repo_id.0))
+}
 use suaegi_term::presence::AgentPresence;
 
 use crate::agent_status::contract::BadgeState;
@@ -101,6 +112,7 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     let repo_id_for_button = repo_id.clone();
     let name_row = row![
         text_input("new-worktree-name", draft)
+            .id(name_input_id(&repo_id))
             .on_input(move |value| Message::WorktreeNameInputChanged {
                 repo_id: repo_id_for_input.clone(),
                 value,
@@ -142,6 +154,7 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
         "initial prompt (optional)",
         state.worktree_prompt_draft(&repo_id),
     )
+    .id(prompt_input_id(&repo_id))
     .on_input(move |value| Message::WorktreePromptInputChanged {
         repo_id: repo_id_for_prompt.clone(),
         value,
