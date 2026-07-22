@@ -1513,13 +1513,17 @@ impl AppState {
                         injects.push((id, gate.prompt().to_string()));
                         finished.push(id);
                     }
+                    // **포기한 게이트도 회수한다.** 안 그러면 `has_armed_prompt_gates()`가
+                    // 계속 true라 presence tier가 세션 내내 ACTIVE(750ms)에 고착된다 —
+                    // 이 게이트의 근거("주입 창은 시작 직후 몇 초뿐")와 정면으로 어긋난다.
+                    GateAction::GaveUp => {
+                        finished.push(id);
+                    }
                     GateAction::Wait => {}
                 }
             }
         }
-        // 끝난(주입한) 게이트를 제거한다. 하드 타임아웃으로 포기한 게이트는
-        // `Wait`를 내지만 내부적으로 `Finished`라 이후 poll이 no-op이고, 세션이
-        // 닫힐 때 `close_session`이 거둔다.
+        // 주입했거나 포기한 게이트를 제거한다 — 회수가 tier를 idle로 되돌린다.
         for id in finished {
             self.prompt_gates.remove(&id);
         }
@@ -5643,6 +5647,54 @@ mod tests {
             !state.pending_injections.contains_key(&session_id)
                 && !state.prompt_gates.contains_key(&session_id),
             "typing must cancel both the queued injection and any armed gate"
+        );
+    }
+
+    /// 하드 타임아웃으로 **포기한** 게이트는 회수되어야 한다 — 안 그러면
+    /// `has_armed_prompt_gates()`가 계속 true라 presence tier가 세션 내내
+    /// ACTIVE(750ms)에 고착된다. 게이트는 clock-주입이라 실제 8초를 기다리지 않고
+    /// `started`를 과거로 세워 다음 poll이 곧바로 타임아웃에 걸리게 한다.
+    #[test]
+    fn a_gate_that_gives_up_is_reclaimed_so_the_tier_returns_to_idle() {
+        use std::time::{Duration, Instant};
+
+        let mut state = AppState::default();
+        // poll이 관측할 살아 있는 세션이 필요하다(해가 없는 sleep).
+        #[cfg(unix)]
+        let cmd = ("sleep".to_string(), vec!["5".to_string()]);
+        #[cfg(windows)]
+        let cmd = (
+            "cmd".to_string(),
+            vec!["/C".to_string(), "ping -n 6 127.0.0.1 > nul".to_string()],
+        );
+        let session_id = state
+            .session_store_mut()
+            .start_for_test_with_agent(cmd, Some("aider"));
+
+        // 시계가 이미 타임아웃을 넘긴 게이트를 무장한다(과거 `started`).
+        let past =
+            Instant::now() - crate::prompt_inject::HARD_TIMEOUT - Duration::from_secs(1);
+        state
+            .prompt_gates
+            .insert(session_id, PromptGate::armed_at("the prompt".to_string(), past));
+        assert!(state.has_armed_prompt_gates(), "precondition: a gate is armed");
+        assert_eq!(
+            crate::presence_poll::tier(&state),
+            crate::presence_poll::ACTIVE_TIER,
+            "precondition: an armed gate bumps the tier to ACTIVE"
+        );
+
+        // 이 poll이 하드 타임아웃에 걸려 게이트를 포기·회수해야 한다.
+        state.poll_prompt_injections();
+
+        assert!(
+            !state.has_armed_prompt_gates(),
+            "a gave-up gate must be reclaimed — otherwise the tier stays ACTIVE forever"
+        );
+        assert_eq!(
+            crate::presence_poll::tier(&state),
+            crate::presence_poll::IDLE_TIER,
+            "with the gate reclaimed and no agent present, the tier returns to idle"
         );
     }
 

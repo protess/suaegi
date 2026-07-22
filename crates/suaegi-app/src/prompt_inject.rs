@@ -47,6 +47,11 @@ pub enum GateAction {
     /// 지금 프롬프트를 **한 번** 써넣어라. poll이 이 값을 낸 뒤 게이트는
     /// `Finished`가 되어 다시는 `Inject`를 내지 않는다.
     Inject,
+    /// 하드 타임아웃으로 **영구 포기**했다 — 아무것도 쓰지 말고 게이트를 **회수**하라.
+    /// `Wait`과 구별되는 것이 핵심이다: 둘 다 아무 바이트도 안 내지만, `Wait`은
+    /// "아직 대기"라 게이트를 남겨야 하고 `GaveUp`은 "끝났다"라 회수해야 tier가
+    /// ACTIVE에 영구 고착되지 않는다. poll이 이 값을 낸 뒤 게이트는 `Finished`다.
+    GaveUp,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,11 +99,13 @@ impl PromptGate {
             return GateAction::Wait;
         }
 
-        // 하드 타임아웃: 어느 phase든 상관없이 조용히 포기한다. 첫 poll에서는
-        // `started == now`라 0 < HARD_TIMEOUT이므로 걸리지 않는다.
+        // 하드 타임아웃: 어느 phase든 상관없이 조용히 포기한다(주입 없음). 첫
+        // poll에서는 `started == now`라 0 < HARD_TIMEOUT이므로 걸리지 않는다.
+        // `GaveUp`을 내 호출부가 게이트를 **회수**하게 한다 — 안 그러면 포기한
+        // 게이트가 남아 presence tier가 세션 내내 ACTIVE에 고착된다.
         if obs.now.saturating_duration_since(started) >= HARD_TIMEOUT {
             self.phase = Phase::Finished;
-            return GateAction::Wait;
+            return GateAction::GaveUp;
         }
 
         match &mut self.phase {
@@ -136,6 +143,18 @@ impl PromptGate {
     #[cfg(test)]
     fn is_finished(&self) -> bool {
         matches!(self.phase, Phase::Finished)
+    }
+
+    /// 시계가 **이미 `started`부터 흐르고 있는** 게이트를 만든다. 앱-레벨 tier
+    /// 회수 테스트가 실제 벽시계 8초를 기다리지 않고, 다음 poll이 곧바로
+    /// 하드 타임아웃에 걸리도록 `started`를 과거로 세우는 용도다.
+    #[cfg(test)]
+    pub(crate) fn armed_at(prompt: String, started: Instant) -> Self {
+        Self {
+            prompt,
+            started: Some(started),
+            phase: Phase::WaitingForBracketedPaste,
+        }
     }
 }
 
@@ -242,15 +261,17 @@ mod tests {
         assert_eq!(gate.poll(obs(t0, false, 0)), GateAction::Wait);
         assert_eq!(
             gate.poll(obs(t0 + Duration::from_millis(8000), false, 0)),
-            GateAction::Wait,
-            "at the hard timeout the gate gives up — it must NOT inject"
+            GateAction::GaveUp,
+            "at the hard timeout the gate gives up — it must NOT inject, and it must say so \
+             (GaveUp) so the caller reclaims it"
         );
         assert!(gate.is_finished(), "the gate is done, not still armed");
-        // 이후 아무리 이상적인 관측이 와도 다시 살아나지 않는다.
+        // 이후 아무리 이상적인 관측이 와도 다시 살아나지 않는다(그리고 GaveUp을
+        // 두 번 내지도 않는다 — 회수는 한 번뿐이다).
         assert_eq!(
             gate.poll(obs(t0 + Duration::from_millis(9000), true, 5)),
             GateAction::Wait,
-            "a finished (gave-up) gate never revives"
+            "a finished (gave-up) gate never revives and never re-reports GaveUp"
         );
     }
 
@@ -268,7 +289,7 @@ mod tests {
         );
         assert_eq!(
             gate.poll(obs(t0 + Duration::from_millis(8000), true, 99)),
-            GateAction::Wait,
+            GateAction::GaveUp,
             "endless output must not defeat the hard timeout"
         );
         assert!(gate.is_finished());
