@@ -118,10 +118,17 @@ pub fn classify_merge_failure(stderr: &str) -> MergeFailure {
     }
 
     // 브랜치 보호/필수 체크/리뷰 승인 필요 등으로 차단.
+    // **`at least`는 일반 영어 bigram이라 단독 매칭 금지** — transient stderr가 우연히
+    // "wait at least a minute"처럼 포함하면 확정 거부로 날조된다(§89-92 narrow 규율 위반).
+    // 리뷰-승인 맥락(`review`/`approv`)과 공존할 때만 차단으로 본다.
+    let at_least_reviews =
+        lower.contains("at least") && (lower.contains("review") || lower.contains("approv"));
     if lower.contains("required status check")
         || lower.contains("required status checks")
         || lower.contains("branch protection")
-        || lower.contains("at least")  // "at least N approving review(s) required"
+        || at_least_reviews
+        || lower.contains("approving review")
+        || lower.contains("required by reviewers")
         || lower.contains("review required")
         || lower.contains("reviews required")
         || lower.contains("is blocked")
@@ -429,6 +436,29 @@ mod tests {
             classify_merge_failure("some unexpected gh explosion"),
             MergeFailure::Transient(_)
         ));
+    }
+
+    /// **회귀 방어 — `at least` pin이 transient를 날조하면 안 된다.** "at least"는 일반
+    /// bigram이라, 리뷰-승인 맥락 없이 transient stderr에 우연히 들어도 확정 `Rejected`가
+    /// 아니라 `Transient`(→ 분류된 Unavailable)로 유지돼야 한다. pin을 다시 넓은 단독
+    /// `"at least"`로 되돌리면 첫 단언이 깨진다. 진짜 리뷰-승인 차단은 여전히 `Rejected(Blocked)`.
+    #[test]
+    fn at_least_pin_does_not_fabricate_rejection_from_transient() {
+        // transient(레이트리밋)이 "at least"를 포함해도 확정 거부로 날조되지 않는다.
+        assert_eq!(
+            classify_merge_failure("HTTP 429: rate limit exceeded; please wait at least a minute"),
+            MergeFailure::Transient(ForgeUnavailable::RateLimited)
+        );
+        // 리뷰 맥락 없는 다른 "at least"도 Transient(낯섦 → 분류된 Unavailable).
+        assert!(matches!(
+            classify_merge_failure("upload failed: file must be at least 1 byte"),
+            MergeFailure::Transient(_)
+        ));
+        // 하지만 진짜 리뷰-승인 차단은 여전히 Blocked(양방향).
+        assert_eq!(
+            classify_merge_failure("At least 1 approving review is required by reviewers"),
+            MergeFailure::Rejected(MergeRejection::Blocked)
+        );
     }
 
     #[test]
