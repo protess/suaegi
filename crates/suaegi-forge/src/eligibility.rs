@@ -84,7 +84,7 @@ pub async fn creation_eligibility<P: ForgeProvider + Sync>(
 /// `git rev-parse --abbrev-ref @{u}`가 성공하면 upstream 추적 ref가 있다. upstream이
 /// 없으면 git은 exit 128("no upstream configured")을 낸다. 확정 못 하면(=git 오류)
 /// 보수적으로 false — push를 auth-check 없이 제안하지 않는다.
-async fn has_upstream(git_runner: &GitRunner, worktree: &Path) -> bool {
+pub(crate) async fn has_upstream(git_runner: &GitRunner, worktree: &Path) -> bool {
     match git_runner
         .run_expecting(worktree, &["rev-parse", "--abbrev-ref", "@{u}"], &[128])
         .await

@@ -269,7 +269,9 @@ pub enum PrReviewState {
 }
 
 impl PrReviewState {
-    fn from_gh(state: &str) -> Self {
+    /// GitHub 리뷰 상태 문자열(gh JSON·REST 공통 대문자 토큰)을 매핑한다. gh CLI와 HTTP REST
+    /// 백엔드가 **같은 토큰**(APPROVED/CHANGES_REQUESTED/...)을 쓰므로 두 경로가 공유한다.
+    pub fn from_api(state: &str) -> Self {
         match state.to_ascii_uppercase().as_str() {
             "APPROVED" => PrReviewState::Approved,
             "CHANGES_REQUESTED" => PrReviewState::ChangesRequested,
@@ -285,7 +287,7 @@ impl From<GhReviewRaw> for PrReview {
     fn from(r: GhReviewRaw) -> Self {
         PrReview {
             author: actor_login(r.author),
-            state: PrReviewState::from_gh(&r.state),
+            state: PrReviewState::from_api(&r.state),
             body: r.body,
             submitted_at: r.submitted_at,
         }
@@ -530,14 +532,14 @@ mod tests {
 
     #[test]
     fn review_state_mapping_is_conservative() {
-        assert_eq!(PrReviewState::from_gh("APPROVED"), PrReviewState::Approved);
+        assert_eq!(PrReviewState::from_api("APPROVED"), PrReviewState::Approved);
         assert_eq!(
-            PrReviewState::from_gh("CHANGES_REQUESTED"),
+            PrReviewState::from_api("CHANGES_REQUESTED"),
             PrReviewState::ChangesRequested
         );
-        assert_eq!(PrReviewState::from_gh("COMMENTED"), PrReviewState::Commented);
+        assert_eq!(PrReviewState::from_api("COMMENTED"), PrReviewState::Commented);
         // 알 수 없는 상태는 Approved로 오독하지 않고 Other.
-        assert_eq!(PrReviewState::from_gh("WEIRD_NEW_STATE"), PrReviewState::Other);
+        assert_eq!(PrReviewState::from_api("WEIRD_NEW_STATE"), PrReviewState::Other);
     }
 
     #[test]

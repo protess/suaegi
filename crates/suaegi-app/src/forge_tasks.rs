@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use iced::Task;
 use suaegi_core::domain::WorktreeId;
 use suaegi_forge::{
-    creation_eligibility, glab_creation_eligibility, AnyForge, CommentLookup, CreateReviewInput,
-    CreationBlockedReason, CreationEligibility, ForgeError, ForgeProvider, ForgeUnavailable,
-    GhRunner, GlabRunner, MergeMethod, MergeOptions, MergeabilityState, PrActions, Review,
-    ReviewLookup, ReviewThreadLookup,
+    creation_eligibility, glab_creation_eligibility, http_creation_eligibility, AnyForge,
+    CommentLookup, CreateReviewInput, CreationBlockedReason, CreationEligibility, ForgeError,
+    ForgeProvider, ForgeUnavailable, GhRunner, GlabRunner, MergeMethod, MergeOptions,
+    MergeabilityState, PrActions, Review, ReviewLookup, ReviewThreadLookup,
 };
 use suaegi_git::runner::GitRunner;
 
@@ -61,6 +61,10 @@ pub async fn fetch_status_now(
                 AnyForge::Github(gh) => {
                     let gh_runner = GhRunner::new();
                     creation_eligibility(gh, &git_runner, &gh_runner, &worktree_path, branch).await
+                }
+                // HTTP 백엔드는 gh preflight 대신 토큰 존재로 게이팅한다(같은 4단계).
+                AnyForge::GithubHttp(http) => {
+                    http_creation_eligibility(http, &git_runner, &worktree_path, branch).await
                 }
             }
         }

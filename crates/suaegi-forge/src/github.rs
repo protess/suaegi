@@ -344,7 +344,8 @@ impl ForgeProvider for GhForge {
 }
 
 /// worktree에서 PR 템플릿을 찾아 읽는다(Orca `readPullRequestTemplate` 미러). 첫 매치만.
-fn read_pr_template(worktree: &Path) -> Option<String> {
+/// HTTP 백엔드(`github_http`)도 같은 템플릿 규율을 공유하므로 pub(crate)로 재사용한다.
+pub(crate) fn read_pr_template(worktree: &Path) -> Option<String> {
     const CANDIDATES: &[&str] = &[
         ".github/PULL_REQUEST_TEMPLATE.md",
         ".github/pull_request_template.md",
