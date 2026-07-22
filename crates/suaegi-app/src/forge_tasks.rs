@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use iced::Task;
 use suaegi_core::domain::WorktreeId;
 use suaegi_forge::{
-    creation_eligibility, CommentLookup, CreateReviewInput, CreationBlockedReason,
-    CreationEligibility, ForgeError, ForgeProvider, ForgeUnavailable, GhForge, GhRunner, MergeMethod,
-    MergeOptions, MergeabilityState, PrActions, Review, ReviewLookup, ReviewThreadLookup,
+    creation_eligibility, glab_creation_eligibility, AnyForge, CommentLookup, CreateReviewInput,
+    CreationBlockedReason, CreationEligibility, ForgeError, ForgeProvider, ForgeUnavailable,
+    GhRunner, GlabRunner, MergeMethod, MergeOptions, MergeabilityState, PrActions, Review,
+    ReviewLookup, ReviewThreadLookup,
 };
 use suaegi_git::runner::GitRunner;
 
@@ -29,12 +30,14 @@ pub async fn fetch_status_now(
     branch: Option<String>,
     linked_pr: Option<u64>,
 ) -> (GithubFetch, CreationEligibility) {
-    let provider = GhForge::new();
+    // provider 라우팅: origin 원격을 보고 GitHub/GitLab을 고른다(§7c 최소 배선).
+    let provider = AnyForge::select(&worktree_path).await;
 
-    // 1. PR 상태.
+    // 1. PR/MR 상태.
     let fetch = fetch_only(&provider, &worktree_path, branch.as_deref(), linked_pr).await;
 
-    // 2. Create-PR 자격. NotGitHub/detached는 추가 gh 호출 없이 단락시킨다.
+    // 2. Create-PR/MR 자격. NotGitHub/detached는 추가 호출 없이 단락시킨다. provider별로
+    //    preflight가 다르므로(gh vs glab) 자격 게이팅도 provider에 맞춰 가른다.
     let eligibility = match (&fetch, branch.as_deref()) {
         (GithubFetch::NotGitHub, _) => {
             CreationEligibility::Blocked(CreationBlockedReason::NotGitHubRepo)
@@ -43,8 +46,23 @@ pub async fn fetch_status_now(
         (_, None) => CreationEligibility::Blocked(CreationBlockedReason::NoUpstream),
         (_, Some(branch)) => {
             let git_runner = GitRunner::new();
-            let gh_runner = GhRunner::new();
-            creation_eligibility(&provider, &git_runner, &gh_runner, &worktree_path, branch).await
+            match &provider {
+                AnyForge::Gitlab(glab) => {
+                    let glab_runner = GlabRunner::new();
+                    glab_creation_eligibility(
+                        glab,
+                        &git_runner,
+                        &glab_runner,
+                        &worktree_path,
+                        branch,
+                    )
+                    .await
+                }
+                AnyForge::Github(gh) => {
+                    let gh_runner = GhRunner::new();
+                    creation_eligibility(gh, &git_runner, &gh_runner, &worktree_path, branch).await
+                }
+            }
         }
     };
 
@@ -54,7 +72,7 @@ pub async fn fetch_status_now(
 /// resolve_repository → review 조회. `linked_pr`가 있으면 번호로(상태가 안정적),
 /// 없으면 브랜치로 조회한다. 번호로 조회했는데 PR이 사라졌으면 브랜치로 폴백한다.
 async fn fetch_only(
-    provider: &GhForge,
+    provider: &AnyForge,
     worktree_path: &Path,
     branch: Option<&str>,
     linked_pr: Option<u64>,
@@ -64,8 +82,9 @@ async fn fetch_only(
         Ok(None) => return GithubFetch::NotGitHub,
         Err(ForgeError::Unavailable(u)) => return GithubFetch::Unavailable(u),
         Err(_) => {
+            // provider-중립 문구: GitLab worktree에서도 노출되므로 "GitHub"을 박지 않는다.
             return GithubFetch::Unavailable(ForgeUnavailable::Other(
-                "GitHub is unavailable".to_string(),
+                "The forge is unavailable".to_string(),
             ))
         }
     };
@@ -94,7 +113,7 @@ async fn fetch_only(
 
 /// PR 생성. 에러는 여기서 **분류된 문구**로 접는다(raw stderr는 UI에 안 닿는다).
 pub async fn create_pr_now(input: CreateReviewInput) -> Result<Review, String> {
-    let provider = GhForge::new();
+    let provider = AnyForge::select(&input.worktree_path).await;
     provider.create_review(input).await.map_err(create_error_text)
 }
 
@@ -114,18 +133,18 @@ fn details_unavailable(reason: ForgeUnavailable) -> PrDetails {
 /// PR 패널 세부를 **한 번의 활성화**에 함께 조회한다(머지가능성 + 리뷰 + 코멘트).
 /// `fetch_status_now`와 같은 얼개 — repo를 한 번 resolve한 뒤 세 조회를 잇는다.
 pub async fn fetch_pr_details_now(worktree_path: PathBuf, number: u64) -> PrDetails {
-    let provider = GhForge::new();
+    let provider = AnyForge::select(&worktree_path).await;
     let coords = match provider.resolve_repository(&worktree_path).await {
         Ok(Some(coords)) => coords,
         Ok(None) => {
             return details_unavailable(ForgeUnavailable::Other(
-                "not a GitHub repository".to_string(),
+                "not a supported forge repository".to_string(),
             ))
         }
         Err(ForgeError::Unavailable(u)) => return details_unavailable(u),
         Err(_) => {
             return details_unavailable(ForgeUnavailable::Other(
-                "GitHub is unavailable".to_string(),
+                "The forge is unavailable".to_string(),
             ))
         }
     };
@@ -149,11 +168,13 @@ pub async fn merge_pr_now(
     method: MergeMethod,
     options: MergeOptions,
 ) -> MergeResultDisplay {
-    let provider = GhForge::new();
+    let provider = AnyForge::select(&worktree_path).await;
     let coords = match provider.resolve_repository(&worktree_path).await {
         Ok(Some(coords)) => coords,
         Ok(None) => {
-            return MergeResultDisplay::Unavailable("not a GitHub repository — retry".to_string())
+            return MergeResultDisplay::Unavailable(
+                "not a supported forge repository — retry".to_string(),
+            )
         }
         // resolve 실패도 "거부됨"이 아니라 일시 실패(재시도).
         Err(e) => return merge_result_display(Err(e)),
