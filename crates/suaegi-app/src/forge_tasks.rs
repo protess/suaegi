@@ -82,8 +82,9 @@ async fn fetch_only(
         Ok(None) => return GithubFetch::NotGitHub,
         Err(ForgeError::Unavailable(u)) => return GithubFetch::Unavailable(u),
         Err(_) => {
+            // provider-중립 문구: GitLab worktree에서도 노출되므로 "GitHub"을 박지 않는다.
             return GithubFetch::Unavailable(ForgeUnavailable::Other(
-                "GitHub is unavailable".to_string(),
+                "The forge is unavailable".to_string(),
             ))
         }
     };
@@ -137,13 +138,13 @@ pub async fn fetch_pr_details_now(worktree_path: PathBuf, number: u64) -> PrDeta
         Ok(Some(coords)) => coords,
         Ok(None) => {
             return details_unavailable(ForgeUnavailable::Other(
-                "not a GitHub repository".to_string(),
+                "not a supported forge repository".to_string(),
             ))
         }
         Err(ForgeError::Unavailable(u)) => return details_unavailable(u),
         Err(_) => {
             return details_unavailable(ForgeUnavailable::Other(
-                "GitHub is unavailable".to_string(),
+                "The forge is unavailable".to_string(),
             ))
         }
     };
@@ -171,7 +172,9 @@ pub async fn merge_pr_now(
     let coords = match provider.resolve_repository(&worktree_path).await {
         Ok(Some(coords)) => coords,
         Ok(None) => {
-            return MergeResultDisplay::Unavailable("not a GitHub repository — retry".to_string())
+            return MergeResultDisplay::Unavailable(
+                "not a supported forge repository — retry".to_string(),
+            )
         }
         // resolve 실패도 "거부됨"이 아니라 일시 실패(재시도).
         Err(e) => return merge_result_display(Err(e)),

@@ -310,6 +310,47 @@ fn glab_merge_method_flag(method: MergeMethod) -> Option<&'static str> {
     }
 }
 
+/// `glab mr merge` args를 **순수 함수로** 조립한다 — merge_pr/set_auto_merge가 공유한다.
+/// 벡터를 직접 반환하므로 테스트가 "잘못 추가된 플래그의 **부재**"까지 exact로 단언할 수 있다
+/// (fake-glab의 prefix 매칭으로는 `--remove-source-branch` 항상-추가 회귀가 살아남는다 —
+/// **파괴적 소스브랜치 삭제가 기본이 되는 회귀**는 이 순수 함수 단언으로만 잡힌다).
+///
+/// 순서(load-bearing): `mr merge <iid> -R <path> --yes [--auto-merge] [<method>]
+/// [--remove-source-branch] [--hostname <host>]`.
+fn build_merge_args(
+    repo_arg: &str,
+    host: Option<&str>,
+    number: u64,
+    method: MergeMethod,
+    auto_merge: bool,
+    delete_branch: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "mr".into(),
+        "merge".into(),
+        number.to_string(),
+        "-R".into(),
+        repo_arg.to_string(),
+        // `--yes`는 glab의 비대화형 확인일 뿐(자동 승인 아님). 파괴적 머지는 UI가 먼저 확인한다.
+        "--yes".into(),
+    ];
+    if auto_merge {
+        args.push("--auto-merge".into());
+    }
+    if let Some(flag) = glab_merge_method_flag(method) {
+        args.push(flag.into());
+    }
+    // **기본 off.** delete_branch일 때만 붙인다 — 파괴적 소스브랜치 삭제를 기본으로 만들지 않는다.
+    if delete_branch {
+        args.push("--remove-source-branch".into());
+    }
+    if let Some(host) = host {
+        args.push("--hostname".into());
+        args.push(host.to_string());
+    }
+    args
+}
+
 #[async_trait]
 impl PrActions for GlabForge {
     async fn merge_pr(
@@ -322,18 +363,8 @@ impl PrActions for GlabForge {
         // **파괴적**. 이 백엔드는 auto-confirm을 하지 않는다 — UI가 먼저 확인한 뒤 부른다.
         // `--yes`는 glab의 비대화형 확인일 뿐(자동 승인 아님, gh와 동일 규율).
         let (repo_arg, host) = Self::repo_args(repo);
-        let number_str = number.to_string();
-        let mut args: Vec<&str> = vec!["mr", "merge", &number_str, "-R", &repo_arg, "--yes"];
-        if let Some(flag) = glab_merge_method_flag(method) {
-            args.push(flag);
-        }
-        if options.delete_branch {
-            args.push("--remove-source-branch");
-        }
-        if let Some(host) = host {
-            args.push("--hostname");
-            args.push(host);
-        }
+        let owned = build_merge_args(&repo_arg, host, number, method, false, options.delete_branch);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
         let res = self
             .runner
@@ -357,23 +388,9 @@ impl PrActions for GlabForge {
         method: MergeMethod,
     ) -> Result<(), ForgeError> {
         let (repo_arg, host) = Self::repo_args(repo);
-        let number_str = number.to_string();
-        let mut args: Vec<&str> = vec![
-            "mr",
-            "merge",
-            &number_str,
-            "-R",
-            &repo_arg,
-            "--yes",
-            "--auto-merge",
-        ];
-        if let Some(flag) = glab_merge_method_flag(method) {
-            args.push(flag);
-        }
-        if let Some(host) = host {
-            args.push("--hostname");
-            args.push(host);
-        }
+        // auto_merge=true, delete_branch=false(auto-merge는 소스브랜치 삭제를 예약하지 않는다).
+        let owned = build_merge_args(&repo_arg, host, number, method, true, false);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         let res = self
             .runner
             .run_with_timeout(Self::neutral_cwd(), &args, MERGE_TIMEOUT)
@@ -521,5 +538,88 @@ mod tests {
         assert_eq!(glab_merge_method_flag(MergeMethod::Merge), None);
         assert_eq!(glab_merge_method_flag(MergeMethod::Squash), Some("--squash"));
         assert_eq!(glab_merge_method_flag(MergeMethod::Rebase), Some("--rebase"));
+    }
+
+    /// **회귀 방어 — 파괴적 `--remove-source-branch`는 기본 off.** fake-glab의 prefix 매칭은
+    /// 잘못 추가된 플래그의 **부재**를 못 잡으므로(항상-추가 mutation이 살아남는다), args
+    /// 벡터를 **exact로** 단언한다. delete_branch=false면 `--remove-source-branch`가 없어야
+    /// 하고 method=Merge면 `--squash`/`--rebase`도 없어야 한다(무플래그).
+    #[test]
+    fn merge_args_default_has_no_destructive_or_method_flags() {
+        let args = build_merge_args("acme/widget", None, 57, MergeMethod::Merge, false, false);
+        assert_eq!(
+            args,
+            vec!["mr", "merge", "57", "-R", "acme/widget", "--yes"],
+            "default merge must not add --remove-source-branch, --squash, or --rebase"
+        );
+        assert!(!args.iter().any(|a| a == "--remove-source-branch"));
+        assert!(!args.iter().any(|a| a == "--squash" || a == "--rebase"));
+    }
+
+    /// 양방향: delete_branch=true면 `--remove-source-branch`가 method 플래그 뒤에 정확히 붙는다.
+    #[test]
+    fn merge_args_delete_branch_appends_remove_source_branch() {
+        let args = build_merge_args("acme/widget", None, 57, MergeMethod::Squash, false, true);
+        assert_eq!(
+            args,
+            vec![
+                "mr",
+                "merge",
+                "57",
+                "-R",
+                "acme/widget",
+                "--yes",
+                "--squash",
+                "--remove-source-branch"
+            ]
+        );
+    }
+
+    /// auto-merge는 `--auto-merge`를 method 앞에 넣고, 소스브랜치 삭제는 예약하지 않는다.
+    #[test]
+    fn auto_merge_args_shape_and_no_remove_source_branch() {
+        let args = build_merge_args("acme/widget", None, 57, MergeMethod::Squash, true, false);
+        assert_eq!(
+            args,
+            vec![
+                "mr",
+                "merge",
+                "57",
+                "-R",
+                "acme/widget",
+                "--yes",
+                "--auto-merge",
+                "--squash"
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--remove-source-branch"));
+    }
+
+    /// self-hosted면 `--hostname <host>`가 끝에 붙는다.
+    #[test]
+    fn merge_args_self_hosted_appends_hostname() {
+        let args = build_merge_args(
+            "group/sub/widget",
+            Some("gitlab.example.com"),
+            9,
+            MergeMethod::Rebase,
+            false,
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "mr",
+                "merge",
+                "9",
+                "-R",
+                "group/sub/widget",
+                "--yes",
+                "--rebase",
+                "--remove-source-branch",
+                "--hostname",
+                "gitlab.example.com"
+            ]
+        );
     }
 }
