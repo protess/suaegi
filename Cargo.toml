@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-term", "crates/suaegi-app"]
+members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-secrets", "crates/suaegi-term", "crates/suaegi-app"]
 
 [workspace.package]
 version = "0.1.0"
