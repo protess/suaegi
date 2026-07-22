@@ -4,8 +4,9 @@
 //! 픽셀·상호작용은 사이드바에 남고 사람 눈으로 본다.
 
 use suaegi_forge::{
-    ChecksSummary, CreationBlockedReason, CreationEligibility, ForgeError, ForgeUnavailable,
-    ReviewLookup, ReviewState,
+    ChecksSummary, CommentLookup, CreationBlockedReason, CreationEligibility, ForgeError,
+    ForgeUnavailable, MergeOutcome, MergeRejection, MergeabilityState, PrReview, PrReviewState,
+    ReviewLookup, ReviewState, ReviewThreadLookup,
 };
 
 /// worktree 하나의 PR 상태 캐시. **on-activate 1회 + 수동 새로고침으로만** 채워진다
@@ -140,6 +141,151 @@ pub fn unavailable_text(reason: &ForgeUnavailable) -> String {
         ForgeUnavailable::RateLimited => "GitHub rate limit — try again later".to_string(),
         ForgeUnavailable::Network => "network error reaching GitHub".to_string(),
         ForgeUnavailable::Other(m) => m.clone(),
+    }
+}
+
+// ================= Plan 7b: PR 패널 순수 로직 =================
+// 7a와 같은 규율을 UI 값에서도 지킨다: 백엔드가 애써 보존한 구별을 여기서 접으면
+// 안 된다 — Unavailable≠none(리뷰·코멘트), Rejected≠일시실패(머지 결과),
+// Mergeable만 Enabled(파괴적 버튼). `()` 렌더러 아래 그림은 단언할 수 없으므로
+// 검사 가능한 결정만 여기 값으로 뽑고, 픽셀은 `pr_panel`에 남겨 사람 눈으로 본다.
+
+/// 패널이 **한 번의 조회로** 받는 PR 세부 3종. 하나의 op/staleness 게이트로 다룬다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrDetails {
+    pub mergeability: MergeabilityState,
+    pub reviews: ReviewThreadLookup,
+    pub comments: CommentLookup,
+}
+
+/// Merge 버튼의 어포던스. **`Enabled`는 오직 머지가능성이 `Mergeable`일 때만** 나온다
+/// (§4.6, brief). 그 밖은 죽은 버튼이 아니라 **이유를 단** `Disabled`다 — 파괴적
+/// 머지가 Blocked/Conflicting/Unknown에서 눌리면 안 된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeButton {
+    Enabled,
+    Disabled(String),
+}
+
+/// 머지가능성 → 버튼 어포던스. **이 매핑이 load-bearing이다**: `Mergeable`이 아닌
+/// 어떤 상태를 `Enabled`로 접는 뮤턴트든 §5 테스트를 깨야 한다. 특히 `Unknown`
+/// (일시 실패·불완전 메타데이터의 흡수 상태)은 절대 Enabled가 아니다.
+pub fn merge_button(mergeability: MergeabilityState) -> MergeButton {
+    match mergeability {
+        MergeabilityState::Mergeable => MergeButton::Enabled,
+        MergeabilityState::Blocked => {
+            MergeButton::Disabled("blocked — needs approvals or passing checks".to_string())
+        }
+        MergeabilityState::Conflicting => {
+            MergeButton::Disabled("conflicts with the base branch".to_string())
+        }
+        // 일시 실패·불완전 메타데이터 → 절대 Enabled가 아니다.
+        MergeabilityState::Unknown => {
+            MergeButton::Disabled("mergeability unknown — refresh to retry".to_string())
+        }
+    }
+}
+
+/// 리뷰 요약 표시. **`Summary`(빈 = 진짜 리뷰 없음)와 `Unavailable`(일시 실패)을
+/// 구별**한다 — 조회 실패가 "리뷰 없음"으로 렌더되면 안 된다(캐시-오염의 UI 계약,
+/// 7a `Unavailable`≠`NoPr`와 같은 규율).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewsLine {
+    Summary(String),
+    Unavailable(String),
+}
+
+pub fn reviews_line(lookup: &ReviewThreadLookup) -> ReviewsLine {
+    match lookup {
+        ReviewThreadLookup::Found(reviews) => ReviewsLine::Summary(summarize_reviews(reviews)),
+        // 일시 실패 → "리뷰 없음"이 아니라 재시도 안내.
+        ReviewThreadLookup::Unavailable(u) => {
+            ReviewsLine::Unavailable(format!("reviews unavailable — {}", unavailable_text(u)))
+        }
+    }
+}
+
+/// 리뷰 벡터 → 한 줄 요약. **빈 벡터는 "no reviews yet"**(진짜 없음) — 절대 실패
+/// 문구가 아니다.
+fn summarize_reviews(reviews: &[PrReview]) -> String {
+    if reviews.is_empty() {
+        return "no reviews yet".to_string();
+    }
+    let mut approved = 0usize;
+    let mut changes = 0usize;
+    let mut commented = 0usize;
+    for r in reviews {
+        match r.state {
+            PrReviewState::Approved => approved += 1,
+            PrReviewState::ChangesRequested => changes += 1,
+            _ => commented += 1,
+        }
+    }
+    format!("{approved} approved · {changes} changes requested · {commented} commented")
+}
+
+/// 코멘트 요약 표시. 리뷰와 같은 규율 — 일시 실패는 빈 요약("no comments")이 아니라
+/// `Unavailable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentsLine {
+    Summary(String),
+    Unavailable(String),
+}
+
+pub fn comments_line(lookup: &CommentLookup) -> CommentsLine {
+    match lookup {
+        CommentLookup::Found(comments) => {
+            let n = comments.len();
+            CommentsLine::Summary(match n {
+                0 => "no comments".to_string(),
+                1 => "1 comment".to_string(),
+                _ => format!("{n} comments"),
+            })
+        }
+        CommentLookup::Unavailable(u) => {
+            CommentsLine::Unavailable(format!("comments unavailable — {}", unavailable_text(u)))
+        }
+    }
+}
+
+/// merge 호출 결과의 표시. **세 갈래가 서로 다르고, 실패 둘 다 성공으로 안 읽힌다**:
+/// `Merged`(성공) / `Rejected`(확정적 거부, 분류된 사유) / `Unavailable`(일시 실패, 재시도).
+/// brief §2: `Rejected`를 성공으로, 일시 실패를 `Rejected`로 접으면 안 된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeResultDisplay {
+    Merged,
+    Rejected(String),
+    Unavailable(String),
+}
+
+pub fn merge_result_display(result: Result<MergeOutcome, ForgeError>) -> MergeResultDisplay {
+    match result {
+        Ok(MergeOutcome::Merged) => MergeResultDisplay::Merged,
+        // 확정적 거부 — 분류된 사유(raw stderr 아님).
+        Ok(MergeOutcome::Rejected(reason)) => MergeResultDisplay::Rejected(rejection_text(reason)),
+        // 일시 실패 → "거부됨"이 아니라 재시도 안내.
+        Err(ForgeError::Unavailable(u)) => {
+            MergeResultDisplay::Unavailable(format!("{} — retry", unavailable_text(&u)))
+        }
+        // Validation/Parse는 merge_pr가 실제로는 내지 않지만(백엔드는 실패를 Unavailable로만
+        // 접는다), 방어적으로 **성공도 확정 거부도 아닌** 실패로 표시한다.
+        Err(ForgeError::Validation(m)) | Err(ForgeError::Parse(m)) => {
+            MergeResultDisplay::Unavailable(m)
+        }
+    }
+}
+
+/// 확정적 거부 사유 → 사용자 문구. raw stderr가 아니라 구조화 라벨을 번역한다.
+pub fn rejection_text(reason: MergeRejection) -> String {
+    match reason {
+        MergeRejection::NotMergeable => "GitHub reports this PR is not mergeable.".to_string(),
+        MergeRejection::Conflict => "Merge conflict with the base branch.".to_string(),
+        MergeRejection::Blocked => {
+            "Blocked by branch protection, required checks, or reviews.".to_string()
+        }
+        MergeRejection::ChangesRequested => "A review requested changes.".to_string(),
+        MergeRejection::PermissionDenied => "You do not have permission to merge.".to_string(),
+        MergeRejection::AlreadyClosed => "This PR is already merged or closed.".to_string(),
     }
 }
 
@@ -297,5 +443,149 @@ mod tests {
         );
         assert!(create_error_text(ForgeError::Unavailable(ForgeUnavailable::NotInstalled))
             .contains("not installed"));
+    }
+
+    // ---- Plan 7b ----
+
+    fn review(state: PrReviewState) -> PrReview {
+        PrReview {
+            author: "a".to_string(),
+            state,
+            body: String::new(),
+            submitted_at: String::new(),
+        }
+    }
+
+    fn comment() -> suaegi_forge::PrComment {
+        suaegi_forge::PrComment {
+            author: "a".to_string(),
+            body: String::new(),
+            created_at: String::new(),
+            url: String::new(),
+        }
+    }
+
+    /// **§5 mutation (a): Merge 버튼은 오직 `Mergeable`일 때만 Enabled.**
+    /// Unknown/Blocked/Conflicting에서 Enabled로 접는 뮤턴트는 이 테스트를 깨야 한다 —
+    /// 파괴적 머지가 확인되지 않은 상태에서 눌리는 것을 막는 유일한 게이트다.
+    #[test]
+    fn merge_is_enabled_only_when_mergeable() {
+        assert_eq!(
+            merge_button(MergeabilityState::Mergeable),
+            MergeButton::Enabled
+        );
+        for state in [
+            MergeabilityState::Blocked,
+            MergeabilityState::Conflicting,
+            MergeabilityState::Unknown,
+        ] {
+            match merge_button(state) {
+                MergeButton::Disabled(reason) => assert!(
+                    !reason.is_empty(),
+                    "{state:?} must give a reason, not a dead button"
+                ),
+                MergeButton::Enabled => {
+                    panic!("{state:?} must NOT enable the destructive merge button")
+                }
+            }
+        }
+    }
+
+    /// **§5 mutation (d): 일시 실패한 리뷰 조회는 절대 "리뷰 없음"으로 렌더되지
+    /// 않는다.** `Found(빈)`과 `Unavailable`은 다른 변형이고 문구도 다르며, Unavailable
+    /// 문구에는 "no review"가 없다. Unavailable→Summary로 접는 뮤턴트는 깨진다.
+    #[test]
+    fn an_unavailable_review_lookup_never_reads_as_no_reviews() {
+        let none = reviews_line(&ReviewThreadLookup::Found(vec![]));
+        let unavailable = reviews_line(&ReviewThreadLookup::Unavailable(ForgeUnavailable::Network));
+        assert!(matches!(none, ReviewsLine::Summary(_)));
+        assert!(matches!(unavailable, ReviewsLine::Unavailable(_)));
+        assert_ne!(none, unavailable);
+        if let ReviewsLine::Unavailable(text) = &unavailable {
+            assert!(
+                !text.to_lowercase().contains("no review"),
+                "a failed lookup must not read as 'no reviews': {text}"
+            );
+        }
+    }
+
+    /// 실제 리뷰가 있으면 승인/변경요청 카운트를 요약한다(빈 요약과 구별된다).
+    #[test]
+    fn a_review_summary_counts_approvals_and_change_requests() {
+        let line = reviews_line(&ReviewThreadLookup::Found(vec![
+            review(PrReviewState::Approved),
+            review(PrReviewState::ChangesRequested),
+            review(PrReviewState::Commented),
+        ]));
+        match line {
+            ReviewsLine::Summary(s) => {
+                assert!(s.contains("1 approved"), "{s}");
+                assert!(s.contains("1 changes requested"), "{s}");
+            }
+            other => panic!("found reviews must summarize, got {other:?}"),
+        }
+    }
+
+    /// 코멘트도 같은 규율 — 일시 실패는 "no comments"가 아니라 Unavailable.
+    #[test]
+    fn an_unavailable_comment_lookup_never_reads_as_no_comments() {
+        let none = comments_line(&CommentLookup::Found(vec![]));
+        let some = comments_line(&CommentLookup::Found(vec![comment(), comment()]));
+        let unavailable = comments_line(&CommentLookup::Unavailable(ForgeUnavailable::RateLimited));
+        assert!(matches!(none, CommentsLine::Summary(_)));
+        assert!(matches!(unavailable, CommentsLine::Unavailable(_)));
+        assert_ne!(none, unavailable);
+        if let CommentsLine::Summary(s) = &some {
+            assert!(s.contains('2'), "counts real comments: {s}");
+        }
+        if let CommentsLine::Unavailable(text) = &unavailable {
+            assert!(!text.to_lowercase().contains("no comment"), "{text}");
+        }
+    }
+
+    /// **§5 mutation (c): `Rejected`와 `Unavailable`은 서로 다르고, 둘 다 성공
+    /// (`Merged`)으로 안 읽힌다.** 확정 거부를 Merged로, 일시 실패를 Rejected로 접는
+    /// 뮤턴트는 이 테스트를 깨야 한다.
+    #[test]
+    fn merge_rejection_and_unavailable_are_distinct_and_neither_is_success() {
+        let merged = merge_result_display(Ok(MergeOutcome::Merged));
+        let rejected = merge_result_display(Ok(MergeOutcome::Rejected(MergeRejection::Conflict)));
+        let unavailable =
+            merge_result_display(Err(ForgeError::Unavailable(ForgeUnavailable::RateLimited)));
+
+        assert_eq!(merged, MergeResultDisplay::Merged);
+        assert!(matches!(rejected, MergeResultDisplay::Rejected(_)));
+        assert!(matches!(unavailable, MergeResultDisplay::Unavailable(_)));
+        assert_ne!(rejected, unavailable);
+        assert_ne!(rejected, merged);
+        assert_ne!(unavailable, merged);
+        for d in [&rejected, &unavailable] {
+            assert!(
+                !matches!(d, MergeResultDisplay::Merged),
+                "a failure must never read as a successful merge: {d:?}"
+            );
+        }
+    }
+
+    /// 확정 거부 사유는 서로 다른 문구로 번역된다 — 라벨이 뭉개지면 사용자가 무엇을
+    /// 고쳐야 하는지 모른다.
+    #[test]
+    fn each_rejection_reason_has_its_own_text() {
+        let reasons = [
+            MergeRejection::NotMergeable,
+            MergeRejection::Conflict,
+            MergeRejection::Blocked,
+            MergeRejection::ChangesRequested,
+            MergeRejection::PermissionDenied,
+            MergeRejection::AlreadyClosed,
+        ];
+        let texts: Vec<String> = reasons.iter().map(|r| rejection_text(*r)).collect();
+        for (i, a) in texts.iter().enumerate() {
+            for (j, b) in texts.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "rejection reasons {i},{j} share text");
+                }
+            }
+        }
     }
 }

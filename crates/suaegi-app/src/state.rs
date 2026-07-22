@@ -12,8 +12,11 @@ use suaegi_core::domain::{
 use suaegi_git::compare::{CompareOutcome, FileDiff};
 
 use crate::diff_panel::{panel_state_for, patch_state_for, DiffState};
-use crate::forge_ui::{GithubFetch, GithubStatus};
-use suaegi_forge::{CreateReviewInput, CreationEligibility, Review, ReviewLookup};
+use crate::forge_ui::{GithubFetch, GithubStatus, MergeResultDisplay, PrDetails};
+use crate::pr_panel::PrPanelState;
+use suaegi_forge::{
+    CreateReviewInput, CreationEligibility, MergeMethod, MergeOptions, Review, ReviewLookup,
+};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
@@ -412,6 +415,38 @@ pub enum Message {
         op: OpId,
         result: Result<Review, String>,
     },
+
+    // ---- Plan 7b: PR 패널 (머지가능성·리뷰·코멘트 읽기 + 확인 게이트 머지) ----
+    /// worktree의 PR 패널을 연다(사이드바의 `PR` 버튼이 낸다). 헤더는 7a 리뷰에서
+    /// 씨딩하고, 세부(머지가능성·리뷰·코멘트)를 `forge_tasks`로 조회한다.
+    PrPanelOpened {
+        worktree: WorktreeId,
+    },
+    PrPanelClosed,
+    /// 패널의 세부를 다시 조회한다(수동 새로고침).
+    PrPanelRefreshRequested,
+    /// `forge_tasks::fetch_pr_details`의 완료. `op`로 staleness를 거른다.
+    PrDetailsFetched {
+        worktree: WorktreeId,
+        op: OpId,
+        details: PrDetails,
+    },
+    /// Merge 버튼 — **확인 단계를 열 뿐 머지하지 않는다**(§4.6). 머지가능성이
+    /// `Mergeable`일 때만 확인 단계가 열린다.
+    MergeRequested,
+    /// 확인 단계에서 방식(merge/squash/rebase)을 고른다.
+    MergeMethodSelected(MergeMethod),
+    MergeDeleteBranchToggled(bool),
+    /// **파괴적 확정** — 확인 단계가 열려 있을 때만 `merge_pr`을 발급한다(UI 스레드 밖).
+    MergeConfirmed,
+    MergeCancelled,
+    /// `forge_tasks::merge_pr`의 완료. Merged면 7a 상태·패널 세부를 재조회한다;
+    /// Rejected/Unavailable은 **구별된** 표시로 남긴다(성공으로 안 읽힌다).
+    MergeCompleted {
+        worktree: WorktreeId,
+        op: OpId,
+        display: MergeResultDisplay,
+    },
 }
 
 /// 열려 있는 Create-PR 다이얼로그의 편집 상태. 한 번에 하나만(선택된 worktree에
@@ -603,6 +638,11 @@ pub struct AppState {
     latest_forge_op: HashMap<WorktreeId, OpId>,
     /// 열려 있는 Create-PR 다이얼로그(없으면 닫힘). 한 번에 하나.
     create_pr: Option<CreatePrDraft>,
+
+    // ---- Plan 7b: PR 패널 ----
+    /// 열려 있는 PR 패널 상태(닫혀 있으면 `worktree`가 `None`). diff 패널과 같이
+    /// 필드 하나로 든다 — 머지가능성·리뷰·코멘트 + 확인 게이트 머지가 여기 산다.
+    pr_panel: PrPanelState,
 }
 
 /// pane 하나의 배지 장부.
@@ -707,6 +747,7 @@ impl Default for AppState {
             github_status: HashMap::new(),
             latest_forge_op: HashMap::new(),
             create_pr: None,
+            pr_panel: PrPanelState::default(),
         }
     }
 }
@@ -1344,6 +1385,11 @@ impl AppState {
     /// 열려 있는 Create-PR 다이얼로그(없으면 `None`). 사이드바가 폼을 그릴지 판단한다.
     pub(crate) fn create_pr_dialog(&self) -> Option<&CreatePrDraft> {
         self.create_pr.as_ref()
+    }
+
+    /// PR 패널 상태. `lib.rs`가 `pr_panel::view`에 넘겨 (열려 있으면) 패널을 그린다.
+    pub(crate) fn pr_panel(&self) -> &PrPanelState {
+        &self.pr_panel
     }
 
     /// worktree의 PR 상태 조회를 발급한다. **`force=false`면 on-activate 1회**(캐시가
@@ -2802,6 +2848,132 @@ impl AppState {
                     iced::Task::none()
                 }
             },
+
+            // ---- Plan 7b: PR 패널 ----
+            Message::PrPanelOpened { worktree } => {
+                // 헤더는 **7a 리뷰에서** 씨딩한다(중복 상태-조회 안 함). Found 리뷰가
+                // 없으면(비-GitHub·조회 전·PR 없음·조회 실패) 열지 않는다 — 사이드바
+                // 버튼도 Present일 때만 뜨므로 정상 경로에선 항상 리뷰가 있다.
+                let review = match self.github_status.get(&worktree) {
+                    Some(GithubStatus::Fetched {
+                        fetch: GithubFetch::Resolved(ReviewLookup::Found(review)),
+                        ..
+                    }) => review.clone(),
+                    _ => return iced::Task::none(),
+                };
+                let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let path = entry.path;
+                let number = review.number;
+                let op = self.next_op();
+                self.pr_panel
+                    .open(worktree.clone(), number, review.title, review.state, op);
+                crate::forge_tasks::fetch_pr_details(op, worktree, path, number)
+            }
+            Message::PrPanelClosed => {
+                self.pr_panel.close();
+                iced::Task::none()
+            }
+            Message::PrPanelRefreshRequested => {
+                let Some(worktree) = self.pr_panel.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                let Some(number) = self.pr_panel.number() else {
+                    return iced::Task::none();
+                };
+                let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let path = entry.path;
+                let op = self.next_op();
+                self.pr_panel.begin_details(op);
+                crate::forge_tasks::fetch_pr_details(op, worktree, path, number)
+            }
+            Message::PrDetailsFetched {
+                worktree,
+                op,
+                details,
+            } => {
+                // 낡은/다른 worktree의 결과는 버린다(수동 새로고침이 on-open 조회를
+                // 앞질렀을 수 있다 — diff 패널과 같은 규율).
+                if self.pr_panel.accept_details(&worktree, op) {
+                    self.pr_panel.apply_details(details);
+                }
+                iced::Task::none()
+            }
+            Message::MergeRequested => {
+                // **확인 단계를 열 뿐 머지하지 않는다.** 머지가능성이 Mergeable이
+                // 아니면 아무 일도 없다(비활성 버튼의 마지막 방어선).
+                self.pr_panel.request_merge();
+                iced::Task::none()
+            }
+            Message::MergeMethodSelected(method) => {
+                self.pr_panel.set_method(method);
+                iced::Task::none()
+            }
+            Message::MergeDeleteBranchToggled(value) => {
+                self.pr_panel.set_delete_branch(value);
+                iced::Task::none()
+            }
+            Message::MergeCancelled => {
+                self.pr_panel.cancel_merge();
+                iced::Task::none()
+            }
+            Message::MergeConfirmed => {
+                // **파괴적 확정.** worktree·번호·경로를 먼저 확정한 뒤 `confirm_merge`를
+                // 부른다 — 그래야 확인 단계가 없을 때(`None`) `merging`을 세우지 않고
+                // 조용히 끝난다. 이것이 원클릭 파괴를 막는 게이트다: 확인 단계가
+                // 열려 있지 않으면 `merge_pr` 태스크를 절대 만들지 않는다.
+                let Some(worktree) = self.pr_panel.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                let Some(number) = self.pr_panel.number() else {
+                    return iced::Task::none();
+                };
+                let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let path = entry.path;
+                let op = self.next_op();
+                let Some(confirm) = self.pr_panel.confirm_merge(op) else {
+                    // 확인 단계가 없다 = 아무도 확인하지 않았다 → 머지 발급 안 함.
+                    return iced::Task::none();
+                };
+                let options = MergeOptions {
+                    delete_branch: confirm.delete_branch,
+                };
+                crate::forge_tasks::merge_pr(op, worktree, path, number, confirm.method, options)
+            }
+            Message::MergeCompleted {
+                worktree,
+                op,
+                display,
+            } => {
+                if !self.pr_panel.accept_merge(&worktree, op) {
+                    return iced::Task::none();
+                }
+                let merged = matches!(display, MergeResultDisplay::Merged);
+                self.pr_panel.apply_merge(display);
+                if !merged {
+                    // Rejected/Unavailable은 패널에 남긴다 — 사용자가 사유를 보고
+                    // 재시도/수정하도록. 상태를 새로 조회하지 않는다.
+                    return iced::Task::none();
+                }
+                // 성공 → 사이드바 7a 표시자를 강제 재조회하고(merged로 바뀐다),
+                // 패널 세부도 새로고침한다.
+                let refresh_status = self.request_github_status(worktree.clone(), true);
+                match (self.pr_panel.number(), self.find_worktree(&worktree)) {
+                    (Some(number), Some((_repo_id, entry))) => {
+                        let op2 = self.next_op();
+                        self.pr_panel.begin_details(op2);
+                        let details =
+                            crate::forge_tasks::fetch_pr_details(op2, worktree, entry.path, number);
+                        iced::Task::batch([refresh_status, details])
+                    }
+                    _ => refresh_status,
+                }
+            }
         }
     }
 }
@@ -6331,6 +6503,167 @@ mod tests {
                 Some(GithubStatus::Checking)
             ),
             "a stale fetch (older op) must not overwrite the in-flight status"
+        );
+    }
+
+    // ---- Plan 7b: PR 패널 배선(실제 `update` 디스패치) ----
+    //
+    // 순수 확인-게이트 상태기계는 `pr_panel` 유닛 테스트가 본다. `update`가 그
+    // 게이트를 **부르는 것을 빠뜨리는** 뮤턴트는 그걸로 못 잡으므로, 여기서 실제
+    // 메시지를 흘려 배선 자체를 태운다(diff 패널 `wiring` 모듈과 같은 규율).
+
+    /// PR 패널을 열 수 있도록 7a Found 리뷰를 캐시에 심는다.
+    fn seed_found_pr(state: &mut AppState, worktree_id: &WorktreeId, number: u64) {
+        state.github_status.insert(
+            worktree_id.clone(),
+            GithubStatus::Fetched {
+                fetch: GithubFetch::Resolved(ReviewLookup::Found(review(number, ReviewState::Open))),
+                eligibility: CreationEligibility::Blocked(CreationBlockedReason::AlreadyExists),
+            },
+        );
+    }
+
+    fn details_with(mergeability: suaegi_forge::MergeabilityState) -> PrDetails {
+        PrDetails {
+            mergeability,
+            reviews: suaegi_forge::ReviewThreadLookup::Found(vec![]),
+            comments: suaegi_forge::CommentLookup::Found(vec![]),
+        }
+    }
+
+    /// **7b의 심장, 실제 디스패치로: 파괴적 머지는 확인 단계 없이 절대 발급되지
+    /// 않는다.** `update`가 `MergeConfirmed`에서 `confirm_merge`의 `None`을 무시하고
+    /// 무조건 머지를 발급하는(원클릭) 뮤턴트, 또는 `MergeRequested`를 바로 머지로
+    /// 잇는 뮤턴트는 이 테스트를 깨야 한다.
+    #[test]
+    fn a_merge_never_fires_without_the_confirm_step_via_real_dispatch() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        seed_found_pr(&mut state, &worktree_id, 42);
+
+        let _ = state.update(Message::PrPanelOpened {
+            worktree: worktree_id.clone(),
+        });
+        assert!(state.pr_panel().is_open(), "the panel opened for the linked PR");
+        assert_eq!(state.pr_panel().number(), Some(42));
+
+        // 머지가능성만 테스트 seam으로 세운다(on-open 조회 op를 흉내내지 않는다).
+        state
+            .pr_panel
+            .apply_details(details_with(suaegi_forge::MergeabilityState::Mergeable));
+
+        // 확인 단계 없이 확정 → **머지 발급 안 됨.**
+        let _ = state.update(Message::MergeConfirmed);
+        assert!(
+            !state.pr_panel().is_merging(),
+            "MergeConfirmed with no open confirm step must not start a merge"
+        );
+
+        // Merge 버튼 → 확인 단계만 연다(아직 머지 아님).
+        let _ = state.update(Message::MergeRequested);
+        assert!(
+            state.pr_panel().confirm().is_some(),
+            "the confirm step is now open"
+        );
+        assert!(
+            !state.pr_panel().is_merging(),
+            "opening the confirm step must not be a merge — the whole point of 7b"
+        );
+
+        // 확정 → 머지 in flight.
+        let _ = state.update(Message::MergeConfirmed);
+        assert!(
+            state.pr_panel().is_merging(),
+            "confirming an open confirm step must start the merge"
+        );
+    }
+
+    /// 머지가능성이 `Mergeable`이 아니면 `MergeRequested`는 확인 단계를 열지 않는다 —
+    /// 실제 디스패치로(비활성 버튼의 마지막 방어선을 `update`가 존중하는지).
+    #[test]
+    fn merge_request_is_inert_when_not_mergeable_via_real_dispatch() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        seed_found_pr(&mut state, &worktree_id, 42);
+        let _ = state.update(Message::PrPanelOpened {
+            worktree: worktree_id.clone(),
+        });
+        state
+            .pr_panel
+            .apply_details(details_with(suaegi_forge::MergeabilityState::Blocked));
+
+        let _ = state.update(Message::MergeRequested);
+        assert!(
+            state.pr_panel().confirm().is_none(),
+            "Blocked must not open a confirm step"
+        );
+        let _ = state.update(Message::MergeConfirmed);
+        assert!(!state.pr_panel().is_merging(), "and no merge may start");
+    }
+
+    /// 성공한 머지는 7a 표시자를 강제 재조회(→ Checking)하고 결과를 Merged로 남긴다.
+    #[test]
+    fn a_successful_merge_refreshes_the_status_and_records_merged() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        seed_found_pr(&mut state, &worktree_id, 42);
+        let _ = state.update(Message::PrPanelOpened {
+            worktree: worktree_id.clone(),
+        });
+        state
+            .pr_panel
+            .apply_details(details_with(suaegi_forge::MergeabilityState::Mergeable));
+
+        // 알려진 op로 in-flight 머지를 만든다(`MergeCompleted`의 staleness 가드 통과용).
+        let _ = state.update(Message::MergeRequested);
+        let _ = state.pr_panel.confirm_merge(OpId(500));
+
+        let _ = state.update(Message::MergeCompleted {
+            worktree: worktree_id.clone(),
+            op: OpId(500),
+            display: MergeResultDisplay::Merged,
+        });
+
+        assert_eq!(state.pr_panel().outcome(), Some(&MergeResultDisplay::Merged));
+        assert!(!state.pr_panel().is_merging());
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Checking)
+            ),
+            "a successful merge must force-refresh the 7a status indicator"
+        );
+    }
+
+    /// 확정적 거부는 **성공으로 안 읽히고**, 7a 상태를 재조회하지도 않는다 — 사용자가
+    /// 사유를 보고 고치도록 패널에 남는다. Rejected를 Merged로, 또는 재조회를 무조건
+    /// 거는 뮤턴트는 이 테스트를 깬다.
+    #[test]
+    fn a_rejected_merge_is_distinct_from_success_and_does_not_refresh() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        seed_found_pr(&mut state, &worktree_id, 42);
+        let _ = state.update(Message::PrPanelOpened {
+            worktree: worktree_id.clone(),
+        });
+        state
+            .pr_panel
+            .apply_details(details_with(suaegi_forge::MergeabilityState::Mergeable));
+        let _ = state.update(Message::MergeRequested);
+        let _ = state.pr_panel.confirm_merge(OpId(501));
+
+        let rejected = MergeResultDisplay::Rejected("Merge conflict.".to_string());
+        let _ = state.update(Message::MergeCompleted {
+            worktree: worktree_id.clone(),
+            op: OpId(501),
+            display: rejected.clone(),
+        });
+
+        assert_eq!(state.pr_panel().outcome(), Some(&rejected));
+        assert!(!state.pr_panel().is_merging());
+        // 7a 상태는 그대로(Found) — 재조회하지 않는다.
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Fetched { .. })
+            ),
+            "a rejected merge must not force a 7a status refresh"
         );
     }
 

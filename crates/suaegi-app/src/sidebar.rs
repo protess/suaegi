@@ -292,6 +292,16 @@ fn pr_status_row(
             })
             .into(),
     );
+    // Plan 7b: PR이 있을 때만 패널 열기 버튼(머지가능성·리뷰·코멘트 + 확인 게이트 머지).
+    if matches!(indicator, PrIndicator::Present { .. }) {
+        cells.push(
+            button(text("PR").size(11))
+                .on_press(Message::PrPanelOpened {
+                    worktree: worktree_id.clone(),
+                })
+                .into(),
+        );
+    }
     match affordance {
         CreatePrAffordance::Offer => cells.push(
             button(text("Create PR").size(11))

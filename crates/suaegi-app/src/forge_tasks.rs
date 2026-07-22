@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use iced::Task;
 use suaegi_core::domain::WorktreeId;
 use suaegi_forge::{
-    creation_eligibility, CreateReviewInput, CreationBlockedReason, CreationEligibility, ForgeError,
-    ForgeProvider, ForgeUnavailable, GhForge, GhRunner, Review, ReviewLookup,
+    creation_eligibility, CommentLookup, CreateReviewInput, CreationBlockedReason,
+    CreationEligibility, ForgeError, ForgeProvider, ForgeUnavailable, GhForge, GhRunner, MergeMethod,
+    MergeOptions, MergeabilityState, PrActions, Review, ReviewLookup, ReviewThreadLookup,
 };
 use suaegi_git::runner::GitRunner;
 
-use crate::forge_ui::{create_error_text, GithubFetch};
+use crate::forge_ui::{create_error_text, merge_result_display, GithubFetch, MergeResultDisplay, PrDetails};
 use crate::state::{Message, OpId};
 
 // ---- `*_now`: 실제 gh 작업. iced::Task 없이 직접 테스트 가능(하지만 gh를 때리므로
@@ -97,6 +98,69 @@ pub async fn create_pr_now(input: CreateReviewInput) -> Result<Review, String> {
     provider.create_review(input).await.map_err(create_error_text)
 }
 
+// ---- Plan 7b: PR 패널 세부(머지가능성·리뷰·코멘트) + 확인된 파괴적 머지 ----
+
+/// resolve 실패/비-GitHub 시의 세부 폴백. **머지가능성은 `Unknown`(안전, 절대
+/// Mergeable 아님), 리뷰·코멘트는 `Unavailable`(절대 "없음" 아님)** — 백엔드 규율을
+/// 그대로 옮긴다.
+fn details_unavailable(reason: ForgeUnavailable) -> PrDetails {
+    PrDetails {
+        mergeability: MergeabilityState::Unknown,
+        reviews: ReviewThreadLookup::Unavailable(reason.clone()),
+        comments: CommentLookup::Unavailable(reason),
+    }
+}
+
+/// PR 패널 세부를 **한 번의 활성화**에 함께 조회한다(머지가능성 + 리뷰 + 코멘트).
+/// `fetch_status_now`와 같은 얼개 — repo를 한 번 resolve한 뒤 세 조회를 잇는다.
+pub async fn fetch_pr_details_now(worktree_path: PathBuf, number: u64) -> PrDetails {
+    let provider = GhForge::new();
+    let coords = match provider.resolve_repository(&worktree_path).await {
+        Ok(Some(coords)) => coords,
+        Ok(None) => {
+            return details_unavailable(ForgeUnavailable::Other(
+                "not a GitHub repository".to_string(),
+            ))
+        }
+        Err(ForgeError::Unavailable(u)) => return details_unavailable(u),
+        Err(_) => {
+            return details_unavailable(ForgeUnavailable::Other(
+                "GitHub is unavailable".to_string(),
+            ))
+        }
+    };
+    // 각 조회는 자체적으로 일시 실패를 Unknown/Unavailable로 접는다(캐시-오염 방지).
+    let mergeability = provider.mergeability_state(&coords, number).await;
+    let reviews = provider.pr_reviews(&coords, number).await;
+    let comments = provider.pr_comments(&coords, number).await;
+    PrDetails {
+        mergeability,
+        reviews,
+        comments,
+    }
+}
+
+/// **파괴적**: PR을 머지한다. UI의 확인 단계를 통과한 뒤에만 불린다 — 이 함수는
+/// auto-confirm을 하지 않는다. 결과는 `merge_result_display`로 **표시 값**으로 접는다
+/// (Merged/Rejected/Unavailable을 구별해 UI가 셋을 다르게 그린다).
+pub async fn merge_pr_now(
+    worktree_path: PathBuf,
+    number: u64,
+    method: MergeMethod,
+    options: MergeOptions,
+) -> MergeResultDisplay {
+    let provider = GhForge::new();
+    let coords = match provider.resolve_repository(&worktree_path).await {
+        Ok(Some(coords)) => coords,
+        Ok(None) => {
+            return MergeResultDisplay::Unavailable("not a GitHub repository — retry".to_string())
+        }
+        // resolve 실패도 "거부됨"이 아니라 일시 실패(재시도).
+        Err(e) => return merge_result_display(Err(e)),
+    };
+    merge_result_display(provider.merge_pr(&coords, number, method, options).await)
+}
+
 // ---- 얇은 Task<Message> 래퍼: 검사 불가능한 접착제, 최대한 작게. ----
 
 /// worktree 활성화(또는 수동 새로고침) 시 PR 상태+자격 조회를 발급한다.
@@ -127,4 +191,40 @@ pub fn create_pr(op: OpId, worktree: WorktreeId, input: CreateReviewInput) -> Ta
             result,
         }
     })
+}
+
+/// PR 패널을 열거나 새로고칠 때 세부 조회를 발급한다(UI 스레드 밖).
+pub fn fetch_pr_details(
+    op: OpId,
+    worktree: WorktreeId,
+    worktree_path: PathBuf,
+    number: u64,
+) -> Task<Message> {
+    Task::perform(
+        fetch_pr_details_now(worktree_path, number),
+        move |details| Message::PrDetailsFetched {
+            worktree: worktree.clone(),
+            op,
+            details,
+        },
+    )
+}
+
+/// **확인된** 머지를 발급한다. `state.rs`가 확인 단계를 통과한 뒤에만 부른다.
+pub fn merge_pr(
+    op: OpId,
+    worktree: WorktreeId,
+    worktree_path: PathBuf,
+    number: u64,
+    method: MergeMethod,
+    options: MergeOptions,
+) -> Task<Message> {
+    Task::perform(
+        merge_pr_now(worktree_path, number, method, options),
+        move |display| Message::MergeCompleted {
+            worktree: worktree.clone(),
+            op,
+            display,
+        },
+    )
 }
