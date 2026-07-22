@@ -940,6 +940,20 @@ mod tests {
         assert_key(&k, TermMode::NONE, Some("é".as_bytes()));
     }
 
+    /// **IME 조합이 확정한 여러 음절 문자열이 통째로 나간다.** 한글 IME의
+    /// `Commit`은 한 글자가 아니라 완성된 문자열("안녕")을 준다 — 위젯이 그걸
+    /// `text`가 채워진 `Unknown` 키로 실어 이 경로를 탄다. 단일 문자만 검증하면
+    /// "첫 글자만 보낸다" 같은 버그를 놓친다(각 음절은 UTF-8 3바이트라 첫
+    /// 글자만 보내면 6바이트가 아니라 3바이트가 나간다).
+    #[test]
+    fn unknown_key_with_multi_syllable_text_types_the_whole_string() {
+        let mut k = key(TermKey::Unknown);
+        k.text = Some("안녕".to_string());
+        assert_key(&k, TermMode::NONE, Some("안녕".as_bytes()));
+        // 회귀 방어를 명시적으로: 6바이트 전부여야 한다(음절당 3).
+        assert_eq!("안녕".as_bytes().len(), 6);
+    }
+
     /// `text`가 비어 있으면 논리 문자로 떨어진다.
     #[test]
     fn empty_text_falls_back_to_logical_char() {

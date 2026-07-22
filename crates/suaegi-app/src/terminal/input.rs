@@ -6,6 +6,7 @@
 //! 프로토콜 타입으로 옮기는 일은 앱 몫이고, 여기가 그 자리다.
 
 use alacritty_terminal::grid::Scroll;
+use iced::advanced::input_method;
 use iced::advanced::{clipboard, Clipboard, Shell};
 use iced::keyboard::key::{Named as IcedNamed, Physical};
 use iced::keyboard::{self, Key, Location, Modifiers};
@@ -239,6 +240,42 @@ pub(crate) fn update(
     }
 
     if !state.focused {
+        return;
+    }
+
+    // IME 조합. **`KeyPressed`보다 먼저 처리한다** — 아래 `let else`가 IME
+    // 이벤트를 걸러 `return`시키기 때문이다. 한글·CJK·데드키는 조합이 끝날 때
+    // `Commit`으로 완성 문자열이 오고, 그 전까지는 `Preedit`로 진행 중인 조합이
+    // 온다. `KeyPressed.text`만 읽으면 낱자가 새어 나가 자소가 분리된다.
+    if let Event::InputMethod(ime) = event {
+        match ime {
+            input_method::Event::Opened => state.ime_preedit = Some(String::new()),
+            input_method::Event::Closed => state.ime_preedit = None,
+            input_method::Event::Preedit(content, _selection) => {
+                state.ime_preedit = Some(content.clone());
+            }
+            input_method::Event::Commit(text) => {
+                state.ime_preedit = None;
+                if !text.is_empty() {
+                    // 완성 텍스트는 **타이핑**이지 붙여넣기가 아니다 — bracketed
+                    // paste로 감싸지 않고, `text`가 채워진 `KeyInput`으로 실어
+                    // `encode_key`의 우선순위 3번(text) 경로를 그대로 탄다.
+                    // 여러 코드포인트(예: "안녕")도 한 번에 UTF-8로 나간다.
+                    let input = KeyInput {
+                        key: TermKey::Unknown,
+                        physical_latin: None,
+                        location: KeyLocation::Standard,
+                        mods: Mods::default(),
+                        text: Some(text.clone()),
+                        repeat: false,
+                    };
+                    // 타이핑하면 맨 아래로 — `KeyPressed` 경로와 같은 순서(Scroll 먼저).
+                    shell.publish((id, TermCommand::Scroll(Scroll::Bottom)));
+                    shell.publish((id, TermCommand::Key(input)));
+                }
+            }
+        }
+        shell.capture_event();
         return;
     }
 
