@@ -1,0 +1,24 @@
+[package]
+name = "suaegi-secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# keyring는 **타깃별로 다른 백엔드 피처**를 골라야 해서 workspace.dependencies 한 줄로
+# 표현하기 어렵다(피처가 OS마다 다르다). 이 크레이트만 keyring을 쓰므로 여기에 인라인한다.
+#   - macOS   : apple-native   (Security.framework, 이 호스트에서 실제로 빌드/검증됨)
+#   - Windows : windows-native (Credential Manager) — 이 호스트에서 미검증
+#   - Linux   : sync-secret-service + crypto-rust (D-Bus Secret Service 데몬) — 이 호스트에서 미검증
+# 셋 다 keyring의 "네이티브 OS 자격 저장소"이지 파일 백엔드가 아니다.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
