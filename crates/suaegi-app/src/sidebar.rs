@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Alignment, Color, Element, Length};
 
 use suaegi_core::domain::{Repo, RepoId};
@@ -82,7 +82,7 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     let repo_id_for_input = repo_id.clone();
     let repo_id_for_submit = repo_id.clone();
     let repo_id_for_button = repo_id.clone();
-    let create_row = row![
+    let name_row = row![
         text_input("new-worktree-name", draft)
             .on_input(move |value| Message::WorktreeNameInputChanged {
                 repo_id: repo_id_for_input.clone(),
@@ -100,6 +100,22 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+
+    // 에이전트 피커. 옵션은 로그인 셸(기본) + **설치된** 에이전트만 — 목록에
+    // 있으면 곧 설치돼 있다는 뜻이라 고른 게 exec 실패로 이어지지 않는다. 기본
+    // 선택이 "Login shell"이라 피커를 무시하면 오늘의 동작 그대로다.
+    let repo_id_for_agent = repo_id.clone();
+    let agent_picker = pick_list(
+        state.agent_picker_choices(),
+        Some(state.worktree_agent_selection(&repo_id)),
+        move |choice| Message::WorktreeAgentSelected {
+            repo_id: repo_id_for_agent.clone(),
+            choice,
+        },
+    )
+    .width(Length::Fill)
+    .text_size(12);
+    let create_row = column![agent_picker, name_row].spacing(6);
 
     let mut rows = column![header, create_row].spacing(6);
     for entry in &group.worktrees {

@@ -13,7 +13,7 @@ use suaegi_git::compare::{CompareOutcome, FileDiff};
 
 use crate::diff_panel::{panel_state_for, patch_state_for, DiffState};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
-use suaegi_term::agent::AgentKind;
+use suaegi_term::agent::agent_def_by_id;
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::{CopyTargets, WriteOutcome};
 use suaegi_term::presence::AgentPresence;
@@ -123,14 +123,60 @@ pub enum WorktreeListing {
 /// worktree 하나의 생성 메타데이터. `persisted_snapshot`이 매 저장마다
 /// `created_at_unix_ms: 0`으로 합성하던 자리표시자를 대신한다(follow-ups #15).
 ///
-/// **`created_with_agent`는 항상 `None`이다.** 채울 소스가 아직 없다 —
-/// `WorktreeSelected`가 `AgentKind::Custom, None`을 하드코딩하고 에이전트 선택
-/// UI는 범위 밖이다. **가짜로 채우지 않는다**: 틀린 값이 디스크에 굳으면 나중에
-/// 진짜 값이 생겼을 때 어느 것이 진짜인지 구별할 수 없다.
+/// **`created_with_agent`**(6c): 생성 시 사이드바 피커가 고른 에이전트 id.
+/// `None`이면 로그인 셸(기본, 오늘의 동작). 이 값이 디스크에 굳어 복원 후에도
+/// 세션이 같은 에이전트로 뜬다 — `start_session_for`가 레지스트리로 다시 검증해
+/// 표에 없는 값이면 로그인 셸로 안전하게 떨어뜨린다.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeMeta {
     pub created_with_agent: Option<String>,
     pub created_at_unix_ms: u64,
+}
+
+/// 사이드바 에이전트 피커의 한 항목. `None` = 로그인 셸(기본, 오늘의 동작).
+/// `pick_list`가 요구하는 `ToString + PartialEq + Clone`을 만족한다(id가 `'static`
+/// 이라 `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentChoice(pub Option<&'static str>);
+
+impl AgentChoice {
+    /// 피커의 기본이자 항상 존재하는 항목 — 에이전트를 안 고른 상태.
+    pub const LOGIN_SHELL: AgentChoice = AgentChoice(None);
+
+    /// 드롭다운에 보일 이름. 로그인 셸은 명시적으로 이름을 준다. 등록된 id는
+    /// 표의 `display_name`을, (있을 리 없지만) 미등록 id는 id 자체를 보여준다.
+    pub fn label(self) -> &'static str {
+        match self.0 {
+            None => "Login shell",
+            Some(id) => agent_def_by_id(id).map(|d| d.display_name).unwrap_or(id),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// 설치된 에이전트 id 목록 → 피커 옵션. 항상 맨 앞에 로그인 셸(기본)을 둔다.
+/// 순수 함수라 설치 감지(PATH 스캔)와 분리해 직접 테스트한다.
+pub(crate) fn agent_choices(installed: &[&'static str]) -> Vec<AgentChoice> {
+    let mut choices = vec![AgentChoice::LOGIN_SHELL];
+    choices.extend(installed.iter().map(|id| AgentChoice(Some(id))));
+    choices
+}
+
+/// 현재 런타임에서 PATH로 설치가 확인되는 33행의 id들. `boot`이 한 번만 부른다.
+fn detect_installed_agents() -> Vec<&'static str> {
+    use suaegi_term::agent::{agent_defs, current_runtime, detect_installed, PathProbe};
+    let probe = PathProbe;
+    let runtime = current_runtime();
+    agent_defs()
+        .iter()
+        .filter(|def| detect_installed(def, &probe, runtime))
+        .map(|def| def.id)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +196,9 @@ pub enum Message {
     WorktreeCreated {
         request: OpId,
         repo_id: RepoId,
+        /// 생성을 시작할 때 고른 에이전트 id(`None`=로그인 셸). 성공 시
+        /// [`WorktreeMeta::created_with_agent`]로 굳어 세션 시작 때 그 에이전트를 띄운다.
+        created_with_agent: Option<String>,
         result: Result<CreatedWorktree, String>,
     },
     WorktreeRemoved {
@@ -165,6 +214,12 @@ pub enum Message {
     WorktreeNameInputChanged {
         repo_id: RepoId,
         value: String,
+    },
+    /// 사이드바 에이전트 피커의 선택 변경. `CreateWorktreeSubmitted`가 이 드래프트를
+    /// 읽어 새 worktree의 시작 에이전트로 굳힌다.
+    WorktreeAgentSelected {
+        repo_id: RepoId,
+        choice: AgentChoice,
     },
     CreateWorktreeSubmitted {
         repo_id: RepoId,
@@ -316,6 +371,14 @@ pub struct AppState {
     repo_path_input: String,
     /// repo별 "새 worktree 이름" 입력창의 임시 값.
     worktree_name_draft: HashMap<RepoId, String>,
+    /// repo별 에이전트 피커의 선택. 엔트리가 없으면 로그인 셸(기본) — 피커를
+    /// 무시한 사용자는 오늘의 동작을 그대로 받는다. `AgentChoice::LOGIN_SHELL`을
+    /// 고르면 엔트리를 지운다(= 없음과 같다).
+    worktree_agent_draft: HashMap<RepoId, AgentChoice>,
+    /// PATH에서 설치가 확인된 에이전트 id(피커에 나열). **부팅 때 한 번** 스캔한다
+    /// (`detect_installed`는 에이전트마다 PATH를 훑으므로 프레임마다 하면 비싸다).
+    /// 앱 실행 중 새로 설치한 에이전트는 재부팅 전까지 안 보인다 — v1 한계.
+    installed_agents: Vec<&'static str>,
     selected_worktree: Option<WorktreeId>,
     /// 가장 최근 git 작업(등록/목록/생성/삭제) 실패 메시지. 다음 실패가 오면
     /// 덮어쓴다 — worktree마다 개별 배지를 다는 건 Task 7 이후 범위.
@@ -500,6 +563,10 @@ impl Default for AppState {
             repos: Vec::new(),
             repo_path_input: String::new(),
             worktree_name_draft: HashMap::new(),
+            // 기본은 빈 목록 = 피커에 로그인 셸만. 실제 앱 경로(`boot`)만 PATH를
+            // 스캔한다 — 손으로 세우는 테스트 상태는 스캔 비용을 치르지 않는다.
+            worktree_agent_draft: HashMap::new(),
+            installed_agents: Vec::new(),
             selected_worktree: None,
             last_error: None,
             next_op_id: 0,
@@ -565,6 +632,8 @@ impl AppState {
         let boot = PersistenceHandle::spawn(crate::persistence_thread::default_data_file());
         let mut state = AppState::from_load(boot.load);
         state.persistence = Some(boot.handle);
+        // **여기서 딱 한 번** 설치된 에이전트를 감지한다(위 필드 주석 참고).
+        state.installed_agents = detect_installed_agents();
         state.install_hooks();
         state.attach_hook_server(hook_server);
 
@@ -941,11 +1010,19 @@ impl AppState {
             None => Vec::new(),
         };
 
-        // Custom + 커맨드 없음 = 로그인 셸. 에이전트 실행 커맨드 선택 UI는
-        // 범위 밖(§2 스펙 항목 3).
+        // worktree 생성 시 고른 에이전트를 그대로 띄운다(6c). 디스크에 굳은
+        // `created_with_agent` 문자열을 **레지스트리로 다시 검증**해 `&'static str`
+        // id로 만든다 — 표에 없는 값(제거된 에이전트, 손상된 저장본)은 `None`으로
+        // 떨어져 로그인 셸이 된다(오늘의 기본과 동일). 고른 게 없으면 `None` →
+        // 로그인 셸이라 기존 동작이 그대로다.
+        let agent_id: Option<&'static str> = worktree
+            .created_with_agent
+            .as_deref()
+            .and_then(agent_def_by_id)
+            .map(|def| def.id);
         let task = self
             .session_store
-            .start(session_id, &worktree, AgentKind::Custom, None, env);
+            .start(session_id, &worktree, agent_id, None, env);
         Some((session_id, task))
     }
 
@@ -1071,6 +1148,19 @@ impl AppState {
             .get(repo)
             .map(String::as_str)
             .unwrap_or("")
+    }
+
+    /// 이 repo의 에이전트 피커에 나열할 옵션(로그인 셸 + 설치된 에이전트들).
+    pub(crate) fn agent_picker_choices(&self) -> Vec<AgentChoice> {
+        agent_choices(&self.installed_agents)
+    }
+
+    /// 이 repo의 현재 피커 선택. 엔트리가 없으면 로그인 셸(기본).
+    pub(crate) fn worktree_agent_selection(&self, repo: &RepoId) -> AgentChoice {
+        self.worktree_agent_draft
+            .get(repo)
+            .copied()
+            .unwrap_or(AgentChoice::LOGIN_SHELL)
     }
 
     pub(crate) fn selected_worktree(&self) -> Option<&WorktreeId> {
@@ -1818,6 +1908,16 @@ impl AppState {
                 self.worktree_name_draft.insert(repo_id, value);
                 iced::Task::none()
             }
+            Message::WorktreeAgentSelected { repo_id, choice } => {
+                // 로그인 셸(기본)을 고르면 엔트리를 지운다 — "없음"과 같은 의미라
+                // 맵이 불필요하게 자라지 않는다.
+                if choice == AgentChoice::LOGIN_SHELL {
+                    self.worktree_agent_draft.remove(&repo_id);
+                } else {
+                    self.worktree_agent_draft.insert(repo_id, choice);
+                }
+                iced::Task::none()
+            }
             Message::CreateWorktreeSubmitted { repo_id } => {
                 let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
                     return iced::Task::none();
@@ -1826,6 +1926,12 @@ impl AppState {
                 if name.is_empty() {
                     return iced::Task::none();
                 }
+                // 제출 시점의 피커 선택을 create op에 실어 보낸다(응답을 기다리는
+                // 사이 피커가 바뀌어도 이 worktree엔 영향 없다).
+                let selected_agent = self
+                    .worktree_agent_selection(&repo_id)
+                    .0
+                    .map(|id| id.to_string());
                 // repo 등록 시 감지한 HEAD 브랜치를 기본 base ref로 쓴다. probe가
                 // 실패했거나 HEAD를 못 읽었으면 "main"으로 최선을 다해 추정한다 —
                 // 정확한 기본 브랜치 선택 UI는 이 태스크 범위 밖이다.
@@ -1840,10 +1946,14 @@ impl AppState {
                     name,
                     base_ref,
                     self.workspace_root.clone(),
+                    selected_agent,
                 )
             }
             Message::WorktreeCreated {
-                repo_id, result, ..
+                repo_id,
+                created_with_agent,
+                result,
+                ..
             } => match result {
                 // **Task 6: 생성 시점이 메타데이터의 유일한 진짜 출처다.**
                 // 여기서 `Ok(_created)`를 통째로 버리면 그 시각은 영영 없다 —
@@ -1851,6 +1961,10 @@ impl AppState {
                 Ok(created) => {
                     self.last_error = None;
                     self.worktree_name_draft.remove(&repo_id);
+                    // 이 create가 소비했으니 피커 선택도 초기화(다음 worktree는 다시
+                    // 로그인 셸 기본에서 시작). 성공 경로에서만 지운다 — 실패하면
+                    // 사용자가 재시도할 때 고른 에이전트가 유지된다.
+                    self.worktree_agent_draft.remove(&repo_id);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -1863,10 +1977,11 @@ impl AppState {
                     self.worktree_meta.insert(
                         worktree_id_for(&created.path),
                         WorktreeMeta {
-                            // **가짜로 채우지 않는다.** 에이전트 선택 UI가 범위
-                            // 밖이라 채울 소스가 없다 — 틀린 값이 디스크에 굳으면
-                            // 나중에 진짜 값이 생겼을 때 구별할 수 없다.
-                            created_with_agent: None,
+                            // 6c: 생성 시점에 고른 에이전트를 여기 굳힌다. `None`이면
+                            // (피커를 안 건드림) 로그인 셸로 뜬다 — 예전과 동일.
+                            // 세션 시작(`start_session_for`)이 이 값을 레지스트리로
+                            // 다시 검증해 그 에이전트를 직접 띄운다.
+                            created_with_agent,
                             created_at_unix_ms: now_ms,
                         },
                     );
@@ -2918,6 +3033,7 @@ mod tests {
         let _ = state.update(Message::WorktreeCreated {
             request: OpId(1),
             repo_id: RepoId("/tmp/r".into()),
+            created_with_agent: None,
             result: Err("branch already exists".to_string()),
         });
         assert_eq!(state.last_error(), Some("branch already exists"));
@@ -5092,6 +5208,92 @@ mod tests {
         );
     }
 
+    /// 6c 핵심 검증: worktree가 claude로 생성됐으면 세션 시작이 **claude를 직접**
+    /// 띄운다 — program=claude, cwd=worktree, 그리고 SUAEGI_* 훅 env가 **함께** 심긴다.
+    /// 이 셋이 한 번의 관측으로 성립해야 직접 실행 경로에서 훅이 발화할 근거가 된다.
+    /// (실제 훅 POST가 뜨는지는 실 claude가 필요해 human-eyes 항목 — 보고서 참고.)
+    #[test]
+    fn a_claude_worktree_launches_claude_directly_with_the_hook_environment() {
+        let mut state = AppState::default();
+        // 세션 시작 전에 엔드포인트가 붙어 있어야 env가 심긴다(boot 순서와 동일).
+        state.hook_endpoint = Some((51999, "tok-claude".to_string()));
+
+        let path = "/nonexistent-suaegi-claude-launch";
+        let repo_id = RepoId("/tmp/r-claude".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id, OpId(1), vec![entry_at(path, "feat")]);
+        // 이 worktree는 claude로 생성됐다 — 생성 메타에 그렇게 굳어 있다.
+        state.worktree_meta.insert(
+            wt(path),
+            WorktreeMeta {
+                created_with_agent: Some("claude".to_string()),
+                created_at_unix_ms: 1,
+            },
+        );
+
+        let _ = state.update(Message::WorktreeSelected(wt(path)));
+
+        let spawn = state
+            .session_store()
+            .last_spawn()
+            .expect("selecting the worktree must have started a session")
+            .clone();
+        assert_eq!(
+            spawn.program, "claude",
+            "a claude worktree must launch the claude program directly, not a login shell"
+        );
+        assert_eq!(
+            spawn.cwd.as_deref(),
+            Some(std::path::Path::new(path)),
+            "claude must be launched with cwd set to the worktree so it reads that \
+             worktree's .claude/settings.local.json"
+        );
+        let get = |k: &str| {
+            spawn
+                .env
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            get("SUAEGI_HOOK_PORT"),
+            Some("51999".to_string()),
+            "the direct claude launch must still carry the hook env, or 6b-A's hook \
+             precedence can never fire"
+        );
+        assert_eq!(get("SUAEGI_HOOK_TOKEN"), Some("tok-claude".to_string()));
+        assert!(get("SUAEGI_PANE_KEY").is_some());
+    }
+
+    /// 대조군: 에이전트를 안 고른 worktree는 예전 그대로 **로그인 셸**로 뜬다
+    /// (program이 claude가 아니다). 위 테스트가 "라우팅이 옳다"임을 보장한다.
+    #[test]
+    fn a_worktree_without_a_chosen_agent_still_launches_a_login_shell() {
+        let mut state = AppState::default();
+        let path = "/nonexistent-suaegi-login-shell";
+        let repo_id = RepoId("/tmp/r-shell".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id, OpId(1), vec![entry_at(path, "feat")]);
+        // worktree_meta 없음 = created_with_agent None = 로그인 셸.
+
+        let _ = state.update(Message::WorktreeSelected(wt(path)));
+
+        let spawn = state
+            .session_store()
+            .last_spawn()
+            .expect("selecting the worktree must have started a session")
+            .clone();
+        assert_ne!(
+            spawn.program, "claude",
+            "no agent chosen must keep the login-shell default, unchanged from before 6c"
+        );
+        #[cfg(unix)]
+        assert!(
+            spawn.args.iter().any(|a| a == "-l"),
+            "the default must be a login shell"
+        );
+    }
+
     /// 이 기능보다 **먼저 만들어진** worktree도 설정 파일을 받아야 한다 —
     /// 생성 시점에만 쓰면 기존 worktree의 배지는 영구히 없다.
     #[test]
@@ -5197,7 +5399,7 @@ mod tests {
     }
 
     /// 생성 시점이 메타데이터의 유일한 진짜 출처다 — `Ok(_created)`를 버리면
-    /// 그 시각은 영영 없다.
+    /// 그 시각은 영영 없다. 에이전트를 안 고르면(피커 미조작) agent는 `None`.
     #[test]
     fn creating_a_worktree_records_a_real_timestamp_but_no_agent() {
         let mut state = AppState::default();
@@ -5211,6 +5413,7 @@ mod tests {
         let _ = state.update(Message::WorktreeCreated {
             request: OpId(1),
             repo_id,
+            created_with_agent: None,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-new"),
                 branch: "new".into(),
@@ -5228,8 +5431,95 @@ mod tests {
         );
         assert_eq!(
             meta.created_with_agent, None,
-            "there is no truthful source for the agent yet (no agent-selection UI), and \
-             faking it would bake a wrong value into the file forever"
+            "no agent was chosen, so the worktree stays a login shell (today's default)"
+        );
+    }
+
+    /// 6c: 생성 시 고른 에이전트 id가 메타데이터로 굳어야 한다 — 그래야 세션 시작이
+    /// 로그인 셸이 아니라 그 에이전트를 띄운다.
+    #[test]
+    fn creating_a_worktree_records_the_chosen_agent() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/creator".into());
+        state.upsert_repo(some_repo("creator"));
+
+        let _ = state.update(Message::WorktreeCreated {
+            request: OpId(1),
+            repo_id,
+            created_with_agent: Some("claude".to_string()),
+            result: Ok(CreatedWorktree {
+                path: PathBuf::from("/tmp/wt-claude"),
+                branch: "new".into(),
+                display_name: "new".into(),
+            }),
+        });
+
+        let meta = state
+            .worktree_meta
+            .get(&wt("/tmp/wt-claude"))
+            .expect("creation must record metadata");
+        assert_eq!(
+            meta.created_with_agent.as_deref(),
+            Some("claude"),
+            "the chosen agent id must be baked into the worktree metadata"
+        );
+    }
+
+    /// 피커 옵션: 로그인 셸이 **항상 맨 앞**(기본)이고, 설치된 에이전트가 뒤따른다.
+    /// 설치 감지(PATH)와 분리된 순수 함수라 합성 목록으로 직접 검증한다.
+    #[test]
+    fn agent_choices_puts_login_shell_first_then_installed() {
+        let choices = agent_choices(&["claude", "codex"]);
+        assert_eq!(
+            choices,
+            vec![
+                AgentChoice::LOGIN_SHELL,
+                AgentChoice(Some("claude")),
+                AgentChoice(Some("codex")),
+            ]
+        );
+        // 아무것도 설치 안 됐어도 로그인 셸은 늘 고를 수 있다.
+        assert_eq!(agent_choices(&[]), vec![AgentChoice::LOGIN_SHELL]);
+    }
+
+    /// 드롭다운 라벨: 로그인 셸은 명시적 이름, 에이전트는 표의 display_name.
+    #[test]
+    fn agent_choice_labels_read_from_the_registry() {
+        assert_eq!(AgentChoice::LOGIN_SHELL.label(), "Login shell");
+        assert_eq!(AgentChoice(Some("claude")).label(), "Claude");
+    }
+
+    /// 피커 선택이 드래프트에 남고, 로그인 셸(기본)을 고르면 지워진다(= 없음).
+    #[test]
+    fn selecting_an_agent_updates_the_draft_then_login_shell_clears_it() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/r".into());
+
+        // 기본은 로그인 셸.
+        assert_eq!(
+            state.worktree_agent_selection(&repo_id),
+            AgentChoice::LOGIN_SHELL
+        );
+
+        let _ = state.update(Message::WorktreeAgentSelected {
+            repo_id: repo_id.clone(),
+            choice: AgentChoice(Some("claude")),
+        });
+        assert_eq!(
+            state.worktree_agent_selection(&repo_id),
+            AgentChoice(Some("claude")),
+            "selecting claude must persist in the draft"
+        );
+
+        // 대조군: 다시 로그인 셸을 고르면 기본으로 되돌아간다.
+        let _ = state.update(Message::WorktreeAgentSelected {
+            repo_id: repo_id.clone(),
+            choice: AgentChoice::LOGIN_SHELL,
+        });
+        assert_eq!(
+            state.worktree_agent_selection(&repo_id),
+            AgentChoice::LOGIN_SHELL,
+            "choosing login shell must clear the draft"
         );
     }
 
