@@ -5,6 +5,7 @@ pub mod any;
 pub mod classify;
 pub mod eligibility;
 pub mod github;
+pub mod github_http;
 pub mod gitlab;
 pub mod parse;
 pub mod pr_actions;
@@ -14,6 +15,10 @@ pub mod runner;
 pub use any::AnyForge;
 pub use eligibility::{creation_eligibility, CreationBlockedReason, CreationEligibility};
 pub use github::{preflight, GhForge, Preflight, MIN_GH_VERSION};
+pub use github_http::{
+    choose_github_backend, http_creation_eligibility, GithubBackend, HttpGhForge, HttpTransport,
+    ReqwestTransport,
+};
 pub use gitlab::{
     glab_creation_eligibility, glab_preflight, GlabError, GlabForge, GlabOutput, GlabPreflight,
     GlabRunner, MIN_GLAB_VERSION,
