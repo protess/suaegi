@@ -12,6 +12,8 @@ use suaegi_core::domain::{
 use suaegi_git::compare::{CompareOutcome, FileDiff};
 
 use crate::diff_panel::{panel_state_for, patch_state_for, DiffState};
+use crate::forge_ui::{GithubFetch, GithubStatus};
+use suaegi_forge::{CreateReviewInput, CreationEligibility, Review, ReviewLookup};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
@@ -375,6 +377,56 @@ pub enum Message {
     RestoreWatchdog {
         generation: u64,
     },
+
+    // ---- Plan 7a-1: GitHub PR 상태 · 생성 (forge_tasks 경유, gh shell-out) ----
+    /// PR 상태 재조회 트리거. worktree 행의 새로고침 버튼이 낸다 — **명시적 수동
+    /// 새로고침**이라 캐시가 있어도 다시 조회한다(§3.7: 배경 폴링 없음, 새로고침은 재조회).
+    GithubRefreshRequested {
+        worktree: WorktreeId,
+    },
+    /// `forge_tasks::fetch_status`의 완료. **결과는 gh shell-out에서 오므로 UI 스레드
+    /// 밖에서 만들어진다.** `op`로 staleness를 거른다(수동 새로고침이 on-activate 조회를
+    /// 앞지를 수 있다). `Found`면 `linked_github_pr`을 굳힌다.
+    GithubStatusFetched {
+        worktree: WorktreeId,
+        op: OpId,
+        fetch: GithubFetch,
+        eligibility: CreationEligibility,
+    },
+    /// Create-PR 다이얼로그 열기(자격이 있을 때만 어포던스가 뜬다). base 기본값과
+    /// 제목 초안을 채운다.
+    CreatePrOpened {
+        worktree: WorktreeId,
+    },
+    CreatePrTitleChanged(String),
+    CreatePrBodyChanged(String),
+    CreatePrBaseChanged(String),
+    CreatePrDraftToggled(bool),
+    /// 다이얼로그 제출 → gh `pr create`(UI 스레드 밖).
+    CreatePrSubmitted,
+    CreatePrCancelled,
+    /// `forge_tasks::create_pr`의 완료. 성공하면 `linked_github_pr`을 굳히고 상태를
+    /// 새로고침한다; 실패는 **분류된 문구**로 다이얼로그에 표시한다(raw stderr 아님).
+    CreatePrCreated {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<Review, String>,
+    },
+}
+
+/// 열려 있는 Create-PR 다이얼로그의 편집 상태. 한 번에 하나만(선택된 worktree에
+/// 대해). 필드 초안은 이름 드래프트와 같은 수명 — 제출/취소/성공이 지운다.
+#[derive(Debug, Clone)]
+pub(crate) struct CreatePrDraft {
+    pub worktree: WorktreeId,
+    pub title: String,
+    pub body: String,
+    pub base: String,
+    pub draft: bool,
+    /// gh `pr create`가 진행 중 — 버튼을 잠그고 중복 제출을 막는다.
+    pub submitting: bool,
+    /// 마지막 제출 실패의 **분류된** 문구(raw stderr 아님).
+    pub error: Option<String>,
 }
 
 pub struct AppState {
@@ -539,6 +591,18 @@ pub struct AppState {
     /// 취소 손잡이를 `AppState`에 흩뿌리면 이 구조체를 동시에 고치는 다른
     /// 작업과 충돌 면적이 그만큼 넓어진다. 안쪽 불변식도 한곳에 모인다.
     diff: DiffState,
+
+    // ---- Plan 7a-1: GitHub PR 상태 · 생성 ----
+    /// worktree별 마지막 PR 상태 조회 결과 캐시. **엔트리 없음 = 아직 조회 안 함**
+    /// (표시자를 숨긴다). 활성화 시 1회 + 수동 새로고침으로만 채워지고, `PresenceTick`은
+    /// 절대 건드리지 않는다(§3.7: 배경 폴링 없음).
+    github_status: HashMap<WorktreeId, GithubStatus>,
+    /// worktree별 마지막에 발급한 PR 조회의 OpId. 그보다 오래된 응답은 버린다 —
+    /// 수동 새로고침이 on-activate 조회를 앞질러도 낡은 결과가 새 것을 덮지 않게 한다
+    /// (`latest_list_op`와 같은 규율).
+    latest_forge_op: HashMap<WorktreeId, OpId>,
+    /// 열려 있는 Create-PR 다이얼로그(없으면 닫힘). 한 번에 하나.
+    create_pr: Option<CreatePrDraft>,
 }
 
 /// pane 하나의 배지 장부.
@@ -640,6 +704,9 @@ impl Default for AppState {
             worktree_meta: HashMap::new(),
             layout_generation: 0,
             diff: DiffState::default(),
+            github_status: HashMap::new(),
+            latest_forge_op: HashMap::new(),
+            create_pr: None,
         }
     }
 }
@@ -1264,6 +1331,57 @@ impl AppState {
             .get(worktree_id)
             .map(|&id| self.session_store.presence(id))
             .unwrap_or(AgentPresence::Unknown)
+    }
+
+    // ---- Plan 7a-1: 사이드바가 읽는 PR 상태/다이얼로그 접근자 ----
+
+    /// worktree 하나의 마지막 PR 상태 캐시(`None` = 아직 조회 안 함). 사이드바가
+    /// `forge_ui::indicator_for`/`create_pr_affordance`에 넘겨 표시자·어포던스를 파생한다.
+    pub(crate) fn github_status_for(&self, worktree_id: &WorktreeId) -> Option<&GithubStatus> {
+        self.github_status.get(worktree_id)
+    }
+
+    /// 열려 있는 Create-PR 다이얼로그(없으면 `None`). 사이드바가 폼을 그릴지 판단한다.
+    pub(crate) fn create_pr_dialog(&self) -> Option<&CreatePrDraft> {
+        self.create_pr.as_ref()
+    }
+
+    /// worktree의 PR 상태 조회를 발급한다. **`force=false`면 on-activate 1회**(캐시가
+    /// 이미 있으면 건너뛴다); **`force=true`면 수동 새로고침**(항상 재조회). gh 호출은
+    /// `forge_tasks`가 UI 스레드 밖에서 돌린다 — 여기서는 `Checking`만 세우고 op를 건다.
+    fn request_github_status(&mut self, worktree: WorktreeId, force: bool) -> iced::Task<Message> {
+        // 조회가 이미 진행 중이면 중복 발급하지 않는다(강제여도 in-flight는 존중).
+        if matches!(self.github_status.get(&worktree), Some(GithubStatus::Checking)) {
+            return iced::Task::none();
+        }
+        // on-activate는 **1회**다: 캐시가 있으면(성공이든 실패든) 다시 조회하지 않는다.
+        // 재조회는 명시적 새로고침(force)의 몫이다 — 배경 폴링이 아니다.
+        if !force && self.github_status.contains_key(&worktree) {
+            return iced::Task::none();
+        }
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            return iced::Task::none();
+        };
+        let branch = entry.branch.clone();
+        let linked_pr = self
+            .worktree_meta
+            .get(&worktree)
+            .and_then(|meta| meta.linked_github_pr);
+        self.github_status
+            .insert(worktree.clone(), GithubStatus::Checking);
+        let op = self.next_op();
+        self.latest_forge_op.insert(worktree.clone(), op);
+        crate::forge_tasks::fetch_status(op, worktree, entry.path, branch, linked_pr)
+    }
+
+    /// 이 worktree 브랜치에 PR 번호를 굳힌다. `created_at_unix_ms`와 **같은 경로**로
+    /// `WorktreeMeta`에 산다 — `persisted_snapshot`이 매 저장마다 `Worktree`를 새로
+    /// 합성하므로, 여기 씨딩하지 않으면 한 번 저장에 링크가 사라진다.
+    fn link_pr(&mut self, worktree: &WorktreeId, number: u64) {
+        self.worktree_meta
+            .entry(worktree.clone())
+            .or_default()
+            .linked_github_pr = Some(number);
     }
 
     /// 훅 스크립트를 설치하고, 이미 떠 있는 서버의 포트·토큰을 받아 둔다.
@@ -2247,7 +2365,13 @@ impl AppState {
             Message::WorktreeSelected(id) => {
                 self.selected_worktree = Some(id.clone());
                 self.persist();
-                if let Some(&session_id) = self.worktree_sessions.get(&id) {
+                // **worktree가 활성화되면 PR 상태를 1회 조회한다**(§3.7). 세션이 이미
+                // 열려 있든 새로 뜨든 활성화는 선택이다 — 그래서 세션 태스크와 별개로
+                // 여기서 발급하고 batch한다. `force=false`라 캐시가 있으면 건너뛴다
+                // (재조회는 명시적 새로고침의 몫, `PresenceTick`이 아니다).
+                let status_task = self.request_github_status(id.clone(), false);
+                // 세션 쪽 태스크. 조기 return을 없애 status_task와 항상 함께 실린다.
+                let session_task = if let Some(&session_id) = self.worktree_sessions.get(&id) {
                     // 이미 열려 있다 — 새 세션을 띄우지 않고 그 pane에 포커스만
                     // 옮긴다. pane_grid는 pane → 값 매핑만 들고 있으므로 여기서
                     // 직접 훑어야 한다(양방향 인덱스가 없다).
@@ -2256,18 +2380,19 @@ impl AppState {
                             self.focused_pane = Some(*pane);
                         }
                     }
-                    return iced::Task::none();
-                }
-                if self.pending_session_starts.contains_key(&id) {
+                    iced::Task::none()
+                } else if self.pending_session_starts.contains_key(&id) {
                     // 시작 요청이 이미 나가 있다 — 빠른 재클릭으로 세션이
                     // 두 개 뜨는 걸 막는다.
-                    return iced::Task::none();
-                }
-                // 복원과 **같은 경로**를 쓴다 — 갈라두면 한쪽만 장부를 채운다.
-                match self.start_session_for(&id) {
-                    Some((_session_id, task)) => task,
-                    None => iced::Task::none(),
-                }
+                    iced::Task::none()
+                } else {
+                    // 복원과 **같은 경로**를 쓴다 — 갈라두면 한쪽만 장부를 채운다.
+                    match self.start_session_for(&id) {
+                        Some((_session_id, task)) => task,
+                        None => iced::Task::none(),
+                    }
+                };
+                iced::Task::batch([status_task, session_task])
             }
             Message::Saved(report) => {
                 self.last_save_status = Some(report.status);
@@ -2524,6 +2649,159 @@ impl AppState {
                 }
                 iced::Task::none()
             }
+
+            // ---- Plan 7a-1: GitHub PR 상태 · 생성 ----
+            Message::GithubRefreshRequested { worktree } => {
+                // 명시적 수동 새로고침 — 캐시가 있어도 다시 조회한다(force).
+                self.request_github_status(worktree, true)
+            }
+            Message::GithubStatusFetched {
+                worktree,
+                op,
+                fetch,
+                eligibility,
+            } => {
+                // 낡은 응답은 버린다: 수동 새로고침이 on-activate 조회를 앞질렀을 수
+                // 있고, 그때 먼저 떠난 조회의 결과가 새 것을 덮으면 안 된다.
+                if self.latest_forge_op.get(&worktree) != Some(&op) {
+                    return iced::Task::none();
+                }
+                // PR을 찾았으면 번호를 굳힌다(다음 조회는 번호로 — 상태가 안정적이고,
+                // 저장을 한 번 거쳐도 링크가 남는다). `Unavailable`은 **아무것도
+                // 지우지 않는다** — 조회 실패가 알려진 PR 링크를 날리면 안 된다.
+                if let GithubFetch::Resolved(ReviewLookup::Found(review)) = &fetch {
+                    let number = review.number;
+                    if self.worktree_meta.get(&worktree).and_then(|m| m.linked_github_pr)
+                        != Some(number)
+                    {
+                        self.link_pr(&worktree, number);
+                        self.persist();
+                    }
+                }
+                self.github_status
+                    .insert(worktree, GithubStatus::Fetched { fetch, eligibility });
+                iced::Task::none()
+            }
+            Message::CreatePrOpened { worktree } => {
+                // 제목·base 초안을 채운다. base는 repo 기본 브랜치, 제목은 브랜치명.
+                let (branch, base) = match self.find_worktree(&worktree) {
+                    Some((repo_id, entry)) => {
+                        let base = self
+                            .repo_by_id(&repo_id)
+                            .and_then(|r| r.worktree_base_ref.clone())
+                            .unwrap_or_else(|| "main".to_string());
+                        (entry.branch.clone().unwrap_or_default(), base)
+                    }
+                    None => (String::new(), "main".to_string()),
+                };
+                self.create_pr = Some(CreatePrDraft {
+                    worktree,
+                    title: branch,
+                    body: String::new(),
+                    base,
+                    draft: false,
+                    submitting: false,
+                    error: None,
+                });
+                iced::Task::none()
+            }
+            Message::CreatePrTitleChanged(value) => {
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.title = value;
+                }
+                iced::Task::none()
+            }
+            Message::CreatePrBodyChanged(value) => {
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.body = value;
+                }
+                iced::Task::none()
+            }
+            Message::CreatePrBaseChanged(value) => {
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.base = value;
+                }
+                iced::Task::none()
+            }
+            Message::CreatePrDraftToggled(value) => {
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.draft = value;
+                }
+                iced::Task::none()
+            }
+            Message::CreatePrCancelled => {
+                self.create_pr = None;
+                iced::Task::none()
+            }
+            Message::CreatePrSubmitted => {
+                let Some(dialog) = &self.create_pr else {
+                    return iced::Task::none();
+                };
+                // 중복 제출 방지 — 이미 진행 중이면 무시한다.
+                if dialog.submitting {
+                    return iced::Task::none();
+                }
+                // 제목이 비면 UI에서 미리 막는다(백엔드도 거부하지만 왕복이 아깝다).
+                if dialog.title.trim().is_empty() {
+                    if let Some(dialog) = &mut self.create_pr {
+                        dialog.error = Some("Title is required.".to_string());
+                    }
+                    return iced::Task::none();
+                }
+                let worktree = dialog.worktree.clone();
+                // head 브랜치와 worktree 경로는 목록에서 확정한다.
+                let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+                    if let Some(dialog) = &mut self.create_pr {
+                        dialog.error = Some("This worktree is no longer available.".to_string());
+                    }
+                    return iced::Task::none();
+                };
+                let body = dialog.body.clone();
+                let input = CreateReviewInput {
+                    worktree_path: entry.path,
+                    base: dialog.base.trim().to_string(),
+                    head: entry.branch.clone(),
+                    title: dialog.title.trim().to_string(),
+                    // body가 비면 repo PR 템플릿을 쓴다(백엔드가 채운다).
+                    use_template: body.trim().is_empty(),
+                    body,
+                    draft: dialog.draft,
+                };
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.submitting = true;
+                    dialog.error = None;
+                }
+                let op = self.next_op();
+                crate::forge_tasks::create_pr(op, worktree, input)
+            }
+            Message::CreatePrCreated {
+                worktree,
+                op: _,
+                result,
+            } => match result {
+                Ok(review) => {
+                    // **생성 성공은 링크를 굳힌다**(§5 mutation (c)). 저장을 거쳐도
+                    // 남도록 `WorktreeMeta`에 씨딩하고 persist한다.
+                    self.link_pr(&worktree, review.number);
+                    self.persist();
+                    // 다이얼로그가 아직 이 worktree를 위해 열려 있으면 닫는다.
+                    if self.create_pr.as_ref().map(|d| &d.worktree) == Some(&worktree) {
+                        self.create_pr = None;
+                    }
+                    // 상태를 강제 재조회해 표시자가 새 PR(Found)로 바뀌게 한다.
+                    self.request_github_status(worktree, true)
+                }
+                Err(err) => {
+                    // **분류된 문구**를 다이얼로그에 표시한다(raw stderr 아님).
+                    if let Some(dialog) = &mut self.create_pr {
+                        if dialog.worktree == worktree {
+                            dialog.submitting = false;
+                            dialog.error = Some(err);
+                        }
+                    }
+                    iced::Task::none()
+                }
+            },
         }
     }
 }
@@ -2564,6 +2842,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use suaegi_core::domain::PersistedAxis;
+    use suaegi_forge::{ChecksSummary, CreationBlockedReason, ForgeUnavailable, ReviewState};
     use crate::agent_status::contract::{HookEventName, HOOK_STALE_AFTER, NO_AGENT_CONFIRMATIONS};
 
     fn entry(name: &str) -> WorktreeEntry {
@@ -5825,6 +6104,233 @@ mod tests {
             Some(1234),
             "the linked PR read from disk must be written back — if it is not seeded into \
              WorktreeMeta and re-injected, one save-reconstruction erases it (data-loss class)"
+        );
+    }
+
+    fn review(number: u64, state: ReviewState) -> Review {
+        Review {
+            number,
+            state,
+            title: "t".to_string(),
+            url: "https://example/pr".to_string(),
+            checks: ChecksSummary::default(),
+        }
+    }
+
+    /// listed(하지만 세션 없는) worktree 하나. PR 상태/생성 리듀서를 세션 스폰 없이
+    /// 돌리려는 테스트용 — WorktreeSelected의 세션 경로는 여기서 관심사가 아니다.
+    fn state_with_one_listed_worktree() -> (AppState, RepoId, WorktreeId) {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/pr-repo".into());
+        state.upsert_repo(some_repo("pr-repo"));
+        let worktree_id = wt("/tmp/wt-pr");
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/wt-pr", "feature")],
+        );
+        (state, repo_id, worktree_id)
+    }
+
+    /// **§5 mutation (c): 생성 성공은 `linked_github_pr`을 굳히고, 그 링크는 저장을
+    /// 거쳐도 남는다.** `link_pr` 호출을 지우는 뮤턴트는 meta 단언에서, 씨딩·재주입을
+    /// 지우는 뮤턴트는 flush_and_reload 단언에서 죽는다.
+    #[test]
+    fn a_successful_create_pr_persists_the_linked_pr_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        state.persistence = Some(boot.handle);
+
+        // 다이얼로그가 이 worktree를 위해 열려 있다고 가정하고 성공 응답을 넣는다.
+        let _ = state.update(Message::CreatePrOpened {
+            worktree: worktree_id.clone(),
+        });
+        let _ = state.update(Message::CreatePrCreated {
+            worktree: worktree_id.clone(),
+            op: OpId(99),
+            result: Ok(review(77, ReviewState::Open)),
+        });
+
+        assert_eq!(
+            state
+                .worktree_meta
+                .get(&worktree_id)
+                .and_then(|m| m.linked_github_pr),
+            Some(77),
+            "a successful create must link the PR number into WorktreeMeta"
+        );
+        assert!(
+            state.create_pr.is_none(),
+            "a successful create must close the dialog"
+        );
+
+        let saved = flush_and_reload(state, &file);
+        assert_eq!(
+            saved.worktrees[0].linked_github_pr,
+            Some(77),
+            "the linked PR must survive a save — seeded into WorktreeMeta and re-injected"
+        );
+    }
+
+    /// 생성 실패는 다이얼로그를 닫지 않고 **분류된 문구**를 그 자리에 남긴다;
+    /// 링크는 굳히지 않는다.
+    #[test]
+    fn a_failed_create_pr_keeps_the_dialog_open_with_a_classified_error() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        let _ = state.update(Message::CreatePrOpened {
+            worktree: worktree_id.clone(),
+        });
+        let _ = state.update(Message::CreatePrCreated {
+            worktree: worktree_id.clone(),
+            op: OpId(5),
+            result: Err("run gh auth login".to_string()),
+        });
+
+        let dialog = state
+            .create_pr_dialog()
+            .expect("a failed create must keep the dialog open so the user can retry");
+        assert_eq!(dialog.error.as_deref(), Some("run gh auth login"));
+        assert!(!dialog.submitting, "a failed create must unlock the submit button");
+        assert_eq!(
+            state
+                .worktree_meta
+                .get(&worktree_id)
+                .and_then(|m| m.linked_github_pr),
+            None,
+            "a failed create must not link any PR"
+        );
+    }
+
+    /// **§5 mutation (d): PR 상태는 worktree 활성화 시 조회되고, `PresenceTick`으로는
+    /// 절대 조회되지 않는다.** 활성화 트리거를 `PresenceTick`으로 옮기거나 tick에
+    /// 조회를 더하는 뮤턴트는 이 테스트를 깬다.
+    #[test]
+    fn github_status_is_fetched_on_activate_never_on_a_presence_tick() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+
+        // 틱만으로는 절대 조회하지 않는다 — 조회는 명시적 활성화의 몫이다.
+        let _ = state.update(Message::PresenceTick);
+        assert!(
+            state.github_status_for(&worktree_id).is_none(),
+            "a PresenceTick must never trigger a PR fetch (no background polling)"
+        );
+
+        // 활성화는 한 번 조회한다(Checking을 세운다). 세션 경로는 이미 세션이 없고
+        // pending도 아니라 start_session_for로 가지만, 반환된 Task는 테스트에서
+        // 실행되지 않으므로 여기서 관찰하는 것은 상태(Checking)뿐이다.
+        let _ = state.update(Message::WorktreeSelected(worktree_id.clone()));
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Checking)
+            ),
+            "activating a worktree must issue a PR status fetch (Checking)"
+        );
+
+        // 그 뒤의 틱은 상태를 건드리지 않는다.
+        let before = state.github_status_for(&worktree_id).cloned();
+        let _ = state.update(Message::PresenceTick);
+        assert_eq!(
+            state.github_status_for(&worktree_id).cloned(),
+            before,
+            "a PresenceTick must not disturb an already-fetched PR status"
+        );
+    }
+
+    /// on-activate는 **1회**다: 이미 캐시가 있으면(성공이든 실패든) 재조회하지 않는다.
+    /// 재조회는 명시적 새로고침(force)의 몫이다.
+    #[test]
+    fn activate_fetches_once_but_manual_refresh_refetches() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        // 이미 조회가 끝난 캐시(예: Unavailable)를 심는다.
+        state.github_status.insert(
+            worktree_id.clone(),
+            GithubStatus::Fetched {
+                fetch: GithubFetch::Unavailable(ForgeUnavailable::Network),
+                eligibility: CreationEligibility::Blocked(blocked_unavailable()),
+            },
+        );
+
+        // 활성화(force=false)는 캐시가 있으니 재조회하지 않는다 — 상태 그대로.
+        let _ = state.update(Message::WorktreeSelected(worktree_id.clone()));
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Fetched { .. })
+            ),
+            "on-activate must not re-fetch when a cached result already exists"
+        );
+
+        // 수동 새로고침(force=true)은 다시 조회한다 — Checking으로 되돌린다.
+        let _ = state.update(Message::GithubRefreshRequested {
+            worktree: worktree_id.clone(),
+        });
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Checking)
+            ),
+            "a manual refresh must always re-fetch"
+        );
+    }
+
+    fn blocked_unavailable() -> CreationBlockedReason {
+        CreationBlockedReason::Unavailable(ForgeUnavailable::Network)
+    }
+
+    /// 조회 실패(`Unavailable`)가 도착해도 **이미 굳은 `linked_github_pr`을 지우지
+    /// 않는다** — 일시 오류가 알려진 PR 링크를 날리면 안 된다(캐시-오염 구별).
+    #[test]
+    fn an_unavailable_fetch_does_not_erase_an_existing_linked_pr() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        state.link_pr(&worktree_id, 1234);
+        let op = OpId(7);
+        state.latest_forge_op.insert(worktree_id.clone(), op);
+
+        let _ = state.update(Message::GithubStatusFetched {
+            worktree: worktree_id.clone(),
+            op,
+            fetch: GithubFetch::Unavailable(ForgeUnavailable::RateLimited),
+            eligibility: CreationEligibility::Blocked(blocked_unavailable()),
+        });
+
+        assert_eq!(
+            state
+                .worktree_meta
+                .get(&worktree_id)
+                .and_then(|m| m.linked_github_pr),
+            Some(1234),
+            "a transient Unavailable must never clear a known linked PR"
+        );
+    }
+
+    /// 낡은 조회 응답(op이 최신이 아님)은 버린다 — 수동 새로고침이 on-activate
+    /// 조회를 앞질렀을 때 먼저 떠난 결과가 새 것을 덮으면 안 된다.
+    #[test]
+    fn a_stale_github_fetch_response_is_discarded() {
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        // 최신 op은 2. 도착하는 응답은 낡은 op 1.
+        state.latest_forge_op.insert(worktree_id.clone(), OpId(2));
+        state
+            .github_status
+            .insert(worktree_id.clone(), GithubStatus::Checking);
+
+        let _ = state.update(Message::GithubStatusFetched {
+            worktree: worktree_id.clone(),
+            op: OpId(1),
+            fetch: GithubFetch::Resolved(ReviewLookup::None),
+            eligibility: CreationEligibility::Eligible,
+        });
+
+        assert!(
+            matches!(
+                state.github_status_for(&worktree_id),
+                Some(GithubStatus::Checking)
+            ),
+            "a stale fetch (older op) must not overwrite the in-flight status"
         );
     }
 

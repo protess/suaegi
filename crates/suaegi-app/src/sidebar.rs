@@ -1,15 +1,26 @@
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Alignment, Color, Element, Length};
 
 use suaegi_core::domain::{Repo, RepoId};
+use suaegi_forge::{ChecksSummary, ReviewState};
 use suaegi_git::worktree::WorktreeEntry;
 use suaegi_term::presence::AgentPresence;
 
 use crate::agent_status::contract::BadgeState;
+use crate::forge_ui::{self, CreatePrAffordance, PrIndicator};
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
-use crate::state::{worktree_id_for, AppState, Message};
+use crate::state::{worktree_id_for, AppState, CreatePrDraft, Message};
+
+// PR 표시자 색. 배지와 같은 팔레트 계열이되(사이드바 톤 통일) 상태를 색으로 구별한다.
+const PR_NEUTRAL: Color = Color::from_rgb(0.53, 0.53, 0.53);
+const PR_OPEN: Color = Color::from_rgb(0.18, 0.63, 0.26);
+const PR_MERGED: Color = Color::from_rgb(0.52, 0.34, 0.72);
+const PR_CLOSED: Color = Color::from_rgb(0.75, 0.22, 0.17);
+const PR_UNKNOWN: Color = Color::from_rgb(0.85, 0.55, 0.0);
 
 /// 사이드바 고정 폭. `pane_grid`는 고정 폭 pane이 없고(비율 분할만) 사이드바가
 /// 터미널 격자 한가운데로 드래그될 수 있으므로, 사이드바는 pane이 아니라 상위
@@ -18,6 +29,12 @@ pub const WIDTH: f32 = 260.0;
 
 pub fn view(state: &AppState) -> Element<'_, Message> {
     let mut list = column![add_repo_row(state)].spacing(16).padding(12);
+
+    // Create-PR 다이얼로그(열려 있을 때만). 픽셀·상호작용은 사람 눈으로 본다 —
+    // 로직(자격 게이팅, 상태 매핑)은 `forge_ui`가 검사한다.
+    if let Some(dialog) = state.create_pr_dialog() {
+        list = list.push(create_pr_form(dialog));
+    }
 
     for group in grouped_worktrees(state) {
         list = list.push(repo_group(state, &group));
@@ -143,6 +160,16 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
         let presence = state.worktree_presence(&worktree_id);
         let badge = state.worktree_badge(&worktree_id);
         rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, badge, presence));
+        // Plan 7a-1: PR 상태 표시자 + 새로고침 + Create-PR 어포던스. 캐시에서
+        // 파생하되 매핑은 `forge_ui`가 검사한다(Unavailable≠NoPr, Offer는 자격 있을 때만).
+        let status = state.github_status_for(&worktree_id);
+        if let Some(pr_row) = pr_status_row(
+            worktree_id,
+            forge_ui::indicator_for(status),
+            forge_ui::create_pr_affordance(status),
+        ) {
+            rows = rows.push(pr_row);
+        }
     }
 
     container(rows).width(Length::Fill).into()
@@ -233,6 +260,149 @@ fn worktree_row(
     }
 
     row(cells).spacing(6).align_y(Alignment::Center).into()
+}
+
+/// PR 상태 한 줄: 표시자 + 새로고침(↻) + Create-PR 어포던스. 그릴 게 하나도 없으면
+/// (조회 전이거나 GitHub 리포가 아니면) `None`을 돌려 행 자체를 넣지 않는다.
+///
+/// **표시자 텍스트/색은 사람 눈으로 보는 픽셀이다.** 검사되는 결정은 `forge_ui`의
+/// `indicator_for`/`create_pr_affordance`(순수)이고, 여기 `pr_indicator_label`은 그
+/// 결과가 시각적으로 구별되는지만 얕게 테스트한다(배지의 `badge_glyph`와 같은 규율).
+fn pr_status_row(
+    worktree_id: suaegi_core::domain::WorktreeId,
+    indicator: PrIndicator,
+    affordance: CreatePrAffordance,
+) -> Option<Element<'static, Message>> {
+    let label = pr_indicator_label(&indicator);
+    // 조회 전(라벨 없음) + 어포던스 숨김 = 이 worktree엔 보여줄 GitHub 정보가 없다.
+    if label.is_none() && matches!(affordance, CreatePrAffordance::Hidden) {
+        return None;
+    }
+
+    let mut cells: Vec<Element<'static, Message>> = Vec::new();
+    if let Some((txt, color)) = label {
+        cells.push(text(txt).size(11).color(color).into());
+    }
+    // 명시적 수동 새로고침(배경 폴링 없음 — §3.7).
+    let refresh_id = worktree_id.clone();
+    cells.push(
+        button(text("↻").size(11))
+            .on_press(Message::GithubRefreshRequested {
+                worktree: refresh_id,
+            })
+            .into(),
+    );
+    match affordance {
+        CreatePrAffordance::Offer => cells.push(
+            button(text("Create PR").size(11))
+                .on_press(Message::CreatePrOpened {
+                    worktree: worktree_id,
+                })
+                .into(),
+        ),
+        // 죽은 버튼 대신 이유. 예: NoUpstream → "push the branch first".
+        CreatePrAffordance::Blocked(reason) => {
+            cells.push(text(reason).size(10).color(PR_NEUTRAL).into())
+        }
+        CreatePrAffordance::Hidden => {}
+    }
+
+    Some(row(cells).spacing(6).align_y(Alignment::Center).into())
+}
+
+/// PR 표시자 → (문구, 색). `None` = 아무것도 안 그린다(Hidden). **`Unknown`은
+/// `NoPr`와 문구·색이 모두 다르다** — "상태 모름"이 "PR 없음"으로 보이면 안 된다.
+fn pr_indicator_label(indicator: &PrIndicator) -> Option<(String, Color)> {
+    match indicator {
+        PrIndicator::Hidden => None,
+        PrIndicator::Checking => Some(("PR …".to_string(), PR_NEUTRAL)),
+        PrIndicator::NoPr => Some(("no PR".to_string(), PR_NEUTRAL)),
+        PrIndicator::Present {
+            number,
+            state,
+            checks,
+        } => {
+            let mut label = format!("PR #{number} {}", pr_state_text(*state));
+            if let Some(summary) = checks_text(*checks) {
+                label.push(' ');
+                label.push_str(&summary);
+            }
+            Some((label, pr_state_color(*state)))
+        }
+        // 실행 가능한 힌트를 붙인다(NotAuthenticated → "run gh auth login" 등).
+        PrIndicator::Unknown(reason) => Some((
+            format!("PR ? {}", forge_ui::unavailable_text(reason)),
+            PR_UNKNOWN,
+        )),
+    }
+}
+
+fn pr_state_text(state: ReviewState) -> &'static str {
+    match state {
+        ReviewState::Open => "open",
+        ReviewState::Merged => "merged",
+        ReviewState::Closed => "closed",
+        ReviewState::Draft => "draft",
+    }
+}
+
+fn pr_state_color(state: ReviewState) -> Color {
+    match state {
+        ReviewState::Open => PR_OPEN,
+        ReviewState::Merged => PR_MERGED,
+        ReviewState::Closed => PR_CLOSED,
+        ReviewState::Draft => PR_NEUTRAL,
+    }
+}
+
+/// CI 체크 요약 "✓passing ✗failing •pending". 체크가 하나도 없으면 `None`(조용).
+fn checks_text(checks: ChecksSummary) -> Option<String> {
+    if checks.passing == 0 && checks.failing == 0 && checks.pending == 0 {
+        return None;
+    }
+    Some(format!(
+        "✓{} ✗{} •{}",
+        checks.passing, checks.failing, checks.pending
+    ))
+}
+
+/// Create-PR 다이얼로그 폼. **픽셀·상호작용은 사람 눈**이다 — 자격 게이팅과 성공 시
+/// 링크 영속화는 `state`/`forge_ui`에서 검사한다.
+fn create_pr_form(dialog: &CreatePrDraft) -> Element<'_, Message> {
+    let mut form = column![
+        text("Create pull request").size(14),
+        text_input("title", &dialog.title)
+            .on_input(Message::CreatePrTitleChanged)
+            .size(12),
+        text_input("base branch", &dialog.base)
+            .on_input(Message::CreatePrBaseChanged)
+            .size(12),
+        text_input("body (blank = repo PR template)", &dialog.body)
+            .on_input(Message::CreatePrBodyChanged)
+            .size(12),
+        checkbox(dialog.draft)
+            .label("Draft")
+            .on_toggle(Message::CreatePrDraftToggled)
+            .text_size(12),
+    ]
+    .spacing(6);
+
+    if let Some(err) = &dialog.error {
+        form = form.push(text(format!("! {err}")).size(11).color(PR_CLOSED));
+    }
+
+    // 제출 중이면 버튼을 잠근다(중복 제출 방지).
+    let submit_label = if dialog.submitting {
+        "Creating…"
+    } else {
+        "Create"
+    };
+    let submit = button(text(submit_label).size(12))
+        .on_press_maybe((!dialog.submitting).then_some(Message::CreatePrSubmitted));
+    let cancel = button(text("Cancel").size(12)).on_press(Message::CreatePrCancelled);
+    form = form.push(row![submit, cancel].spacing(6));
+
+    container(form).padding(8).into()
 }
 
 /// `LoadOrigin::Fresh`(신규 설치)와 `Loaded`(정상 로드)는 경고가 없다.
@@ -487,5 +657,55 @@ mod tests {
             status: SaveStatus::Superseded { by: 2 },
         }));
         assert!(status_line(&state).is_none());
+    }
+
+    use suaegi_forge::ForgeUnavailable;
+
+    /// **"상태 모름"과 "PR 없음"은 시각적으로 구별된다** — `indicator_for`(§5 (a))가
+    /// 둘을 다른 변형으로 나눠도, 라벨이 같은 문구·색이면 화면에서 구별이 사라진다.
+    /// 이 테스트가 뷰 쪽 계약을 잠근다.
+    #[test]
+    fn unknown_status_never_looks_like_no_pr() {
+        let no_pr = pr_indicator_label(&PrIndicator::NoPr).expect("no PR has a label");
+        let unknown = pr_indicator_label(&PrIndicator::Unknown(ForgeUnavailable::NotAuthenticated))
+            .expect("unknown has a label");
+        assert_ne!(no_pr.0, unknown.0, "'no PR' and 'status unknown' must read differently");
+        assert_ne!(
+            (no_pr.1.r, no_pr.1.g, no_pr.1.b),
+            (unknown.1.r, unknown.1.g, unknown.1.b),
+            "'no PR' and 'status unknown' must not share a colour"
+        );
+        // 인증 안 됨은 실행 가능한 힌트를 노출한다.
+        assert!(unknown.0.contains("gh auth login"));
+    }
+
+    /// Hidden(조회 전/비-GitHub)은 아무 라벨도 없다 — worktree 행에 잡음을 안 남긴다.
+    #[test]
+    fn a_hidden_indicator_renders_no_label() {
+        assert!(pr_indicator_label(&PrIndicator::Hidden).is_none());
+    }
+
+    /// Present는 번호·상태·체크 요약을 한 줄에 담는다.
+    #[test]
+    fn a_present_pr_shows_number_state_and_checks() {
+        let label = pr_indicator_label(&PrIndicator::Present {
+            number: 12,
+            state: ReviewState::Open,
+            checks: ChecksSummary {
+                passing: 2,
+                failing: 1,
+                pending: 0,
+            },
+        })
+        .expect("present has a label");
+        assert!(label.0.contains("#12"));
+        assert!(label.0.contains("open"));
+        assert!(label.0.contains("✓2"));
+        assert!(label.0.contains("✗1"));
+    }
+
+    #[test]
+    fn checks_summary_is_silent_when_there_are_no_checks() {
+        assert!(checks_text(ChecksSummary::default()).is_none());
     }
 }
