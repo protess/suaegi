@@ -15,6 +15,7 @@
 
 pub mod contract;
 pub mod inject;
+pub mod title;
 pub mod parse;
 pub mod server;
 pub mod subscription;
