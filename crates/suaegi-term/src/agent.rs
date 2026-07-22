@@ -647,6 +647,17 @@ const PYTHON_LAUNCHERS: &[&str] = &["python", "python3"];
 /// (Orca `agent-process-recognition.ts:88-95`). 예: `codex-aarch64-apple-darwin`.
 const PACKAGED_BINARY_PREFIXES: &[(&str, &str)] = &[("codex-", "codex"), ("grok-", "grok")];
 
+/// 세션이 상태 신호를 어디서 얻는가. `AgentKind`가 좁아(Claude/Codex/Custom)
+/// `AgentDef` 조회 없이 결정한다. **Claude만 훅**이고, Codex와 Custom(사용자가
+/// 직접 띄운 임의 CLI)은 OSC 타이틀이 유일한 신호다 — 우리가 무엇을 띄웠는지와
+/// 무관하게 pane이 내보내는 타이틀에서 상태를 추론한다.
+pub fn status_source_for(kind: AgentKind) -> StatusSource {
+    match kind {
+        AgentKind::Claude => StatusSource::Hooks,
+        AgentKind::Codex | AgentKind::Custom => StatusSource::OscTitle,
+    }
+}
+
 pub fn agent_def(kind: AgentKind) -> Option<&'static AgentDef> {
     let id = match kind {
         AgentKind::Claude => "claude",
@@ -1385,5 +1396,15 @@ mod tests {
             &FakePath(&["synth", "helper", "extra"]),
             Runtime::Linux
         ));
+    }
+
+    /// **Claude만 훅, 그 외는 OSC 타이틀.** 이 매핑이 6b-A 배선의 게이트다 —
+    /// Claude가 OscTitle로 새면 타이틀 감지가 훅 상태를 덮고, Codex/Custom이 Hooks로
+    /// 새면 그들의 유일한 상태 신호(타이틀)가 배선되지 않는다.
+    #[test]
+    fn status_source_routes_only_claude_to_hooks() {
+        assert_eq!(status_source_for(AgentKind::Claude), StatusSource::Hooks);
+        assert_eq!(status_source_for(AgentKind::Codex), StatusSource::OscTitle);
+        assert_eq!(status_source_for(AgentKind::Custom), StatusSource::OscTitle);
     }
 }

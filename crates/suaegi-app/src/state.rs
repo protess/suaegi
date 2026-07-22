@@ -1285,6 +1285,53 @@ impl AppState {
         }
     }
 
+    /// 모든 세션의 타이틀 변경을 드레인하고, OscTitle 세션은 최신 타이틀에서 배지
+    /// 상태를 추론한다. **모든 세션을 드레인한다**(Hooks 세션도) — 안 그러면 그
+    /// 세션의 `title_changes` deque가 상한까지 자란다. 상태를 먹이는 것만 OscTitle로
+    /// 가른다([`title_status_update`]).
+    ///
+    /// [`title_status_update`]: crate::agent_status::title::title_status_update
+    fn poll_title_status(&mut self) {
+        // `sessions()`가 스토어를 빌리는 동안 `badges`를 못 바꾸므로 먼저 모은다.
+        let mut updates: Vec<(WorktreeId, HookState)> = Vec::new();
+        for (id, session) in self.session_store.sessions() {
+            let changes = session.take_title_changes();
+            let Some(source) = self.session_store.status_source(id) else {
+                continue;
+            };
+            if let Some(state) =
+                crate::agent_status::title::title_status_update(&changes, source)
+            {
+                if let Some(worktree_id) = self.session_worktrees.get(&id) {
+                    updates.push((worktree_id.clone(), state));
+                }
+            }
+        }
+        for (worktree_id, state) in updates {
+            self.note_title_status_for_badge(&worktree_id, state);
+        }
+    }
+
+    /// 타이틀에서 추론한 상태를 배지 장부에 반영한다. `apply_hook`의 꼬리와 같은
+    /// 규칙으로 `hook` 슬롯과 `previous`를 갱신한다 — 타이틀-파생 상태는 훅과 같은
+    /// "가장 최근 상태 신호 + 시각" 슬롯을 쓴다.
+    fn note_title_status_for_badge(&mut self, worktree_id: &WorktreeId, state: HookState) {
+        let presence = self.worktree_presence(worktree_id);
+        let Some(badge) = self.badges.get_mut(worktree_id) else {
+            return;
+        };
+        badge.hook = Some((state, Instant::now()));
+        if !matches!(presence, AgentPresence::NoAgent) {
+            badge.previous = reduce(&BadgeInput {
+                presence,
+                hook: badge.hook,
+                previous: badge.previous,
+                no_agent_streak: badge.no_agent_streak,
+                now: Instant::now(),
+            });
+        }
+    }
+
     pub(crate) fn session_title(&self, id: SessionId) -> &str {
         self.session_titles
             .get(&id)
@@ -2069,6 +2116,9 @@ impl AppState {
             Message::PresenceTick => {
                 // 이 틱이 앱에서 가장 규칙적으로 도는 지점이라 여기서 확인한다.
                 self.note_hook_drops();
+                // 비-Claude(OscTitle) 세션의 상태는 터미널 타이틀에서 온다. presence와
+                // 같은 티어로 폴링한다 — 나이 기반 배지 규칙과 결이 맞는다.
+                self.poll_title_status();
                 let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
                 task
             }

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use iced::Task;
 use suaegi_core::domain::{Worktree, WorktreeId};
-use suaegi_term::agent::{build_spawn, AgentKind};
+use suaegi_term::agent::{build_spawn, status_source_for, AgentKind, StatusSource};
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::CopyRequest;
 use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe, PsProbe};
@@ -168,6 +168,9 @@ pub enum StartRejected {
 pub struct SessionSlot {
     pub id: SessionId,
     pub worktree_id: WorktreeId,
+    /// 이 세션을 어느 에이전트로 띄웠나. OSC-title 상태 배선이 훅(Claude)과
+    /// OSC-title(그 외) 세션을 가르는 데 쓴다([`status_source_for`]).
+    pub agent: AgentKind,
     pub session: Arc<TerminalSession>,
     pub snapshot: TerminalSnapshot,
     pub snapshot_generation: u64,
@@ -192,10 +195,11 @@ pub struct SessionSlot {
 }
 
 impl SessionSlot {
-    fn new(id: SessionId, worktree_id: WorktreeId, session: TerminalSession) -> Self {
+    fn new(id: SessionId, worktree_id: WorktreeId, agent: AgentKind, session: TerminalSession) -> Self {
         Self {
             id,
             worktree_id,
+            agent,
             session: Arc::new(session),
             snapshot: blank_snapshot(),
             snapshot_generation: 0,
@@ -245,6 +249,11 @@ pub struct SessionStore {
     track_reaped_at: bool,
     retired_count: Arc<AtomicU64>,
     next_id: u64,
+    /// `start()`가 발급한 세션의 `AgentKind`를 `accept_started`가 슬롯을 만들 때까지
+    /// 보관한다. 시작 결과는 비동기라 그 사이 슬롯이 없으므로, 여기 잠깐 둔다.
+    /// 시작이 거절되거나 결과가 끝내 안 와도 엔트리가 새지 않게 `accept_started`가
+    /// 반드시 `remove`한다(복원·테스트 경로처럼 `start`를 안 거친 슬롯은 기본 Custom).
+    pending_agents: HashMap<SessionId, AgentKind>,
 }
 
 impl Default for SessionStore {
@@ -262,6 +271,7 @@ impl SessionStore {
             track_reaped_at: false,
             retired_count: Arc::new(AtomicU64::new(0)),
             next_id: 0,
+            pending_agents: HashMap::new(),
             #[cfg(test)]
             last_spawn_env: None,
         }
@@ -298,6 +308,8 @@ impl SessionStore {
     ) -> Task<Message> {
         let worktree_id = worktree.id.clone();
         let cwd = worktree.path.clone();
+        // 슬롯이 생기는 `accept_started`까지 어느 에이전트였는지 기억해 둔다.
+        self.pending_agents.insert(id, agent);
         let mut spawn = build_spawn(
             agent,
             None,
@@ -342,13 +354,22 @@ impl SessionStore {
         session: TerminalSession,
         worktree_still_exists: bool,
     ) -> Result<(), StartRejected> {
+        // 거절되든 받아들여지든 pending 엔트리는 여기서 소비한다(안 그러면 샌다).
+        // 복원·테스트처럼 `start`를 안 거친 경로는 Custom(= OSC-title)으로 둔다.
+        let agent = self.pending_agents.remove(&id).unwrap_or(AgentKind::Custom);
         if !worktree_still_exists {
             self.retire(Arc::new(session), Some(id));
             return Err(StartRejected::WorktreeGone);
         }
         self.slots
-            .insert(id, SessionSlot::new(id, worktree_id, session));
+            .insert(id, SessionSlot::new(id, worktree_id, agent, session));
         Ok(())
+    }
+
+    /// 세션의 상태 신호 출처. `None` = 그런 세션이 없다. OSC-title 배선이 이걸로
+    /// 훅(Claude) 세션과 OSC-title 세션을 가른다.
+    pub fn status_source(&self, id: SessionId) -> Option<StatusSource> {
+        self.slots.get(&id).map(|s| status_source_for(s.agent))
     }
 
     /// 스냅샷은 UI 스레드에서 뜨지 않는다. 이미 진행 중이면 `false`를 반환하고
@@ -749,7 +770,12 @@ impl SessionStore {
         let session = TerminalSession::start(spec).expect("test session must start");
         self.slots.insert(
             id,
-            SessionSlot::new(id, WorktreeId("test-worktree".to_string()), session),
+            SessionSlot::new(
+                id,
+                WorktreeId("test-worktree".to_string()),
+                AgentKind::Custom,
+                session,
+            ),
         );
         id
     }
