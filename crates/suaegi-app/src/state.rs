@@ -132,6 +132,11 @@ pub enum WorktreeListing {
 pub struct WorktreeMeta {
     pub created_with_agent: Option<String>,
     pub created_at_unix_ms: u64,
+    /// Plan 7a: 이 worktree 브랜치에 연결된 GitHub PR 번호. `created_at_unix_ms`와
+    /// **똑같은 이유로** 여기 산다 — `persisted_snapshot`이 매 저장마다 도메인
+    /// `Worktree`를 새로 합성하므로, 이 값을 meta에 씨딩해 두지 않으면 앱을 한 번
+    /// 열었다 닫는 것만으로 연결된 PR이 영구히 사라진다(위 `created_at_unix_ms` 주석 참고).
+    pub linked_github_pr: Option<u64>,
 }
 
 /// 사이드바 에이전트 피커의 한 항목. `None` = 로그인 셸(기본, 오늘의 동작).
@@ -725,6 +730,7 @@ impl AppState {
                 WorktreeMeta {
                     created_with_agent: worktree.created_with_agent,
                     created_at_unix_ms: worktree.created_at_unix_ms,
+                    linked_github_pr: worktree.linked_github_pr,
                 },
             );
             worktrees_by_repo
@@ -768,6 +774,7 @@ impl AppState {
                             .unwrap_or_else(|| "worktree".to_string()),
                         created_with_agent: meta.created_with_agent,
                         created_at_unix_ms: meta.created_at_unix_ms,
+                        linked_github_pr: meta.linked_github_pr,
                     }
                 })
             })
@@ -1022,6 +1029,7 @@ impl AppState {
                 .unwrap_or_else(|| "worktree".to_string()),
             created_with_agent: created.created_with_agent,
             created_at_unix_ms: created.created_at_unix_ms,
+            linked_github_pr: created.linked_github_pr,
         };
         // **세션을 띄울 때마다 주입한다.** 생성 시점에만 쓰면 이 기능보다 **먼저
         // 만들어진 worktree**는 설정 파일을 영영 못 받고, 파일이 지워진 경우도
@@ -2145,6 +2153,9 @@ impl AppState {
                             // 다시 검증해 그 에이전트를 직접 띄운다.
                             created_with_agent,
                             created_at_unix_ms: now_ms,
+                            // 갓 만든 worktree엔 아직 연결된 PR이 없다. UI 후속(Create PR
+                            // 다이얼로그)이 생성 성공 시 이 값을 채운다.
+                            linked_github_pr: None,
                         },
                     );
                     // **일회성 프롬프트를 메모리에만 담는다**(`WorktreeMeta`가 아니라).
@@ -4627,6 +4638,7 @@ mod tests {
                 display_name: "a".into(),
                 created_with_agent: None,
                 created_at_unix_ms: 1,
+                linked_github_pr: None,
             },
             Worktree {
                 id: wt("/tmp/wt-b"),
@@ -4636,6 +4648,7 @@ mod tests {
                 display_name: "b".into(),
                 created_with_agent: None,
                 created_at_unix_ms: 2,
+                linked_github_pr: None,
             },
         ];
         disk.session.panes = Some(split(
@@ -5410,6 +5423,7 @@ mod tests {
             WorktreeMeta {
                 created_with_agent: Some("claude".to_string()),
                 created_at_unix_ms: 1,
+                linked_github_pr: None,
             },
         );
 
@@ -5493,6 +5507,7 @@ mod tests {
             WorktreeMeta {
                 created_with_agent: Some("claude".to_string()),
                 created_at_unix_ms: 1,
+                linked_github_pr: None,
             },
         );
         // 이 worktree엔 일회성 프롬프트가 걸려 있다(create가 담아둔 것).
@@ -5539,6 +5554,7 @@ mod tests {
             WorktreeMeta {
                 created_with_agent: Some("aider".to_string()),
                 created_at_unix_ms: 1,
+                linked_github_pr: None,
             },
         );
         state
@@ -5778,6 +5794,10 @@ mod tests {
             display_name: "meta".into(),
             created_with_agent: None,
             created_at_unix_ms: 1_700_000_000_000,
+            // Plan 7a: 연결된 PR도 `created_at_unix_ms`와 같은 경로로 보존돼야 한다 —
+            // `persisted_snapshot`이 매 저장마다 Worktree를 새로 합성하므로, 이 값이
+            // `WorktreeMeta`로 씨딩·재주입되지 않으면 한 번 저장에 사라진다.
+            linked_github_pr: Some(1234),
         }];
 
         let mut state = AppState::from_load(LoadDiagnostics {
@@ -5799,6 +5819,12 @@ mod tests {
             saved.worktrees[0].created_at_unix_ms, 1_700_000_000_000,
             "the creation timestamp read from disk must be written back, not replaced by \
              the placeholder 0 that the old snapshot synthesized every single save"
+        );
+        assert_eq!(
+            saved.worktrees[0].linked_github_pr,
+            Some(1234),
+            "the linked PR read from disk must be written back — if it is not seeded into \
+             WorktreeMeta and re-injected, one save-reconstruction erases it (data-loss class)"
         );
     }
 
@@ -5944,6 +5970,7 @@ mod tests {
             WorktreeMeta {
                 created_with_agent: None,
                 created_at_unix_ms: 42,
+                linked_github_pr: None,
             },
         );
 
