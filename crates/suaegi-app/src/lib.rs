@@ -6,6 +6,7 @@ pub mod forge_ui;
 pub mod git_tasks;
 pub mod layout;
 pub mod persistence_thread;
+pub mod pr_panel;
 pub mod presence_poll;
 pub mod prompt_inject;
 pub mod reaper;
@@ -39,6 +40,10 @@ impl AppState {
         let mut regions: Vec<Element<'_, Message>> =
             vec![sidebar::view(self), workbench::view(self)];
         if let Some(panel) = diff_panel::view(self.diff()) {
+            regions.push(panel);
+        }
+        // PR 패널도 diff 패널과 같이 **열렸을 때만** `row!`에 들어간다.
+        if let Some(panel) = pr_panel::view(self.pr_panel()) {
             regions.push(panel);
         }
         row(regions).height(Length::Fill).into()
