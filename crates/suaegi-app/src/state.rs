@@ -2790,12 +2790,12 @@ mod tests {
         let _ = state.update(Message::PresenceReady {
             id,
             generation: 1,
-            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+            presence: AgentPresence::Agent("claude"),
         });
 
         assert!(matches!(
             state.worktree_presence(&worktree_id),
-            AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude)
+            AgentPresence::Agent("claude")
         ));
     }
 
@@ -4484,7 +4484,7 @@ mod tests {
         let _ = state.update(Message::PresenceReady {
             id,
             generation: 1,
-            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+            presence: AgentPresence::Agent("claude"),
         });
         let _ = state.update(Message::HookArrived(HookEvent {
             pane_key: PaneKey(worktree_id.clone()),
@@ -4556,7 +4556,7 @@ mod tests {
         let _ = state.update(Message::PresenceReady {
             id,
             generation: 1,
-            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+            presence: AgentPresence::Agent("claude"),
         });
         assert_eq!(
             state.badges[&worktree_id].no_agent_streak, 0,
@@ -4816,7 +4816,7 @@ mod tests {
         let _ = state.update(Message::PresenceReady {
             id,
             generation: 1,
-            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+            presence: AgentPresence::Agent("claude"),
         });
         let _ = state.update(Message::HookArrived(hook(
             worktree_id.0.as_str(),
@@ -4865,7 +4865,7 @@ mod tests {
         let _ = state.update(Message::PresenceReady {
             id,
             generation: 1,
-            presence: AgentPresence::Agent(suaegi_term::agent::AgentKind::Claude),
+            presence: AgentPresence::Agent("claude"),
         });
         assert_eq!(
             state.badges[&worktree_id].previous,

@@ -2,8 +2,6 @@ mod platform;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-use suaegi_term::agent::AgentKind;
 use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe};
 use suaegi_term::pty::PtySpawn;
 use suaegi_term::session::{SessionSpec, TerminalSession};
@@ -124,7 +122,7 @@ mod unix_only {
         let mut monitor = PresenceMonitor::default();
         assert_eq!(
             monitor.probe(&session, &probe),
-            AgentPresence::Agent(AgentKind::Claude)
+            AgentPresence::Agent("claude")
         );
     }
 

@@ -1,4 +1,4 @@
-use crate::agent::{match_agent, AgentKind};
+use crate::agent::match_agent;
 use crate::session::TerminalSession;
 
 /// PTY foreground 프로세스로 판정하는 **에이전트 존재 여부**.
@@ -8,7 +8,9 @@ use crate::session::TerminalSession;
 pub enum AgentPresence {
     /// foreground가 에이전트가 아님 (셸 프롬프트 등)
     NoAgent,
-    Agent(AgentKind),
+    /// foreground가 에이전트다. 값은 [`crate::agent::AgentDef::id`](레지스트리 키).
+    /// 프로덕션은 `Agent(_)` 변형 여부만 보고 안쪽 id는 아직 소비하지 않는다(6b UI용).
+    Agent(&'static str),
     Exited {
         code: i32,
     },
@@ -55,7 +57,7 @@ const CACHE_REVALIDATE_AFTER: u32 = 20;
 
 #[derive(Debug, Default)]
 pub struct PresenceMonitor {
-    cached_agent: Option<(i32, AgentKind)>,
+    cached_agent: Option<(i32, &'static str)>,
     cache_hits: u32,
 }
 
@@ -85,10 +87,10 @@ impl PresenceMonitor {
             let Some(pgid) = session.foreground_pgid() else {
                 return AgentPresence::Unknown;
             };
-            if let Some((cached_pgid, kind)) = self.cached_agent {
+            if let Some((cached_pgid, id)) = self.cached_agent {
                 if cached_pgid == pgid && self.cache_hits < CACHE_REVALIDATE_AFTER {
                     self.cache_hits += 1;
-                    return AgentPresence::Agent(kind);
+                    return AgentPresence::Agent(id);
                 }
             }
             // 프로세스를 해석하지 못하면 NoAgent로 단정하지 않는다 —
@@ -97,10 +99,10 @@ impl PresenceMonitor {
                 return AgentPresence::Unknown;
             };
             match match_agent(&line) {
-                Some(kind) => {
-                    self.cached_agent = Some((pgid, kind));
+                Some(def) => {
+                    self.cached_agent = Some((pgid, def.id));
                     self.cache_hits = 0;
-                    AgentPresence::Agent(kind)
+                    AgentPresence::Agent(def.id)
                 }
                 None => {
                     self.cached_agent = None;
