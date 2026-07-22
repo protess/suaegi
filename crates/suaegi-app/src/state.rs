@@ -454,6 +454,14 @@ struct PaneBadge {
     expected: SpawnNonce,
     /// 마지막으로 관측한 훅 상태와 그 시각. `None` = 훅을 하나도 못 봤다.
     hook: Option<(HookState, Instant)>,
+    /// **이 pane이 훅을 하나라도 받았는가.** 로그인 셸(`AgentKind::Custom`) 안에서
+    /// 사용자가 claude를 띄우면, 그 세션은 `StatusSource::OscTitle`이면서 **동시에**
+    /// 훅을 낸다 — 훅과 OSC-title이 같은 `hook` 슬롯을 공유하므로 `hook.is_some()`
+    /// 만으로는 출처를 못 가른다. 훅을 한 번이라도 본 pane은 훅이 권위이고, 그 뒤로는
+    /// 타이틀이 배지를 건드리지 못하게 한다(안 그러면 claude의 `✳ …` idle 타이틀이
+    /// permission 대기 `Waiting`을 `Done`으로 덮어 MVP가 검증한 주황 배지를 회귀시킨다).
+    /// **스폰마다 [`PaneBadge::new`]로 리셋되므로 세션 교체를 넘어 새지 않는다.**
+    received_hook: bool,
     /// `NoAgent` streak가 확정되기 전에 유지할 값.
     previous: BadgeState,
     no_agent_streak: u8,
@@ -464,6 +472,7 @@ impl PaneBadge {
         Self {
             expected,
             hook: None,
+            received_hook: false,
             previous: BadgeState::Unknown,
             no_agent_streak: 0,
         }
@@ -1228,6 +1237,10 @@ impl AppState {
             // 옛 세대의 늦은 훅. **조용히 버린다** — 오류가 아니다.
             return;
         }
+        // 이 세대의 훅이 **하나라도** 도착했다 = claude가 이 pane을 소유한다.
+        // 출처가 `Ignore`(유령)든 `Reset`(SessionStart)이든, 이 pane은 훅-권위이고
+        // 그 뒤로 OSC-title이 배지를 덮어선 안 된다([`note_title_status_for_badge`]).
+        badge.received_hook = true;
         match hook_outcome(event) {
             HookOutcome::Ignore => {}
             HookOutcome::Reset => badge.hook = None,
@@ -1315,11 +1328,18 @@ impl AppState {
     /// 타이틀에서 추론한 상태를 배지 장부에 반영한다. `apply_hook`의 꼬리와 같은
     /// 규칙으로 `hook` 슬롯과 `previous`를 갱신한다 — 타이틀-파생 상태는 훅과 같은
     /// "가장 최근 상태 신호 + 시각" 슬롯을 쓴다.
+    ///
+    /// **훅을 본 pane은 건드리지 않는다**(`received_hook`). 로그인 셸 안에서 돌아가는
+    /// claude처럼 OSC-title 세션이 훅도 낼 때, 타이틀이 정밀한 훅 상태를 덮는 것을
+    /// 막는 유일한 지점이다 — precedence: 훅 > 타이틀.
     fn note_title_status_for_badge(&mut self, worktree_id: &WorktreeId, state: HookState) {
         let presence = self.worktree_presence(worktree_id);
         let Some(badge) = self.badges.get_mut(worktree_id) else {
             return;
         };
+        if badge.received_hook {
+            return;
+        }
         badge.hook = Some((state, Instant::now()));
         if !matches!(presence, AgentPresence::NoAgent) {
             badge.previous = reduce(&BadgeInput {
@@ -4516,6 +4536,53 @@ mod tests {
         assert!(
             state.badges[&wt("/tmp/wt-a")].hook.is_none(),
             "a fresh session starts from Unknown, not from whatever the last one was doing"
+        );
+    }
+
+    /// **precedence: 훅 > 타이틀.** 로그인 셸(`Custom`→`OscTitle`) 안에서 claude를
+    /// 띄우면 그 세션은 훅과 OSC-title을 **둘 다** 낸다. 훅이 permission 대기
+    /// (`Waiting`)를 세운 뒤 claude의 `✳ Claude Code`(→`Done`) idle 타이틀이 폴에
+    /// 잡혀도 배지는 **`Waiting`을 유지**해야 한다 — 안 그러면 MVP가 검증한 주황 배지가
+    /// 회색(`Done`)으로 덮이고, 거부 후엔 훅이 오지 않아 회색에 고착한다.
+    #[test]
+    fn a_title_never_overwrites_a_pane_that_has_received_hooks() {
+        let mut state = state_with_badge("/tmp/wt-a", 1);
+        // 훅이 permission 대기를 세운다 → received_hook=true, hook=Waiting.
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PermissionRequest,
+        )));
+        assert_eq!(
+            state.worktree_badge(&wt("/tmp/wt-a")),
+            BadgeState::Waiting,
+            "precondition: the hook set the badge to Waiting"
+        );
+
+        // claude가 로그인 셸에서 내보내는 idle 타이틀(`✳ Claude Code`→Done)이 폴에
+        // 잡힌 것과 동일하게, 타이틀-파생 Done을 배지에 반영 시도한다.
+        state.note_title_status_for_badge(&wt("/tmp/wt-a"), HookState::Done);
+        assert_eq!(
+            state.badges[&wt("/tmp/wt-a")].hook.map(|(s, _)| s),
+            Some(HookState::Waiting),
+            "a hook-owned pane must ignore the title — the ✳ idle title must not clobber the \
+             authoritative Waiting hook state"
+        );
+        assert_eq!(
+            state.worktree_badge(&wt("/tmp/wt-a")),
+            BadgeState::Waiting,
+            "the badge stays orange (Waiting); the title path does not reach a hook-owned pane"
+        );
+
+        // 대조군: 훅을 한 번도 못 본 pane(진짜 non-hook 에이전트 — 로그인 셸의
+        // codex/goose 등)은 타이틀 경로가 그대로 작동한다. 이게 없으면 위 단언이
+        // "타이틀 경로가 아예 죽었다"로도 설명된다.
+        let mut fresh = state_with_badge("/tmp/wt-b", 1);
+        fresh.note_title_status_for_badge(&wt("/tmp/wt-b"), HookState::Done);
+        assert_eq!(
+            fresh.badges[&wt("/tmp/wt-b")].hook.map(|(s, _)| s),
+            Some(HookState::Done),
+            "control: a pane that never received a hook still takes title-derived status"
         );
     }
 

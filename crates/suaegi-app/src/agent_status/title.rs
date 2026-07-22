@@ -449,11 +449,20 @@ pub fn title_status_update(changes: &[TitleChange], source: StatusSource) -> Opt
 mod tests {
     use super::*;
 
-    // 아래 픽스처는 전부 Orca의 실제 테스트
+    // 아래 **양성**(status를 내는) 픽스처는 전부 Orca의 실제 테스트
     // (`src/renderer/src/lib/agent-status.test.ts`)에서 그대로 가져왔다. 임의로
-    // 지어낸 타이틀은 "working"이 우연히 들어가 공허하게 통과할 수 있어 쓰지 않는다.
-    // Orca는 working/permission/idle을 돌려주고, 우리는 그것을 Working/Waiting/Done
-    // 으로 매핑한다.
+    // 지어낸 양성 타이틀은 "working"이 우연히 들어가 공허하게 통과할 수 있어 쓰지
+    // 않는다. Orca는 working/permission/idle을 돌려주고, 우리는 그것을
+    // Working/Waiting/Done으로 매핑한다.
+    //
+    // **예외**: `out_of_name_set_agents_cannot_derive_idle_from_title`의 goose/crush
+    // 입력은 Orca 테스트 파일에 없다 — Orca는 out-of-set "에이전트 이름"을 직접
+    // 테스트하지 않고, substring 비-매칭(`timestamp ready`·`clamp working`·`android
+    // …`, 이건 아래 `cwd_and_path_fragments…`에 실제 Orca 픽스처로 있다)으로만
+    // 게이트를 고정한다. goose/crush는 플랜 §3의 out-of-set 로스터에서 가져와, 실제
+    // Orca 픽스처("claude ready"→idle)와 **같은 타이틀 모양**으로 구성했다 — 이름만
+    // 바꿔 게이트가 결과를 가르는지 본다. 지어낸 타이틀이지만 게이트에 **걸려서
+    // None이 되는** 케이스라, "working이 우연히 들어가 통과"하는 공허함과는 반대다.
     const WORKING: Option<HookState> = Some(HookState::Working);
     const WAITING: Option<HookState> = Some(HookState::Waiting); // Orca "permission"
     const DONE: Option<HookState> = Some(HookState::Done); // Orca "idle"
