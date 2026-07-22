@@ -2216,8 +2216,13 @@ impl AppState {
                 iced::Task::none()
             }
             Message::WorktreeNameInputChanged { repo_id, value } => {
+                // **사이드바 입력에 포커스를 잡아 터미널을 unfocus한다.** 이게 없으면
+                // 포커스된 터미널 pane이 그대로 남아, 여기 타이핑한 키가 활성
+                // 터미널로도 새어 들어간다(iced가 포커스된 터미널을 먼저 라우팅해
+                // `is_event_captured`도 못 막는다 — 실측으로 확인).
+                let focus = iced::widget::operation::focus(crate::sidebar::name_input_id(&repo_id));
                 self.worktree_name_draft.insert(repo_id, value);
-                iced::Task::none()
+                focus
             }
             Message::WorktreeAgentSelected { repo_id, choice } => {
                 // 로그인 셸(기본)을 고르면 엔트리를 지운다 — "없음"과 같은 의미라
@@ -2230,6 +2235,9 @@ impl AppState {
                 iced::Task::none()
             }
             Message::WorktreePromptInputChanged { repo_id, value } => {
+                // name 입력과 같은 이유로 사이드바에 포커스를 잡아 터미널을 unfocus한다.
+                let focus =
+                    iced::widget::operation::focus(crate::sidebar::prompt_input_id(&repo_id));
                 // 빈 값이면 엔트리를 지운다(= 주입 없음, 기본). 맵을 불필요하게
                 // 키우지 않는다.
                 if value.is_empty() {
@@ -2237,7 +2245,7 @@ impl AppState {
                 } else {
                     self.worktree_prompt_draft.insert(repo_id, value);
                 }
-                iced::Task::none()
+                focus
             }
             Message::CreateWorktreeSubmitted { repo_id } => {
                 let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
