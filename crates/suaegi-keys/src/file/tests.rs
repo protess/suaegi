@@ -271,6 +271,12 @@ fn rejects_invalid_binding_on_write() {
 
 /// keybinding-file.test.ts:193-219 — resetting removes only the active-platform
 /// mask; a hand-authored common binding shows back through.
+///
+/// The linux section carries a SIBLING override (`terminal.paste`) alongside the
+/// reset target so the removal is scoped: `active_platform.remove(action)` must
+/// drop only `terminal.search` and leave the sibling. A `remove(action)` ->
+/// `clear()` mutation (which would wipe the whole active section — a data-loss
+/// bug) fails on the sibling-survives assertion below.
 #[test]
 fn resets_only_the_active_platform() {
     let dir = tempdir().unwrap();
@@ -278,7 +284,12 @@ fn resets_only_the_active_platform() {
         dir.path(),
         r#"{
           "keybindings": { "terminal.search": "Ctrl+Alt+F" },
-          "platforms": { "linux": { "terminal.search": "Ctrl+Shift+F" } }
+          "platforms": {
+            "linux": {
+              "terminal.search": "Ctrl+Shift+F",
+              "terminal.paste": "Ctrl+Alt+V"
+            }
+          }
         }"#,
     );
 
@@ -289,14 +300,97 @@ fn resets_only_the_active_platform() {
         snapshot.common_overrides.get(&A::TerminalSearch),
         Some(&bindings(&["Ctrl+Alt+F"]))
     );
-    assert_eq!(
-        snapshot.platform_overrides.get(&Linux),
-        Some(&std::collections::HashMap::new())
+    // The linux section lost ONLY the reset target; the sibling override survives.
+    let linux = snapshot
+        .platform_overrides
+        .get(&Linux)
+        .expect("linux section present");
+    assert!(
+        !linux.contains_key(&A::TerminalSearch),
+        "reset target removed: {linux:?}"
     );
-    // The common binding shows through as the effective override.
+    assert_eq!(
+        linux.get(&A::TerminalPaste),
+        Some(&bindings(&["Ctrl+Alt+V"])),
+        "sibling override must survive a scoped reset (not a section-wide clear): {linux:?}"
+    );
+    // The common binding shows through as the effective override for the reset action.
     assert_eq!(
         overrides_of(&snapshot, A::TerminalSearch),
         Some(&bindings(&["Ctrl+Alt+F"]))
+    );
+}
+
+/// PIN (#2 — unknown root keys preserved): a write clones the existing document
+/// and only re-inserts `version` / `keybindings` / `platforms`, so any unknown
+/// root key (a `$schema` pointer, a hand-added field) must survive verbatim. A
+/// mutation that rebuilds the document from scratch would drop these.
+#[test]
+fn write_preserves_unknown_root_keys() {
+    let dir = tempdir().unwrap();
+    let path = write_file(
+        dir.path(),
+        r#"{
+          "$schema": "https://example.com/keybindings.schema.json",
+          "customRootKey": { "nested": [1, 2, 3] },
+          "keybindings": { "worktree.quickOpen": "Mod+Shift+P" }
+        }"#,
+    );
+
+    write_keybinding_override(
+        &path,
+        A::TerminalSearch,
+        Some(&bindings(&["Mod+Shift+F"])),
+        Darwin,
+    )
+    .expect("write");
+
+    let written = read_json(&path);
+    assert_eq!(
+        written["$schema"],
+        "https://example.com/keybindings.schema.json"
+    );
+    assert_eq!(
+        written["customRootKey"],
+        serde_json::json!({ "nested": [1, 2, 3] })
+    );
+    // And the write still landed.
+    assert_eq!(
+        written["platforms"]["darwin"]["terminal.search"],
+        Value::Array(vec!["Mod+Shift+F".into()])
+    );
+}
+
+/// PIN (#3 — same-platform section merge): writing action B into a platform that
+/// already holds action A must keep A. The active section is cloned before the
+/// single insertion, not rebuilt — a mutation that starts the active section from
+/// an empty map would drop the prior sibling.
+#[test]
+fn write_preserves_sibling_in_same_platform_section() {
+    let dir = tempdir().unwrap();
+    let path = write_file(
+        dir.path(),
+        r#"{
+          "platforms": { "darwin": { "terminal.search": "Mod+F" } }
+        }"#,
+    );
+
+    // Write a DIFFERENT action into the SAME (darwin) section.
+    write_keybinding_override(
+        &path,
+        A::TerminalPaste,
+        Some(&bindings(&["Mod+Shift+V"])),
+        Darwin,
+    )
+    .expect("write");
+
+    let written = read_json(&path);
+    // The prior sibling survives...
+    assert_eq!(written["platforms"]["darwin"]["terminal.search"], "Mod+F");
+    // ...alongside the newly written override.
+    assert_eq!(
+        written["platforms"]["darwin"]["terminal.paste"],
+        Value::Array(vec!["Mod+Shift+V".into()])
     );
 }
 
