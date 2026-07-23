@@ -13,6 +13,8 @@ suaegi-secrets = { path = "../suaegi-secrets" }
 suaegi-core = { path = "../suaegi-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Jira Basic 인증 헤더 `base64(email:token)` 조립(§2, Orca `client.ts:338`). 엄격 표준 알파벳.
+base64 = { workspace = true }
 
 [dev-dependencies]
 # FakeTransport로 real api.linear.app를 안 친다. test-support 피처는 dev에서만 → 프로덕션 미포함.
