@@ -54,6 +54,13 @@ fn escape_glob_path(rel_path: &str) -> String {
 ///   `-foo` 같은 악의적 exclude 값이 argv 플래그로 해석될 수 없다.
 ///
 /// 반환 argv는 `--glob <값>` 쌍이 flat하게 들어간다(searchRoot 미포함).
+///
+/// ⚠️ **`excludes`는 basename-anywhere blocklist 이름 전용**(`node_modules`, `.git` 같은
+/// 디렉터리 *이름*)이다 — `!**/name`은 그 이름을 **어느 깊이에서든** prune한다. **nested-worktree
+/// rooted prefix(`packages/app` 같은)를 여기 넣지 말 것**: rooted prefix는 rg에서 rooted
+/// `!<prefix>` + `!<prefix>/**` 두-glob 형식이 필요하고(Orca quick-open-filter.ts:224-228),
+/// `!**/prefix`로 넣으면 같은 이름의 무관한 하위 경로까지 over-prune된다. worktree prefix는
+/// M3가 별도 경로로 처리한다(git 쪽은 `ls_files_args`가 이미 rooted `:(exclude,glob)`로 받음).
 pub fn rg_args(include_ignored: bool, excludes: &[String]) -> Vec<String> {
     let mut args = vec!["--files".to_string(), "--hidden".to_string()];
     if include_ignored {
@@ -274,12 +281,6 @@ pub fn classify_quick_open_git_entry(probe: GitEntryProbe) -> GitEntryAction {
 
 // ─── excludePaths 정규화 (Orca quick-open-filter.ts:98-133, 173-176) ──
 
-/// `..` 또는 `../…`(root 밖으로 탈출)인가. `..name`은 유효한 child라 걸리지 않는다
-/// (Orca `isParentRelativePath`, quick-open-filter.ts:173-176).
-fn is_parent_relative(rel: &str) -> bool {
-    rel == ".." || rel.starts_with("../")
-}
-
 /// worktree-상대 exclude 후보 하나를 `/`-구분 root-relative prefix로 정규화한다.
 /// malformed / root 밖 / root-equal(`""`·`.`)은 **조용히 drop**(`None`) — stale하거나 오타난
 /// exclude 경로가 요청 전체를 실패시키지 못하게(Orca `buildExcludePathPrefixes`의 per-entry
@@ -287,17 +288,26 @@ fn is_parent_relative(rel: &str) -> bool {
 ///
 /// 규칙(순서):
 /// 1. 백슬래시 → `/`.
-/// 2. absolute(`/…`) 또는 parent(`..`/`../…`) → `None`(root 밖, Orca:122).
+/// 2. absolute(`/…`) → `None`(root 밖, Orca:122).
 /// 3. 끝 `/` 제거(경계 검사 명확화, Orca:126). 남은 게 root-equal(`""`/`.`)이면 `None`
 ///    (전체 트리를 exclude 거부, Orca:114-117·127). trim 뒤 한 번만 검사하면 `""`·`.`·
 ///    `./`·`packages/app/`가 전부 이 한 관문을 지난다 — trim 전 별도 검사는 redundant.
+/// 4. **어떤 위치의 `..` 세그먼트든**(leading `../x`이든 mid-path `a/../y`이든) → `None`.
+///    Orca는 leading `..`만 거부하고 나머지는 경로 해소가 root 밖으로 못 나가는 M2b 전제에
+///    기대지만, 여기선 **방어적으로** 경로 해소 없이 `..`가 있으면 무조건 거부한다 — exclude
+///    prefix가 root 밖을 가리키는 위험을 원천 차단(리뷰 F4). `..`는 유닉스에서 항상 부모
+///    디렉터리 엔트리라 진짜 파일명이 아니므로 오탐 없음. `..name`은 `..`가 아니라 통과.
 pub fn normalize_exclude_path(worktree_rel: &str) -> Option<String> {
     let fwd = worktree_rel.replace('\\', "/");
-    if fwd.starts_with('/') || is_parent_relative(&fwd) {
+    if fwd.starts_with('/') {
         return None;
     }
     let trimmed = fwd.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "." {
+        return None;
+    }
+    // 어떤 세그먼트든 `..`면 거부(root 밖 탈출 원천 차단).
+    if trimmed.split('/').any(|seg| seg == "..") {
         return None;
     }
     Some(trimmed.to_string())
@@ -374,9 +384,11 @@ pub fn collapse_expansion_paths(paths: Vec<ExpansionPath>) -> Vec<ExpansionPath>
             continue;
         }
 
-        // ancestor 없음: 삽입(같은 key면 Orca Map.set처럼 덮어쓴다).
+        // ancestor 없음: 삽입. 같은 rel key가 이미 있으면 `include_symlinks`를 **OR**한다
+        // (덮어쓰기 금지) — untracked_dir(true)와 gitlink(false)가 같은 rel로 둘 다 오면
+        // (primary/ignored 패스 overlap) 심링크-leaf 계약을 잃지 않게 true를 유지한다.
         if let Some(existing) = collapsed.iter_mut().find(|c| c.rel == ep.rel) {
-            existing.include_symlinks = ep.include_symlinks;
+            existing.include_symlinks |= ep.include_symlinks;
         } else {
             collapsed.push(ep);
         }
@@ -563,12 +575,46 @@ mod tests {
         assert_eq!(e.path, "build/");
     }
 
-    // hash 자리에 non-hex(대문자 A)가 오면 스테이지가 아니다 → untracked 취급.
+    // hash 자리에 non-hex(대문자 A/`g`)가 오면 스테이지가 아니다 → untracked 취급.
+    // mutation: hex 검사(is_lower_hex)를 완화(예: 대문자 허용/`b'a'..=b'g'`)하면 이 케이스가
+    // stage로 오인돼 Some을 내 FAIL.
     #[test]
     fn stage_rejects_non_hex_hash() {
         // 40자 중 대문자 → hex 아님. 접두가 안 맞아 stage None.
-        let rec = format!("100644 {} 0\tf", "A".repeat(40));
+        assert_eq!(
+            parse_ls_files_stage_path(&format!("100644 {} 0\tf", "A".repeat(40))),
+            None
+        );
+        // `g`는 [0-9a-f] 밖.
+        assert_eq!(
+            parse_ls_files_stage_path(&format!("100644 {} 0\tf", "g".repeat(40))),
+            None
+        );
+    }
+
+    // F1: octal mode `[0-7]` 상한 pin. mode에 8/9가 오면 stage 아님.
+    // mutation: mode 검사 `[0-7]`→`[0-9]`로 완화하면 이 케이스가 stage로 파싱돼 FAIL.
+    #[test]
+    fn stage_rejects_non_octal_mode() {
+        // 첫 자리 8(octal 밖).
+        let rec = format!("800644 {} 0\tf", "a".repeat(40));
         assert_eq!(parse_ls_files_stage_path(&rec), None);
+        // 끝자리 9.
+        let rec9 = format!("100649 {} 0\tf", "a".repeat(40));
+        assert_eq!(parse_ls_files_stage_path(&rec9), None);
+    }
+
+    // F1: stage 자리 `[0-3]` 상한 pin. stage 4는 유효한 stage가 아니다.
+    // mutation: stage 검사 `[0-3]`→`[0-9]`로 완화하면 이 케이스가 stage로 파싱돼 FAIL.
+    #[test]
+    fn stage_rejects_out_of_range_stage_digit() {
+        let rec = format!("100644 {} 4\tf", "a".repeat(40));
+        assert_eq!(parse_ls_files_stage_path(&rec), None);
+        // 실제 유효 stage 0..=3은 파싱된다(대조군).
+        for s in ['0', '1', '2', '3'] {
+            let ok = format!("100644 {} {s}\tf", "a".repeat(40));
+            assert_eq!(parse_ls_files_stage_path(&ok), Some("f"), "stage {s}");
+        }
     }
 
     // `-z` 스트림 분리: NUL split + 빈 조각 skip(status.rs 규율 재사용).
@@ -688,6 +734,19 @@ mod tests {
         );
     }
 
+    // F4: 어떤 위치의 `..` 세그먼트든 거부(leading이든 mid-path든) — root 밖 탈출 원천 차단.
+    // mutation: `..` 세그먼트 거부 가드(`split('/').any(seg == "..")`)를 제거하면
+    // `a/../../x`·`a/..`·`x/../y`가 Some을 내 FAIL.
+    #[test]
+    fn normalize_rejects_dotdot_any_position() {
+        assert_eq!(normalize_exclude_path("a/../../x"), None, "mid escape");
+        assert_eq!(normalize_exclude_path("a/.."), None, "trailing ..");
+        assert_eq!(normalize_exclude_path("../x"), None, "leading");
+        assert_eq!(normalize_exclude_path("x/../y"), None, "mid ..");
+        // 대조군: `..`가 없으면 정상 통과.
+        assert_eq!(normalize_exclude_path("a/b/c"), Some("a/b/c".to_string()));
+    }
+
     // ─── collapse: includeSymlinks OR 전파 (Codex-flagged crux) ─────
 
     // crux: descendant(true)가 ancestor(false)에 병합되면 ancestor가 true로 승격.
@@ -716,6 +775,23 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rel, "a");
         assert!(out[0].include_symlinks, "ancestor true 유지");
+    }
+
+    // F3: 같은 rel이 no-ancestor 경로로 중복 삽입되면 flag를 OR한다(다운그레이드 금지).
+    // untracked_dir("a")(true)와 gitlink("a")(false)가 같은 rel로 오면 a:true 유지.
+    // mutation: `|=`를 `=`(overwrite)로 바꾸면 a:false가 돼 FAIL.
+    #[test]
+    fn collapse_or_on_duplicate_rel() {
+        let out = collapse_expansion_paths(vec![
+            ExpansionPath::untracked_dir("a"), // true
+            ExpansionPath::gitlink("a"),       // false, 같은 rel
+        ]);
+        assert_eq!(out.len(), 1, "같은 rel은 하나로");
+        assert_eq!(out[0].rel, "a");
+        assert!(
+            out[0].include_symlinks,
+            "중복 rel은 OR — true가 false에 덮이면 안 된다"
+        );
     }
 
     // 무관한 sibling은 병합 안 됨 — 둘 다 유지, flag 각각.
