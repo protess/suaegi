@@ -1,5 +1,6 @@
-//! suaegi-tracker — 이슈트래커 통합. N1 **Linear 읽기 + 워크트리 링크**, N2 **Jira 읽기**(REST).
-//! (N3 Linear write-back은 후속). PR forge(`suaegi-forge`)가 아니라 `suaegi-http`(§Q5 추출된
+//! suaegi-tracker — 이슈트래커 통합. N1 **Linear 읽기 + 워크트리 링크**, N2 **Jira 읽기**(REST),
+//! N3a **Linear write-back**([`linear::write`] — writeId 멱등 + readback 확인 + 4-way 분류; N3b
+//! 에이전트 CLI-RPC 노출은 후속). PR forge(`suaegi-forge`)가 아니라 `suaegi-http`(§Q5 추출된
 //! leaf 전송)에 의존한다 — 이슈트래커→PR-forge 레이어링 스멜을 피한다.
 //!
 //! 핵심 규율(forge와 공유): **일시 실패(transient)를 절대 None/empty로 오독하지 않는다** —
@@ -19,4 +20,7 @@ pub use jira::{
 pub use link::{
     resolve_current_issue, resolve_current_jira_issue, LinkedJiraIssue, LinkedLinearIssue,
 };
-pub use linear::{Comment, Issue, IssuePage, LinearClient, LinearWorkspace};
+pub use linear::{
+    Comment, CreatedAttachment, CreatedComment, InvalidWriteId, Issue, IssuePage, IssueUpdate,
+    LinearClient, LinearWorkspace, NewIssue, WriteId, WriteOutcome,
+};
