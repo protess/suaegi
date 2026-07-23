@@ -633,4 +633,85 @@ mod tests {
             Err(InvalidReason::MissingModifier)
         );
     }
+
+    // --- Pinning tests (close hollow-test gaps; additive only) --------------
+
+    /// The full non-function-key bare allow-list from `is_safe_bare_key`
+    /// (Orca `keybindings.ts:1361-1373`). Every entry must be accepted bare for
+    /// an opt-in action and rejected bare for a non-opt-in one; dropping any key
+    /// from the allow-list must fail this. (Function keys are covered separately
+    /// by the F7/Shift+F7 tests.)
+    #[test]
+    fn bare_allow_list_keys_gated_by_opt_in() {
+        const BARE_KEYS: &[&str] = &[
+            "Backspace",
+            "Delete",
+            "Enter",
+            "Escape",
+            "Tab",
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+            "PageUp",
+            "PageDown",
+        ];
+        for key in BARE_KEYS {
+            // Accepted bare for an action that opts in (FileExplorerDelete has
+            // allow_bare_keybindings = true).
+            assert_eq!(
+                normalize_keybinding_list_for_action(A::FileExplorerDelete, key),
+                Ok(vec![(*key).to_string()]),
+                "{key} should be accepted bare for an allow-bare action"
+            );
+            // Rejected bare for an action that does not opt in.
+            assert_eq!(
+                normalize_keybinding_list_for_action(A::WorktreeQuickOpen, key),
+                Err(InvalidReason::MissingModifier),
+                "{key} should be rejected bare for a non-opt-in action"
+            );
+        }
+    }
+
+    // Pins the `1`-`9` lower bound: `0` is not a valid digit-index key, so a
+    // digit-index action must reject `Mod+0`. Widening `is_digit_index_key` to
+    // `[b'0'..=b'9']` (which would rewrite Mod+0 -> Mod+1) fails this.
+    #[test]
+    fn digit_index_rejects_zero() {
+        assert_eq!(
+            normalize_keybinding_list_for_action(A::TabSelectByIndex, "Mod+0"),
+            Err(InvalidReason::NotDigitIndexKey)
+        );
+        assert_eq!(
+            normalize_keybinding_list_for_action(A::WorkspaceSelectByIndex, "Mod+0"),
+            Err(InvalidReason::NotDigitIndexKey)
+        );
+    }
+
+    // Pins every `InvalidReason` Display string to its exact Orca message,
+    // including the en-dash (U+2013) in the digit-index message. Any one-char
+    // edit to a message string fails this.
+    #[test]
+    fn invalid_reason_display_matches_orca() {
+        assert_eq!(
+            InvalidReason::MissingModifier.to_string(),
+            "Include at least one modifier key."
+        );
+        assert_eq!(
+            InvalidReason::NotDigitIndexKey.to_string(),
+            "Pick a number key 1\u{2013}9 with a modifier, like Cmd+1 or Ctrl+1."
+        );
+        // Unparsable's Display is fixed regardless of the wrapped ParseError
+        // (thiserror uses only the format string; the source is separate).
+        assert_eq!(
+            InvalidReason::Unparsable(ParseError::Empty).to_string(),
+            "Use a shortcut like Ctrl+Shift+P or Cmd+K."
+        );
+        // ModWithPlatformModifier is also pinned in normalizes_and_rejects_double_tap;
+        // re-asserted here so all four variants live in one place.
+        assert_eq!(
+            InvalidReason::ModWithPlatformModifier.to_string(),
+            "Use either Mod or a platform-specific modifier, not both."
+        );
+    }
 }
