@@ -20,13 +20,21 @@
 //!     `KeybindingConflict`) — reduces each action's effective bindings to a
 //!     platform-resolved identity, buckets by conflict-group/scope, and reports
 //!     collisions only when a customized action participates.
+//!   - M5: the on-disk file layer (`read_keybinding_file`,
+//!     `write_keybinding_override`, `KeybindingFileSnapshot`, `Diagnostic`) —
+//!     parses a `keybindings.json` (tolerating the legacy flat root), drops
+//!     conflicting overrides via a bounded fixpoint, and writes a single
+//!     override back atomically (own `tempfile` temp+rename, F3) into the active
+//!     platform section only. The file *path* is always injected by the caller;
+//!     this crate never resolves a config dir (that stays in M6).
 //!
-//! The on-disk file layer (M5) lands in a later milestone. The templated
+//! The templated
 //! `tab.newAgent.${agent}` family (Orca `keybindings.ts:26,1059`) is intentionally
 //! **excluded** here (see F2 in the plan) and gets wired at the app boundary in M6.
 
 mod chord;
 mod conflicts;
+mod file;
 mod format;
 mod normalize;
 mod registry;
@@ -40,6 +48,10 @@ pub use chord::{
 pub use conflicts::{
     find_keybinding_conflicts, find_keybinding_conflicts_with_options,
     FindKeybindingConflictOptions, KeybindingConflict,
+};
+pub use file::{
+    read_keybinding_file, write_keybinding_override, Diagnostic, KeybindingFileSnapshot, Severity,
+    WriteError,
 };
 pub use format::{format_keybinding, format_keybinding_list};
 pub use normalize::{

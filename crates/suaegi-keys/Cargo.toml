@@ -8,8 +8,10 @@ license.workspace = true
 # Why: leaf crate. Deliberately depends on NOTHING from suaegi (no iced, no tokio,
 # no suaegi-term/-core). The keybinding registry + parser + formatter must stay a
 # pure String<->struct layer so every function is mutation-verifiable in isolation.
-# serde_json/tempfile land here in M5 (file layer); not yet used in M1.
+# serde_json/tempfile back the M5 file layer (own atomic temp+rename, F3 — no
+# suaegi-core::Store dependency, preserving leaf isolation).
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
