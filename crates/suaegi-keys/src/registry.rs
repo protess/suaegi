@@ -234,6 +234,22 @@ impl KeybindingActionId {
             .find(|def| def.id.as_str() == value)
             .map(|def| def.id)
     }
+
+    /// The definition row for this action. Mirror of Orca `DEFINITIONS_BY_ID.get`
+    /// (`keybindings.ts:1078`). Returns `None` only in the theoretically
+    /// impossible case that a variant has no row (kept as `Option` to match
+    /// Orca's graceful `definition?` lookups; the `defs_cover_every_variant`
+    /// golden test proves it is always `Some`).
+    pub fn definition(self) -> Option<&'static KeybindingDefinition> {
+        KEYBINDING_DEFINITIONS.iter().find(|def| def.id == self)
+    }
+}
+
+/// Whether `action` is one of the ranged digit-index rows (its stored chord is a
+/// `1`-`9` representative). Mirror of Orca `isDigitIndexActionId`
+/// (`keybindings.ts:1097`).
+pub fn is_digit_index_action_id(action: KeybindingActionId) -> bool {
+    DIGIT_INDEX_ACTION_IDS.contains(&action)
 }
 
 impl Serialize for KeybindingActionId {

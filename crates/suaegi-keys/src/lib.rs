@@ -5,18 +5,22 @@
 //! whole layer stays a pure `String` <-> struct transform that can be
 //! mutation-verified in isolation (repo hard rule).
 //!
-//! Milestone M1 covers:
-//!   - the registry (`KeybindingActionId`, `KeybindingDefinition`, the 84 defs),
-//!   - the chord grammar (parse / canonicalize / double-tap / `Mod` resolution),
-//!   - the formatter (glyphs on darwin, text elsewhere).
+//! Milestones landed so far:
+//!   - M1: the registry (`KeybindingActionId`, `KeybindingDefinition`, the 84
+//!     defs), the chord grammar (parse / canonicalize / double-tap / `Mod`
+//!     resolution), and the formatter (glyphs on darwin, text elsewhere).
+//!   - M2: normalize/validate (`normalize_keybinding*`, `KeybindingValidationResult`)
+//!     plus the digit-index (`1`-`9` -> `1`) canonicalization and per-action
+//!     bare/shift-only rules.
 //!
-//! Normalize/validate (M2), the event->action resolver (M3), conflict detection
+//! The event->action resolver (M3), conflict detection
 //! (M4), and the on-disk file layer (M5) land in later milestones. The templated
 //! `tab.newAgent.${agent}` family (Orca `keybindings.ts:26,1059`) is intentionally
 //! **excluded** here (see F2 in the plan) and gets wired at the app boundary in M6.
 
 mod chord;
 mod format;
+mod normalize;
 mod registry;
 
 pub use chord::{
@@ -25,7 +29,12 @@ pub use chord::{
     PhysicalModifier,
 };
 pub use format::{format_keybinding, format_keybinding_list};
+pub use normalize::{
+    normalize_keybinding, normalize_keybinding_array_for_action, normalize_keybinding_list,
+    normalize_keybinding_list_for_action, InvalidReason, KeybindingListResult,
+    KeybindingValidationResult,
+};
 pub use registry::{
-    KeybindingActionId, KeybindingDefinition, KeybindingPlatform, PerPlatform, Scope,
-    DIGIT_INDEX_ACTION_IDS, KEYBINDING_DEFINITIONS,
+    is_digit_index_action_id, KeybindingActionId, KeybindingDefinition, KeybindingPlatform,
+    PerPlatform, Scope, DIGIT_INDEX_ACTION_IDS, KEYBINDING_DEFINITIONS,
 };
