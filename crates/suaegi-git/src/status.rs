@@ -41,11 +41,41 @@ pub enum FileStatus {
     Copied { from: String },
     /// 미추적(`??`).
     Untracked,
-    /// 미병합(충돌). porcelain의 unmerged 상태: `DD`,`AU`,`UD`,`UA`,`DU`,`AA`,`UU`.
-    Conflicted,
+    /// 미병합(충돌). porcelain의 unmerged 상태 7종. XY 코드에서 **어느 쪽이 무엇을
+    /// 했는가**를 `ConflictKind`로 함께 담는다(Orca `parseConflictKind`, status.ts:877-896).
+    /// 새 git 호출 없이 `classify_xy`가 이미 뽑은 (x,y)에서 직접 계산한다(plan F2).
+    Conflicted(ConflictKind),
     /// 위 어디에도 안 맞는 `XY`(예: 우리가 특별히 모델링하지 않은 조합). 원본
     /// 두 글자를 그대로 담아 **추측하지 않는다**(`compare.rs`의 `Other`와 같은 규율).
     Other(String),
+}
+
+/// 미병합(충돌) 경로의 종류. `git status --porcelain=v1`의 unmerged XY 코드를 **누가
+/// 무엇을 했는가**로 옮긴 것 — Orca `parseConflictKind`(status.ts:877-896)의 7종과 1:1.
+///
+/// `us`는 현재 브랜치(HEAD, merge의 `--ours`), `them`은 병합해 들어오는 쪽(`--theirs`).
+/// **`AddedByUs`/`AddedByThem`, `DeletedByUs`/`DeletedByThem`의 us/them 방향이 crux다** —
+/// XY에서 `U`가 아닌 쪽(변경을 남긴 쪽)이 누구인지로 갈린다:
+/// - `AU`(index=Added, worktree=Unmerged) → **우리가** 추가 = `AddedByUs`
+/// - `UA` → **저쪽이** 추가 = `AddedByThem`
+/// - `DU` → **우리가** 삭제 = `DeletedByUs`
+/// - `UD` → **저쪽이** 삭제 = `DeletedByThem`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// `UU` — 양쪽이 수정.
+    BothModified,
+    /// `AA` — 양쪽이 추가.
+    BothAdded,
+    /// `DD` — 양쪽이 삭제.
+    BothDeleted,
+    /// `AU` — 우리가 추가, 저쪽은 미병합.
+    AddedByUs,
+    /// `UA` — 저쪽이 추가, 우리는 미병합.
+    AddedByThem,
+    /// `DU` — 우리가 삭제, 저쪽은 미병합.
+    DeletedByUs,
+    /// `UD` — 저쪽이 삭제, 우리는 미병합.
+    DeletedByThem,
 }
 
 /// 주어진 워크트리-상대 경로들 중 **git이 무시하는** 것들의 집합.
@@ -179,8 +209,16 @@ fn parse_porcelain_status(stdout: &str) -> Result<HashMap<String, FileStatus>, G
 fn classify_xy(x: char, y: char) -> FileStatus {
     match (x, y) {
         ('?', '?') => FileStatus::Untracked,
-        // unmerged(충돌) 상태 전부. `A`/`D`가 양쪽에 겹치는 `AA`/`DD`도 충돌이다.
-        ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D') => FileStatus::Conflicted,
+        // unmerged(충돌) 7종. **이 arm이 비-충돌 fallback보다 먼저 와야** `AA`/`DD`가
+        // 아래 index/worktree 폴백으로 새지 않는다(순서 불변식). kind는 (x,y)에서 직접
+        // 계산 — 새 git 호출/porcelain-v2 없음(plan F2, Orca status.ts:877-896).
+        ('U', 'U') => FileStatus::Conflicted(ConflictKind::BothModified),
+        ('A', 'A') => FileStatus::Conflicted(ConflictKind::BothAdded),
+        ('D', 'D') => FileStatus::Conflicted(ConflictKind::BothDeleted),
+        ('A', 'U') => FileStatus::Conflicted(ConflictKind::AddedByUs),
+        ('U', 'A') => FileStatus::Conflicted(ConflictKind::AddedByThem),
+        ('D', 'U') => FileStatus::Conflicted(ConflictKind::DeletedByUs),
+        ('U', 'D') => FileStatus::Conflicted(ConflictKind::DeletedByThem),
         _ => {
             // 인덱스(X)를 우선하되 비어있으면 워킹트리(Y)를 본다. `??`는 위에서 걸렀다.
             let code = if x != ' ' && x != '?' { x } else { y };
@@ -198,7 +236,7 @@ fn classify_xy(x: char, y: char) -> FileStatus {
 mod tests {
     //! 순수 파서(`parse_porcelain_status`)를 실제 git이 내는 `-z` 바이트로 고정한다.
     //! 이 형태는 위 `sed`/`xxd` 실측(git 2.50.1)에서 그대로 가져왔다.
-    use super::{classify_xy, parse_porcelain_status, FileStatus};
+    use super::{classify_xy, parse_porcelain_status, ConflictKind, FileStatus};
 
     #[test]
     fn parses_modified_added_deleted_untracked() {
@@ -251,17 +289,38 @@ mod tests {
         assert_eq!(map.len(), 1);
     }
 
+    // --- crux: XY → ConflictKind 매핑 (순수, 7종 전수) ---
+    // us/them 방향이 이 테이블의 핵심이다. 예컨대 AU→AddedByThem으로 뒤집는(us/them swap)
+    // mutation은 이 표에서 즉시 FAIL한다. classify_xy가 파서를 거쳐 그대로 흐르므로
+    // parse_porcelain_status로 종단 고정한다.
     #[test]
-    fn conflict_states_are_conflicted() {
-        for xy in ["UU", "AA", "DD", "AU", "UD", "UA", "DU"] {
+    fn conflict_xy_maps_to_exact_kind() {
+        let cases = [
+            ("UU", ConflictKind::BothModified),
+            ("AA", ConflictKind::BothAdded),
+            ("DD", ConflictKind::BothDeleted),
+            ("AU", ConflictKind::AddedByUs),
+            ("UA", ConflictKind::AddedByThem),
+            ("DU", ConflictKind::DeletedByUs),
+            ("UD", ConflictKind::DeletedByThem),
+        ];
+        for (xy, kind) in cases {
             let input = format!("{xy} f\0");
             let map = parse_porcelain_status(&input).unwrap();
             assert_eq!(
                 map.get("f"),
-                Some(&FileStatus::Conflicted),
-                "{xy}가 Conflicted로 분류되지 않았다"
+                Some(&FileStatus::Conflicted(kind.clone())),
+                "{xy}가 {kind:?}로 분류되지 않았다"
             );
         }
+    }
+
+    // classify_xy 직접: 충돌이 아닌 pair(`AM` = staged add + wt modify)는 Conflicted가
+    // 아니다 — 충돌 arm이 정상 상태를 잘못 삼키지 않는지 고정한다.
+    #[test]
+    fn non_conflict_pair_is_not_conflicted() {
+        assert_eq!(classify_xy('A', 'M'), FileStatus::Added);
+        assert!(!matches!(classify_xy('A', 'M'), FileStatus::Conflicted(_)));
     }
 
     // 비ASCII 경로가 -z에서 날것으로 온다(이스케이프 없음).
