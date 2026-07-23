@@ -6,8 +6,8 @@ use futures::StreamExt;
 use iced::advanced::clipboard;
 use iced::widget::pane_grid;
 use suaegi_core::domain::{
-    PersistedPane, PersistedState, Repo, RepoId, SessionState, Settings, Worktree, WorktreeId,
-    SCHEMA_VERSION,
+    JiraConnectionConfig, PersistedPane, PersistedState, Repo, RepoId, SessionState, Settings,
+    Worktree, WorktreeId, SCHEMA_VERSION,
 };
 use suaegi_git::compare::{CompareOutcome, FileDiff};
 
@@ -18,7 +18,10 @@ use suaegi_forge::{
     CreateReviewInput, CreationEligibility, MergeMethod, MergeOptions, Review, ReviewLookup,
 };
 use suaegi_secrets::Secret;
-use suaegi_tracker::{IssuePage, LinearWorkspace, LinkedLinearIssue, Lookup};
+use suaegi_tracker::{
+    IssuePage, JiraAuthType, JiraConnection, JiraIssue, JiraPage, JiraViewer, LinearWorkspace,
+    LinkedJiraIssue, LinkedLinearIssue, Lookup,
+};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
@@ -151,6 +154,12 @@ pub struct WorktreeMeta {
     pub linked_linear_issue: Option<String>,
     pub linked_linear_issue_workspace_id: Option<String>,
     pub linked_linear_issue_organization_url_key: Option<String>,
+    /// N2 §2: 이 worktree에 링크된 Jira 이슈 키(예: `PROJ-123`) + 사이트. **`linked_linear_issue`와
+    /// 똑같은 데이터-손실 계약이다** — `persisted_snapshot`이 매 저장마다 `Worktree`를 새로 합성하므로
+    /// 여기 씨딩·재주입하지 않으면 한 번 저장에 링크가 사라진다(forge #14 클래스). 사이트는 딥링크·
+    /// 다중-사이트 구분용이라 키와 함께 산다.
+    pub linked_jira_issue: Option<String>,
+    pub linked_jira_site: Option<String>,
 }
 
 /// 사이드바 에이전트 피커의 한 항목. `None` = 로그인 셸(기본, 오늘의 동작).
@@ -482,6 +491,38 @@ pub enum Message {
         worktree: WorktreeId,
         issue: suaegi_tracker::Issue,
     },
+
+    // ---- N2: Jira 트래커 UI ----
+    /// 연결 폼 입력들의 변경. site/email/토큰은 각기 다른 필드에 산다(토큰만 평문 버퍼, 즉시 소거).
+    JiraSiteUrlChanged(String),
+    JiraEmailChanged(String),
+    /// 마스킹된 토큰 입력의 변경. 값은 `JiraState::token_input`(평문 버퍼)에만 잠깐 산다.
+    JiraTokenChanged(String),
+    /// Cloud/Server 토글. `JiraAuthType`을 정한다(REST 버전·인증 헤더·바디 포맷이 갈린다).
+    JiraCloudToggled(bool),
+    /// 연결 제출 — 입력들로 `JiraConnection`을 조립하고 토큰을 `Secret`로 감싸 `test_connection`을
+    /// UI 스레드 밖에서 발급한다.
+    JiraConnectSubmitted,
+    /// `tracker_tasks::jira_connect`의 완료. Found면 계정을 굳히고 이슈 조회를 잇는다; Unavailable은
+    /// **분류된 문구**를 남긴다(raw 에러/토큰 아님).
+    JiraConnected {
+        op: OpId,
+        result: Lookup<JiraViewer>,
+    },
+    /// 이슈 목록 수동 새로고침.
+    JiraIssuesRefreshRequested,
+    /// `tracker_tasks::jira_list_issues`의 완료. raw `Lookup`을 그대로 담고, 표시 매핑은
+    /// `tracker_ui::jira_issue_list`가 한다 — **`Unavailable`을 빈 목록으로 접지 않는다**.
+    JiraIssuesFetched {
+        op: OpId,
+        result: Lookup<JiraPage<JiraIssue>>,
+    },
+    /// 이슈 행의 "link this worktree" — **선택된** worktree를 이 Jira 이슈에 링크한다. 링크는
+    /// `WorktreeMeta`에 굳고 즉시 persist된다(저장을 거쳐도 남는다 — forge #14 데이터-손실 가드).
+    JiraIssueLinked {
+        worktree: WorktreeId,
+        issue: JiraIssue,
+    },
 }
 
 /// 열려 있는 Create-PR 다이얼로그의 편집 상태. 한 번에 하나만(선택된 worktree에
@@ -530,6 +571,78 @@ impl std::fmt::Debug for LinearState {
             .field("api_key_input", &"<redacted>")
             .field("authenticated", &self.token.is_some())
             .field("workspace", &self.workspace)
+            .field("connecting", &self.connecting)
+            .field("connect_error", &self.connect_error)
+            .field("issues_loading", &self.issues_loading)
+            .finish()
+    }
+}
+
+/// N2(Jira) 연결 + 이슈 목록의 UI 상태. Linear보다 **연결 입력이 많다**(Jira는 API 키 하나로
+/// 안 되고 site/email/token/Cloud-Server가 필요). **토큰은 여기서 `Secret`로만 다룬다** —
+/// `token_input`만 잠깐 평문(text_input이 `&str`을 요구)이고, 커스텀 `Debug`가 그마저 리댁션한다.
+/// 토큰/계정/이슈는 메모리 전용이고 **`persisted_snapshot`의 토큰에는 절대 안 들어간다**(토큰은
+/// `suaegi-secrets` 키체인으로만). 단, non-secret 연결 설정([`JiraConnection`])은 `Settings`에
+/// 굳어 부팅 재연결에 쓴다(토큰 없이 site/email/auth_type만).
+pub(crate) struct JiraState {
+    /// 사이트 URL 입력 버퍼(예: `https://acme.atlassian.net`). 제출 시 정규화된다.
+    pub site_url_input: String,
+    /// 로그인 이메일 입력 버퍼(Cloud/Server-Basic). Server PAT면 비워도 된다(→ Bearer).
+    pub email_input: String,
+    /// 마스킹된 토큰/PAT 입력 버퍼. 제출 즉시 비운다(평문을 오래 들고 있지 않는다).
+    pub token_input: String,
+    /// Cloud/Server 토글 상태. true=Cloud(`/rest/api/3`, ADF), false=Server(`/rest/api/2`, plain).
+    pub is_cloud: bool,
+    /// 인증된 토큰(연결 성공 또는 부팅 시 키체인/env 로드). 이슈 조회가 이걸 clone해 쓴다.
+    pub token: Option<Secret>,
+    /// 활성 연결 설정(site/email/auth_type). 성공한 연결이 채우고 **`Settings`에 굳어** 부팅
+    /// 재연결에 쓴다. 이슈 조회가 클라이언트를 재조립할 때도 이걸 clone한다. **토큰은 여기 없다.**
+    pub connection: Option<JiraConnection>,
+    /// 연결 확인된 계정(`/myself`). 성공한 `test_connection`이 채운다(연결 표시).
+    pub viewer: Option<JiraViewer>,
+    /// 연결 시도 진행 중 — 버튼을 잠그고 중복 제출을 막는다.
+    pub connecting: bool,
+    /// 마지막 연결 실패의 **분류된** 문구(raw 에러/토큰 아님).
+    pub connect_error: Option<String>,
+    /// 마지막 이슈 목록 조회 결과(raw `Lookup`). 표시 매핑(Unavailable≠no issues)은
+    /// `tracker_ui::jira_issue_list`가 한다 — 여기서 빈 목록으로 접지 않는다.
+    pub issues: Option<Lookup<JiraPage<JiraIssue>>>,
+    /// 이슈 조회 진행 중.
+    pub issues_loading: bool,
+}
+
+/// **기본은 Cloud**(가장 흔한 배포). 나머지는 빈/None(미연결). `Default` 파생 대신 손으로 써서
+/// `is_cloud: true`를 못박는다.
+impl Default for JiraState {
+    fn default() -> Self {
+        Self {
+            site_url_input: String::new(),
+            email_input: String::new(),
+            token_input: String::new(),
+            is_cloud: true,
+            token: None,
+            connection: None,
+            viewer: None,
+            connecting: false,
+            connect_error: None,
+            issues: None,
+            issues_loading: false,
+        }
+    }
+}
+
+/// 커스텀 `Debug`: `token_input`(text_input 평문 버퍼)을 절대 찍지 않는다. `Secret`은 이미
+/// 리댁션하지만 입력 버퍼는 타입이 `String`이라 여기서 막는다(`LinearState`와 같은 규율).
+impl std::fmt::Debug for JiraState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JiraState")
+            .field("site_url_input", &self.site_url_input)
+            .field("email_input", &self.email_input)
+            .field("token_input", &"<redacted>")
+            .field("is_cloud", &self.is_cloud)
+            .field("authenticated", &self.token.is_some())
+            .field("connection", &self.connection)
+            .field("viewer", &self.viewer)
             .field("connecting", &self.connecting)
             .field("connect_error", &self.connect_error)
             .field("issues_loading", &self.issues_loading)
@@ -719,6 +832,14 @@ pub struct AppState {
     /// 재연결이 진행 중인 이슈 조회를 앞질러도 낡은 결과가 새 것을 덮지 않게 한다.
     latest_linear_op: Option<OpId>,
 
+    // ---- N2: Jira 트래커 UI ----
+    /// Jira 연결 + 이슈 목록 상태. 토큰은 여기서 `Secret`로만 다루고 키체인(account=site)으로만
+    /// 저장된다. non-secret 연결 설정은 `Settings`에 굳어 부팅 재연결에 쓴다.
+    jira: JiraState,
+    /// 마지막에 발급한 Jira 네트워크 op(연결·이슈 조회 공용). Linear의 `latest_linear_op`와 같은
+    /// 규율 — 낡은 응답이 새 것을 덮지 않게 한다.
+    latest_jira_op: Option<OpId>,
+
     // ---- Plan 7b: PR 패널 ----
     /// 열려 있는 PR 패널 상태(닫혀 있으면 `worktree`가 `None`). diff 패널과 같이
     /// 필드 하나로 든다 — 머지가능성·리뷰·코멘트 + 확인 게이트 머지가 여기 산다.
@@ -829,6 +950,8 @@ impl Default for AppState {
             create_pr: None,
             linear: LinearState::default(),
             latest_linear_op: None,
+            jira: JiraState::default(),
+            latest_jira_op: None,
             pr_panel: PrPanelState::default(),
         }
     }
@@ -900,6 +1023,22 @@ impl AppState {
             tasks.push(crate::tracker_tasks::connect(op, token));
         }
 
+        // N2: 저장된 Jira 연결(`from_load`가 settings에서 올린 것)이 있으면 키체인 토큰
+        // (account=site)을 짚어 재연결(verify + 계정/이슈 조회)을 발급한다. 토큰이 없으면 연결을
+        // 시도하지 않는다 — 연결 설정은 그대로 두어(폼이 미리 채워진 채) 다음 저장에 보존되고,
+        // 사용자가 토큰만 다시 넣으면 재연결된다. 토큰은 절대 로그/JSON에 안 남는다.
+        if let Some(connection) = state.jira.connection.clone() {
+            let resolved =
+                suaegi_secrets::load(&crate::tracker_tasks::jira_secret_request(&connection.site_url));
+            if let Some(token) = resolved.secret {
+                state.jira.token = Some(token.clone());
+                state.jira.connecting = true;
+                let op = state.next_op();
+                state.latest_jira_op = Some(op);
+                tasks.push(crate::tracker_tasks::jira_connect(op, connection, token));
+            }
+        }
+
         (state, iced::Task::batch(tasks))
     }
 
@@ -912,6 +1051,24 @@ impl AppState {
         let mut state = AppState::default();
         state.repos = load.state.repos;
         state.workspace_root = load.state.settings.workspace_root;
+        // N2 §2: 저장된 Jira 연결 설정(non-secret)을 메모리로 올린다. 부팅(`boot`)이 이걸로 키체인
+        // 토큰을 짚어 재연결하고, `persisted_snapshot`이 다시 `Settings`로 굳혀 왕복이 닫힌다.
+        // 연결 폼 입력도 미리 채워, 키체인 토큰이 없을 때 사용자가 site/email을 다시 안 쳐도 되게 한다
+        // (토큰 입력은 절대 채우지 않는다 — 토큰은 디스크에 없다).
+        if let Some(cfg) = load.state.settings.jira_connection {
+            state.jira.site_url_input = cfg.site_url.clone();
+            state.jira.email_input = cfg.email.clone();
+            state.jira.is_cloud = cfg.is_cloud;
+            state.jira.connection = Some(JiraConnection {
+                site_url: cfg.site_url,
+                email: cfg.email,
+                auth_type: if cfg.is_cloud {
+                    JiraAuthType::Cloud
+                } else {
+                    JiraAuthType::Server
+                },
+            });
+        }
         state.load_origin = load.origin;
         // **부팅 시 실제로 읽는다.** 여기까지가 이 필드의 오랜 공백이었다 —
         // `persisted_snapshot`이 쓰기만 하고 아무도 읽지 않았다.
@@ -940,6 +1097,11 @@ impl AppState {
                     linked_linear_issue_workspace_id: worktree.linked_linear_issue_workspace_id,
                     linked_linear_issue_organization_url_key: worktree
                         .linked_linear_issue_organization_url_key,
+                    // N2 §2: Jira 링크도 **정확히 같은 데이터-손실 계약**으로 씨딩한다 — 안 하면
+                    // 다음 저장이 None으로 덮어써 링크가 사라진다(forge #14). persisted_snapshot의
+                    // 재주입과 짝을 이룬다.
+                    linked_jira_issue: worktree.linked_jira_issue,
+                    linked_jira_site: worktree.linked_jira_site,
                 },
             );
             worktrees_by_repo
@@ -993,6 +1155,10 @@ impl AppState {
                         linked_linear_issue_organization_url_key: meta
                             .linked_linear_issue_organization_url_key
                             .clone(),
+                        // N2 §2: Jira 링크도 meta에서 **재주입**한다 — from_load 씨딩과 짝을 이룬다.
+                        // 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다(forge #14).
+                        linked_jira_issue: meta.linked_jira_issue.clone(),
+                        linked_jira_site: meta.linked_jira_site.clone(),
                     }
                 })
             })
@@ -1007,6 +1173,13 @@ impl AppState {
             },
             settings: Settings {
                 workspace_root: self.workspace_root.clone(),
+                // N2 §2: 활성 Jira 연결(있으면)을 non-secret 설정으로 굳힌다 — 부팅 재연결의 근거.
+                // **토큰은 절대 여기 없다**(키체인 전용). auth_type을 is_cloud로 평평하게 매핑한다.
+                jira_connection: self.jira.connection.as_ref().map(|c| JiraConnectionConfig {
+                    site_url: c.site_url.clone(),
+                    email: c.email.clone(),
+                    is_cloud: c.auth_type.is_cloud(),
+                }),
             },
         }
     }
@@ -1252,6 +1425,9 @@ impl AppState {
             linked_linear_issue: None,
             linked_linear_issue_workspace_id: None,
             linked_linear_issue_organization_url_key: None,
+            // Jira 링크(N2 §2)도 마찬가지 → None(이슈 목록의 "link this worktree"가 나중에 굳힌다).
+            linked_jira_issue: None,
+            linked_jira_site: None,
         };
         // **세션을 띄울 때마다 주입한다.** 생성 시점에만 쓰면 이 기능보다 **먼저
         // 만들어진 worktree**는 설정 파일을 영영 못 받고, 파일이 지워진 경우도
@@ -1507,6 +1683,12 @@ impl AppState {
         &self.linear
     }
 
+    /// N2: Jira 연결/이슈 상태. 사이드바가 연결 폼(site/email/token/Cloud-Server)·이슈 목록을
+    /// 그릴 때 읽는다. 표시 매핑(Unavailable≠no issues)은 `tracker_ui`가 한다.
+    pub(crate) fn jira(&self) -> &JiraState {
+        &self.jira
+    }
+
     /// PR 패널 상태. `lib.rs`가 `pr_panel::view`에 넘겨 (열려 있으면) 패널을 그린다.
     pub(crate) fn pr_panel(&self) -> &PrPanelState {
         &self.pr_panel
@@ -1565,6 +1747,22 @@ impl AppState {
         self.worktree_meta
             .get(worktree)
             .and_then(|m| m.linked_linear_issue.as_deref())
+    }
+
+    /// 이 worktree에 Jira 이슈를 링크한다(N2 §2). `link_linear_issue`와 **같은 경로**로
+    /// `WorktreeMeta`에 산다 — 씨딩·재주입이 없으면 한 번 저장에 링크가 사라진다(forge #14).
+    /// 부르는 쪽이 persist한다.
+    fn link_jira_issue(&mut self, worktree: &WorktreeId, link: &LinkedJiraIssue) {
+        let meta = self.worktree_meta.entry(worktree.clone()).or_default();
+        meta.linked_jira_issue = Some(link.issue.clone());
+        meta.linked_jira_site = link.site.clone();
+    }
+
+    /// 사이드바 worktree 행이 읽는, 링크된 Jira 이슈 키(예: `PROJ-123`). 없으면 `None`.
+    pub(crate) fn linked_jira_issue(&self, worktree: &WorktreeId) -> Option<&str> {
+        self.worktree_meta
+            .get(worktree)
+            .and_then(|m| m.linked_jira_issue.as_deref())
     }
 
     /// 훅 스크립트를 설치하고, 이미 떠 있는 서버의 포트·토큰을 받아 둔다.
@@ -2470,6 +2668,9 @@ impl AppState {
                             linked_linear_issue: None,
                             linked_linear_issue_workspace_id: None,
                             linked_linear_issue_organization_url_key: None,
+                            // 갓 만든 worktree엔 링크된 Jira 이슈도 없다(N2 §2, 같은 이유).
+                            linked_jira_issue: None,
+                            linked_jira_site: None,
                         },
                     );
                     // **일회성 프롬프트를 메모리에만 담는다**(`WorktreeMeta`가 아니라).
@@ -3194,6 +3395,115 @@ impl AppState {
                 self.persist();
                 iced::Task::none()
             }
+
+            // ---- N2: Jira 트래커 UI ----
+            Message::JiraSiteUrlChanged(value) => {
+                self.jira.site_url_input = value;
+                iced::Task::none()
+            }
+            Message::JiraEmailChanged(value) => {
+                self.jira.email_input = value;
+                iced::Task::none()
+            }
+            Message::JiraTokenChanged(value) => {
+                self.jira.token_input = value;
+                iced::Task::none()
+            }
+            Message::JiraCloudToggled(is_cloud) => {
+                self.jira.is_cloud = is_cloud;
+                iced::Task::none()
+            }
+            Message::JiraConnectSubmitted => {
+                // 중복 제출 방지.
+                if self.jira.connecting {
+                    return iced::Task::none();
+                }
+                let site_url = crate::tracker_ui::normalize_site_url(&self.jira.site_url_input);
+                if site_url.is_empty() {
+                    self.jira.connect_error = Some("Enter your Jira site URL.".to_string());
+                    return iced::Task::none();
+                }
+                let token_raw = self.jira.token_input.trim().to_string();
+                if token_raw.is_empty() {
+                    self.jira.connect_error = Some("Enter a Jira API token.".to_string());
+                    return iced::Task::none();
+                }
+                let auth_type = if self.jira.is_cloud {
+                    JiraAuthType::Cloud
+                } else {
+                    JiraAuthType::Server
+                };
+                // Cloud/Server-Basic은 email이 필요하다(Basic base64). Server PAT만 email 없이(→ Bearer).
+                let email = self.jira.email_input.trim().to_string();
+                if auth_type == JiraAuthType::Cloud && email.is_empty() {
+                    self.jira.connect_error =
+                        Some("Cloud Jira needs the account email.".to_string());
+                    return iced::Task::none();
+                }
+                // 토큰 입력 버퍼를 즉시 비운다 — 평문 토큰을 UI 상태에 오래 들고 있지 않는다.
+                self.jira.token_input.clear();
+                let connection = JiraConnection {
+                    site_url,
+                    email,
+                    auth_type,
+                };
+                let token = Secret::new(token_raw);
+                // 성공 시 재조립·persist에 쓰도록 지금 굳혀 둔다(Linear가 token을 미리 세우는 것과
+                // 같은 규율). 실패하면 아래 `JiraConnected` 핸들러가 되돌린다.
+                self.jira.connection = Some(connection.clone());
+                self.jira.token = Some(token.clone());
+                self.jira.connecting = true;
+                self.jira.connect_error = None;
+                let op = self.next_op();
+                self.latest_jira_op = Some(op);
+                crate::tracker_tasks::jira_connect(op, connection, token)
+            }
+            Message::JiraConnected { op, result } => {
+                // 낡은 응답은 버린다: 재연결이 앞선 시도를 앞질렀을 수 있다.
+                if self.latest_jira_op != Some(op) {
+                    return iced::Task::none();
+                }
+                self.jira.connecting = false;
+                match crate::tracker_ui::jira_connect_view(&result) {
+                    crate::tracker_ui::JiraConnectView::Connected(viewer) => {
+                        self.jira.viewer = Some(viewer);
+                        self.jira.connect_error = None;
+                        // 연결 성공 → 활성 연결 설정을 persist해 부팅 재연결이 지속되게 한다.
+                        self.persist();
+                        // 이슈를 한 번 가져온다(같은 연결·토큰으로, UI 스레드 밖).
+                        self.request_jira_issues()
+                    }
+                    crate::tracker_ui::JiraConnectView::Failed(msg) => {
+                        // 인증 실패면 토큰·연결을 버린다 — 무효 크리덴셜로 이슈를 조회하지 않고,
+                        // 무효 연결을 persist하지 않는다(다음 저장에 굳지 않도록 connection을 지운다).
+                        self.jira.token = None;
+                        self.jira.connection = None;
+                        self.jira.viewer = None;
+                        self.jira.connect_error = Some(msg);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::JiraIssuesRefreshRequested => self.request_jira_issues(),
+            Message::JiraIssuesFetched { op, result } => {
+                if self.latest_jira_op != Some(op) {
+                    return iced::Task::none();
+                }
+                self.jira.issues_loading = false;
+                // raw `Lookup`을 그대로 담는다 — `Unavailable`을 빈 목록으로 접지 않는다.
+                // 표시 매핑(Unavailable≠no issues)은 `tracker_ui::jira_issue_list`가 한다.
+                self.jira.issues = Some(result);
+                iced::Task::none()
+            }
+            Message::JiraIssueLinked { worktree, issue } => {
+                // 이슈 + 연결된 사이트 → 도메인 링크 필드(순수 매핑). 사이트를 모르면 None(키만 링크).
+                let site = self.jira.connection.as_ref().map(|c| c.site_url.clone());
+                let link = crate::tracker_ui::jira_link_for(&issue, site.as_deref());
+                self.link_jira_issue(&worktree, &link);
+                // **저장을 거쳐도 남도록** 즉시 persist한다(forge #14 데이터-손실 가드).
+                self.persist();
+                iced::Task::none()
+            }
         }
     }
 
@@ -3207,6 +3517,20 @@ impl AppState {
         let op = self.next_op();
         self.latest_linear_op = Some(op);
         crate::tracker_tasks::list_issues(op, token)
+    }
+
+    /// 저장된 연결·토큰으로 Jira 이슈 목록 조회를 발급한다(연결 성공 직후 + 수동 새로고침). 연결이나
+    /// 토큰이 없으면(미연결) 아무것도 하지 않는다. 네트워크는 UI 스레드 밖(`Task::perform`).
+    fn request_jira_issues(&mut self) -> iced::Task<Message> {
+        let (Some(connection), Some(token)) =
+            (self.jira.connection.clone(), self.jira.token.clone())
+        else {
+            return iced::Task::none();
+        };
+        self.jira.issues_loading = true;
+        let op = self.next_op();
+        self.latest_jira_op = Some(op);
+        crate::tracker_tasks::jira_list_issues(op, connection, token)
     }
 }
 
@@ -5325,6 +5649,8 @@ mod tests {
                 linked_linear_issue: None,
                 linked_linear_issue_workspace_id: None,
                 linked_linear_issue_organization_url_key: None,
+                linked_jira_issue: None,
+                linked_jira_site: None,
             },
             Worktree {
                 id: wt("/tmp/wt-b"),
@@ -5338,6 +5664,8 @@ mod tests {
                 linked_linear_issue: None,
                 linked_linear_issue_workspace_id: None,
                 linked_linear_issue_organization_url_key: None,
+                linked_jira_issue: None,
+                linked_jira_site: None,
             },
         ];
         disk.session.panes = Some(split(
@@ -6495,6 +6823,10 @@ mod tests {
             linked_linear_issue: Some("ENG-42".into()),
             linked_linear_issue_workspace_id: Some("org-77".into()),
             linked_linear_issue_organization_url_key: Some("acme".into()),
+            // N2 §2: Jira 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입 중 하나라도
+            // 지우는 뮤턴트는 아래 두 단언에서 죽는다. 두 조각(키 + 사이트)을 다 심는다.
+            linked_jira_issue: Some("PROJ-99".into()),
+            linked_jira_site: Some("https://acme.atlassian.net".into()),
         }];
 
         let mut state = AppState::from_load(LoadDiagnostics {
@@ -6542,6 +6874,19 @@ mod tests {
                 .as_deref(),
             Some("acme"),
             "the Linear url_key coordinate must survive too"
+        );
+        // **N2 데이터-손실 가드**: from_load 씨딩(linked_jira_*) 또는 persisted_snapshot 재주입
+        // 중 하나라도 지우는 뮤턴트는 이 두 단언에서 죽는다(forge #14 클래스, 두 경로 모두 load-bearing).
+        assert_eq!(
+            saved.worktrees[0].linked_jira_issue.as_deref(),
+            Some("PROJ-99"),
+            "the linked Jira issue read from disk must survive a save — seeded into WorktreeMeta \
+             and re-injected, exactly like linked_linear_issue (forge #14 class)"
+        );
+        assert_eq!(
+            saved.worktrees[0].linked_jira_site.as_deref(),
+            Some("https://acme.atlassian.net"),
+            "the Jira site coordinate must survive too (deep-link/multi-site)"
         );
     }
 
@@ -6636,6 +6981,164 @@ mod tests {
         assert!(
             !dbg.contains(KEY),
             "the Linear API key must never appear in Debug output: {dbg}"
+        );
+    }
+
+    // ---- N2: Jira 트래커 UI ----
+
+    fn jira_issue(key: &str) -> JiraIssue {
+        JiraIssue {
+            id: format!("id_{key}"),
+            key: key.to_string(),
+            title: "Fix the bug".to_string(),
+            description: String::new(),
+            url: format!("https://acme.atlassian.net/browse/{key}"),
+            project_key: Some("PROJ".to_string()),
+            issue_type: Some("Task".to_string()),
+            status: Some("In Progress".to_string()),
+            assignee: None,
+            labels: vec![],
+        }
+    }
+
+    fn connected_jira_connection() -> JiraConnection {
+        JiraConnection {
+            site_url: "https://acme.atlassian.net".into(),
+            email: "ada@acme.com".into(),
+            auth_type: JiraAuthType::Cloud,
+        }
+    }
+
+    /// **N2 데이터-손실 가드 (리듀서 경로)**: 이슈 목록의 "link this worktree"가 굳힌 Jira 링크는
+    /// 저장을 거쳐도 남는다. `JiraIssueLinked` 핸들러의 `link_jira_issue`/`persist`를 지우는 뮤턴트는
+    /// meta 단언에서, 씨딩·재주입을 지우는 뮤턴트는 flush_and_reload 단언에서 죽는다(N1 미러).
+    #[test]
+    fn linking_a_worktree_to_a_jira_issue_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        state.persistence = Some(boot.handle);
+
+        // 연결된 사이트를 가정하고(사이트 좌표를 채우려고) 이슈를 링크한다.
+        state.jira.connection = Some(connected_jira_connection());
+        let _ = state.update(Message::JiraIssueLinked {
+            worktree: worktree_id.clone(),
+            issue: jira_issue("PROJ-42"),
+        });
+
+        // 메모리에 굳었는가(link_jira_issue).
+        assert_eq!(
+            state
+                .worktree_meta
+                .get(&worktree_id)
+                .and_then(|m| m.linked_jira_issue.as_deref()),
+            Some("PROJ-42"),
+            "linking must fold the issue key into WorktreeMeta"
+        );
+        assert_eq!(
+            state.linked_jira_issue(&worktree_id),
+            Some("PROJ-42"),
+            "the sidebar reader must see the link"
+        );
+
+        // 저장을 거쳐도 남는가(씨딩·재주입 + 사이트 좌표).
+        let saved = flush_and_reload(state, &file);
+        assert_eq!(
+            saved.worktrees[0].linked_jira_issue.as_deref(),
+            Some("PROJ-42"),
+            "the link must survive a save — WorktreeMeta seeded + re-injected (forge #14 class)"
+        );
+        assert_eq!(
+            saved.worktrees[0].linked_jira_site.as_deref(),
+            Some("https://acme.atlassian.net"),
+            "the site coordinate captured from the connected connection must survive too"
+        );
+    }
+
+    /// **토큰 규율 (c)**: Jira 토큰은 `suaegi-secrets`로만 가고 **평문 JSON에 절대 안 들어간다**.
+    /// 인메모리 토큰/입력 버퍼를 세우고 연결까지 굳혀도 `persisted_snapshot` 직렬화에 토큰이
+    /// 나타나지 않고(site/email 같은 non-secret 설정은 나타나도 됨), `JiraState`의 커스텀 Debug도
+    /// 토큰 입력 버퍼를 리댁션한다. 토큰을 영속 필드에 흘리는 뮤턴트는 JSON 단언에서 죽는다.
+    #[test]
+    fn the_jira_token_never_enters_persisted_json_or_debug() {
+        const TOKEN: &str = "jira_pat_supersecret_ABC123";
+        let (mut state, _repo_id, _worktree_id) = state_with_one_listed_worktree();
+        // 사용자가 토큰을 입력하고(평문 버퍼) 연결된 상태를 흉내낸다.
+        state.jira.token_input = TOKEN.to_string();
+        state.jira.token = Some(Secret::new(TOKEN));
+        state.jira.connection = Some(connected_jira_connection());
+        state.jira.viewer = Some(JiraViewer {
+            account_id: "acc_1".into(),
+            display_name: "Ada".into(),
+            email: Some("ada@acme.com".into()),
+        });
+
+        // 영속 스냅샷 JSON 어디에도 토큰이 없다(토큰은 키체인으로만 간다).
+        let json = serde_json::to_string(&state.persisted_snapshot()).unwrap();
+        assert!(
+            !json.contains(TOKEN),
+            "the Jira token must never appear in the persisted JSON"
+        );
+        // 대조군: non-secret 연결 설정은 실제로 굳는다(부팅 재연결의 근거) — 위 단언이 "아무것도
+        // 안 썼다"로 설명되면 안 된다.
+        assert!(
+            json.contains("acme.atlassian.net"),
+            "control: the non-secret connection config must be persisted for boot reconnect"
+        );
+        // JiraState Debug도 토큰 입력 버퍼(평문)를 리댁션한다.
+        let dbg = format!("{:?}", state.jira);
+        assert!(
+            !dbg.contains(TOKEN),
+            "the Jira token must never appear in Debug output: {dbg}"
+        );
+    }
+
+    /// 부팅 재연결의 근거: 성공한 Jira 연결은 non-secret 설정을 `Settings`에 굳히고, 그 설정은
+    /// 저장→재로드를 거쳐 `from_load`가 메모리 연결로 되살린다(토큰은 키체인이 따로 짚는다).
+    /// 이 왕복이 깨지면 "연결"이 재시작을 못 넘는다.
+    #[test]
+    fn a_jira_connection_config_survives_a_save_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let (mut state, _repo_id, _worktree_id) = state_with_one_listed_worktree();
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        state.persistence = Some(boot.handle);
+
+        state.jira.connection = Some(JiraConnection {
+            site_url: "https://acme.atlassian.net".into(),
+            email: "ada@acme.com".into(),
+            auth_type: JiraAuthType::Server,
+        });
+        state.persist();
+
+        let saved = flush_and_reload(state, &file);
+        let cfg = saved
+            .settings
+            .jira_connection
+            .clone()
+            .expect("the connection config must be persisted into Settings");
+        assert_eq!(cfg.site_url, "https://acme.atlassian.net");
+        assert_eq!(cfg.email, "ada@acme.com");
+        assert!(!cfg.is_cloud, "Server auth_type must map to is_cloud=false");
+
+        // from_load가 그 설정으로 메모리 연결을 되살린다(부팅이 재연결에 쓸 좌표).
+        let reloaded = AppState::from_load(LoadDiagnostics {
+            state: saved,
+            origin: LoadOrigin::Fresh,
+            save_blocked: false,
+        });
+        let conn = reloaded
+            .jira
+            .connection
+            .expect("from_load must revive the connection from persisted settings");
+        assert_eq!(conn.site_url, "https://acme.atlassian.net");
+        assert_eq!(conn.auth_type, JiraAuthType::Server);
+        // 폼 입력도 미리 채워진다(토큰 입력만 빼고 — 토큰은 디스크에 없다).
+        assert_eq!(reloaded.jira.site_url_input, "https://acme.atlassian.net");
+        assert!(
+            reloaded.jira.token_input.is_empty(),
+            "the token input must never be seeded from disk"
         );
     }
 
