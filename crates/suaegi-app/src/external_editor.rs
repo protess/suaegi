@@ -409,7 +409,7 @@ pub fn resolve_external_editor_launch_spec(
     }
 }
 
-/// spec을 detached로 spawn한다 — stdio 무시, unref(대기하지 않음).
+/// spec을 detached로 spawn한다 — stdio 무시, 즉시 반환(UI 블록 없음).
 ///
 /// Orca `shell.ts:64-71,92-95`의 `detached:true, stdio:'ignore'` + `unref` 등가.
 /// argv 정확성은 순수 함수 테스트가 이미 증명하므로 여기는 얇게 유지한다.
@@ -427,10 +427,11 @@ pub fn spawn_external_editor(spec: &LaunchSpec) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // detach: 자식이 우리 프로세스 그룹/세션에 매이지 않게 한다. child를 drop해
-    // wait하지 않는다(unref 등가) — reaper는 우리가 소유하지 않는 이 자식을 건드리지
-    // 않는다. Windows에서는 hide_windows_console에 따라 콘솔을 숨기는 것이 이상적이나
-    // (CREATE_NO_WINDOW), macOS-first라 여기서는 detach만 이식한다.
+    // unix에서 setsid로 자식을 우리 세션에서 분리한다(부모 종료와 무관하게 생존).
+    // setsid는 세션만 분리할 뿐 부모-자식 reaping은 바꾸지 않으므로, 아래에서
+    // 백그라운드 스레드가 wait해 좀비를 거둔다. Windows에서는 hide_windows_console에
+    // 따라 콘솔을 숨기는 것이 이상적이나(CREATE_NO_WINDOW), macOS-first라 여기서는
+    // 세션 분리만 이식한다.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -443,8 +444,14 @@ pub fn spawn_external_editor(spec: &LaunchSpec) -> io::Result<()> {
         }
     }
 
-    let _child = cmd.spawn()?;
-    // child를 drop한다: wait하지 않음(unref). detached라 좀비가 남지 않는다.
+    let child = cmd.spawn()?;
+    // 즉시 반환해 UI를 블록하지 않되, 백그라운드 스레드가 자식을 wait로 reap한다.
+    // Child를 그냥 drop하면 wait가 일어나지 않아 `open -a`/`code`/`cursor` shim처럼
+    // 곧장 종료하는 자식이 suaegi 수명 내내 좀비로 쌓인다 — 스레드가 그걸 막는다.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
     Ok(())
 }
 
