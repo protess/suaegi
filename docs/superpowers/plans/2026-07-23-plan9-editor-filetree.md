@@ -84,6 +84,12 @@ fs 리스팅/read/write + 경로 안전은 `suaegi-git`에 둔다(이미 `resolv
   `editor-self-write-registry.ts:3-13`, TTL 750ms)·conflict 배너 **미포팅**. M5 =
   **원자적 쓰기 + 저장 후 disk-signature 재베이스라인(`editor-autosave-controller.ts:143-145`)
   + open/save 시점에만 staleness 검사**. 배너급 conflict UI는 watcher 추가하는 후속 플랜으로.
+- **민감경로 denylist (M1 리뷰 INFO 이월)**: M1 containment는 `.git/hooks/pre-commit`
+  등 워크트리 *안쪽* 경로를 전부 허용한다(탈출 아님). 하지만 쓰기는 코드실행 벡터이므로
+  M5는 `.git/` 하위(특히 hooks) 쓰기를 거부하는 denylist가 필요. mutation 테스트로 가드.
+- **leaf-symlink 쓰기 (M1 리뷰 테스트갭 이월)**: write 모드에서 기존 leaf가 심링크면 M1이
+  `Resolved::Symlink`로 surface한다 — M5는 그걸 따라가 밖에 쓰지 말고 거부(또는 링크 교체)
+  해야 함. 커밋 회귀 테스트로 고정.
 - **crux**: 외부 변경 시 편집 손실(open/save staleness 검사로 감지), 루트 밖 쓰기(M1).
   상태머신 자율. 완전 자율(배너 없음).
 
