@@ -515,4 +515,186 @@ mod tests {
             KeybindingPlatform::Darwin
         ));
     }
+
+    // --- Registry real-binding pinning (table-driven) ----------------------
+    //
+    // The `code_to_dom` / `named_key_dom` matches end in `_ => ""`, so dropping
+    // any single arm survives silently — and the physical-code path only fires
+    // on non-US / mac-Option layouts that CI never exercises, so a regression
+    // would hide behind a green suite. These tables pin every `(Code, DOM)` and
+    // `(Named, DOM)` pair that appears in a `suaegi-keys` registry default
+    // binding: knocking any arm to `""` (or a wrong string) fails the row.
+
+    /// Every physical `code` that a real default binding can resolve through the
+    /// physical fallback. Letters `KeyA`-`KeyZ` and digits `Digit0`-`Digit9` are
+    /// generated below; this holds the punctuation / nav / edit / numpad /
+    /// function codes the registry actually uses (`Mod+Comma`, `Mod+Equal`,
+    /// `Mod+Minus`, `Mod+Bracket*`, `Mod+Numpad{Add,Subtract}`, arrows, `Ctrl+
+    /// PageUp/Down`, `Ctrl+Tab`, `Mod+Backspace`, `Delete`, `Shift+Insert`,
+    /// `Mod+Shift+Enter`, `F7`).
+    const REAL_PUNCT_NAV_CODES: &[(Code, &str)] = &[
+        (Code::Comma, "Comma"),
+        (Code::Equal, "Equal"),
+        (Code::Minus, "Minus"),
+        (Code::BracketLeft, "BracketLeft"),
+        (Code::BracketRight, "BracketRight"),
+        (Code::NumpadAdd, "NumpadAdd"),
+        (Code::NumpadSubtract, "NumpadSubtract"),
+        (Code::ArrowLeft, "ArrowLeft"),
+        (Code::ArrowRight, "ArrowRight"),
+        (Code::ArrowUp, "ArrowUp"),
+        (Code::ArrowDown, "ArrowDown"),
+        (Code::Enter, "Enter"),
+        (Code::Tab, "Tab"),
+        (Code::Backspace, "Backspace"),
+        (Code::Delete, "Delete"),
+        (Code::Insert, "Insert"),
+        (Code::Escape, "Escape"),
+        (Code::PageUp, "PageUp"),
+        (Code::PageDown, "PageDown"),
+        (Code::F7, "F7"),
+    ];
+
+    /// The 26 letter codes, generated so no `KeyA => ""` slip survives.
+    const LETTER_CODES: &[(Code, &str)] = &[
+        (Code::KeyA, "KeyA"),
+        (Code::KeyB, "KeyB"),
+        (Code::KeyC, "KeyC"),
+        (Code::KeyD, "KeyD"),
+        (Code::KeyE, "KeyE"),
+        (Code::KeyF, "KeyF"),
+        (Code::KeyG, "KeyG"),
+        (Code::KeyH, "KeyH"),
+        (Code::KeyI, "KeyI"),
+        (Code::KeyJ, "KeyJ"),
+        (Code::KeyK, "KeyK"),
+        (Code::KeyL, "KeyL"),
+        (Code::KeyM, "KeyM"),
+        (Code::KeyN, "KeyN"),
+        (Code::KeyO, "KeyO"),
+        (Code::KeyP, "KeyP"),
+        (Code::KeyQ, "KeyQ"),
+        (Code::KeyR, "KeyR"),
+        (Code::KeyS, "KeyS"),
+        (Code::KeyT, "KeyT"),
+        (Code::KeyU, "KeyU"),
+        (Code::KeyV, "KeyV"),
+        (Code::KeyW, "KeyW"),
+        (Code::KeyX, "KeyX"),
+        (Code::KeyY, "KeyY"),
+        (Code::KeyZ, "KeyZ"),
+    ];
+
+    /// The 10 digit codes (`Ctrl+1` / `Alt+1` etc. resolve digit-index actions).
+    const DIGIT_CODES: &[(Code, &str)] = &[
+        (Code::Digit0, "Digit0"),
+        (Code::Digit1, "Digit1"),
+        (Code::Digit2, "Digit2"),
+        (Code::Digit3, "Digit3"),
+        (Code::Digit4, "Digit4"),
+        (Code::Digit5, "Digit5"),
+        (Code::Digit6, "Digit6"),
+        (Code::Digit7, "Digit7"),
+        (Code::Digit8, "Digit8"),
+        (Code::Digit9, "Digit9"),
+    ];
+
+    /// Pin every physical `(Code, DOM)` pair a real binding depends on. Knocking
+    /// any covered arm to `""` (e.g. `Code::Minus => ""`, a zoom-out key) or a
+    /// wrong string fails the matching row. The logical `key` is irrelevant to
+    /// the `code` field, so a fixed filler char is used.
+    #[test]
+    fn physical_codes_for_real_bindings_are_pinned() {
+        for (code, dom) in REAL_PUNCT_NAV_CODES
+            .iter()
+            .chain(LETTER_CODES)
+            .chain(DIGIT_CODES)
+        {
+            let input = keybinding_input_from_iced(
+                &Key::Character("x".into()),
+                &Physical::Code(*code),
+                &no_mods(),
+            );
+            assert_eq!(input.code, *dom, "{code:?} must map to code {dom:?}");
+        }
+    }
+
+    /// Every logical named key a real binding can carry. Arrows, `Enter`, `Tab`,
+    /// `Backspace`, `Delete`, `Escape`, `Insert`, `PageUp/Down`, plus `Space`
+    /// (Shift+Space = switchInputSource) and `Super` -> DOM `"Meta"` (the Cmd
+    /// key), and `F7`.
+    const REAL_NAMED_KEYS: &[(Named, &str)] = &[
+        (Named::ArrowLeft, "ArrowLeft"),
+        (Named::ArrowRight, "ArrowRight"),
+        (Named::ArrowUp, "ArrowUp"),
+        (Named::ArrowDown, "ArrowDown"),
+        (Named::Enter, "Enter"),
+        (Named::Tab, "Tab"),
+        (Named::Backspace, "Backspace"),
+        (Named::Delete, "Delete"),
+        (Named::Escape, "Escape"),
+        (Named::Insert, "Insert"),
+        (Named::PageUp, "PageUp"),
+        (Named::PageDown, "PageDown"),
+        (Named::Space, " "),
+        (Named::Super, "Meta"),
+        (Named::F7, "F7"),
+    ];
+
+    /// Pin every named `(Named, DOM)` pair a real binding depends on. Knocking
+    /// any covered arm to `""` (e.g. `Named::PageUp => ""`) or a wrong string
+    /// fails the matching row. A filler physical code is passed since only the
+    /// logical `key` field is under test.
+    #[test]
+    fn named_keys_for_real_bindings_are_pinned() {
+        for (named, dom) in REAL_NAMED_KEYS {
+            let input = keybinding_input_from_iced(
+                &Key::Named(*named),
+                &Physical::Code(Code::Escape),
+                &no_mods(),
+            );
+            assert_eq!(input.key, *dom, "{named:?} must map to key {dom:?}");
+        }
+    }
+
+    // --- End-to-end physical-fallback through the resolver -----------------
+
+    /// macOS Option+`-` composes to a non-Latin char (`"–"`, en dash), so the
+    /// resolver must fall back to the physical `Minus` code to match `Alt+Minus`.
+    /// This proves the adapter's separate raw-`key` / `code` output drives the
+    /// mac-Option **punctuation** physical fallback — the path that never runs on
+    /// a US-QWERTY CI box.
+    #[test]
+    fn option_minus_resolves_to_alt_minus_on_darwin() {
+        let input = from(
+            Key::Character("–".into()),
+            Code::Minus,
+            mods(true, false, false, false),
+        );
+        assert_eq!(input.key, "–");
+        assert_eq!(input.code, "Minus");
+        assert!(keybinding_matches_input(
+            "Alt+Minus",
+            &input,
+            KeybindingPlatform::Darwin
+        ));
+    }
+
+    /// The real `Mod+Alt+ArrowLeft` binding (worktree.history.back): a
+    /// Cmd+Option+Left event on darwin (logical `"ArrowLeft"`, code `ArrowLeft`,
+    /// logo+alt) matches end-to-end. Exercises the logical arrow path an actual
+    /// default binding uses.
+    #[test]
+    fn cmd_alt_arrow_left_resolves_to_history_back_on_darwin() {
+        let input = from(
+            Key::Named(Named::ArrowLeft),
+            Code::ArrowLeft,
+            mods(true, true, false, false),
+        );
+        assert!(keybinding_matches_input(
+            "Mod+Alt+ArrowLeft",
+            &input,
+            KeybindingPlatform::Darwin
+        ));
+    }
 }
