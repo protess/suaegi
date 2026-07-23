@@ -2,7 +2,9 @@
 //! in Orca `keybindings.test.ts` (the `keybinding resolution` + `digit-index
 //! shortcuts` describe blocks), plus crux tests that pin each enumerable branch
 //! (bucketing, `Mod`-resolved identity, the customized-only rule, digit-index
-//! collapse, and a real-registry-bucket sample).
+//! collapse, distinguishing double-tap identity, the binding+action_ids dedup
+//! key, a real-registry-bucket sample, and an all-customized registry-integrity
+//! guard).
 
 use super::*;
 use crate::registry::KeybindingActionId as A;
@@ -13,6 +15,22 @@ fn overrides(pairs: &[(KeybindingActionId, &[&str])]) -> KeybindingOverrides {
     pairs
         .iter()
         .map(|(action, chords)| (*action, chords.iter().map(|s| s.to_string()).collect()))
+        .collect()
+}
+
+/// Every action mapped to its own effective default on `platform` — so the
+/// customized set becomes ALL actions and the customized-only filter turns into a
+/// pass-through. Used to assert the registry itself is collision-free (see
+/// `registry_has_no_builtin_collisions_when_all_customized`).
+fn all_customized_overrides(platform: crate::registry::KeybindingPlatform) -> KeybindingOverrides {
+    crate::KEYBINDING_DEFINITIONS
+        .iter()
+        .map(|def| {
+            (
+                def.id,
+                crate::get_effective_keybindings_for_action(def.id, platform, None),
+            )
+        })
         .collect()
 }
 
@@ -266,6 +284,59 @@ fn digit_index_ranges_swap_modifiers_without_false_conflict() {
     assert_eq!(find_keybinding_conflicts(Darwin, Some(&ov)), vec![]);
 }
 
+// Crux (double-tap identity is distinguishing): two DIFFERENT double-tap chords
+// in the SAME bucket, both customized, must NOT conflict — their identities
+// differ (`DoubleTap:Shift` vs `DoubleTap:Alt`). Collapsing the double-tap branch
+// of `conflict_identity_for_parsed` to a constant would make them share an
+// identity and wrongly report, so this negative test kills that mutant.
+#[test]
+fn crux_distinct_double_taps_in_same_bucket_do_not_conflict() {
+    let ov = overrides(&[
+        (A::WorktreeQuickOpen, &["DoubleTap+Shift"]),
+        (A::ViewTasks, &["DoubleTap+Alt"]),
+    ]);
+    // Both are Global scope (same bucket) and both customized, yet distinct.
+    assert_eq!(find_keybinding_conflicts(Darwin, Some(&ov)), vec![]);
+}
+
+// Crux (dedup key includes action_ids, not just binding). A single override can
+// produce TWO conflicts sharing the same `binding` string but different action
+// sets, via dual-bucketing: tab.openQuickCommandsMenu (conflict_group "global",
+// scope "tabs") customized onto Mod+Shift+Y meets a Global-scope mate in the
+// "global" bucket and a Tabs-scope mate in the "tabs" bucket. Both rows must
+// survive; a binding-only dedup key (Orca dedups on binding + actionIds,
+// :2282-2289) would collapse them to one.
+#[test]
+fn crux_dedup_preserves_distinct_action_sets_on_same_binding() {
+    let ov = overrides(&[
+        (A::TabOpenQuickCommandsMenu, &["Mod+Shift+Y"]),
+        (A::ViewTasks, &["Mod+Shift+Y"]), // Global-scope mate -> "global" bucket
+        (A::TabNewTerminal, &["Mod+Shift+Y"]), // Tabs-scope mate -> "tabs" bucket
+    ]);
+    let conflicts = find_keybinding_conflicts(Darwin, Some(&ov));
+
+    // Exactly the two expected rows carry this binding, with distinct action sets.
+    let on_binding: Vec<_> = conflicts
+        .iter()
+        .filter(|c| c.binding == "Mod+Shift+Y")
+        .collect();
+    assert_eq!(
+        on_binding.len(),
+        2,
+        "expected two distinct-action-set rows on Mod+Shift+Y, got {conflicts:#?}"
+    );
+    assert_contains_conflict(
+        &conflicts,
+        "Mod+Shift+Y",
+        &[A::ViewTasks, A::TabOpenQuickCommandsMenu],
+    );
+    assert_contains_conflict(
+        &conflicts,
+        "Mod+Shift+Y",
+        &[A::TabNewTerminal, A::TabOpenQuickCommandsMenu],
+    );
+}
+
 // --- Crux tests: each pins one enumerable branch -----------------------------
 
 // Crux (bucketing): two actions with the SAME chord but DIFFERENT buckets do NOT
@@ -330,7 +401,8 @@ fn crux_mod_identity_is_platform_resolved() {
 //     `macos_rename_shortcuts_bucket_by_shared_group_not_scope` (a size-1 bucket
 //     containing the customized action would leak in as a spurious conflict).
 // A regression that *introduces* a built-in collision is caught by
-// `default_registry_is_conflict_free_on_all_platforms` below.
+// `registry_has_no_builtin_collisions_when_all_customized` below (which, being
+// non-hollow, would also make the "always report" mutant killable at that point).
 #[test]
 fn crux_customized_only_rule() {
     // A customized action colliding with a built-in in the same bucket IS
@@ -353,16 +425,37 @@ fn crux_customized_only_rule() {
     );
 }
 
-// The default (no-override) registry is conflict-free on every platform. This is
-// both the Orca oracle (`findKeybindingConflicts('linux'|'darwin')` -> []) and
-// the guard that a future registry edit introducing a built-in same-bucket
-// collision fails loudly (which would also make the customized-only mutant
-// killable again).
+// The registry has NO built-in same-bucket collisions on any platform.
+//
+// This must be asserted with EVERY action customized to its own effective
+// default — NOT with `find_keybinding_conflicts(_, None)`. With empty overrides
+// the customized set is empty, so the customized-only filter drops every bucket
+// and `[]` is returned regardless of the registry's contents (a hollow guard: a
+// real built-in collision, e.g. view.tasks defaulting to Mod+P, would still slip
+// through). By mapping every action to its own default, the customized set
+// becomes ALL actions, the filter turns into a pass-through, and the assertion
+// genuinely reflects whether any two registry rows collide in a shared bucket.
+//
+// Consequence for the "always report" (customized-filter removed) mutant: with
+// this non-hollow guard, that mutant is killable exactly when a built-in
+// collision exists. On today's clean registry the two are behaviorally identical
+// (no collisions -> `[]` either way), so the mutant stays equivalent HERE; but
+// any future registry edit that introduces a built-in collision trips this guard
+// AND makes the filter observable. (See the NOTE on `crux_customized_only_rule`.)
 #[test]
-fn default_registry_is_conflict_free_on_all_platforms() {
-    assert_eq!(find_keybinding_conflicts(Darwin, None), vec![]);
-    assert_eq!(find_keybinding_conflicts(Linux, None), vec![]);
-    assert_eq!(find_keybinding_conflicts(Win32, None), vec![]);
+fn registry_has_no_builtin_collisions_when_all_customized() {
+    for platform in [Darwin, Linux, Win32] {
+        let ov = all_customized_overrides(platform);
+        assert_eq!(
+            find_keybinding_conflicts_with_options(
+                platform,
+                Some(&ov),
+                &FindKeybindingConflictOptions::default(),
+            ),
+            vec![],
+            "unexpected built-in same-bucket collision on {platform:?}"
+        );
+    }
 }
 
 // Crux (digit-index collapse): two digit-index actions colliding via the Mod+1..9

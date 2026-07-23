@@ -53,6 +53,10 @@ pub struct FindKeybindingConflictOptions<'a> {
 /// The `resolveModifierToken` string form used in a double-tap identity. Orca
 /// interpolates the resolved token (`'Meta'`/`'Control'`/`'Alt'`/`'Shift'`)
 /// directly (`keybindings.ts:2048`).
+// F4 (INFO): the exact casing here is unobservable — a double-tap identity is
+// only ever a HashMap key compared against other double-tap identities (all built
+// by this same function), never against the non-double-tap `Meta+Control+..`
+// identity form; kept matching Orca's capitalization for fidelity.
 fn physical_modifier_str(modifier: PhysicalModifier) -> &'static str {
     match modifier {
         PhysicalModifier::Meta => "Meta",

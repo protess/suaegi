@@ -46,6 +46,11 @@ impl Scope {
     /// action together with every `Scope::Global` action. Mirror of the raw
     /// `definition.scope` string flowing into Orca `findKeybindingConflicts`
     /// (`keybindings.ts:2253`).
+    // F5 (INFO): only `"global"` (matched against the `"global"` conflict group)
+    // is externally observable; the exact camelCase of the multi-word scopes
+    // (e.g. `"fileExplorer"`) is unobserved — no conflict group uses those names,
+    // so intra-scope bucketing only needs this fn to be internally consistent.
+    // Kept camelCase to match Orca's `KeybindingScope` union verbatim.
     pub const fn as_bucket_str(self) -> &'static str {
         match self {
             Scope::Global => "global",
