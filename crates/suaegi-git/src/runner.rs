@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -117,6 +117,38 @@ async fn drain<R: AsyncRead + Unpin>(pipe: Option<&mut R>) {
     }
 }
 
+/// 자식 stdin에 전부 쓰고 **쓰기 끝을 닫아 EOF를 보낸다.** 읽기(`read_capped`)와
+/// **동시에** 돌려야 한다 — 순차로 하면 고전적 교착이다: 자식이 stdout 파이프가
+/// 가득 차 write에 블록되면 더 이상 stdin을 읽지 않고, 그러면 우리 `write_all`이
+/// 영영 안 끝난다. `run_full`은 이 future를 `read_capped`들과 함께 `try_join!`에
+/// 넣어 그 교착을 없앤다.
+///
+/// **EPIPE(BrokenPipe)는 오류가 아니다.** 자식이 우리 입력을 다 읽기 전에 끝낼 수
+/// 있다(예: `check-ignore`가 조기 종료). 그건 자식의 선택이고 진실은 종료 코드에
+/// 있으므로, 여기서 죽이지 않고 조용히 멈춘다. 종료 코드 판정은 호출부가 한다.
+///
+/// 파이프를 **값으로 받아** future가 끝나면 떨어지게 한다 — `shutdown` 뒤 drop까지
+/// 겹쳐 fd가 확실히 닫힌다.
+async fn write_stdin(pipe: Option<ChildStdin>, data: Option<&[u8]>) -> Result<(), RunAbort> {
+    let (Some(mut pipe), Some(data)) = (pipe, data) else {
+        return Ok(());
+    };
+    match pipe.write_all(data).await {
+        Ok(()) => {
+            // flush + 쓰기 끝 닫기 → git이 EOF를 본다. 여기서도 BrokenPipe는 무해.
+            if let Err(e) = pipe.shutdown().await {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(RunAbort::Io(e));
+                }
+            }
+            Ok(())
+        }
+        // 자식이 먼저 읽기를 멈췄다 — 정상. 나머지는 종료 코드가 말한다.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(RunAbort::Io(e)),
+    }
+}
+
 /// 죽인 자식을 거둔다. **기다림에 상한을 둔다** — 킬이 통하지 않는 경우(Windows의
 /// 손자, 저지 불가 상태의 자식)에 `wait()`는 영영 돌아오지 않고, 그러면 이 함수를
 /// 부른 git 호출이 **자기 타임아웃보다 오래** 매달린다. mutation으로 실측한 것도
@@ -135,7 +167,7 @@ impl GitRunner {
     }
 
     pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
-        self.run_full(cwd, args, DEFAULT_TIMEOUT, &[])
+        self.run_full(cwd, args, DEFAULT_TIMEOUT, &[], None)
             .await
             .map(lossy)
     }
@@ -146,7 +178,9 @@ impl GitRunner {
         args: &[&str],
         timeout: Duration,
     ) -> Result<GitOutput, GitError> {
-        self.run_full(cwd, args, timeout, &[]).await.map(lossy)
+        self.run_full(cwd, args, timeout, &[], None)
+            .await
+            .map(lossy)
     }
 
     pub async fn run_expecting(
@@ -155,7 +189,7 @@ impl GitRunner {
         args: &[&str],
         extra_ok_codes: &[i32],
     ) -> Result<GitOutput, GitError> {
-        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes)
+        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes, None)
             .await
             .map(lossy)
     }
@@ -167,8 +201,28 @@ impl GitRunner {
         args: &[&str],
         extra_ok_codes: &[i32],
     ) -> Result<GitBytes, GitError> {
-        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes)
+        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes, None)
             .await
+    }
+
+    /// git의 stdin에 `stdin` 바이트를 먹인다. `git check-ignore --stdin`처럼
+    /// **positional 인자로는 경로 수 폭발/인자 길이 한계에 걸리는** 호출용
+    /// (`check-ignored-paths.ts:18-30`).
+    ///
+    /// 쓰기와 읽기를 **동시에** 돌려 교착을 피한다(`write_stdin` 참고). 출력 상한·
+    /// 타임아웃·프로세스 트리 킬은 다른 경로와 똑같이 적용된다. `extra_ok_codes`는
+    /// `run_expecting`과 같은 의미다 — check-ignore의 **exit 1("무시된 것 없음")을
+    /// 오류가 아닌 성공으로** 받으려면 `&[1]`을 넘긴다.
+    pub async fn run_with_stdin(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        stdin: &[u8],
+        extra_ok_codes: &[i32],
+    ) -> Result<GitOutput, GitError> {
+        self.run_full(cwd, args, DEFAULT_TIMEOUT, extra_ok_codes, Some(stdin))
+            .await
+            .map(lossy)
     }
 
     async fn run_full(
@@ -177,6 +231,7 @@ impl GitRunner {
         args: &[&str],
         timeout: Duration,
         extra_ok_codes: &[i32],
+        stdin: Option<&[u8]>,
     ) -> Result<GitBytes, GitError> {
         let args_str = args.join(" ");
         let mut cmd = Command::new("git");
@@ -185,7 +240,13 @@ impl GitRunner {
             // 파서가 항상 영어 출력을 보도록; 인증 프롬프트로 행 걸리지 않도록
             .env("LC_ALL", "C")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
+            // stdin을 줄 때만 파이프한다. 없으면 기존 그대로 null — 인증 프롬프트로
+            // 행 걸리지 않게 하는 불변식을 유지한다.
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -193,6 +254,7 @@ impl GitRunner {
         cmd.process_group(0); // 타임아웃 시 그룹 전체 킬 가능하게
 
         let mut child = cmd.spawn()?;
+        let stdin_pipe = child.stdin.take();
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
         let mut out = Vec::new();
@@ -200,14 +262,17 @@ impl GitRunner {
         let budget = AtomicUsize::new(0);
 
         let waited = tokio::time::timeout(timeout, async {
-            // stdout/stderr 동시 드레인 — 순차로 읽으면 반대쪽 파이프가 가득 차
-            // 자식이 블록되는 교착 가능
+            // stdin 쓰기와 stdout/stderr 읽기를 **모두 동시에** 돌린다 — 어느 하나를
+            // 순차로 하면 반대쪽 파이프가 가득 차 자식이 블록되는 교착이 난다
+            // (stdin write vs stdout read 교착 포함, `write_stdin` 참고).
             let read_out = read_capped(stdout_pipe.as_mut(), &mut out, &budget);
             let read_err = read_capped(stderr_pipe.as_mut(), &mut err, &budget);
-            let (status, _, _) = tokio::try_join!(
+            let write_in = write_stdin(stdin_pipe, stdin);
+            let (status, _, _, _) = tokio::try_join!(
                 async { child.wait().await.map_err(RunAbort::Io) },
                 read_out,
-                read_err
+                read_err,
+                write_in
             )?;
             Ok::<_, RunAbort>(status)
         })
