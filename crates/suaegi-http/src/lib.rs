@@ -1,9 +1,16 @@
-//! HTTP 전송 추상화. **테스트가 real github.com을 안 치게 하는 경계**다 — gh 백엔드의
-//! PATH-주입 fake-gh 스크립트에 대응하는 HTTP 아날로그다. 실제 impl([`ReqwestTransport`])은
-//! reqwest를 감싸고, 테스트는 [`FakeTransport`]로 canned 응답(진짜 GitHub JSON·상태·헤더)을 준다.
+//! suaegi-http — 주입 가능한 HTTP 전송 추상화. **테스트가 real 원격을 안 치게 하는 경계**다.
+//! 실제 impl([`ReqwestTransport`])은 reqwest를 감싸고, 테스트는 [`fake::FakeTransport`]로 canned
+//! 응답(진짜 서버 JSON·상태·헤더)을 준다.
 //!
-//! **분류·None-vs-Unavailable 규율은 이 층 위(forge)에 산다** — 전송은 상태코드/헤더/바디를
-//! 있는 그대로만 나른다. 그래야 `classify`를 mutate하면 forge 테스트가 깨진다(공허하지 않다).
+//! # 레이어링 (§Q5)
+//! 이 크레이트는 내부 크레이트에 의존하지 않는다(async-trait + reqwest 뿐) — `suaegi-secrets`가
+//! 세운 leaf-크레이트 선례와 같은 모양. 그래서 `suaegi-forge`(PR forge)와 `suaegi-tracker`
+//! (이슈트래커)가 **둘 다** 사이클 없이 이걸 의존한다. 이슈트래커가 "PR forge"에 의존하는
+//! 레이어링 스멜을 피하려 여기로 추출했다(원래 `suaegi-forge/src/github_http/transport.rs`).
+//!
+//! **분류·None-vs-Unavailable 규율은 이 층 위(forge/tracker)에 산다** — 전송은 상태코드/헤더/
+//! 바디를 있는 그대로만 나른다. 그래야 각 소비자의 `classify`를 mutate하면 그 크레이트 테스트가
+//! 깨진다(공허하지 않다).
 //!
 //! **토큰 리댁션**: 전송 에러는 절대 토큰/원본 URL을 담지 않는다 — 고정 라벨만. 토큰은
 //! 오직 `Authorization` 헤더로만 실린다([`HttpRequest::headers`]).
@@ -11,7 +18,7 @@
 use async_trait::async_trait;
 use std::time::Duration;
 
-/// 우리가 쓰는 HTTP 메서드(GitHub REST v3 표면에 필요한 것만).
+/// 우리가 쓰는 HTTP 메서드(REST/GraphQL 표면에 필요한 것만).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
@@ -19,20 +26,20 @@ pub enum HttpMethod {
     Put,
 }
 
-/// forge가 전송에 넘기는 요청. `headers`에 `Authorization`이 들어간다(유일한 토큰 경로).
+/// 소비자가 전송에 넘기는 요청. `headers`에 `Authorization`이 들어간다(유일한 토큰 경로).
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: String,
-    /// 헤더(Authorization, Accept, User-Agent, X-GitHub-Api-Version 등).
+    /// 헤더(Authorization, Accept, User-Agent, Content-Type 등).
     pub headers: Vec<(String, String)>,
     /// JSON 바디(POST/PUT). GET이면 None.
     pub body: Option<String>,
-    /// 이 요청 하나의 타임아웃. read/create/merge가 서로 다른 값을 준다(gh runner 미러).
+    /// 이 요청 하나의 타임아웃. read/create/merge가 서로 다른 값을 준다.
     pub timeout: Duration,
 }
 
-/// 전송이 돌려주는 응답. 상태/헤더/바디 raw — 분류는 forge가 한다.
+/// 전송이 돌려주는 응답. 상태/헤더/바디 raw — 분류는 소비자가 한다.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -53,7 +60,7 @@ impl HttpResponse {
 }
 
 /// 전송-레벨 실패(HTTP 상태를 받기 **전**의 실패: DNS/연결/TLS/타임아웃). **토큰·원본 URL을
-/// 절대 담지 않는다** — 고정 라벨만. forge가 이를 분류된 `ForgeUnavailable::Network`로 접는다.
+/// 절대 담지 않는다** — 고정 라벨만. 소비자가 이를 분류된 unavailable로 접는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     /// 요청이 타임아웃.
@@ -63,13 +70,13 @@ pub enum TransportError {
 }
 
 /// 주입 가능한 HTTP 전송. 실제는 reqwest, 테스트는 fake. `Send + Sync`라 `Arc<dyn ..>`로
-/// forge가 들고 다닐 수 있다(forge는 `Send` future를 낸다).
+/// 소비자가 들고 다닐 수 있다(async future를 낸다).
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, TransportError>;
 }
 
-/// reqwest 기반 실제 전송. **여기가 real github.com을 치는 유일한 지점**(human-eyes).
+/// reqwest 기반 실제 전송. **여기가 real 원격을 치는 유일한 지점**(human-eyes).
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
@@ -144,9 +151,10 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
-/// 주입용 fake 전송(테스트 전용). canned 응답 큐 + 받은 요청 기록.
-#[cfg(test)]
-pub(crate) mod fake {
+/// 주입용 fake 전송. **`test-support` 피처 뒤**에 있어 프로덕션 빌드엔 안 실린다 — 소비 크레이트가
+/// dev-dependencies에서만 피처를 켠다. canned 응답 큐 + 받은 요청 기록.
+#[cfg(feature = "test-support")]
+pub mod fake {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -154,14 +162,14 @@ pub(crate) mod fake {
     /// canned 응답을 순서대로 돌려주고, 받은 요청을 기록한다. 큐가 비면 마지막 요청을
     /// 재사용하지 않고 500을 낸다(테스트가 호출 수를 정확히 맞추게).
     #[derive(Default)]
-    pub(crate) struct FakeTransport {
+    pub struct FakeTransport {
         responses: Mutex<VecDeque<Result<HttpResponse, TransportError>>>,
         requests: Mutex<Vec<HttpRequest>>,
     }
 
     impl FakeTransport {
         /// 단일 200/JSON 응답.
-        pub(crate) fn ok_json(status: u16, body: &str) -> Self {
+        pub fn ok_json(status: u16, body: &str) -> Self {
             let t = Self::default();
             t.push_response(Ok(HttpResponse {
                 status,
@@ -172,7 +180,7 @@ pub(crate) mod fake {
         }
 
         /// 헤더 딸린 응답.
-        pub(crate) fn with_response(status: u16, headers: &[(&str, &str)], body: &str) -> Self {
+        pub fn with_response(status: u16, headers: &[(&str, &str)], body: &str) -> Self {
             let t = Self::default();
             t.push_response(Ok(HttpResponse {
                 status,
@@ -186,34 +194,30 @@ pub(crate) mod fake {
         }
 
         /// 전송 에러(네트워크/타임아웃).
-        pub(crate) fn with_error(err: TransportError) -> Self {
+        pub fn with_error(err: TransportError) -> Self {
             let t = Self::default();
             t.push_response(Err(err));
             t
         }
 
-        pub(crate) fn push_response(&self, r: Result<HttpResponse, TransportError>) {
+        pub fn push_response(&self, r: Result<HttpResponse, TransportError>) {
             self.responses.lock().unwrap().push_back(r);
         }
 
         /// 이 전송이 받은 요청들(순서대로).
-        pub(crate) fn requests(&self) -> Vec<HttpRequest> {
+        pub fn requests(&self) -> Vec<HttpRequest> {
             self.requests.lock().unwrap().clone()
         }
 
         /// 마지막 요청의 특정 헤더 값.
-        pub(crate) fn last_header(&self, name: &str) -> Option<String> {
+        pub fn last_header(&self, name: &str) -> Option<String> {
             let want = name.to_ascii_lowercase();
-            self.requests
-                .lock()
-                .unwrap()
-                .last()
-                .and_then(|r| {
-                    r.headers
-                        .iter()
-                        .find(|(k, _)| k.to_ascii_lowercase() == want)
-                        .map(|(_, v)| v.clone())
-                })
+            self.requests.lock().unwrap().last().and_then(|r| {
+                r.headers
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase() == want)
+                    .map(|(_, v)| v.clone())
+            })
         }
     }
 
@@ -231,6 +235,9 @@ pub(crate) mod fake {
         }
     }
 }
+
+#[cfg(feature = "test-support")]
+pub use fake::FakeTransport;
 
 #[cfg(test)]
 mod tests {

@@ -9,11 +9,12 @@ pub mod classify;
 pub mod eligibility;
 pub mod forge;
 pub mod parse;
-pub mod transport;
 
 pub use eligibility::http_creation_eligibility;
 pub use forge::{HttpGhForge, KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
-pub use transport::{HttpTransport, ReqwestTransport};
+// 전송 타입은 §Q5에서 `suaegi-http`로 추출됨. 기존 `suaegi_forge::{HttpTransport,ReqwestTransport}`
+// 공개 경로를 유지하려 여기서 재수출한다(하위 크레이트 import churn 최소화).
+pub use suaegi_http::{HttpTransport, ReqwestTransport};
 
 /// GitHub 원격을 서빙할 백엔드 선택. gh(CLI)를 **우선**하고(이미 주력), gh가 없거나 미인증
 /// 이지만 토큰이 있으면 HTTP로 폴백한다. 둘 다 아니면 gh(→ 기존 NotInstalled/NotAuthenticated

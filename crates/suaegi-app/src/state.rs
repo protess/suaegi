@@ -883,6 +883,11 @@ impl AppState {
                         created_with_agent: meta.created_with_agent,
                         created_at_unix_ms: meta.created_at_unix_ms,
                         linked_github_pr: meta.linked_github_pr,
+                        // Linear 링크(N1 §1.3)는 아직 WorktreeMeta로 씨딩되지 않는다(UI 배선은
+                        // §4 후속). 합성 시 None으로 둔다 — serde(default)가 로드도 커버한다.
+                        linked_linear_issue: None,
+                        linked_linear_issue_workspace_id: None,
+                        linked_linear_issue_organization_url_key: None,
                     }
                 })
             })
@@ -1138,6 +1143,10 @@ impl AppState {
             created_with_agent: created.created_with_agent,
             created_at_unix_ms: created.created_at_unix_ms,
             linked_github_pr: created.linked_github_pr,
+            // Linear 링크(N1 §1.3)는 아직 이 경로로 배선되지 않는다(§4 후속) → None.
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
         };
         // **세션을 띄울 때마다 주입한다.** 생성 시점에만 쓰면 이 기능보다 **먼저
         // 만들어진 worktree**는 설정 파일을 영영 못 받고, 파일이 지워진 경우도
@@ -5098,6 +5107,9 @@ mod tests {
                 created_with_agent: None,
                 created_at_unix_ms: 1,
                 linked_github_pr: None,
+                linked_linear_issue: None,
+                linked_linear_issue_workspace_id: None,
+                linked_linear_issue_organization_url_key: None,
             },
             Worktree {
                 id: wt("/tmp/wt-b"),
@@ -5108,6 +5120,9 @@ mod tests {
                 created_with_agent: None,
                 created_at_unix_ms: 2,
                 linked_github_pr: None,
+                linked_linear_issue: None,
+                linked_linear_issue_workspace_id: None,
+                linked_linear_issue_organization_url_key: None,
             },
         ];
         disk.session.panes = Some(split(
@@ -6257,6 +6272,9 @@ mod tests {
             // `persisted_snapshot`이 매 저장마다 Worktree를 새로 합성하므로, 이 값이
             // `WorktreeMeta`로 씨딩·재주입되지 않으면 한 번 저장에 사라진다.
             linked_github_pr: Some(1234),
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
         }];
 
         let mut state = AppState::from_load(LoadDiagnostics {
