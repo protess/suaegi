@@ -24,7 +24,9 @@ use suaegi_term::presence::AgentPresence;
 use crate::agent_status::contract::BadgeState;
 use crate::forge_ui::{self, CreatePrAffordance, PrIndicator};
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
-use crate::state::{worktree_id_for, AppState, CreatePrDraft, Message};
+use crate::state::{worktree_id_for, AppState, CreatePrDraft, LinearState, Message};
+use crate::tracker_ui::{self, IssueListView};
+use suaegi_core::domain::WorktreeId;
 
 // PR 표시자 색. 배지와 같은 팔레트 계열이되(사이드바 톤 통일) 상태를 색으로 구별한다.
 const PR_NEUTRAL: Color = Color::from_rgb(0.53, 0.53, 0.53);
@@ -32,6 +34,10 @@ const PR_OPEN: Color = Color::from_rgb(0.18, 0.63, 0.26);
 const PR_MERGED: Color = Color::from_rgb(0.52, 0.34, 0.72);
 const PR_CLOSED: Color = Color::from_rgb(0.75, 0.22, 0.17);
 const PR_UNKNOWN: Color = Color::from_rgb(0.85, 0.55, 0.0);
+// Linear 링크/이슈 색. PR 팔레트와 구별되는 보라 계열(트래커 vs forge).
+const LINEAR_LINK: Color = Color::from_rgb(0.42, 0.45, 0.85);
+// 이슈 조회 실패 색. **"no issues"와 시각적으로 구별**한다 — Unavailable≠none의 UI 계약.
+const LINEAR_UNAVAILABLE: Color = Color::from_rgb(0.85, 0.55, 0.0);
 
 /// 사이드바 고정 폭. `pane_grid`는 고정 폭 pane이 없고(비율 분할만) 사이드바가
 /// 터미널 격자 한가운데로 드래그될 수 있으므로, 사이드바는 pane이 아니라 상위
@@ -46,6 +52,10 @@ pub fn view(state: &AppState) -> Element<'_, Message> {
     if let Some(dialog) = state.create_pr_dialog() {
         list = list.push(create_pr_form(dialog));
     }
+
+    // N1: Linear 연결 + 이슈 목록. 픽셀·상호작용은 사람 눈으로 본다 — 로직(연결 결과 매핑,
+    // Unavailable≠no issues)은 `tracker_ui`가 검사한다. 링크 타깃은 **선택된** worktree다.
+    list = list.push(linear_panel(state));
 
     for group in grouped_worktrees(state) {
         list = list.push(repo_group(state, &group));
@@ -173,6 +183,15 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
         let presence = state.worktree_presence(&worktree_id);
         let badge = state.worktree_badge(&worktree_id);
         rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, badge, presence));
+        // N1: 링크된 Linear 이슈가 있으면 worktree 행 아래에 보여준다(식별자만 — 딥링크
+        // 좌표는 메타에 있고 N3 write-back이 쓴다).
+        if let Some(issue) = state.linked_linear_issue(&worktree_id) {
+            rows = rows.push(
+                text(format!("  ⌁ {issue}"))
+                    .size(11)
+                    .color(LINEAR_LINK),
+            );
+        }
         // Plan 7a-1: PR 상태 표시자 + 새로고침 + Create-PR 어포던스. 캐시에서
         // 파생하되 매핑은 `forge_ui`가 검사한다(Unavailable≠NoPr, Offer는 자격 있을 때만).
         let status = state.github_status_for(&worktree_id);
@@ -426,6 +445,122 @@ fn create_pr_form(dialog: &CreatePrDraft) -> Element<'_, Message> {
     form = form.push(row![submit, cancel].spacing(6));
 
     container(form).padding(8).into()
+}
+
+/// N1: Linear 패널. 미연결이면 **마스킹된** 키 입력 + Connect, 연결 중이면 진행 표시,
+/// 연결됐으면 워크스페이스(org) 이름 + 이슈 목록을 그린다.
+///
+/// **픽셀·상호작용은 사람 눈으로 본다.** 검사되는 결정은 `tracker_ui`가 값으로 뽑는다:
+/// 연결 결과 매핑(성공/실패), 그리고 crux인 **Unavailable≠no issues**(이슈 목록 매핑).
+fn linear_panel(state: &AppState) -> Element<'_, Message> {
+    let linear: &LinearState = state.linear();
+    let selected = state.selected_worktree().cloned();
+
+    let mut panel = column![text("Linear").size(14)].spacing(6);
+
+    match &linear.workspace {
+        // 연결됨: org 이름 + 이슈 새로고침 + 이슈 목록.
+        Some(ws) => {
+            panel = panel.push(
+                row![
+                    text(format!("● {}", ws.name)).size(12).color(PR_OPEN),
+                    button(text("↻ issues").size(11))
+                        .on_press(Message::LinearIssuesRefreshRequested),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+            panel = panel.push(linear_issue_list(linear, selected.as_ref()));
+        }
+        // 미연결(또는 연결 실패): 키 입력 + Connect. 연결 중이면 버튼을 잠근다.
+        None => {
+            // **마스킹된 secure 입력** — 키가 화면에 평문으로 안 뜬다(로그/Debug에도 안 샌다).
+            panel = panel.push(
+                text_input("Linear API key", &linear.api_key_input)
+                    .secure(true)
+                    .on_input(Message::LinearApiKeyChanged)
+                    .on_submit(Message::LinearConnectSubmitted)
+                    .size(12),
+            );
+            let connect_label = if linear.connecting {
+                "Connecting…"
+            } else {
+                "Connect"
+            };
+            panel = panel.push(
+                button(text(connect_label).size(12))
+                    .on_press_maybe((!linear.connecting).then_some(Message::LinearConnectSubmitted)),
+            );
+            if let Some(err) = &linear.connect_error {
+                panel = panel.push(text(format!("! {err}")).size(11).color(PR_CLOSED));
+            }
+        }
+    }
+
+    container(panel).padding(8).into()
+}
+
+/// 이슈 목록 렌더. **`tracker_ui::issue_list`가 Unavailable≠no issues를 정하고**, 여기선
+/// 그 값을 픽셀로 옮길 뿐이다(사람 눈). 링크 버튼은 **선택된** worktree를 이 이슈에 링크한다.
+fn linear_issue_list(
+    linear: &LinearState,
+    selected: Option<&WorktreeId>,
+) -> Element<'static, Message> {
+    if linear.issues_loading && linear.issues.is_none() {
+        return text("loading issues…").size(11).color(PR_NEUTRAL).into();
+    }
+    let Some(lookup) = &linear.issues else {
+        return text("no issues loaded yet").size(11).color(PR_NEUTRAL).into();
+    };
+
+    match tracker_ui::issue_list(lookup) {
+        IssueListView::Unavailable(msg) => {
+            // **절대 "no issues"가 아니다** — 조회 실패는 구별된 색·문구로.
+            text(format!("issues unavailable — {msg}"))
+                .size(11)
+                .color(LINEAR_UNAVAILABLE)
+                .into()
+        }
+        IssueListView::Issues { issues, has_more } => {
+            if issues.is_empty() {
+                return text("no issues").size(11).color(PR_NEUTRAL).into();
+            }
+            let mut list = column![].spacing(4);
+            for issue in &issues {
+                list = list.push(issue_row(issue, selected));
+            }
+            if has_more {
+                // 무성 절단 금지 — bounded traversal이 끊었음을 표면화한다.
+                list = list.push(text("…more (showing a bounded page)").size(10).color(PR_NEUTRAL));
+            }
+            list.into()
+        }
+    }
+}
+
+/// 이슈 한 줄: 식별자 + 제목 (+ 상태) + "link" 버튼. 링크 버튼은 선택된 worktree가 있을 때만
+/// 눌린다(없으면 무엇에 링크할지 모른다 — 죽은 버튼 대신 비활성).
+fn issue_row(
+    issue: &suaegi_tracker::Issue,
+    selected: Option<&WorktreeId>,
+) -> Element<'static, Message> {
+    let state_suffix = issue
+        .state
+        .as_deref()
+        .map(|s| format!(" · {s}"))
+        .unwrap_or_default();
+    let label = text(format!("{} {}{}", issue.identifier, issue.title, state_suffix)).size(11);
+
+    let link_msg = selected.map(|wt| Message::LinearIssueLinked {
+        worktree: wt.clone(),
+        issue: issue.clone(),
+    });
+    let link_btn = button(text("link").size(10)).on_press_maybe(link_msg);
+
+    row![label, link_btn]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// `LoadOrigin::Fresh`(신규 설치)와 `Loaded`(정상 로드)는 경고가 없다.
