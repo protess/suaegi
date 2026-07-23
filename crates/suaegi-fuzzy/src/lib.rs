@@ -540,4 +540,39 @@ mod tests {
         // All contain 'a'; take only the first by input order at limit 1.
         assert_eq!(rank("a", &files, 1).len(), 1);
     }
+
+    // ------------------------------------------------------------------
+    // Additive hollow-gap probes (F1/F2/F3). The oracle cases assert
+    // orderings that stay true under these constant tweaks, so these pin the
+    // exact numeric behavior — ranking weights are the UX and must not
+    // silently drift.
+    // ------------------------------------------------------------------
+
+    /// F1 — gap accumulation is `ti - last - 1` (chars skipped BETWEEN matches),
+    /// not `ti - last`. "ab" vs "axb": 'a'@0 (gap 0), 'b'@2 (gap 2-0-1 = 1);
+    /// filename "axb" does not contain "ab" so no -100 -> score 1.
+    /// Mutation: `ti - last - 1` -> `ti - last` makes the gap 2 -> score 2.
+    #[test]
+    fn probe_gap_accumulation_exact_score() {
+        assert_eq!(rank("ab", &["axb"], RESULT_LIMIT)[0].score, 1);
+    }
+
+    /// F2 — `.` and `-` are separator-boundary characters too, not just `/`.
+    /// "a.b"/"a-b": 'b' matches after the separator (boundary -5) and the
+    /// filename contains "b" (-100) -> -105 each.
+    /// Mutation: shrink the boundary set to just `/` -> the -5 is lost -> -100.
+    #[test]
+    fn probe_dot_and_dash_are_boundaries() {
+        assert_eq!(rank("b", &["a.b"], RESULT_LIMIT)[0].score, -105);
+        assert_eq!(rank("b", &["a-b"], RESULT_LIMIT)[0].score, -105);
+    }
+
+    /// F3 — the byte cap is strictly-greater (`>`), so a query of exactly
+    /// `QUERY_MAX_BYTES` bytes is ACCEPTED (Orca parity).
+    /// Mutation: `>` -> `>=` rejects the boundary query -> `[]`.
+    #[test]
+    fn probe_size_cap_accepts_exactly_max() {
+        let q = "a".repeat(QUERY_MAX_BYTES);
+        assert_eq!(rank(&q, &[q.as_str()], RESULT_LIMIT).len(), 1);
+    }
 }
