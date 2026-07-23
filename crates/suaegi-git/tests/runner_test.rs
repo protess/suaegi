@@ -1,6 +1,54 @@
 use std::time::Duration;
 use suaegi_git::runner::{GitError, GitRunner};
 
+/// stdin 경로 전용 최소 repo: `git init` + `.gitignore = "*"`(모든 경로가 무시로
+/// 잡혀 `check-ignore --stdin`이 먹인 것을 전부 stdout으로 되돌린다).
+fn ignore_all_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    std::fs::write(dir.path().join(".gitignore"), "*\n").unwrap();
+    dir
+}
+
+/// 교착 회귀: stdin과 stdout이 **둘 다** OS 파이프 버퍼(~64KB)를 크게 넘긴다.
+/// 순차로 쓰고-읽으면 자식이 stdout write에 블록되어 stdin 읽기를 멈추고, 우리
+/// `write_all`이 영영 안 끝나 타임아웃까지 간다. `run_full`이 write/read를
+/// `try_join!`으로 겹쳐야만 이 테스트가 **타임아웃 없이** 통과한다.
+#[tokio::test]
+async fn large_stdin_does_not_deadlock() {
+    let dir = ignore_all_repo();
+    let r = GitRunner::new();
+    // 100k개 경로, 각 ~7바이트 → stdin ~700KB. 모두 무시로 잡혀 stdout도 ~700KB.
+    // 양방향 모두 64KB 파이프 버퍼를 한참 넘는다(그리고 6MB 상한 아래).
+    let n = 100_000usize;
+    let mut stdin = Vec::with_capacity(n * 8);
+    for i in 0..n {
+        stdin.extend_from_slice(format!("f{i:05}").as_bytes());
+        stdin.push(0);
+    }
+    // 교착이면 기본 30초를 다 쓴다. 15초 안에 못 끝나면 실패로 본다.
+    let out = tokio::time::timeout(
+        Duration::from_secs(15),
+        r.run_with_stdin(dir.path(), &["check-ignore", "-z", "--stdin"], &stdin, &[1]),
+    )
+    .await
+    .expect("large stdin deadlocked (timed out)")
+    .expect("check-ignore --stdin failed");
+    // 모두 무시로 잡혔으니 stdout에도 n개 경로가 되돌아온다.
+    let echoed = out.stdout.split('\0').filter(|s| !s.is_empty()).count();
+    assert_eq!(echoed, n, "먹인 경로가 전부 되돌아오지 않았다: {echoed}");
+}
+
 #[tokio::test]
 async fn run_version_succeeds() {
     let r = GitRunner::new();
