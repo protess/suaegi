@@ -209,8 +209,9 @@ pub async fn commit_changes(
     {
         Ok(out) => Ok(classify_commit(&out.stdout, &out.stderr, out.code)),
         // git이 돌았으나 예상 밖 non-zero(예: 128 fatal). 여전히 "돌고 실패"이므로
-        // `GitError`가 아니라 `Failed`로 올린다. `GitError::Failed`는 stdout을 보존하지
-        // 않아 메시지는 stderr에서 온다(그 코드들의 사유는 stderr에 실린다).
+        // `GitError`가 아니라 `Failed`로 올린다. Orca는 error 객체로 양쪽 채널을 다
+        // 갖지만 `GitError::Failed`는 stdout을 버려 stderr만 남는다 — 이 코드들(예: 128
+        // "not a git repository")은 사유가 stderr에 실려 stdout 소실이 무해하다.
         Err(GitError::Failed { stderr, code, .. }) => {
             Ok(classify_commit("", &stderr, code.unwrap_or(-1)))
         }

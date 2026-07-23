@@ -317,3 +317,60 @@ async fn commit_message_with_special_chars_is_literal() {
         .stdout;
     assert_eq!(msg.trim(), weird, "메시지는 리터럴로 기록되어야 한다");
 }
+
+// --- crux: 128 fatal은 Err가 아니라 Ok(Failed) (mutant: 128-arm을 Err(e)=>Err(e)로 leak) ---
+// git repo가 **아닌** 디렉터리에서 커밋하면 exit 128("not a git repository")로, run_expecting(&[1])는
+// 이를 Err(GitError::Failed)로 돌린다 — commit_changes의 128-arm이 그걸 "돌고 실패"로 보고
+// Ok(Failed)로 올린다. 그 arm을 Err leak으로 바꾸면 이 테스트가 FAIL. (128은 stdout 없이 stderr에
+// 메시지가 있어 채널 규칙이 그대로 집어낸다.)
+#[tokio::test]
+async fn commit_fatal_128_is_failed_not_err() {
+    // fixture::init_repo를 안 부른다 — 일부러 git repo가 아닌 빈 tempdir.
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = commit_changes(&GitRunner::new(), dir.path(), "x").await;
+    match outcome {
+        Ok(CommitOutcome::Failed { message }) => assert!(
+            message.contains("not a git repository"),
+            "128 fatal 메시지는 stderr의 'not a git repository'여야 한다: {message:?}"
+        ),
+        other => panic!("128 fatal은 Ok(Failed)여야 한다, got {other:?}"),
+    }
+}
+
+// --- crux: hook-bypass 불변식 F4 (mutant: 배포 argv에 --no-verify 주입 → Committed로 FAIL) ---
+// fixture repo의 hooksPath(.no-hooks)에 **실패하는** pre-commit hook(exit 1)을 설치하고 커밋하면
+// hook이 커밋을 막아 Failed여야 한다. commit_changes가 `--no-verify`를 붙이면 hook을 우회해
+// Committed가 되어 이 단언이 깨진다. (hook 설치는 이 테스트 tempdir 안에서만 — repo 오염 없음.)
+#[cfg(unix)]
+#[tokio::test]
+async fn commit_respects_failing_pre_commit_hook_no_bypass() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (repo, r) = setup();
+    let wt = repo.path();
+    // fixture가 core.hooksPath=.no-hooks로 세팅해 뒀다 — 그 디렉터리에 pre-commit을 심는다.
+    let hook = wt.join(".no-hooks").join("pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho 'pre-commit reject' 1>&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(wt.join("k.txt"), "x\n").unwrap();
+    stage(&r, wt, "k.txt").await.unwrap();
+
+    let outcome = commit_changes(&r, wt, "should be blocked by hook")
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CommitOutcome::Failed { .. }),
+        "실패하는 pre-commit hook은 커밋을 막아야 한다(--no-verify 우회 금지): {outcome:?}"
+    );
+    // 실제로 커밋이 안 됐다: k.txt가 여전히 스테이징된 채 남는다.
+    let cached = r
+        .run(wt, &["diff", "--cached", "--name-only"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        cached.contains("k.txt"),
+        "hook이 막았으니 k.txt는 인덱스에 스테이징된 채여야 한다"
+    );
+}
