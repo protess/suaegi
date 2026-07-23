@@ -138,9 +138,92 @@ fn duplicate_error(e: &GitError) -> GitError {
     }
 }
 
+// --- M2: 커밋 (`commit_changes`) ---
+
+/// `commit_changes`의 결과. Orca `commitChanges`의 `{ success, error? }`를 모델링한다
+/// (`status.ts:1962-1990`). git이 **돌긴 했으나** 실패한 경우(hook/GPG 거부, empty index)를
+/// 담는다 — git을 **아예 못 돌린** 경우(spawn/timeout)는 `commit_changes`가 `GitError`로
+/// 돌려주는, 이와 **별개의** 실패다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// 커밋 성공(exit 0).
+    Committed,
+    /// git이 돌았으나 커밋을 거부/중단했다(non-zero exit). `message`는 채널 우선순위
+    /// 규칙(stderr→stdout→generic)으로 고른, 사람이 읽을 사유다.
+    Failed { message: String },
+}
+
+/// 커밋 실패 시 사람에게 보일 메시지를 고른다 — **stderr → stdout → generic**
+/// (Orca `status.ts:1972-1986`). hook/GPG 실패는 stderr로, "nothing to commit"은 stdout으로
+/// 나오므로 **비어 있지 않은** stderr를 먼저, 없으면 stdout을, 둘 다 비면 generic fallback.
+///
+/// **순수 함수 — 이 마일스톤의 핵심 crux.** 우선순위를 뒤집거나(stdout 먼저) 한 채널을
+/// 지우는 mutation은 unit 테스트가 잡는다.
+fn pick_commit_error(stdout: &str, stderr: &str) -> String {
+    if !stderr.is_empty() {
+        stderr.to_string()
+    } else if !stdout.is_empty() {
+        stdout.to_string()
+    } else {
+        "Commit failed".to_string()
+    }
+}
+
+/// `(stdout, stderr, exit code)`를 `CommitOutcome`으로 분류하는 순수 함수. exit 0이면
+/// `Committed`, 아니면 `Failed`(메시지는 `pick_commit_error`). code가 load-bearing이라
+/// "non-zero를 Committed로" 뒤집는 mutation을 empty-index 테스트가 잡는다.
+fn classify_commit(stdout: &str, stderr: &str, code: i32) -> CommitOutcome {
+    if code == 0 {
+        CommitOutcome::Committed
+    } else {
+        CommitOutcome::Failed {
+            message: pick_commit_error(stdout, stderr),
+        }
+    }
+}
+
+/// 스테이징된 변경을 커밋한다 — `git commit -m <message>`.
+///
+/// **F3/F4 불변식(plan §1):** `-c user.name/user.email`, `commit.gpgsign`, `--no-verify`,
+/// 전역 config 접촉 — **어느 것도 하지 않는다.** 실 유저로 그의 repo에 bare 커밋한다
+/// (identity override는 서명 제거+가짜 author 회귀, `--no-verify`는 에이전트의 조용한
+/// hook 우회다). `message`는 **별개 argv 원소**로 넘겨(절대 shell 보간 없음) 선행 대시나
+/// 셸 메타문자가 담긴 메시지도 리터럴로 커밋된다.
+///
+/// - exit 0 → `Ok(Committed)`.
+/// - git이 돌았으나 non-zero(예: empty index는 exit 1 + stdout "nothing to commit") →
+///   `Ok(Failed { message })`. 이건 커밋 실패이지 crate 에러가 아니다.
+/// - git을 아예 못 돌림(spawn 실패/타임아웃/출력 초과) → `Err(GitError)`.
+pub async fn commit_changes(
+    runner: &GitRunner,
+    worktree: &Path,
+    message: &str,
+) -> Result<CommitOutcome, GitError> {
+    // exit 1은 "돌긴 했으나 실패"의 흔한 코드다("nothing to commit"은 stdout, hook/GPG는
+    // stderr). `run_expecting(&[1])`로 exit 1을 에러가 아닌 성공으로 받아 **양쪽 채널과
+    // exit code**를 그대로 손에 넣는다 — `GitError::Failed`는 stderr만 담고 stdout·code를
+    // 버려 "nothing to commit"을 잃기 때문이다.
+    match runner
+        .run_expecting(worktree, &["commit", "-m", message], &[1])
+        .await
+    {
+        Ok(out) => Ok(classify_commit(&out.stdout, &out.stderr, out.code)),
+        // git이 돌았으나 예상 밖 non-zero(예: 128 fatal). 여전히 "돌고 실패"이므로
+        // `GitError`가 아니라 `Failed`로 올린다. `GitError::Failed`는 stdout을 보존하지
+        // 않아 메시지는 stderr에서 온다(그 코드들의 사유는 stderr에 실린다).
+        Err(GitError::Failed { stderr, code, .. }) => {
+            Ok(classify_commit("", &stderr, code.unwrap_or(-1)))
+        }
+        // git을 못 돌렸다(spawn/timeout/output-too-large) — 진짜 crate 에러.
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{literal_pathspec, literal_pathspec_impl};
+    use super::{
+        classify_commit, literal_pathspec, literal_pathspec_impl, pick_commit_error, CommitOutcome,
+    };
 
     // literal_pathspec: 평범한 경로 → :(literal) 접두.
     #[test]
@@ -170,6 +253,60 @@ mod tests {
         assert_eq!(
             literal_pathspec_impl(r"src\main\a.rs", false),
             r":(literal)src\main\a.rs"
+        );
+    }
+
+    // --- M2 crux: 채널 우선순위 picker (순수) ---
+
+    // stderr가 비어있지 않으면 stderr를 고른다(hook/GPG 실패는 stderr로 온다).
+    // mutation "stdout 먼저"는 여기서 "nothing to commit"을 골라 FAIL.
+    #[test]
+    fn pick_prefers_stderr_when_present() {
+        assert_eq!(
+            pick_commit_error("nothing to commit", "hook failed"),
+            "hook failed"
+        );
+    }
+
+    // stderr가 비면 stdout으로 폴백한다("nothing to commit"은 stdout으로 온다).
+    // mutation "항상 stderr(stdout 드롭)"는 generic으로 떨어져 FAIL.
+    #[test]
+    fn pick_falls_back_to_stdout_when_stderr_empty() {
+        assert_eq!(
+            pick_commit_error("nothing to commit", ""),
+            "nothing to commit"
+        );
+    }
+
+    // 둘 다 비면 generic fallback.
+    #[test]
+    fn pick_generic_when_both_empty() {
+        assert_eq!(pick_commit_error("", ""), "Commit failed");
+    }
+
+    // --- M2 crux: classify (code가 load-bearing) ---
+
+    // exit 0 → Committed. mutation "code 비교 뒤집기(non-zero→Committed)"는 아래 non-zero
+    // 테스트와 empty-index 통합 테스트를 깬다.
+    #[test]
+    fn classify_zero_is_committed() {
+        assert_eq!(classify_commit("out", "err", 0), CommitOutcome::Committed);
+    }
+
+    // non-zero → Failed(메시지는 채널 규칙). stderr 우선, 없으면 stdout.
+    #[test]
+    fn classify_nonzero_is_failed_with_channel_message() {
+        assert_eq!(
+            classify_commit("nothing to commit", "", 1),
+            CommitOutcome::Failed {
+                message: "nothing to commit".to_string()
+            }
+        );
+        assert_eq!(
+            classify_commit("", "hook failed", 1),
+            CommitOutcome::Failed {
+                message: "hook failed".to_string()
+            }
         );
     }
 }

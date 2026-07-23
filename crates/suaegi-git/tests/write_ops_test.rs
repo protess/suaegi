@@ -7,7 +7,9 @@ mod fixture;
 use std::collections::HashSet;
 use std::path::Path;
 use suaegi_git::runner::GitRunner;
-use suaegi_git::write_ops::{bulk_stage, bulk_unstage, stage, unstage};
+use suaegi_git::write_ops::{
+    bulk_stage, bulk_unstage, commit_changes, stage, unstage, CommitOutcome,
+};
 
 /// 격리된 repo tempdir + `GitRunner`.
 fn setup() -> (tempfile::TempDir, GitRunner) {
@@ -186,4 +188,132 @@ async fn bulk_stage_empty_is_empty_vec() {
     let (repo, r) = setup();
     let results = bulk_stage(&r, repo.path(), &[]).await;
     assert!(results.is_empty());
+}
+
+// --- M2: commit_changes real-git 통합 ---
+
+/// 현재 HEAD 커밋 SHA.
+async fn head(r: &GitRunner, wt: &Path) -> String {
+    r.run(wt, &["rev-parse", "HEAD"])
+        .await
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string()
+}
+
+/// HEAD까지의 커밋 개수 — `git rev-list --count HEAD`.
+async fn commit_count(r: &GitRunner, wt: &Path) -> usize {
+    r.run(wt, &["rev-list", "--count", "HEAD"])
+        .await
+        .unwrap()
+        .stdout
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+// --- crux: happy commit (mutant: -m/메시지 미전달 → 메시지 불일치로 FAIL) ---
+// 파일을 stage → commit → Committed; HEAD가 정확히 1개 전진하고 워크트리가 깨끗하다.
+#[tokio::test]
+async fn commit_happy_path_advances_head_and_cleans_worktree() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("f.txt"), "hi\n").unwrap();
+    stage(&r, wt, "f.txt").await.unwrap();
+
+    let before = commit_count(&r, wt).await;
+    let outcome = commit_changes(&r, wt, "add f.txt").await.unwrap();
+
+    assert_eq!(outcome, CommitOutcome::Committed);
+    assert_eq!(
+        commit_count(&r, wt).await,
+        before + 1,
+        "HEAD가 커밋 1개만큼 전진해야 한다"
+    );
+    // 워크트리 clean: porcelain 출력이 비어 있다.
+    let status = r.run(wt, &["status", "--porcelain"]).await.unwrap().stdout;
+    assert!(status.trim().is_empty(), "커밋 후 워크트리가 깨끗해야 한다");
+    // 커밋 메시지가 그대로 기록되었다(-m/메시지 전달 확인).
+    let msg = r
+        .run(wt, &["log", "-1", "--format=%B"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(msg.trim(), "add f.txt");
+}
+
+// --- crux: empty-index 게이트 (mutant: non-zero→Committed → HEAD 전진 단언으로 FAIL) ---
+// 아무것도 stage 안 한 채 commit → Failed("nothing to commit"); HEAD가 전진하지 않는다.
+#[tokio::test]
+async fn commit_empty_index_is_failed_and_head_unchanged() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+
+    let before = head(&r, wt).await;
+    let outcome = commit_changes(&r, wt, "nothing here").await.unwrap();
+
+    match outcome {
+        CommitOutcome::Failed { message } => assert!(
+            message.contains("nothing to commit"),
+            "empty index 메시지는 stdout의 'nothing to commit'이어야 한다: {message:?}"
+        ),
+        CommitOutcome::Committed => panic!("empty index인데 Committed로 판정됐다"),
+    }
+    assert_eq!(
+        head(&r, wt).await,
+        before,
+        "실패한 커밋은 HEAD를 전진시키면 안 된다"
+    );
+}
+
+// --- crux: identity override 없음 (mutant: -c user.* 주입 → author 불일치로 FAIL) ---
+// commit_changes가 어떤 identity도 주입하지 않으므로 author는 fixture의 repo-local
+// 정체(`test <t@example.com>`)여야 한다. `-c user.name=...`을 넣으면 이 단언이 깨진다.
+#[tokio::test]
+async fn commit_uses_fixture_repo_local_identity_not_injected() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("g.txt"), "x\n").unwrap();
+    stage(&r, wt, "g.txt").await.unwrap();
+
+    assert_eq!(
+        commit_changes(&r, wt, "id check").await.unwrap(),
+        CommitOutcome::Committed
+    );
+
+    let author = r
+        .run(wt, &["log", "-1", "--format=%an <%ae>"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(
+        author.trim(),
+        "test <t@example.com>",
+        "커밋은 fixture의 repo-local identity로 저작되어야 한다(주입 금지)"
+    );
+}
+
+// --- crux: 특수문자 메시지는 리터럴로 커밋 (mutant: shell 보간 시 메시지 변형 → FAIL) ---
+// 선행 대시 + 셸 메타문자가 담긴 메시지가 별개 argv로 넘어가 그대로 기록된다.
+// argv 전달이라 shell이 없어 `$(...)`/backtick/`;`가 실행되지 않는다.
+#[tokio::test]
+async fn commit_message_with_special_chars_is_literal() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("h.txt"), "x\n").unwrap();
+    stage(&r, wt, "h.txt").await.unwrap();
+
+    let weird = "-x weird $(whoami) `id` ; rm -rf /";
+    assert_eq!(
+        commit_changes(&r, wt, weird).await.unwrap(),
+        CommitOutcome::Committed
+    );
+
+    let msg = r
+        .run(wt, &["log", "-1", "--format=%B"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(msg.trim(), weird, "메시지는 리터럴로 기록되어야 한다");
 }
