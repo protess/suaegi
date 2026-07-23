@@ -65,18 +65,24 @@ fn escape_glob_path(rel_path: &str) -> String {
 /// - `include_ignored`(ignored 패스): `--no-ignore-vcs` 추가 — gitignore/부모/전역-ignore
 ///   까지 넓힌다(Orca `ignoredPass`, quick-open-filter.ts:289-297).
 /// - `worktree_prefixes`(중첩 워크트리 exclude, root-relative `/`-구분): 각 prefix →
-///   **rooted 2-glob** `!<escaped>` + `!<escaped>/**`(Orca `buildRgArgsForQuickOpen`,
-///   quick-open-filter.ts:271-276). directory-match form `!<prefix>`가 그 워크트리로의
-///   traversal을 prune하고, contents form `!<prefix>/**`가 이미 나열된 파일까지 제거한다.
+///   **선행 슬래시로 root-앵커한 2-glob** `!/<escaped>` + `!/<escaped>/**`. directory-match
+///   form `!/<prefix>`가 그 워크트리로의 traversal을 prune하고, contents form `!/<prefix>/**`가
+///   이미 나열된 파일까지 제거한다.
 ///
-/// **F7 — rooted vs basename(대죄 가드)**: worktree prefix는 rg에서 **rooted**여야 한다.
-/// blocklist 이름의 basename-anywhere `!**/name`(어느 깊이든 prune)과 달리, `packages/app`
-/// 같은 멀티세그먼트 prefix를 `!**/packages/app`로 넣으면 **트리 어디에 있는 동명 경로든**
-/// over-prune돼 무관한 `other/packages/app`의 파일까지 놓친다(=파일 누락). 그래서 rooted
-/// `!packages/app`로 root 바로 아래 그 경로만 prune한다(Orca:274-275). git 쪽 rooted 대응은
-/// `ls_files_args`의 `:(exclude,glob)`(둘 다 rooted라 의미가 일치한다).
+/// **F1 — 선행 슬래시 앵커(대죄 가드)**: worktree prefix는 rg에서 반드시 **선행 슬래시로
+/// 앵커**해야 한다. rg/gitignore 규칙상 **선행 슬래시 없는 단일세그먼트 글롭**(`!sub`)은
+/// basename처럼 **어느 깊이든 매칭**한다 — 중첩 워크트리 `{root}/sub`(흔한 depth-1)를 `!sub`로
+/// 넣으면 무관한 `deep/sub`·`packages/sub`까지 over-prune돼 파일을 놓친다(실 rg 15.1.0 재현).
+/// 멀티세그먼트 `packages/app`은 중간 슬래시 때문에 이미 앵커되지만, 단일세그먼트는 아니므로
+/// **모든 경우에 선행 슬래시**를 붙여 root 바로 아래만 prune한다. 이러면 git
+/// `:(exclude,glob)<prefix>`(항상 root-앵커)·walk `should_exclude_quick_open_rel_path`(root
+/// segment-boundary)와 세 티어가 정확히 일치한다.
 ///
-/// 값은 `escape_glob_path`로 escape하고 **항상 `!` 접두**라 `-foo` 같은 값이 argv 플래그로
+/// **Orca divergence**: Orca `buildRgArgsForQuickOpen`(quick-open-filter.ts:271-276)는
+/// `!${escapeGlobPath(prefix)}`(선행 슬래시 없음)라 같은 단일세그먼트 over-prune latent bug를
+/// 안고 있다. suaegi는 선행 슬래시로 이를 교정한다(rg를 git/walk와 일치시키는 게 우선).
+///
+/// 값은 `escape_glob_path`로 escape하고 **항상 `!/` 접두**라 `-foo` 같은 값이 argv 플래그로
 /// 해석될 수 없다. 항상-on hidden-dir blocklist(`node_modules`/`.git` 등 *이름*)는 **별개**로
 /// `rg_hidden_dir_exclude_globs`가 basename-anywhere `!**/name`로 낸다(이름은 어느 깊이든
 /// prune하는 게 옳다) — 드라이버가 두 입력을 각각 주입한다.
@@ -87,11 +93,11 @@ pub fn rg_args(include_ignored: bool, worktree_prefixes: &[String]) -> Vec<Strin
     }
     for prefix in worktree_prefixes {
         let escaped = escape_glob_path(prefix);
-        // rooted directory-match + contents(basename `!**/`이 아님 — F7 over-prune 방지).
+        // 선행 슬래시로 root 앵커(`!sub`은 어느 깊이든 매칭 → over-prune, F1). git/walk와 일치.
         args.push("--glob".to_string());
-        args.push(format!("!{escaped}"));
+        args.push(format!("!/{escaped}"));
         args.push("--glob".to_string());
-        args.push(format!("!{escaped}/**"));
+        args.push(format!("!/{escaped}/**"));
     }
     args
 }
@@ -976,7 +982,13 @@ fn classify_entry(
     };
     match classify_quick_open_git_entry(probe) {
         GitEntryAction::Keep => {
-            files.insert(rel.to_string());
+            // F2: keep 파일마다 blocklist 필터(Orca addFinalPath → shouldIncludeQuickOpenPath,
+            // quick-open-readdir-walk.ts:287). ls-files엔 blocklist 글롭이 없어 이게 유일 방어 —
+            // tracked `.husky/pre-commit`나 force-add된 `node_modules/*`가 git 티어 결과에 새는
+            // under-prune 누출을 막는다.
+            if should_include_quick_open_path(rel) {
+                files.insert(rel.to_string());
+            }
         }
         GitEntryAction::DropPlaceholder => {}
         // gitlink 중첩 저장소 → 확장하되 심링크 leaf는 제외(include_symlinks=false).
@@ -1095,8 +1107,10 @@ fn list_with_walk(
 /// - `is_hidden_path_blocklisted`(경로): 멀티세그먼트 `.local/share`(이름 규칙이 못 잡는)를
 ///   하강 전에 prune(Orca `shouldIncludeQuickOpenPath`의 HIDDEN_PATH 부분).
 ///
-/// 하강 게이트가 완결적이라(blocklist dir로 내려가지 않음) leaf엔 별도 백스톱을 두지 않는다.
-/// git이 collapse해 넘긴 placeholder의 이름-blocklist는 `classify_entry`가 확장 전에 이미 걸렀다.
+/// leaf(파일)엔 **F3 하드닝**: 파일 자신의 이름이 blocklist(`node_modules`/`.git`)거나 파일이
+/// `.local/share` 경로면 drop한다. 하강 게이트는 dir만 보므로 이름이 blocklist인 *파일*은
+/// leaf에서만 걸린다(Orca는 leaf에도 `shouldIncludeQuickOpenPath` 적용, :243). git이 collapse해
+/// 넘긴 placeholder의 이름-blocklist는 `classify_entry`가 확장 전에 이미 걸렀다.
 fn walk(
     worktree: &Path,
     start_rel: &str,
@@ -1144,8 +1158,17 @@ fn walk(
                     }
                     continue;
                 }
-                // leaf: 일반 파일은 항상, 심링크는 include_symlinks일 때만(Orca:241-243).
+                // leaf: 심링크는 include_symlinks일 때만(Orca:241-243).
                 if entry.is_symlink && !include_symlinks {
+                    continue;
+                }
+                // F3: 파일 **자신의 이름**이 blocklist(`node_modules`/`.git` 등)거나 파일이
+                // 멀티세그먼트 `.local/share` 경로면 drop. 하강 게이트는 dir만 보므로 이름이
+                // blocklist인 *파일*은 여기서만 걸린다. 두 검사 모두 파일의 이름/경로 blocklist만
+                // 봐서 하강 `should_descend`(dir 이름)를 마스킹하지 않는다 — 경로 전체 세그먼트를
+                // 보는 `should_include`를 leaf에 쓰면 node_modules 하위 파일이 이중 커버돼
+                // `should_descend` mutant가 살아남는다(그래서 leaf는 파일 이름 토큰만 본다).
+                if !should_descend(&entry.name) || is_hidden_path_blocklisted(&child_rel) {
                     continue;
                 }
                 budget.consume()?;
@@ -1222,23 +1245,32 @@ mod tests {
         );
     }
 
-    // crux(F7 rooted + injection): worktree prefix는 rooted `!<p>` + `!<p>/**` 두 glob으로 나가고
-    // (basename `!**/` 아님), 악의적 `-foo`도 항상 `!` 접두라 argv 플래그가 못 된다.
-    // mutation: rooted `!<p>`를 basename `!**/<p>`로 바꾸면(over-prune 형식) 이 assert가 FAIL.
+    // crux(F1 선행슬래시 앵커 + injection): worktree prefix는 `!/<p>` + `!/<p>/**` 두 glob으로
+    // 나가고(선행 슬래시로 root 앵커), 악의적 `-foo`도 항상 `!/` 접두라 argv 플래그가 못 된다.
+    // mutation: 선행 슬래시를 떼 `!<p>`로 바꾸면(단일세그먼트 basename-anywhere 매칭 → over-prune)
+    // 이 assert가 FAIL. (argv-레벨 항상-on 가드; 실 rg 없어도 이 mutant를 죽인다.)
     #[test]
-    fn rg_worktree_prefix_is_rooted_two_globs() {
+    fn rg_worktree_prefix_is_slash_anchored_two_globs() {
         let args = rg_args(false, &["-foo".to_string()]);
         assert_eq!(
             args,
-            vec!["--files", "--hidden", "--glob", "!-foo", "--glob", "!-foo/**"]
+            vec![
+                "--files",
+                "--hidden",
+                "--glob",
+                "!/-foo",
+                "--glob",
+                "!/-foo/**"
+            ]
         );
-        // rooted directory-match이지 basename `!**/`가 아니다(F7).
+        // 선행 슬래시로 앵커된 형식이지 basename `!**/`나 비앵커 `!foo`가 아니다(F1).
         assert!(!args.iter().any(|a| a.starts_with("!**/")));
+        assert!(args.iter().all(|a| a != "!-foo" && a != "!-foo/**"));
         // exclude 값이 raw 플래그로 새지 않음.
         assert!(!args.iter().any(|a| a == "-foo"));
     }
 
-    // crux: glob 메타문자 escape — `feature[1]`이 `feature1`을 잘못 제외하지 않게(rooted 형식).
+    // crux: glob 메타문자 escape — `feature[1]`이 `feature1`을 잘못 제외하지 않게(앵커 형식).
     #[test]
     fn rg_worktree_prefix_escapes_glob_meta() {
         let args = rg_args(false, &["feature[1]".to_string()]);
@@ -1246,15 +1278,15 @@ mod tests {
             &args[args.len() - 4..],
             &[
                 "--glob".to_string(),
-                r"!feature\[1\]".to_string(),
+                r"!/feature\[1\]".to_string(),
                 "--glob".to_string(),
-                r"!feature\[1\]/**".to_string(),
+                r"!/feature\[1\]/**".to_string(),
             ][..]
         );
     }
 
-    // 다중 세그먼트 prefix: `/`는 escape 안 되고 세그먼트만. rooted라 `packages/app`이 root 바로
-    // 아래만 가리킨다(basename `!**/`면 어느 깊이든 over-prune — F7).
+    // 다중 세그먼트 prefix: `/`는 escape 안 되고 세그먼트만. 선행 슬래시로 앵커돼 `packages/app`이
+    // root 바로 아래만 가리킨다.
     #[test]
     fn rg_worktree_prefix_multi_segment_keeps_slash() {
         let args = rg_args(false, &["packages/app".to_string()]);
@@ -1262,9 +1294,9 @@ mod tests {
             &args[args.len() - 4..],
             &[
                 "--glob".to_string(),
-                "!packages/app".to_string(),
+                "!/packages/app".to_string(),
                 "--glob".to_string(),
-                "!packages/app/**".to_string(),
+                "!/packages/app/**".to_string(),
             ][..]
         );
     }
@@ -2396,13 +2428,11 @@ mod driver_tests {
         );
     }
 
-    // THE F7 cardinal-sin guard(실 rg): rooted `!packages/app`은 root 바로 아래 그 경로만 제외하고
-    // 다른 깊이의 동명 `other/packages/app`은 **살려둔다**. mutation: rg_args rooted `!<p>`를
-    // basename `!**/<p>`로 바꾸면 `other/packages/app/keep.rs`까지 over-prune돼(=파일 누락) 둘째
-    // assert가 FAIL. (pure `rg_worktree_prefix_is_rooted_two_globs`가 argv 레벨에서 항상 이
-    // mutation을 죽이고, 이 테스트는 rg 실물로 재확인 — 실 rg 없으면 스킵.)
+    // 멀티세그먼트 앵커 가드(실 rg): `!/packages/app`은 root 바로 아래 그 경로만 제외하고
+    // 다른 깊이의 동명 `other/packages/app`은 **살려둔다**(멀티세그먼트는 중간 슬래시로도 이미
+    // 앵커되지만 선행 슬래시가 이를 확정). 실 rg 없으면 스킵.
     #[tokio::test]
-    async fn rg_rooted_prefix_does_not_over_prune_same_named_elsewhere() {
+    async fn rg_anchored_prefix_does_not_over_prune_same_named_elsewhere() {
         let wt = tempdir();
         if !rg_available(wt.path()).await {
             return;
@@ -2417,13 +2447,85 @@ mod driver_tests {
             .unwrap();
         assert!(
             !files.contains(&"packages/app/main.rs".to_string()),
-            "rooted prefix가 root 바로 아래 경로를 제외해야 한다: {files:?}"
+            "앵커 prefix가 root 바로 아래 경로를 제외해야 한다: {files:?}"
         );
         assert!(
             files.contains(&"other/packages/app/keep.rs".to_string()),
-            "F7: rooted `!packages/app`이 다른 깊이의 동명 경로를 over-prune하면 안 된다(basename \
-             `!**/packages/app`이면 파일 누락): {files:?}"
+            "앵커 `!/packages/app`이 다른 깊이의 동명 경로를 over-prune하면 안 된다: {files:?}"
         );
+    }
+
+    // THE F1 cardinal-sin guard(실 rg, 리뷰어 재현 케이스): **단일세그먼트** prefix `sub`(흔한
+    // depth-1 중첩 워크트리)가 root `sub/`만 제외하고 무관한 `deep/sub`·`packages/sub`는 **살려둔다**.
+    // 선행 슬래시 없는 `!sub`는 rg/gitignore 규칙상 어느 깊이든 basename 매칭해 셋을 전부 over-prune
+    // 한다(=파일 누락, 대죄). mutation: rg_args에서 선행 슬래시를 떼(`!{escaped}`) 이 assert가 FAIL.
+    // (멀티세그먼트 테스트는 이 단일세그먼트 결함을 못 잡는다 — 중간 슬래시로 이미 앵커되므로.)
+    #[tokio::test]
+    async fn rg_single_segment_prefix_anchors_not_basename_over_prune() {
+        let wt = tempdir();
+        if !rg_available(wt.path()).await {
+            return;
+        }
+        for d in ["sub", "deep/sub", "packages/sub"] {
+            std::fs::create_dir_all(wt.path().join(d)).unwrap();
+            std::fs::write(wt.path().join(d).join("f.rs"), b"x").unwrap();
+        }
+        std::fs::write(wt.path().join("top.rs"), b"x").unwrap();
+
+        let files = list_with_rg(wt.path(), &["sub".to_string()]).await.unwrap();
+        assert!(
+            !files.contains(&"sub/f.rs".to_string()),
+            "root sub는 제외돼야 한다: {files:?}"
+        );
+        assert!(
+            files.contains(&"deep/sub/f.rs".to_string()),
+            "F1: 단일세그먼트 `sub`가 `deep/sub`를 over-prune했다(선행 슬래시 미앵커): {files:?}"
+        );
+        assert!(
+            files.contains(&"packages/sub/f.rs".to_string()),
+            "F1: 단일세그먼트 `sub`가 `packages/sub`를 over-prune했다: {files:?}"
+        );
+        assert!(files.contains(&"top.rs".to_string()));
+    }
+
+    // F1 3티어 일치(실 rg): 같은 단일세그먼트 prefix `sub`에 rg·git·walk 세 티어가 **동일한**
+    // 파일집합을 제외한다 — root `sub`만 빼고 `deep/sub`는 셋 다 유지. rg만 비앵커면 세 집합이
+    // 어긋난다. mutation: rg 선행 슬래시 제거 → rg가 deep/sub까지 빼 rg≠git=walk → assert FAIL.
+    #[tokio::test]
+    async fn exclude_prefix_consistent_across_rg_git_walk() {
+        let wt = tempdir();
+        if !rg_available(wt.path()).await {
+            return;
+        }
+        git(wt.path(), &["init", "-q"]);
+        for d in ["sub", "deep/sub"] {
+            std::fs::create_dir_all(wt.path().join(d)).unwrap();
+            std::fs::write(wt.path().join(d).join("f.rs"), b"x").unwrap();
+        }
+        std::fs::write(wt.path().join("top.rs"), b"x").unwrap();
+        git(wt.path(), &["add", "-A"]);
+
+        let prefix = vec!["sub".to_string()];
+        let rg = list_with_rg(wt.path(), &prefix).await.unwrap();
+        let gitset = list_with_git(wt.path(), &prefix).await.unwrap();
+        // walk는 fs를 직접 도므로 같은 repo에서도 non-git처럼 동작(.git은 should_descend가 막음).
+        let walkset = list_with_walk(wt.path(), &prefix, WalkBudget::new()).unwrap();
+
+        // 관심 파일에 한해 세 티어가 일치(top.rs·deep/sub/f.rs 유지, sub/f.rs 제외).
+        for tier in [&rg, &gitset, &walkset] {
+            assert!(
+                tier.contains(&"deep/sub/f.rs".to_string()),
+                "티어가 deep/sub를 잘못 제외했다(3티어 불일치): {tier:?}"
+            );
+            assert!(
+                !tier.contains(&"sub/f.rs".to_string()),
+                "티어가 root sub를 제외하지 않았다: {tier:?}"
+            );
+            assert!(
+                tier.contains(&"top.rs".to_string()),
+                "top.rs 누락: {tier:?}"
+            );
+        }
     }
 
     // ═══ M3: walk가 node_modules/.git/.next를 prune (mutation: should_descend 전부 하강) ═══
@@ -2544,6 +2646,84 @@ mod driver_tests {
                 .iter()
                 .any(|p| p.split('/').any(|s| s == "node_modules")),
             "git ignored-pass의 node_modules placeholder가 확장돼 노출됐다: {files:?}"
+        );
+    }
+
+    // ═══ F2: git-tier keep 일반파일 blocklist 누출 방지 ═══
+
+    // THE F2 crux(under-prune 누출): git ls-files엔 blocklist 글롭이 없어, tracked `.husky/pre-commit`
+    // 이나 force-add된 `node_modules/*`가 keep 일반파일로 결과에 샌다. classify_entry의 Keep 분기가
+    // should_include로 걸러야 한다(Orca addFinalPath). mutation: Keep 분기에서 should_include 가드를
+    // 제거하면 `.husky/pre-commit`·`node_modules/pkg/x.js`가 나와 이 assert가 FAIL.
+    #[tokio::test]
+    async fn git_tier_keep_files_filtered_by_blocklist() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        // tracked blocklist 파일들(정상 파일도 함께).
+        std::fs::create_dir(wt.path().join(".husky")).unwrap();
+        std::fs::write(wt.path().join(".husky/pre-commit"), b"x").unwrap();
+        std::fs::create_dir_all(wt.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.path().join("node_modules/pkg/x.js"), b"x").unwrap();
+        std::fs::write(wt.path().join("main.rs"), b"x").unwrap();
+        // node_modules는 보통 gitignore되지만 여기선 force-add로 tracked keep 경로를 만든다.
+        git(
+            wt.path(),
+            &[
+                "add",
+                "-f",
+                ".husky/pre-commit",
+                "node_modules/pkg/x.js",
+                "main.rs",
+            ],
+        );
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"main.rs".to_string()),
+            "정상 파일 누락: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.split('/').any(|s| s == ".husky")),
+            "F2: tracked .husky/pre-commit이 git 티어에 샜다: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.split('/').any(|s| s == "node_modules")),
+            "F2: force-add된 node_modules 파일이 git 티어에 샜다: {files:?}"
+        );
+    }
+
+    // ═══ F3: walk leaf — 이름이 blocklist인 *파일* 누출 방지 ═══
+
+    // THE F3 crux: walk 하강 게이트는 dir만 보므로, 이름이 정확히 `node_modules`/`.git`인 **파일**은
+    // leaf에서만 걸린다. mutation: walk leaf의 `!should_descend(&entry.name)` 검사를 제거하면
+    // `weird/node_modules`(파일)·`weird/.git`(파일)이 결과에 나와 이 assert가 FAIL. leaf는 파일
+    // 이름 토큰만 봐서 하강 should_descend를 마스킹하지 않는다(정상 파일 keep.rs는 유지).
+    #[test]
+    fn walk_leaf_drops_blocklist_named_files() {
+        let wt = tempdir();
+        std::fs::create_dir(wt.path().join("weird")).unwrap();
+        std::fs::write(wt.path().join("weird/node_modules"), b"x").unwrap(); // 파일(dir 아님)
+        std::fs::write(wt.path().join("weird/.git"), b"x").unwrap(); // 파일
+        std::fs::write(wt.path().join("weird/keep.rs"), b"x").unwrap();
+
+        let files = list_with_walk(wt.path(), &[], WalkBudget::new()).unwrap();
+        assert!(
+            files.contains(&"weird/keep.rs".to_string()),
+            "정상 파일이 잘못 drop됐다: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.split('/').next_back() == Some("node_modules")),
+            "F3: 이름이 node_modules인 파일이 walk 결과에 샜다: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.split('/').next_back() == Some(".git")),
+            "F3: 이름이 .git인 파일이 walk 결과에 샜다: {files:?}"
         );
     }
 }
