@@ -14,6 +14,8 @@ pub mod session_store;
 pub mod sidebar;
 pub mod state;
 pub mod terminal;
+pub mod tracker_tasks;
+pub mod tracker_ui;
 pub mod workbench;
 
 use iced::widget::row;

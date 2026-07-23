@@ -11,6 +11,12 @@ suaegi-git = { path = "../suaegi-git" }
 suaegi-term = { path = "../suaegi-term" }
 # Plan 7a: GitHub PR 상태/생성. gh CLI shell-out은 이 크레이트 뒤에서만 일어난다.
 suaegi-forge = { path = "../suaegi-forge" }
+# Tracker UI(N1 Linear): 이슈 읽기 + 워크트리 링크. 네트워크는 이 크레이트 뒤에서만.
+suaegi-tracker = { path = "../suaegi-tracker" }
+# Linear API 키 저장(키체인, 평문 JSON 금지). forge는 gh CLI라 안 쓰지만 Linear는 여기 쓴다.
+suaegi-secrets = { path = "../suaegi-secrets" }
+# LinearClient에 주입할 실 전송(ReqwestTransport). 테스트는 tracker 크레이트가 FakeTransport로 덮는다.
+suaegi-http = { path = "../suaegi-http" }
 # 스냅샷 셀이 Color/Flags/CursorShape를 재수출 없이 노출하므로 직접 의존한다
 alacritty_terminal = { workspace = true }
 iced = { workspace = true }

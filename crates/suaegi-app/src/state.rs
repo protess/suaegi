@@ -17,6 +17,8 @@ use crate::pr_panel::PrPanelState;
 use suaegi_forge::{
     CreateReviewInput, CreationEligibility, MergeMethod, MergeOptions, Review, ReviewLookup,
 };
+use suaegi_secrets::Secret;
+use suaegi_tracker::{IssuePage, LinearWorkspace, LinkedLinearIssue, Lookup};
 use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
@@ -142,6 +144,13 @@ pub struct WorktreeMeta {
     /// `Worktree`를 새로 합성하므로, 이 값을 meta에 씨딩해 두지 않으면 앱을 한 번
     /// 열었다 닫는 것만으로 연결된 PR이 영구히 사라진다(위 `created_at_unix_ms` 주석 참고).
     pub linked_github_pr: Option<u64>,
+    /// N1 §1.3: 이 worktree에 링크된 Linear 이슈 식별자(예: `ENG-123`) + 워크스페이스 좌표.
+    /// **`linked_github_pr`과 똑같은 데이터-손실 계약이다** — `persisted_snapshot`이 매 저장마다
+    /// `Worktree`를 새로 합성하므로 여기 씨딩·재주입하지 않으면 한 번 저장에 링크가 사라진다
+    /// (forge #14 클래스). 좌표(workspace/url_key)는 딥링크·재연결용이라 식별자와 함께 산다.
+    pub linked_linear_issue: Option<String>,
+    pub linked_linear_issue_workspace_id: Option<String>,
+    pub linked_linear_issue_organization_url_key: Option<String>,
 }
 
 /// 사이드바 에이전트 피커의 한 항목. `None` = 로그인 셸(기본, 오늘의 동작).
@@ -447,6 +456,32 @@ pub enum Message {
         op: OpId,
         display: MergeResultDisplay,
     },
+
+    // ---- N1: Linear 트래커 UI ----
+    /// 마스킹된 API 키 입력의 변경. 값은 `LinearState::api_key_input`(평문 버퍼)에만 잠깐 산다.
+    LinearApiKeyChanged(String),
+    /// 연결 제출 — 입력 버퍼를 `Secret`로 감싸 `test_connection`을 UI 스레드 밖에서 발급한다.
+    LinearConnectSubmitted,
+    /// `tracker_tasks::connect`의 완료. Found면 워크스페이스를 굳히고 이슈 조회를 잇는다;
+    /// Unavailable은 **분류된 문구**를 남긴다(raw 에러/키 아님).
+    LinearConnected {
+        op: OpId,
+        result: Lookup<LinearWorkspace>,
+    },
+    /// 이슈 목록 수동 새로고침.
+    LinearIssuesRefreshRequested,
+    /// `tracker_tasks::list_issues`의 완료. raw `Lookup`을 그대로 담고, 표시 매핑은
+    /// `tracker_ui::issue_list`가 한다 — **`Unavailable`을 빈 목록으로 접지 않는다**.
+    LinearIssuesFetched {
+        op: OpId,
+        result: Lookup<IssuePage>,
+    },
+    /// 이슈 행의 "link this worktree" — **선택된** worktree를 이 이슈에 링크한다. 링크는
+    /// `WorktreeMeta`에 굳고 즉시 persist된다(저장을 거쳐도 남는다 — forge #14 데이터-손실 가드).
+    LinearIssueLinked {
+        worktree: WorktreeId,
+        issue: suaegi_tracker::Issue,
+    },
 }
 
 /// 열려 있는 Create-PR 다이얼로그의 편집 상태. 한 번에 하나만(선택된 worktree에
@@ -462,6 +497,44 @@ pub(crate) struct CreatePrDraft {
     pub submitting: bool,
     /// 마지막 제출 실패의 **분류된** 문구(raw stderr 아님).
     pub error: Option<String>,
+}
+
+/// N1(Linear) 연결 + 이슈 목록의 UI 상태. **API 키는 여기서 `Secret`로만 다룬다** —
+/// `api_key_input`만 잠깐 평문(text_input이 `&str`을 요구)이고, 커스텀 `Debug`가 그마저
+/// 리댁션한다. 토큰/워크스페이스/이슈는 메모리 전용이고 **`persisted_snapshot`에 절대 안 들어간다**
+/// (평문 JSON 금지 — 키는 `suaegi-secrets` 키체인으로만 간다).
+#[derive(Default)]
+pub(crate) struct LinearState {
+    /// 연결 다이얼로그의 마스킹된 키 입력 버퍼. 제출 즉시 비운다(평문을 오래 들고 있지 않는다).
+    pub api_key_input: String,
+    /// 인증된 토큰(연결 성공 또는 부팅 시 키체인/env 로드). 이슈 조회가 이걸 clone해 쓴다.
+    pub token: Option<Secret>,
+    /// 연결 확인된 워크스페이스(org 이름 표시 + 링크 좌표). 성공한 `test_connection`이 채운다.
+    pub workspace: Option<LinearWorkspace>,
+    /// 연결 시도 진행 중 — 버튼을 잠그고 중복 제출을 막는다.
+    pub connecting: bool,
+    /// 마지막 연결 실패의 **분류된** 문구(raw 에러/키 아님).
+    pub connect_error: Option<String>,
+    /// 마지막 이슈 목록 조회 결과(raw `Lookup`). 표시 매핑은 `tracker_ui::issue_list`가 한다 —
+    /// **`Unavailable`을 여기서 빈 목록으로 접지 않는다**(crux는 매핑에서 지킨다).
+    pub issues: Option<Lookup<IssuePage>>,
+    /// 이슈 조회 진행 중.
+    pub issues_loading: bool,
+}
+
+/// 커스텀 `Debug`: `api_key_input`을 절대 찍지 않는다(text_input 버퍼가 평문이므로 파생 Debug는
+/// 키를 흘린다). `Secret`은 이미 리댁션하지만 입력 버퍼는 타입이 `String`이라 여기서 막는다.
+impl std::fmt::Debug for LinearState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinearState")
+            .field("api_key_input", &"<redacted>")
+            .field("authenticated", &self.token.is_some())
+            .field("workspace", &self.workspace)
+            .field("connecting", &self.connecting)
+            .field("connect_error", &self.connect_error)
+            .field("issues_loading", &self.issues_loading)
+            .finish()
+    }
 }
 
 pub struct AppState {
@@ -639,6 +712,13 @@ pub struct AppState {
     /// 열려 있는 Create-PR 다이얼로그(없으면 닫힘). 한 번에 하나.
     create_pr: Option<CreatePrDraft>,
 
+    // ---- N1: Linear 트래커 UI ----
+    /// Linear 연결 + 이슈 목록 상태. API 키는 여기서 `Secret`로만 다루고 키체인으로만 저장된다.
+    linear: LinearState,
+    /// 마지막에 발급한 Linear 네트워크 op(연결·이슈 조회 공용). 그보다 오래된 응답은 버린다 —
+    /// 재연결이 진행 중인 이슈 조회를 앞질러도 낡은 결과가 새 것을 덮지 않게 한다.
+    latest_linear_op: Option<OpId>,
+
     // ---- Plan 7b: PR 패널 ----
     /// 열려 있는 PR 패널 상태(닫혀 있으면 `worktree`가 `None`). diff 패널과 같이
     /// 필드 하나로 든다 — 머지가능성·리뷰·코멘트 + 확인 게이트 머지가 여기 산다.
@@ -747,6 +827,8 @@ impl Default for AppState {
             github_status: HashMap::new(),
             latest_forge_op: HashMap::new(),
             create_pr: None,
+            linear: LinearState::default(),
+            latest_linear_op: None,
             pr_panel: PrPanelState::default(),
         }
     }
@@ -805,6 +887,19 @@ impl AppState {
         let mut tasks = refresh_tasks;
         tasks.push(restore_task);
         tasks.push(saved_task);
+
+        // N1: 저장된 Linear 키(키체인 우선, env fallback)가 있으면 메모리 토큰으로 올리고
+        // 재연결(verify + 워크스페이스/이슈 조회)을 발급한다 — "연결"이 앱 재시작을 넘어
+        // 지속되게 한다. 키가 없으면 조용히 미연결로 시작한다(키는 절대 로그/JSON에 안 남는다).
+        let resolved = suaegi_secrets::load(&crate::tracker_tasks::secret_request());
+        if let Some(token) = resolved.secret {
+            state.linear.token = Some(token.clone());
+            state.linear.connecting = true;
+            let op = state.next_op();
+            state.latest_linear_op = Some(op);
+            tasks.push(crate::tracker_tasks::connect(op, token));
+        }
+
         (state, iced::Task::batch(tasks))
     }
 
@@ -839,6 +934,12 @@ impl AppState {
                     created_with_agent: worktree.created_with_agent,
                     created_at_unix_ms: worktree.created_at_unix_ms,
                     linked_github_pr: worktree.linked_github_pr,
+                    // N1 §1.3: Linear 링크도 PR과 같은 경로로 씨딩한다 — 안 하면 다음 저장이
+                    // 자리표시자(None)로 덮어써 링크가 영구히 사라진다(forge #14 데이터-손실 클래스).
+                    linked_linear_issue: worktree.linked_linear_issue,
+                    linked_linear_issue_workspace_id: worktree.linked_linear_issue_workspace_id,
+                    linked_linear_issue_organization_url_key: worktree
+                        .linked_linear_issue_organization_url_key,
                 },
             );
             worktrees_by_repo
@@ -883,11 +984,15 @@ impl AppState {
                         created_with_agent: meta.created_with_agent,
                         created_at_unix_ms: meta.created_at_unix_ms,
                         linked_github_pr: meta.linked_github_pr,
-                        // Linear 링크(N1 §1.3)는 아직 WorktreeMeta로 씨딩되지 않는다(UI 배선은
-                        // §4 후속). 합성 시 None으로 둔다 — serde(default)가 로드도 커버한다.
-                        linked_linear_issue: None,
-                        linked_linear_issue_workspace_id: None,
-                        linked_linear_issue_organization_url_key: None,
+                        // N1 §1.3: Linear 링크를 meta에서 **재주입**한다. `linked_github_pr`과
+                        // 똑같이 — 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다.
+                        linked_linear_issue: meta.linked_linear_issue.clone(),
+                        linked_linear_issue_workspace_id: meta
+                            .linked_linear_issue_workspace_id
+                            .clone(),
+                        linked_linear_issue_organization_url_key: meta
+                            .linked_linear_issue_organization_url_key
+                            .clone(),
                     }
                 })
             })
@@ -1396,6 +1501,12 @@ impl AppState {
         self.create_pr.as_ref()
     }
 
+    /// N1: Linear 연결/이슈 상태. 사이드바가 연결 폼·이슈 목록을 그릴 때 읽는다. 표시 매핑
+    /// (Unavailable≠no issues)은 `tracker_ui`가 한다 — 여기선 raw 상태만 노출한다.
+    pub(crate) fn linear(&self) -> &LinearState {
+        &self.linear
+    }
+
     /// PR 패널 상태. `lib.rs`가 `pr_panel::view`에 넘겨 (열려 있으면) 패널을 그린다.
     pub(crate) fn pr_panel(&self) -> &PrPanelState {
         &self.pr_panel
@@ -1437,6 +1548,23 @@ impl AppState {
             .entry(worktree.clone())
             .or_default()
             .linked_github_pr = Some(number);
+    }
+
+    /// 이 worktree에 Linear 이슈를 링크한다(N1 §1.3). `link_pr`과 **같은 경로**로 `WorktreeMeta`에
+    /// 산다 — `persisted_snapshot`이 매 저장마다 `Worktree`를 새로 합성하므로, 여기 씨딩하지
+    /// 않으면 한 번 저장에 링크가 사라진다(forge #14 데이터-손실 클래스). 부르는 쪽이 persist한다.
+    fn link_linear_issue(&mut self, worktree: &WorktreeId, link: &LinkedLinearIssue) {
+        let meta = self.worktree_meta.entry(worktree.clone()).or_default();
+        meta.linked_linear_issue = Some(link.issue.clone());
+        meta.linked_linear_issue_workspace_id = link.workspace_id.clone();
+        meta.linked_linear_issue_organization_url_key = link.organization_url_key.clone();
+    }
+
+    /// 사이드바 worktree 행이 읽는, 링크된 Linear 이슈 식별자(예: `ENG-123`). 없으면 `None`.
+    pub(crate) fn linked_linear_issue(&self, worktree: &WorktreeId) -> Option<&str> {
+        self.worktree_meta
+            .get(worktree)
+            .and_then(|m| m.linked_linear_issue.as_deref())
     }
 
     /// 훅 스크립트를 설치하고, 이미 떠 있는 서버의 포트·토큰을 받아 둔다.
@@ -2337,6 +2465,11 @@ impl AppState {
                             // 갓 만든 worktree엔 아직 연결된 PR이 없다. UI 후속(Create PR
                             // 다이얼로그)이 생성 성공 시 이 값을 채운다.
                             linked_github_pr: None,
+                            // 갓 만든 worktree엔 링크된 Linear 이슈도 없다(이슈 목록의
+                            // "link this worktree"가 나중에 굳힌다).
+                            linked_linear_issue: None,
+                            linked_linear_issue_workspace_id: None,
+                            linked_linear_issue_organization_url_key: None,
                         },
                     );
                     // **일회성 프롬프트를 메모리에만 담는다**(`WorktreeMeta`가 아니라).
@@ -2991,7 +3124,89 @@ impl AppState {
                     _ => refresh_status,
                 }
             }
+
+            // ---- N1: Linear 트래커 UI ----
+            Message::LinearApiKeyChanged(value) => {
+                self.linear.api_key_input = value;
+                iced::Task::none()
+            }
+            Message::LinearConnectSubmitted => {
+                // 중복 제출 방지.
+                if self.linear.connecting {
+                    return iced::Task::none();
+                }
+                let key = self.linear.api_key_input.trim().to_string();
+                if key.is_empty() {
+                    self.linear.connect_error = Some("Enter a Linear API key.".to_string());
+                    return iced::Task::none();
+                }
+                // 입력 버퍼를 즉시 비운다 — 평문 키를 UI 상태에 오래 들고 있지 않는다. 토큰은
+                // `Secret`로만 남는다.
+                self.linear.api_key_input.clear();
+                let token = Secret::new(key);
+                self.linear.token = Some(token.clone());
+                self.linear.connecting = true;
+                self.linear.connect_error = None;
+                let op = self.next_op();
+                self.latest_linear_op = Some(op);
+                crate::tracker_tasks::connect(op, token)
+            }
+            Message::LinearConnected { op, result } => {
+                // 낡은 응답은 버린다: 재연결이 앞선 시도를 앞질렀을 수 있다.
+                if self.latest_linear_op != Some(op) {
+                    return iced::Task::none();
+                }
+                self.linear.connecting = false;
+                match crate::tracker_ui::connect_view(&result) {
+                    crate::tracker_ui::ConnectView::Connected(ws) => {
+                        self.linear.workspace = Some(ws);
+                        self.linear.connect_error = None;
+                        // 연결 성공 → 이슈를 한 번 가져온다(같은 토큰으로, UI 스레드 밖).
+                        self.request_linear_issues()
+                    }
+                    crate::tracker_ui::ConnectView::Failed(msg) => {
+                        // 인증 실패면 토큰을 버린다 — 무효 키를 들고 이슈를 조회하지 않는다.
+                        self.linear.token = None;
+                        self.linear.workspace = None;
+                        self.linear.connect_error = Some(msg);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::LinearIssuesRefreshRequested => self.request_linear_issues(),
+            Message::LinearIssuesFetched { op, result } => {
+                if self.latest_linear_op != Some(op) {
+                    return iced::Task::none();
+                }
+                self.linear.issues_loading = false;
+                // raw `Lookup`을 그대로 담는다 — `Unavailable`을 빈 목록으로 접지 않는다.
+                // 표시 매핑(Unavailable≠no issues)은 `tracker_ui::issue_list`가 한다.
+                self.linear.issues = Some(result);
+                iced::Task::none()
+            }
+            Message::LinearIssueLinked { worktree, issue } => {
+                // 이슈 + 연결된 워크스페이스 좌표 → 도메인 링크 필드(순수 매핑). 워크스페이스를
+                // 모르면 좌표는 None(식별자만 링크).
+                let link = crate::tracker_ui::link_for(&issue, self.linear.workspace.as_ref());
+                self.link_linear_issue(&worktree, &link);
+                // **저장을 거쳐도 남도록** 즉시 persist한다(`WorktreeMeta` 씨딩·재주입 —
+                // forge #14 데이터-손실 가드). `link_pr` 성공 경로와 같은 규율.
+                self.persist();
+                iced::Task::none()
+            }
         }
+    }
+
+    /// 저장된 토큰으로 이슈 목록 조회를 발급한다(연결 성공 직후 + 수동 새로고침). 토큰이 없으면
+    /// (미연결) 아무것도 하지 않는다. 네트워크는 UI 스레드 밖(`Task::perform`).
+    fn request_linear_issues(&mut self) -> iced::Task<Message> {
+        let Some(token) = self.linear.token.clone() else {
+            return iced::Task::none();
+        };
+        self.linear.issues_loading = true;
+        let op = self.next_op();
+        self.latest_linear_op = Some(op);
+        crate::tracker_tasks::list_issues(op, token)
     }
 }
 
@@ -5898,6 +6113,7 @@ mod tests {
                 created_with_agent: Some("claude".to_string()),
                 created_at_unix_ms: 1,
                 linked_github_pr: None,
+                ..Default::default()
             },
         );
 
@@ -5982,6 +6198,7 @@ mod tests {
                 created_with_agent: Some("claude".to_string()),
                 created_at_unix_ms: 1,
                 linked_github_pr: None,
+                ..Default::default()
             },
         );
         // 이 worktree엔 일회성 프롬프트가 걸려 있다(create가 담아둔 것).
@@ -6029,6 +6246,7 @@ mod tests {
                 created_with_agent: Some("aider".to_string()),
                 created_at_unix_ms: 1,
                 linked_github_pr: None,
+                ..Default::default()
             },
         );
         state
@@ -6272,9 +6490,11 @@ mod tests {
             // `persisted_snapshot`이 매 저장마다 Worktree를 새로 합성하므로, 이 값이
             // `WorktreeMeta`로 씨딩·재주입되지 않으면 한 번 저장에 사라진다.
             linked_github_pr: Some(1234),
-            linked_linear_issue: None,
-            linked_linear_issue_workspace_id: None,
-            linked_linear_issue_organization_url_key: None,
+            // N1 §1.3: Linear 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입이
+            // 없으면 한 번 저장에 사라진다(forge #14 클래스). 세 조각(식별자 + 좌표)을 다 심는다.
+            linked_linear_issue: Some("ENG-42".into()),
+            linked_linear_issue_workspace_id: Some("org-77".into()),
+            linked_linear_issue_organization_url_key: Some("acme".into()),
         }];
 
         let mut state = AppState::from_load(LoadDiagnostics {
@@ -6302,6 +6522,120 @@ mod tests {
             Some(1234),
             "the linked PR read from disk must be written back — if it is not seeded into \
              WorktreeMeta and re-injected, one save-reconstruction erases it (data-loss class)"
+        );
+        // **N1 데이터-손실 가드**: from_load 씨딩(state.rs ~933) 또는 persisted_snapshot
+        // 재주입(~897) 중 하나라도 지우는 뮤턴트는 이 세 단언에서 죽는다.
+        assert_eq!(
+            saved.worktrees[0].linked_linear_issue.as_deref(),
+            Some("ENG-42"),
+            "the linked Linear issue read from disk must survive a save — seeded into \
+             WorktreeMeta and re-injected, exactly like linked_github_pr (forge #14 class)"
+        );
+        assert_eq!(
+            saved.worktrees[0].linked_linear_issue_workspace_id.as_deref(),
+            Some("org-77"),
+            "the Linear workspace coordinate must survive too (deep-link/reconnect)"
+        );
+        assert_eq!(
+            saved.worktrees[0]
+                .linked_linear_issue_organization_url_key
+                .as_deref(),
+            Some("acme"),
+            "the Linear url_key coordinate must survive too"
+        );
+    }
+
+    /// **N1 데이터-손실 가드 (리듀서 경로)**: 이슈 목록의 "link this worktree"가 굳힌 링크는
+    /// 저장을 거쳐도 남는다. `LinearIssueLinked` 핸들러의 `link_linear_issue`/`persist`를
+    /// 지우는 뮤턴트는 meta 단언에서, 씨딩·재주입을 지우는 뮤턴트는 flush_and_reload 단언에서
+    /// 죽는다(forge의 `a_successful_create_pr_persists_the_linked_pr_number` 미러).
+    #[test]
+    fn linking_a_worktree_to_a_linear_issue_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let (mut state, _repo_id, worktree_id) = state_with_one_listed_worktree();
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        state.persistence = Some(boot.handle);
+
+        // 연결된 워크스페이스를 가정하고(좌표를 채우려고) 이슈를 링크한다.
+        state.linear.workspace = Some(LinearWorkspace {
+            id: "org-77".into(),
+            name: "Acme".into(),
+            url_key: "acme".into(),
+            viewer_email: "ada@acme.com".into(),
+        });
+        let issue = suaegi_tracker::Issue {
+            id: "iss_1".into(),
+            identifier: "ENG-42".into(),
+            title: "Fix the bug".into(),
+            description: None,
+            url: None,
+            state: Some("In Progress".into()),
+            assignee: None,
+        };
+        let _ = state.update(Message::LinearIssueLinked {
+            worktree: worktree_id.clone(),
+            issue,
+        });
+
+        // 메모리에 굳었는가(link_linear_issue).
+        assert_eq!(
+            state
+                .worktree_meta
+                .get(&worktree_id)
+                .and_then(|m| m.linked_linear_issue.as_deref()),
+            Some("ENG-42"),
+            "linking must fold the issue identifier into WorktreeMeta"
+        );
+        assert_eq!(
+            state.linked_linear_issue(&worktree_id),
+            Some("ENG-42"),
+            "the sidebar reader must see the link"
+        );
+
+        // 저장을 거쳐도 남는가(씨딩·재주입 + 좌표).
+        let saved = flush_and_reload(state, &file);
+        assert_eq!(
+            saved.worktrees[0].linked_linear_issue.as_deref(),
+            Some("ENG-42"),
+            "the link must survive a save — WorktreeMeta seeded + re-injected (forge #14 class)"
+        );
+        assert_eq!(
+            saved.worktrees[0].linked_linear_issue_workspace_id.as_deref(),
+            Some("org-77"),
+            "the workspace coordinate captured from the connected workspace must survive too"
+        );
+    }
+
+    /// **API 키 규율 (c)**: 키는 `suaegi-secrets`로만 가고 **평문 JSON에 절대 안 들어간다**.
+    /// 인메모리 토큰/입력 버퍼를 세워도 `persisted_snapshot` 직렬화에 키가 나타나지 않고,
+    /// `LinearState`의 커스텀 Debug도 입력 버퍼를 리댁션한다. 키를 Worktree/Settings 등
+    /// 영속 필드에 흘리는 뮤턴트는 JSON 단언에서 죽는다.
+    #[test]
+    fn the_linear_api_key_never_enters_persisted_json_or_debug() {
+        const KEY: &str = "lin_api_supersecret_ABC123";
+        let (mut state, _repo_id, _worktree_id) = state_with_one_listed_worktree();
+        // 사용자가 키를 입력하고(평문 버퍼) 연결된 상태를 흉내낸다.
+        state.linear.api_key_input = KEY.to_string();
+        state.linear.token = Some(Secret::new(KEY));
+        state.linear.workspace = Some(LinearWorkspace {
+            id: "org-1".into(),
+            name: "Acme".into(),
+            url_key: "acme".into(),
+            viewer_email: "ada@acme.com".into(),
+        });
+
+        // 영속 스냅샷 JSON 어디에도 키가 없다(토큰은 키체인으로만 간다).
+        let json = serde_json::to_string(&state.persisted_snapshot()).unwrap();
+        assert!(
+            !json.contains(KEY),
+            "the Linear API key must never appear in the persisted JSON"
+        );
+        // LinearState Debug도 입력 버퍼(평문)를 리댁션한다.
+        let dbg = format!("{:?}", state.linear);
+        assert!(
+            !dbg.contains(KEY),
+            "the Linear API key must never appear in Debug output: {dbg}"
         );
     }
 
@@ -6836,6 +7170,7 @@ mod tests {
                 created_with_agent: None,
                 created_at_unix_ms: 42,
                 linked_github_pr: None,
+                ..Default::default()
             },
         );
 
