@@ -128,7 +128,6 @@ fn parse_porcelain_status(stdout: &str) -> Result<HashMap<String, FileStatus>, G
             continue;
         }
         // `XY<SP>PATH` — 최소 `XY`(2) + 공백(1) + 경로 최소 1글자 = 4바이트.
-        // `XY`와 공백은 항상 ASCII라 바이트 인덱스 2/3이 char 경계에 안전하다.
         if record.len() < 4 {
             return Err(GitError::Parse {
                 args: args.to_string(),
@@ -136,8 +135,19 @@ fn parse_porcelain_status(stdout: &str) -> Result<HashMap<String, FileStatus>, G
             });
         }
         let bytes = record.as_bytes();
+        // **byte 2가 ASCII 공백임을 검증한 뒤에만** `record[3..]`을 슬라이스한다.
+        // 실제 git porcelain=v1은 항상 byte2=0x20이라 도달 불가지만, 검증 없이 자르면
+        // byte 2가 멀티바이트 UTF-8 시작인 malformed 입력(`AB€x`)에서 index 3이 char
+        // 경계 중간에 떨어져 **panic**한다. 순수 파서를 어떤 입력에도 total하게 유지한다.
+        if bytes[2] != b' ' {
+            return Err(GitError::Parse {
+                args: args.to_string(),
+                detail: format!("status record {record:?} missing XY/path separator"),
+            });
+        }
         let x = bytes[0] as char;
         let y = bytes[1] as char;
+        // byte 2가 공백(ASCII)임을 확인했으므로 index 3은 char 경계다.
         let path = &record[3..];
 
         let status = if x == 'R' || x == 'C' {
@@ -276,5 +286,17 @@ mod tests {
     #[test]
     fn short_record_is_parse_error() {
         assert!(parse_porcelain_status("M\0").is_err());
+    }
+
+    // byte 2(XY/경로 구분자)가 공백이 아닌 malformed 레코드는 **panic 없이** Parse.
+    // 핵심은 멀티바이트 케이스: "AB€x"는 byte2가 €의 첫 바이트(0xE2)라 len<4를 통과하고,
+    // guard가 없으면 `record[3..]`이 € 중간(char 경계 밖)을 잘라 char-boundary panic이
+    // 난다. guard를 지우고 옛 코드로 되돌리면 이 테스트가 panic해 FAIL한다.
+    #[test]
+    fn non_space_separator_is_parse_error_not_panic() {
+        // 멀티바이트: byte2 = 0xE2. guard 없으면 여기서 panic.
+        assert!(parse_porcelain_status("AB€x\0").is_err());
+        // 순수 ASCII지만 byte2가 공백이 아닌 경우도 total하게 Parse.
+        assert!(parse_porcelain_status("MMxpath\0").is_err());
     }
 }
