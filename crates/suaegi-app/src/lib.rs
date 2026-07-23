@@ -5,6 +5,7 @@ pub mod external_editor;
 pub mod forge_tasks;
 pub mod forge_ui;
 pub mod git_tasks;
+pub mod keybinding_adapter;
 pub mod layout;
 pub mod persistence_thread;
 pub mod pr_panel;

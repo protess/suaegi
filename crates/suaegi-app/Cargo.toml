@@ -9,6 +9,8 @@ license.workspace = true
 suaegi-core = { path = "../suaegi-core" }
 suaegi-git = { path = "../suaegi-git" }
 suaegi-term = { path = "../suaegi-term" }
+# 키바인딩 해석기(순수 크레이트). M6a 어댑터가 iced 키 이벤트를 KeybindingInput으로 옮긴다.
+suaegi-keys = { path = "../suaegi-keys" }
 # Plan 7a: GitHub PR 상태/생성. gh CLI shell-out은 이 크레이트 뒤에서만 일어난다.
 suaegi-forge = { path = "../suaegi-forge" }
 # Tracker UI(N1 Linear): 이슈 읽기 + 워크트리 링크. 네트워크는 이 크레이트 뒤에서만.

@@ -3950,6 +3950,7 @@ dependencies = [
  "suaegi-forge",
  "suaegi-git",
  "suaegi-http",
+ "suaegi-keys",
  "suaegi-secrets",
  "suaegi-term",
  "suaegi-tracker",
