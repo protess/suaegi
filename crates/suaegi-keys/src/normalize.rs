@@ -43,6 +43,12 @@ pub enum InvalidReason {
     /// double-tap / unparsable). Orca `keybindings.ts:1480`.
     #[error("Pick a number key 1\u{2013}9 with a modifier, like Cmd+1 or Ctrl+1.")]
     NotDigitIndexKey,
+    /// A capture ([`keybinding_from_input`](crate::keybinding_from_input)) saw
+    /// only modifier keys, no pressed key. Orca `keybindings.ts:1713`. This
+    /// reason is produced by the M3 resolver's capture path, never by
+    /// normalize/validate.
+    #[error("Press a key, not only a modifier.")]
+    PressAKey,
 }
 
 /// The result of validating a single chord. Rust enum mirror of Orca's
@@ -88,9 +94,9 @@ pub type KeybindingListResult = Result<Vec<String>, InvalidReason>;
 /// Per-action normalize options. Mirror of Orca `NormalizeKeybindingOptions`
 /// (`keybindings.ts:181`).
 #[derive(Debug, Clone, Copy, Default)]
-struct NormalizeOptions {
-    allow_bare: bool,
-    allow_shift_only: bool,
+pub(crate) struct NormalizeOptions {
+    pub(crate) allow_bare: bool,
+    pub(crate) allow_shift_only: bool,
 }
 
 /// Whether a bare (modifier-less) key is safe to bind: function keys, and a set
@@ -125,7 +131,7 @@ fn is_safe_bare_key(parsed: &ParsedKeybinding) -> bool {
 
 /// Validate + canonicalize a single chord under `options`. Mirror of Orca
 /// `normalizeKeybindingWithOptions` (`keybindings.ts:1377-1412`).
-fn normalize_keybinding_with_options(
+pub(crate) fn normalize_keybinding_with_options(
     binding: &str,
     options: NormalizeOptions,
 ) -> KeybindingValidationResult {
@@ -230,7 +236,7 @@ fn normalize_keybinding_array_with_options(
 
 /// The `allow_bare` / `allow_shift_only` options for an action. Mirror of Orca
 /// `normalizeOptionsForAction` (`keybindings.ts:1466-1472`).
-fn normalize_options_for_action(action: KeybindingActionId) -> NormalizeOptions {
+pub(crate) fn normalize_options_for_action(action: KeybindingActionId) -> NormalizeOptions {
     match action.definition() {
         Some(def) => NormalizeOptions {
             allow_bare: def.allow_bare_keybindings,
@@ -242,7 +248,7 @@ fn normalize_options_for_action(action: KeybindingActionId) -> NormalizeOptions 
 
 /// Whether `key` is a single `1`-`9` digit. Mirror of Orca
 /// `DIGIT_INDEX_KEY_PATTERN = /^[1-9]$/` (`keybindings.ts:1095`).
-fn is_digit_index_key(key: &str) -> bool {
+pub(crate) fn is_digit_index_key(key: &str) -> bool {
     matches!(key.as_bytes(), [b'1'..=b'9'])
 }
 
@@ -250,7 +256,7 @@ fn is_digit_index_key(key: &str) -> bool {
 /// display and conflict detection stay identical across the `1`-`9` range;
 /// reject any non-`1`-`9` key (or double-tap / unparsable). Mirror of Orca
 /// `canonicalizeDigitIndexBinding` (`keybindings.ts:1475-1484`).
-fn canonicalize_digit_index_binding(binding: &str) -> KeybindingValidationResult {
+pub(crate) fn canonicalize_digit_index_binding(binding: &str) -> KeybindingValidationResult {
     let parsed = match parse_keybinding(binding) {
         Ok(parsed) => parsed,
         Err(_) => {
