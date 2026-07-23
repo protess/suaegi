@@ -159,10 +159,17 @@ impl WriteHalt {
 
 // ---- 중복 탐지 ----
 
-/// GraphQL 에러가 **중복 id**(멱등 재시도) 신호인지. extensions.type을 **먼저** 보고, 없으면
-/// message-substring으로 폴백한다(Orca `isDuplicateIdError` 미러 — Linear가 중복에 별도 type을
-/// 주는지 미확인이라 message 폴백이 현재 유일한 길, human-eyes 실측 대상). raw message는 **탐지에만**
-/// 쓰고 절대 [`WriteOutcome`]에 담지 않는다(누출 방지).
+/// GraphQL 에러가 **write-id 멱등 충돌**(같은 write-id 재시도) 신호인지. extensions.type을 **먼저**
+/// 보고, 없으면 message-substring으로 좁게 폴백한다(Orca `isDuplicateIdError` 미러 — Linear가 중복
+/// id에 별도 type을 주는지 미확인이라 message 폴백이 현재 유일한 길, human-eyes 실측 대상).
+///
+/// **폴백은 write-id/키를 명백히 가리키는 문구만** 본다("duplicate"[key], "id has already"). bare
+/// "already exists" / "already in use"는 **뺐다** — product-level 유니크 제약 거부(예: `invalid
+/// input` + "An issue with that title already exists in this team")까지 삼켜 **실패한 쓰기를
+/// Duplicate(="이미 반영됨")로 오독**하고 caller가 재시도를 건너뛰게 만들기 때문. false-positive
+/// (실패→Duplicate, 데이터 손실 위험)보다 false-negative(진짜 duplicate를 놓쳐 Rejected로, caller가
+/// 실패로 인지할 뿐 손실 없음)가 안전하다. raw message는 **탐지에만** 쓰고 절대 [`WriteOutcome`]에
+/// 담지 않는다(누출 방지).
 fn is_duplicate_write_error(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return false;
@@ -180,16 +187,15 @@ fn is_duplicate_write_error(body: &str) -> bool {
             return true;
         }
     }
-    // 폴백: raw message substring(탐지 전용, 저장 안 함).
+    // 폴백: raw message substring(탐지 전용, 저장 안 함). **write-id/키 문맥만** — bare
+    // "already exists"/"already in use"는 product-uniqueness 거부를 삼키므로 뺐다.
     let message = first
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    message.contains("duplicate")
-        || message.contains("already exists")
-        || message.contains("already in use")
-        || message.contains("id has already")
+    // DB primary-key 위반("duplicate key value ...")과 명시적 id 참조("id has already")만.
+    message.contains("duplicate") || message.contains("id has already")
 }
 
 // ---- write 오퍼레이션 ----
@@ -241,7 +247,9 @@ impl LinearClient {
             fields["assigneeId"] = json!(v);
         }
         let vars = json!({ "id": issue_id, "input": fields });
-        // update엔 write-id가 input.id로 실리지 않는다(대상은 기존 이슈). duplicate 라벨용 id는 비움.
+        // update엔 write-id가 input.id로 실리지 않는다(대상은 기존 이슈, 자연 멱등) → duplicate
+        // 경로는 도달 불가. 그래도 `post_mutation` 시그니처를 맞추려 빈 라벨 ""을 넘긴다(이 ""이
+        // Duplicate(id)로 표면화될 일은 없다 — issueUpdate는 중복 id 에러를 내지 않는다).
         if let Err(halt) = self.post_mutation(UPDATE, vars, "issueUpdate", "").await {
             return halt.into_outcome();
         }
@@ -630,6 +638,27 @@ mod tests {
         }
         // 중복은 종결 — readback POST를 하지 않는다(정확히 1요청).
         assert_eq!(t.requests().len(), 1, "duplicate is terminal; no readback");
+    }
+
+    /// **mutation-verified (c-2, false-positive 방어)**: product-level 유니크 제약 거부
+    /// (`invalid input` + "An issue with that title already exists in this team", **write-id
+    /// 문맥 없음**)는 **Rejected로 분류되고 절대 Duplicate가 아니다** — 이건 실패한 쓰기이지
+    /// "이미 반영됨"이 아니다. `is_duplicate_write_error`의 좁혀진 폴백을 옛 넓은 substring
+    /// (bare "already exists")으로 되돌리면 이 픽스처가 Duplicate로 떨어져 테스트가 깨진다.
+    #[tokio::test]
+    async fn product_uniqueness_reject_is_rejected_not_duplicate() {
+        const TITLE_UNIQUE_200: &str = r#"{"errors":[{"message":"An issue with that title already exists in this team",
+            "extensions":{"type":"invalid input","userPresentableMessage":"That title is already taken."}}]}"#;
+        let t = Arc::new(FakeTransport::default());
+        t.push_response(ok(200, TITLE_UNIQUE_200));
+        match client(t).create_issue(&wid(), new_issue()).await {
+            WriteOutcome::Rejected(c) => assert_eq!(c.kind, TrackerUnavailable::InvalidInput),
+            WriteOutcome::Duplicate(_) => panic!(
+                "a product-uniqueness rejection (no write-id context) is a failed write, \
+                 NOT an idempotent Duplicate — caller must retry, not skip"
+            ),
+            other => panic!("expected Rejected(InvalidInput), got {other:?}"),
+        }
     }
 
     // ---- 확정 거부(invalid input, 중복 아님) → Rejected ----
