@@ -90,6 +90,66 @@ pub fn rg_args(include_ignored: bool, excludes: &[String]) -> Vec<String> {
     args
 }
 
+// ─── rg 항상-on hidden-dir blocklist (Orca quick-open-filter.ts:27-53,222-234) ─
+
+/// caller `excludes`와 **무관하게 항상** rg에서 prune하는 dot-dir 이름들(Orca
+/// `HIDDEN_DIR_BLOCKLIST`, quick-open-filter.ts:27-45). 도구-생성 캐시/상태 디렉터리라
+/// 사람이 손대지 않는다. `.config`/`.ssh`/`.github` 같은 사용자-저작 dotdir는 **넣지 않는다**
+/// (그 안 파일을 연다). 순서는 Orca 목록 그대로.
+const HIDDEN_DIR_BLOCKLIST: &[&str] = &[
+    ".git",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".stably",
+    ".vscode",
+    ".idea",
+    ".yarn",
+    ".pnpm-store",
+    ".terraform",
+    ".docker",
+    ".husky",
+    ".npm",
+    ".npm-global",
+    ".gvfs",
+];
+
+/// dot-dir가 아니라 별도(Orca `HIDDEN_PATH_BLOCKLIST`, :49) — 생성된 desktop 런타임 subtree만.
+/// `.local` 자체는 사용자 파일을 담을 수 있어 통째로 막지 않는다.
+const HIDDEN_PATH_BLOCKLIST: &[&str] = &[".local/share"];
+
+/// node_modules는 dotfile 디렉터리가 아니지만 모든 traversal에서 prune돼야 한다
+/// (Orca `NON_DOTTED_PRUNE`, :53). blocklist glob에서 **맨 앞**에 온다(:225).
+const NON_DOTTED_PRUNE: &str = "node_modules";
+
+/// rg의 **항상-on** hidden-dir prune glob들(Orca `buildHiddenDirExcludeGlobs`,
+/// quick-open-filter.ts:224-234). caller `excludes`와 **별개로** 두 rg 패스 모두에 주입한다.
+///
+/// **F1(HIGH)**: 이게 없으면 ignored 패스(`--no-ignore-vcs --hidden`)가 `.git/` 전체(hook
+/// 샘플 등 20개+)·`node_modules`·`.next`를 Quick Open 결과로 노출한다(리뷰어 실측 재현).
+/// primary 패스는 `--exclude-standard` 없이 rg 자체 gitignore 존중이라 `.git`은 걸러지지만,
+/// blocklist는 두 패스 모두에 걸어 ignored 패스의 노출을 원천 차단한다.
+///
+/// directory-match form `!**/<name>`(contents-form 아님) — rg는 contents-form만 매칭된
+/// 디렉터리로 여전히 내려가므로 directory-form만 실제 traversal을 prune한다(:217-222).
+/// 이름/경로는 `escape_glob`/`escape_glob_path`로 escape하고 항상 `!` 접두다.
+pub fn rg_hidden_dir_exclude_globs() -> Vec<String> {
+    let mut out = Vec::new();
+    // node_modules 먼저(Orca :225), 그다음 dot-dir blocklist.
+    out.push("--glob".to_string());
+    out.push(format!("!**/{}", escape_glob(NON_DOTTED_PRUNE)));
+    for name in HIDDEN_DIR_BLOCKLIST {
+        out.push("--glob".to_string());
+        out.push(format!("!**/{}", escape_glob(name)));
+    }
+    // multi-segment 경로 blocklist는 escape_glob_path(구분자 `/`는 escape 안 함).
+    for p in HIDDEN_PATH_BLOCKLIST {
+        out.push("--glob".to_string());
+        out.push(format!("!**/{}", escape_glob_path(p)));
+    }
+    out
+}
+
 // ─── git ls-files argv 빌더 (Orca quick-open-filter.ts:312-344) ────────
 
 /// `git ls-files` argv를 만든다.
@@ -478,6 +538,14 @@ impl QuickOpenError {
 /// 2. rg 있으면 → rg 2패스. 런 실패는 **하드 에러**(second-chance git 폴백 금지).
 /// 3. git 티어는 rev-parse가 not-a-worktree면 walk로 soft-fail; 확정 워크트리면 ls-files
 ///    실패는 하드 리젝트.
+///
+/// **F7(M3 선결 조건)**: `excludes`는 지금 rg(`rg_args` → basename-anywhere `!**/{p}`)와
+/// git(`ls_files_args` → rooted `:(exclude,glob){p}`) 양쪽에 **그대로** 전달되는데, 두
+/// 빌더의 exclude 의미가 다르다: 멀티세그먼트 값(`packages/app`)을 rg에 `!**/packages/app`으로
+/// 넣으면 트리 어디에 있는 동명 경로든 over-prune(=파일 누락)한다. M3가 nested-worktree
+/// prefix를 배선하기 전에 **반드시** rg는 rooted `!<p>`+`!<p>/**`, git은 rooted pathspec으로
+/// 분기해 조율해야 한다(현재 M2b는 basename blocklist 이름만 안전하게 통과시키는 전제).
+/// 항상-on hidden-dir blocklist(`rg_hidden_dir_exclude_globs`)는 이 `excludes`와 무관하다.
 pub async fn list_quick_open_files(
     worktree: &Path,
     excludes: &[String],
@@ -556,6 +624,9 @@ async fn list_with_rg_using(
     let mut files: BTreeSet<String> = BTreeSet::new();
     for include_ignored in [false, true] {
         let mut args = rg_args(include_ignored, excludes);
+        // F1: 항상-on hidden-dir blocklist를 caller excludes와 별개로 두 패스 모두에 주입한다
+        // — 이게 없으면 ignored 패스가 `.git/`·node_modules·.next를 노출한다(Orca:269 hiddenDirGlobs).
+        args.extend(rg_hidden_dir_exclude_globs());
         // searchRoot('.')는 M2b가 붙인다(cwd=worktree, cwd-상대 출력). Orca filesystem-list-files.ts:68.
         args.push(".".to_string());
         // `?`: 하드 실패는 즉시 전파(둘째 패스로 절대 넘어가지 않음).
@@ -1007,6 +1078,36 @@ mod tests {
     fn rg_exclude_multi_segment_keeps_slash() {
         let args = rg_args(false, &[".local/share".to_string()]);
         assert_eq!(args.last().unwrap(), "!**/.local/share");
+    }
+
+    // F1: 항상-on hidden-dir blocklist glob. node_modules가 맨 앞, `.git`·`.next` 포함,
+    // multi-segment `.local/share`도. mutation: 목록에서 `.git`(또는 node_modules)을 빼면
+    // 아래 단언이 FAIL. 각 값은 directory-form `!**/name`.
+    #[test]
+    fn rg_hidden_dir_blocklist_globs_shape() {
+        let globs = rg_hidden_dir_exclude_globs();
+        // node_modules가 첫 `--glob` 값(Orca :225 순서).
+        assert_eq!(&globs[0], "--glob");
+        assert_eq!(&globs[1], "!**/node_modules");
+        // 핵심 항목이 directory-form으로 존재.
+        assert!(
+            globs.iter().any(|g| g == "!**/.git"),
+            "blocklist에 .git 누락"
+        );
+        assert!(
+            globs.iter().any(|g| g == "!**/.next"),
+            "blocklist에 .next 누락"
+        );
+        assert!(
+            globs.iter().any(|g| g == "!**/.local/share"),
+            "blocklist에 .local/share 누락"
+        );
+        // 전부 `--glob`/`!**/…` 쌍(홀짝) — argv 주입 불가(항상 `!` 접두).
+        assert_eq!(globs.len() % 2, 0);
+        for pair in globs.chunks(2) {
+            assert_eq!(pair[0], "--glob");
+            assert!(pair[1].starts_with("!**/"));
+        }
     }
 
     // ─── git ls-files argv ─────────────────────────────────────────
@@ -1783,6 +1884,122 @@ mod driver_tests {
         assert_ne!(GIT_TIMEOUT, crate::runner::DEFAULT_TIMEOUT);
         assert_eq!(RG_TIMEOUT, Duration::from_secs(10));
         assert_eq!(RG_PROBE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    // ─── F1(HIGH): rg 티어 항상-on hidden-dir blocklist (실 rg) ────────
+
+    // THE F1 crux: rg 티어 결과에 `.git/`·node_modules·.next 경로가 **없다**. 실 rg 필요
+    // (없으면 스킵). mutation: 드라이버에서 `rg_hidden_dir_exclude_globs()` 주입을 제거하면
+    // ignored 패스가 이들을 노출해 이 단언이 FAIL(리뷰어 실측: .git 내부 20개+ 노출).
+    #[tokio::test]
+    async fn rg_tier_excludes_hidden_dirs() {
+        let wt = tempdir();
+        if !rg_available(wt.path()).await {
+            return; // 실 rg 없으면 이 crux는 검증 불가 — 스킵.
+        }
+        git(wt.path(), &["init", "-q"]);
+        std::fs::create_dir_all(wt.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.path().join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::fs::create_dir(wt.path().join(".next")).unwrap();
+        std::fs::write(wt.path().join(".next/build.txt"), b"x").unwrap();
+        std::fs::create_dir(wt.path().join("src")).unwrap();
+        std::fs::write(wt.path().join("src/main.rs"), b"x").unwrap();
+
+        let files = list_with_rg(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"src/main.rs".to_string()),
+            "정상 파일 누락: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.starts_with(".git/")),
+            ".git/ 내부가 노출됐다(F1): {:?}",
+            files
+                .iter()
+                .filter(|p| p.starts_with(".git/"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.split('/').any(|seg| seg == "node_modules")),
+            "node_modules가 노출됐다(F1): {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.split('/').any(|seg| seg == ".next")),
+            ".next가 노출됐다(F1): {files:?}"
+        );
+    }
+
+    // ─── F2: walk batch 체크포인트 격리 (빈 루트) ─────────────────────
+
+    // THE F2 crux: 엔트리가 **0개인 빈 루트** + 지난 데드라인 → WalkTimeout. 루트에 엔트리가
+    // 없어 per-entry 체크포인트는 절대 안 돈다 → **batch 체크포인트만이** 잡을 수 있다.
+    // mutation: batch 체크포인트(리스팅 전/후 두 개)를 제거하면 per-entry가 못 잡아 Ok([]) → FAIL.
+    // (엔트리가 있는 트리로는 per-entry가 잡아 mutation이 살아남으므로 반드시 빈 루트여야 한다.)
+    #[test]
+    fn walk_empty_root_batch_checkpoint_catches_deadline() {
+        let wt = tempdir(); // 완전히 빈 디렉터리 — list_dir이 [] 반환.
+        let past = WalkBudget::with_limits(10_000, Instant::now() - Duration::from_secs(1));
+        let r = list_with_walk(wt.path(), past);
+        assert!(
+            matches!(r, Err(QuickOpenError::WalkTimeout)),
+            "빈 루트 + 지난 데드라인은 batch 체크포인트가 잡아 WalkTimeout이어야 한다(per-entry 불가): {r:?}"
+        );
+    }
+
+    // ─── F3: git ignored 패스가 gitignore된 파일을 표면화 ─────────────
+
+    // crux: gitignore된 untracked 파일이 ignored 패스(--others --ignored)로 결과에 든다.
+    // mutation: ignored 패스 실행을 제거하면 ignored.txt가 안 나와 FAIL(best-effort swallow는 유지).
+    #[tokio::test]
+    async fn git_ignored_pass_surfaces_ignored_file() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::write(wt.path().join(".gitignore"), b"ignored.txt\n").unwrap();
+        std::fs::write(wt.path().join("ignored.txt"), b"x").unwrap();
+        std::fs::write(wt.path().join("tracked.txt"), b"x").unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"ignored.txt".to_string()),
+            "ignored 패스가 gitignore된 파일을 표면화하지 않았다: {files:?}"
+        );
+        assert!(files.contains(&"tracked.txt".to_string()));
+    }
+
+    // ─── F4: rg exit 1(빈 레포/매치 0) → Ok([]) 하드에러 아님 ──────────
+
+    // crux: rg exit 1은 정상(매치 0) → Ok(빈). mutation: `code == 0 || code == 1`에서 `|| code == 1`
+    // 을 빼면 exit1이 else로 떨어져 RgFailed → 이 단언이 FAIL.
+    #[tokio::test]
+    async fn rg_exit1_empty_is_ok_not_error() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(bin.path(), "rg", "#!/bin/sh\nexit 1\n");
+        let files =
+            list_with_rg_using(wt.path(), rg.to_str().unwrap(), &[], Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert!(files.is_empty(), "exit1은 빈 Ok여야 한다: {files:?}");
+    }
+
+    // ─── F5: bare repo("false") → walk 라우팅 ──────────────────────────
+
+    // crux: bare repo의 rev-parse는 exit0 "false" → **walk로 라우팅**(worktree 아님).
+    // 나는 stdout=="true"만 worktree로 보므로 bare는 walk로 간다. mutation: `=="true"`를
+    // Orca식 `is_ok()`로 되돌리면 bare repo에서 ls-files가 "work tree 아님"으로 실패해
+    // GitLsFilesFailed → 이 단언(Ok + walk 파일)이 FAIL.
+    #[tokio::test]
+    async fn bare_repo_routes_to_walk() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "--bare", "-q", "."]);
+        std::fs::write(wt.path().join("plain-marker.txt"), b"x").unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"plain-marker.txt".to_string()),
+            "bare repo가 walk로 라우팅돼 파일을 나열해야 한다(worktree 취급 아님): {files:?}"
+        );
     }
 
     // ─── rg stdout 파싱 ────────────────────────────────────────────────
