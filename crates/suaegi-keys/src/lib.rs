@@ -16,13 +16,17 @@
 //!     `keybinding_matches_input`, `keybinding_matches_action`,
 //!     `match_keybinding_digit_index`) with the macOS Option-compose, non-Latin /
 //!     AltGr physical-code fallbacks, and terminal-shortcut policy.
+//!   - M4: conflict detection (`find_keybinding_conflicts`,
+//!     `KeybindingConflict`) — reduces each action's effective bindings to a
+//!     platform-resolved identity, buckets by conflict-group/scope, and reports
+//!     collisions only when a customized action participates.
 //!
-//! Conflict detection (M4) and the on-disk file layer (M5) land in later
-//! milestones. The templated
+//! The on-disk file layer (M5) lands in a later milestone. The templated
 //! `tab.newAgent.${agent}` family (Orca `keybindings.ts:26,1059`) is intentionally
 //! **excluded** here (see F2 in the plan) and gets wired at the app boundary in M6.
 
 mod chord;
+mod conflicts;
 mod format;
 mod normalize;
 mod registry;
@@ -32,6 +36,10 @@ pub use chord::{
     canonicalize_parsed_keybinding, is_double_tap_binding, normalize_key_token, parse_keybinding,
     parse_modifier_token, resolve_modifier_token, ModifierToken, ParseError, ParsedKeybinding,
     PhysicalModifier,
+};
+pub use conflicts::{
+    find_keybinding_conflicts, find_keybinding_conflicts_with_options,
+    FindKeybindingConflictOptions, KeybindingConflict,
 };
 pub use format::{format_keybinding, format_keybinding_list};
 pub use normalize::{

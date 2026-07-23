@@ -38,6 +38,33 @@ pub enum Scope {
     Settings,
 }
 
+impl Scope {
+    /// The scope's string form as used for conflict *bucketing* — identical to
+    /// Orca's `KeybindingScope` string union (`keybindings.ts:5-13`), i.e. the
+    /// serde camelCase spelling. This must match a `conflict_group` string
+    /// verbatim so that (for example) the `"global"` conflict group buckets an
+    /// action together with every `Scope::Global` action. Mirror of the raw
+    /// `definition.scope` string flowing into Orca `findKeybindingConflicts`
+    /// (`keybindings.ts:2253`).
+    // F5 (INFO): only `"global"` (matched against the `"global"` conflict group)
+    // is externally observable; the exact camelCase of the multi-word scopes
+    // (e.g. `"fileExplorer"`) is unobserved — no conflict group uses those names,
+    // so intra-scope bucketing only needs this fn to be internally consistent.
+    // Kept camelCase to match Orca's `KeybindingScope` union verbatim.
+    pub const fn as_bucket_str(self) -> &'static str {
+        match self {
+            Scope::Global => "global",
+            Scope::Tabs => "tabs",
+            Scope::Terminal => "terminal",
+            Scope::Browser => "browser",
+            Scope::Editor => "editor",
+            Scope::FileExplorer => "fileExplorer",
+            Scope::Composer => "composer",
+            Scope::Settings => "settings",
+        }
+    }
+}
+
 /// The closed set of remappable actions. Faithful transcription of Orca
 /// `KeybindingActionId` (`keybindings.ts:28-114`) **excluding** the templated
 /// `tab.newAgent.${TuiAgent}` family (`:61`) — that per-agent family is built at

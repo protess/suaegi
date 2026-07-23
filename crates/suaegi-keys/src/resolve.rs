@@ -442,14 +442,16 @@ pub fn keybinding_from_input_for_action(
 
 /// Expected physical modifier state for a parsed chord, resolving the virtual
 /// `Mod` per platform. Mirror of Orca `platformModifiers` (`keybindings.ts:1837-1848`).
-struct ExpectedModifiers {
-    meta: bool,
-    control: bool,
-    alt: bool,
-    shift: bool,
+/// `pub(crate)` so the conflict detector (M4) can reduce a chord to its
+/// platform-resolved identity through the *same* resolution used for matching.
+pub(crate) struct ExpectedModifiers {
+    pub(crate) meta: bool,
+    pub(crate) control: bool,
+    pub(crate) alt: bool,
+    pub(crate) shift: bool,
 }
 
-fn platform_modifiers(
+pub(crate) fn platform_modifiers(
     parsed: &ParsedKeybinding,
     platform: KeybindingPlatform,
 ) -> ExpectedModifiers {
