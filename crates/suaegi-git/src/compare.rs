@@ -351,31 +351,62 @@ pub async fn branch_compare(
 
 /// worktree 안에서 파일 하나가 실제로 무엇인지.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Resolved {
+pub(crate) enum Resolved {
     Regular(PathBuf),
-    /// **따라가지 않는다.** git은 심볼릭 링크를 링크 *내용*으로 다룬다.
+    /// **따라가지 않는다.** git은 심볼릭 링크를 링크 *내용*으로 다룬다. delete/rename도
+    /// 링크 자체를 대상으로 해야 하므로(타깃을 지우면 안 됨) 항상 un-follow로 돌려준다.
     Symlink(PathBuf),
 }
 
-/// worktree 밖을 읽지 않도록 상대 경로를 검증하며 내려간다.
+/// 경로 해석 모드. 유일한 차이는 **leaf가 이미 존재해야 하는가**뿐이다 — 어떤
+/// 모드도 leaf 심링크를 따라가지 않는다(suaegi는 단일 워크트리 containment,
+/// leaf는 링크 내용/링크 자체가 대상이다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveMode {
+    /// 모든 컴포넌트가 이미 존재해야 한다. read(파일 내용)와 delete/rename의
+    /// **source**(지울 링크 자체)용. Orca `preserveSymlink`(parent만 정규화, leaf는
+    /// 보존)에 해당 — 우리 컴포넌트별 walk가 중간 심링크를 즉시 거부하므로 parent
+    /// 정규화 없이 같은 보장을 준다(`filesystem-auth.ts:299-318`).
+    ExistingOnly,
+    /// leaf(그리고 뒤따르는 아직 없는 컴포넌트)가 없어도 된다. create/write/copy와
+    /// rename의 **dest**용. 존재하는 접두는 walk가 심링크가 아님을 확인했으므로
+    /// escape 불가; 없는 꼬리는 위 어휘 검사로 전부 `Normal`임이 보장된다
+    /// (`resolveAuthorizedMissingPath` `filesystem-auth.ts:340-369`의 등가).
+    AllowMissingLeaf,
+}
+
+/// worktree 밖을 읽거나 쓰지 않도록 상대 경로를 검증하며 내려간다.
 ///
 /// **어휘적 포함만으로는 부족하다.** `a/b/c`가 어휘적으로 안에 있어도 `b`가
 /// worktree 밖을 가리키는 심볼릭 링크면 `open`이 그걸 따라간다. 그리고 마지막
 /// 컴포넌트에만 `symlink_metadata`를 부르는 것도 부족하다 — 그 호출 자체가
 /// **중간 컴포넌트는 이미 따라간 뒤**다. 그래서 한 컴포넌트씩 내려가며 본다.
-fn resolve_in_worktree(worktree: &Path, path: &str) -> std::io::Result<Resolved> {
+///
+/// 검사 순서는 값싼 것 먼저다(Codex 4): null-byte·비어있음·비-`Normal` 컴포넌트는
+/// syscall 없이 즉시 거부하고, 그걸 통과한 뒤에야 컴포넌트별 `symlink_metadata`를
+/// 친다(`filesystem-auth.ts:293-338`).
+pub(crate) fn resolve_in_worktree(
+    worktree: &Path,
+    path: &str,
+    mode: ResolveMode,
+) -> std::io::Result<Resolved> {
     let reject = |detail: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{detail}: {path:?}"),
         )
     };
+    // null 바이트는 어떤 fs syscall보다 먼저 명시적으로 거부한다 — 커널까지 가면
+    // 경로가 잘려 다른 파일을 가리킬 수 있다(`filesystem-auth.ts:411,531`).
+    if path.as_bytes().contains(&0) {
+        return Err(reject("path contains a null byte"));
+    }
     let rel = Path::new(path);
     if path.is_empty() {
         return Err(reject("empty path"));
     }
-    // 절대 경로, `..`, 루트 접두는 전부 거절. git이 내는 경로에는 없지만
-    // `file_head_bytes`는 공개 API다.
+    // 절대 경로, `..`, `.`, 루트/드라이브 접두는 전부 거절. git이 내는 경로에는
+    // 없지만 이 함수는 create/write 등 공개 표면의 진입점이다.
     if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
         return Err(reject("path escapes the worktree"));
     }
@@ -384,22 +415,54 @@ fn resolve_in_worktree(worktree: &Path, path: &str) -> std::io::Result<Resolved>
     let mut components = rel.components().peekable();
     while let Some(component) = components.next() {
         current.push(component);
-        if std::fs::symlink_metadata(&current)?
-            .file_type()
-            .is_symlink()
-        {
-            if components.peek().is_some() {
-                return Err(reject("path traverses a symlink"));
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    if components.peek().is_some() {
+                        return Err(reject("path traverses a symlink"));
+                    }
+                    // leaf 심링크: 따라가지 않고 링크 자체를 돌려준다(read든 delete든).
+                    return Ok(Resolved::Symlink(current));
+                }
+                // 존재하는 non-symlink 디렉터리/파일: 계속 내려간다.
             }
-            return Ok(Resolved::Symlink(current));
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && mode == ResolveMode::AllowMissingLeaf =>
+            {
+                // 이 컴포넌트부터 끝까지 아직 없다. 남은 컴포넌트를 붙여 미래 경로를
+                // 만든다. **여기까지의 접두는 위 루프가 심링크가 아님을 확인**했으므로
+                // 존재하는 조상을 통한 escape는 불가능하고, 없는 꼬리는 전부 `Normal`이다.
+                for rest in components {
+                    current.push(rest);
+                }
+                return Ok(Resolved::Regular(current));
+            }
+            // ExistingOnly의 ENOENT 포함 — read/delete는 leaf 존재를 요구한다.
+            Err(e) => return Err(e),
         }
     }
     Ok(Resolved::Regular(current))
 }
 
+/// read(파일 내용) 경로 해석. 모든 컴포넌트가 존재해야 하고 leaf 심링크는 un-follow.
+pub(crate) fn resolve_for_read(worktree: &Path, path: &str) -> std::io::Result<Resolved> {
+    resolve_in_worktree(worktree, path, ResolveMode::ExistingOnly)
+}
+
+/// create/write/copy/rename-dest 경로 해석. leaf(와 없는 꼬리)가 아직 없어도 된다.
+pub(crate) fn resolve_for_write(worktree: &Path, path: &str) -> std::io::Result<Resolved> {
+    resolve_in_worktree(worktree, path, ResolveMode::AllowMissingLeaf)
+}
+
+/// delete/rename-source 경로 해석. leaf 링크 자체를 대상으로(타깃 미추적), 존재 요구.
+pub(crate) fn resolve_preserve_symlink(worktree: &Path, path: &str) -> std::io::Result<Resolved> {
+    resolve_in_worktree(worktree, path, ResolveMode::ExistingOnly)
+}
+
 /// 블로킹 부분만 뽑았다 — `spawn_blocking`에 넘기고, 그대로 단위 테스트한다.
 fn read_head_from_disk(worktree: &Path, path: &str, cap: usize) -> std::io::Result<Vec<u8>> {
-    match resolve_in_worktree(worktree, path)? {
+    match resolve_for_read(worktree, path)? {
         Resolved::Symlink(link) => {
             let mut bytes = std::fs::read_link(&link)?
                 .into_os_string()
@@ -547,4 +610,139 @@ pub async fn working_tree_dirty(
         .run(worktree_path, &["status", "--porcelain"])
         .await?;
     Ok(!out.stdout.trim().is_empty())
+}
+
+#[cfg(all(test, unix))]
+mod path_safety_tests {
+    //! M1 경로 안전 코어. 각 테스트는 하나의 mutant를 죽이도록 설계됐다 —
+    //! 실제 심링크/디렉터리를 `tempdir`에 만들어 검증한다(모킹 금지).
+    use super::{resolve_for_read, resolve_for_write, resolve_preserve_symlink, Resolved};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn worktree() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    // --- traversal: `..`/절대경로 어휘 거부 (mutant: 비-Normal 검사 제거) ---
+    #[test]
+    fn rejects_parent_traversal() {
+        let wt = worktree();
+        assert!(resolve_for_read(wt.path(), "../../etc/passwd").is_err());
+        assert!(resolve_for_read(wt.path(), "a/../../b").is_err());
+        assert!(resolve_for_write(wt.path(), "../../etc/passwd").is_err());
+        // 절대경로도 거부.
+        assert!(resolve_for_read(wt.path(), "/etc/passwd").is_err());
+    }
+
+    // --- 중간 심링크가 밖을 가리키면 거부 (mutant: peek().is_some() 거부 제거) ---
+    #[test]
+    fn rejects_middle_symlink_escape() {
+        let wt = worktree();
+        let outside = worktree();
+        fs::write(outside.path().join("secret"), b"x").unwrap();
+        // worktree 안 `link` -> 밖 디렉터리.
+        symlink(outside.path(), wt.path().join("link")).unwrap();
+        // `link/secret`은 어휘적으로 안이지만 중간 심링크가 밖으로 나간다.
+        assert!(resolve_for_read(wt.path(), "link/secret").is_err());
+    }
+
+    // --- missing-path escape: leaf가 없어도 parent 심링크면 거부 ---
+    // (mutant: AllowMissingLeaf에서 심링크 검사를 건너뛰거나 middle 거부 제거)
+    #[test]
+    fn rejects_missing_leaf_through_parent_symlink() {
+        let wt = worktree();
+        let outside = worktree();
+        // worktree 안 `link` -> 밖 디렉터리. `link/newfile`은 아직 없다.
+        symlink(outside.path(), wt.path().join("link")).unwrap();
+        // create가 없는 leaf를 인가하려 해도 parent가 밖을 가리키면 거부해야 한다.
+        assert!(resolve_for_write(wt.path(), "link/newfile").is_err());
+    }
+
+    // --- leaf 심링크는 un-follow로 돌려준다 (mutant: Symlink -> Regular) ---
+    #[test]
+    fn leaf_symlink_returned_unfollowed_preserve_mode() {
+        let wt = worktree();
+        let outside = worktree();
+        let target = outside.path().join("target");
+        fs::write(&target, b"content").unwrap();
+        symlink(&target, wt.path().join("link")).unwrap();
+        // delete/rename-source: 링크 자체를 대상으로 — 따라가면 밖 파일을 건드린다.
+        match resolve_preserve_symlink(wt.path(), "link").unwrap() {
+            Resolved::Symlink(p) => assert_eq!(p, wt.path().join("link")),
+            other => panic!("leaf 심링크가 un-follow 되지 않았다: {other:?}"),
+        }
+    }
+
+    // read 모드도 leaf 심링크를 따라가지 않는다(git 의미론).
+    #[test]
+    fn leaf_symlink_returned_unfollowed_read_mode() {
+        let wt = worktree();
+        symlink("some-target", wt.path().join("link")).unwrap();
+        assert!(matches!(
+            resolve_for_read(wt.path(), "link").unwrap(),
+            Resolved::Symlink(_)
+        ));
+    }
+
+    // --- null-byte 거부 (mutant: null-byte 가드 제거) ---
+    // Unix stdlib도 interior-nul을 독립적으로 거부하므로("...NUL byte") `is_err`만으로는
+    // 우리 가드 제거를 죽일 수 없다 — 공허해진다. **우리 가드가 먼저 쳤는지**를
+    // 메시지로 확인해 mutant를 죽인다(우리 메시지는 소문자 "null byte").
+    #[test]
+    fn rejects_null_byte() {
+        let wt = worktree();
+        let e = resolve_for_read(wt.path(), "a\0b").unwrap_err();
+        assert!(
+            e.to_string().contains("null byte"),
+            "우리 null-byte 가드가 아니라 stdlib이 거부했다: {e}"
+        );
+        assert!(resolve_for_write(wt.path(), "a\0b")
+            .unwrap_err()
+            .to_string()
+            .contains("null byte"));
+    }
+
+    // --- 정상 깊은 실경로는 read 모드에서 해석된다 ---
+    #[test]
+    fn resolves_deep_real_path_read() {
+        let wt = worktree();
+        fs::create_dir_all(wt.path().join("a/b/c")).unwrap();
+        fs::write(wt.path().join("a/b/c/file"), b"hi").unwrap();
+        assert_eq!(
+            resolve_for_read(wt.path(), "a/b/c/file").unwrap(),
+            Resolved::Regular(wt.path().join("a/b/c/file")),
+        );
+    }
+
+    // --- read 모드는 없는 leaf를 거부; write 모드는 인가 ---
+    // (mutant: AllowMissingLeaf 분기를 ExistingOnly에도 적용하면 read가 없는 파일을 통과)
+    #[test]
+    fn read_requires_existence_write_allows_missing() {
+        let wt = worktree();
+        fs::create_dir_all(wt.path().join("a/b")).unwrap();
+        // read: 없는 leaf -> 에러.
+        assert!(resolve_for_read(wt.path(), "a/b/newfile").is_err());
+        // write: 없는 leaf -> Regular(미래 경로).
+        assert_eq!(
+            resolve_for_write(wt.path(), "a/b/newfile").unwrap(),
+            Resolved::Regular(wt.path().join("a/b/newfile")),
+        );
+        // write: 없는 중간 디렉터리 + 없는 leaf도 인가(create가 parent를 만든다).
+        assert_eq!(
+            resolve_for_write(wt.path(), "a/b/new/deep/file").unwrap(),
+            Resolved::Regular(wt.path().join("a/b/new/deep/file")),
+        );
+    }
+
+    // write 모드도 어휘 검사(`..`)와 중간 실-심링크 거부를 유지한다.
+    #[test]
+    fn write_mode_still_rejects_traversal_and_real_middle_symlink() {
+        let wt = worktree();
+        let outside = worktree();
+        symlink(outside.path(), wt.path().join("link")).unwrap();
+        assert!(resolve_for_write(wt.path(), "a/../../b").is_err());
+        // 존재하는 중간 심링크는 leaf가 있든 없든 거부.
+        assert!(resolve_for_write(wt.path(), "link/sub/newfile").is_err());
+    }
 }
