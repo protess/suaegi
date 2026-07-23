@@ -1,6 +1,7 @@
 pub mod agent_status;
 pub mod background;
 pub mod diff_panel;
+pub mod external_editor;
 pub mod forge_tasks;
 pub mod forge_ui;
 pub mod git_tasks;
