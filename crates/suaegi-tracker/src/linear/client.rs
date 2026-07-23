@@ -29,7 +29,8 @@ const MAX_ISSUES: usize = 250;
 const VIEWER_QUERY: &str =
     "query { viewer { id displayName email organization { id name urlKey } } }";
 
-const ISSUE_FIELDS: &str =
+/// 이슈 노드 필드 집합. 읽기와 write readback([`super::write`])이 같은 모양을 뽑는다.
+pub(super) const ISSUE_FIELDS: &str =
     "id identifier title description url state { name } assignee { displayName }";
 
 /// GraphQL 클라이언트. 토큰이 `None`이면 모든 op이 `Unavailable(NotAuthenticated)`.
@@ -95,6 +96,28 @@ impl LinearClient {
                 Err(Classified::new(TrackerUnavailable::Network))
             }
         }
+    }
+
+    /// **write 경로 전용 저수준 POST**([`super::write`]). auth 헤더 조립 + 단일 실행만 하고,
+    /// 분류는 하지 않는다 — write는 읽기와 분류가 다르기 때문(전송 타임아웃 → `unconfirmed`,
+    /// 확정 거부만 `rejected`; 읽기처럼 전송실패를 뭉뚱그려 Network로 접으면 "실패인지 성공인지
+    /// 모름"을 잃는다). 미인증이면 `None`(호출부가 NotAuthenticated로 접는다).
+    pub(super) async fn post_graphql(
+        &self,
+        query: &str,
+        variables: Value,
+        timeout: Duration,
+    ) -> Option<Result<suaegi_http::HttpResponse, TransportError>> {
+        let headers = self.auth_headers()?;
+        let body = json!({ "query": query, "variables": variables }).to_string();
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            url: LINEAR_ENDPOINT.to_string(),
+            headers,
+            body: Some(body),
+            timeout,
+        };
+        Some(self.transport.execute(req).await)
     }
 
     /// 연결 확인 + 워크스페이스 레코드(§1.2). auth 실패 → `Unavailable(NotAuthenticated)`.
@@ -230,7 +253,8 @@ impl LinearClient {
 }
 
 /// `data` 노드 → [`Issue`]. 없는 필드는 빈 문자열/None(파싱 실패로 전체를 떨구지 않는다).
-fn parse_issue(v: &Value) -> Issue {
+/// write readback([`super::write`])도 같은 파서로 확인된 이슈를 만든다.
+pub(super) fn parse_issue(v: &Value) -> Issue {
     Issue {
         id: v["id"].as_str().unwrap_or_default().to_string(),
         identifier: v["identifier"].as_str().unwrap_or_default().to_string(),
