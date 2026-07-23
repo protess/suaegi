@@ -9,6 +9,7 @@
 //! 플래그로 보이는 파일명을 git이 오해하지 않도록 리터럴로 못 박는다(실측: 바 `a*.txt`는
 //! `a1.txt`까지 스테이징하지만 `:(literal)a*.txt`는 그 파일 하나만).
 
+use crate::compare::resolve_preserve_symlink;
 use crate::runner::{GitError, GitRunner};
 use std::path::Path;
 
@@ -220,10 +221,302 @@ pub async fn commit_changes(
     }
 }
 
+// --- M4: discard (`discard`/`bulk_discard`) — 데이터손실/보안 ---
+
+/// 한 타깃을 discard한 결과. discard는 **삭제/복원**이라 "무엇을 했는가"를 호출부가
+/// 알아야 UI가 정확히 보고할 수 있다(그냥 `()`면 no-op과 실제 삭제를 구별 못 한다).
+///
+/// **경로 안전 거부(traversal/`..`/absolute/null-byte/중간-심링크 escape)는 이 enum이
+/// 아니라 `Err(GitError)`로 나간다** — 그건 "아무것도 안 했고, 위험해서 거부했다"이지
+/// 성공 결과가 아니다. 존재하지 않는 타깃만 `NothingToDiscard`(멱등 성공)다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscardOutcome {
+    /// tracked 경로를 HEAD 내용으로 되돌렸다 — `git restore --worktree --source=HEAD`.
+    /// **워크트리만** 바꾼다(인덱스 미접촉). staged-add(HEAD에 없음)에 대해선 이 git
+    /// (2.50.1)이 워크트리 파일을 **제거**하고 인덱스의 staged 항목은 남긴다(= 워크트리를
+    /// HEAD 상태로 맞춤). Codex/플랜은 "restore가 실패한다"고 봤으나 실측은 exit 0 —
+    /// **의도적으로 이 결과(RestoredTracked)로 흡수**하고, restore가 non-zero인 git
+    /// 버전에서는 `Err(GitError)`로 표면화된다(조용한 미검 경로 없음).
+    RestoredTracked,
+    /// untracked 경로(파일/디렉터리/심링크)를 제거했다 — `git clean -ffdx`(ignored 포함).
+    /// leaf 심링크는 **링크 자체**만 지운다(타깃 미추적).
+    RemovedUntracked,
+    /// 타깃이 존재하지 않는다 — 멱등 no-op 성공. 지울 게 없다(NotFound). Orca처럼
+    /// nearest-existing-parent까지 walk-up하지 않는다(delete엔 불필요).
+    NothingToDiscard,
+}
+
+/// `resolve_preserve_symlink` 검증 결과의 3분기. NotFound(멱등 no-op)와 거부(위험)를
+/// 갈라야 하는데 둘 다 `Err(io)`라 kind로 구별한다.
+enum Validation {
+    /// 워크트리 안의 실존 경로(leaf 심링크 포함 — 링크 자체가 대상). discard 가능.
+    Valid,
+    /// NotFound — 지울 게 없다. 멱등 성공.
+    NothingToDiscard,
+    /// traversal/`..`/absolute/null-byte/중간-심링크 escape 등. **아무것도 지우지 않고 거부.**
+    Rejected(std::io::Error),
+}
+
+/// discard 타깃을 워크트리 경계 안으로 검증한다 — 기존 primitive(`compare.rs`
+/// `resolve_preserve_symlink`, `ExistingOnly`)를 **재사용**한다(Orca `git-discard-path-safety.ts`
+/// realpath-lexical 포팅 금지 — 컴포넌트별 walk가 중간 심링크를 위치 무관 무조건 거부해
+/// strictly stronger). leaf 심링크는 `Resolved::Symlink`로 un-follow 반환 = "링크 자체 삭제"
+/// 라 **허용**한다. NotFound만 멱등 no-op, 그 외 에러는 전부 거부.
+fn validate_target(worktree: &Path, path: &str) -> Validation {
+    match resolve_preserve_symlink(worktree, path) {
+        Ok(_) => Validation::Valid,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Validation::NothingToDiscard,
+        Err(e) => Validation::Rejected(e),
+    }
+}
+
+/// tracked 프로브 — `git ls-files --error-unmatch -- :(literal)<path>`. exit 0=tracked,
+/// 1=untracked. 디렉터리 pathspec도 하위에 tracked 파일이 하나라도 있으면 exit 0.
+async fn probe_tracked(runner: &GitRunner, worktree: &Path, path: &str) -> Result<bool, GitError> {
+    let spec = literal_pathspec(path);
+    let out = runner
+        .run_expecting(
+            worktree,
+            &["ls-files", "--error-unmatch", "--", &spec],
+            &[1],
+        )
+        .await?;
+    Ok(out.code == 0)
+}
+
+/// 한 경로의 워크트리 변경을 discard한다.
+///
+/// 순서(최소-안전 스펙): (1) `validate_target`로 경계 검증 — NotFound→멱등 no-op,
+/// 거부→`Err`(아무것도 안 지움); (2) tracked 프로브; (3) tracked→`restore --worktree
+/// --source=HEAD`(**`--worktree`만** — bare로 떨궈도 git는 --worktree 기본이라 같으나,
+/// `--staged`가 붙으면 인덱스까지 리셋되므로 명시); (4) untracked→**clean 직전 1회
+/// 재검증**(TOCTOU: tracked-restore 단계의 `.gitattributes` smudge/clean 필터 부작용
+/// 가능성) 후 `git clean -ffdx`.
+///
+/// 마지막 재검증~`clean` exec 사이의 좁은 TOCTOU는 남는다 — `fs.rs:219` 쓰기 staleness와
+/// 같은 자세로 **명시하고 수용**한다(락 안 검). 그 창에서 경로가 심링크로 바뀌어도
+/// `:(literal)` pathspec-bounded `clean`은 심링크 부모로 내려가지 않아 blast가 제한된다.
+pub async fn discard(
+    runner: &GitRunner,
+    worktree: &Path,
+    path: &str,
+) -> Result<DiscardOutcome, GitError> {
+    match validate_target(worktree, path) {
+        Validation::Valid => {}
+        Validation::NothingToDiscard => return Ok(DiscardOutcome::NothingToDiscard),
+        Validation::Rejected(e) => return Err(GitError::Io(e)),
+    }
+
+    if probe_tracked(runner, worktree, path).await? {
+        let spec = literal_pathspec(path);
+        // `--worktree`만: 인덱스는 건드리지 않는다. `--staged`를 더하면 staged 변경까지
+        // 날아간다(데이터 손실). restore가 non-zero면 `run`이 `Err`로 표면화한다.
+        runner
+            .run(
+                worktree,
+                &["restore", "--worktree", "--source=HEAD", "--", &spec],
+            )
+            .await?;
+        return Ok(DiscardOutcome::RestoredTracked);
+    }
+
+    // untracked: clean 직전 재검증(TOCTOU). NotFound면 그새 사라진 것 → 멱등 성공.
+    match validate_target(worktree, path) {
+        Validation::Valid => {}
+        Validation::NothingToDiscard => return Ok(DiscardOutcome::NothingToDiscard),
+        Validation::Rejected(e) => return Err(GitError::Io(e)),
+    }
+    let spec = literal_pathspec(path);
+    // `-ffdx`: force + 디렉터리 + **ignored 포함**(Q4 의도적). `:(literal)`로 blast 제한.
+    runner
+        .run(worktree, &["clean", "-ffdx", "--", &spec])
+        .await?;
+    Ok(DiscardOutcome::RemovedUntracked)
+}
+
+/// `git ls-files -z -- <specs...>`를 청크 배치로 돌려 tracked 파일 경로들을 모은다.
+/// bulk 파티션용 — untracked/ignored spec은 출력에 아무것도 안 실으므로 tracked만 남는다.
+/// **빈 입력이면 git을 부르지 않는다**(specs 없는 `ls-files`는 워크트리 전체를 낸다).
+async fn list_tracked(
+    runner: &GitRunner,
+    worktree: &Path,
+    paths: &[&str],
+) -> Result<Vec<String>, GitError> {
+    let mut tracked = Vec::new();
+    for chunk in paths.chunks(BULK_CHUNK_SIZE) {
+        let specs: Vec<String> = chunk.iter().map(|p| literal_pathspec(p)).collect();
+        let mut args: Vec<&str> = vec!["ls-files", "-z", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        let out = runner.run(worktree, &args).await?;
+        for t in out.stdout.split('\0') {
+            if !t.is_empty() {
+                tracked.push(t.to_string());
+            }
+        }
+    }
+    Ok(tracked)
+}
+
+/// 백슬래시→`/` 정규화 + 후행 슬래시 제거(Orca `normalizeGitPathForCompare`, status.ts:2039).
+fn normalize_git_path(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+/// bulk 파티션 술어: `input`이 tracked인가. `tracked_paths`는 `git ls-files -z`가 낸 실제
+/// tracked 파일 경로들. **디렉터리**를 discard 대상으로 주면 ls-files는 그 하위 파일들을
+/// 내므로 input 자체는 목록에 없다 — 그래서 정확히 같거나 `input/`로 시작하는 tracked
+/// 경로가 하나라도 있으면 tracked로 본다(Orca `isTrackedPathSpec`, status.ts:2049).
+///
+/// **순수 함수 — 접두 매칭이 crux.** `input/`(슬래시 포함)이 아니라 `input`으로 시작만
+/// 보면 `dir`이 `dirother/...`를 tracked로 오판한다. mutation을 unit 테스트가 잡는다.
+fn is_tracked_pathspec(input: &str, tracked_paths: &[String]) -> bool {
+    let normalized = normalize_git_path(input);
+    let prefix = format!("{normalized}/");
+    tracked_paths.iter().any(|t| {
+        let nt = normalize_git_path(t);
+        nt == normalized || nt.starts_with(&prefix)
+    })
+}
+
+/// `(원본 index, path)` 목록을 청크(`BULK_CHUNK_SIZE`)로 한 git 명령에 실어 돌리고,
+/// **청크 원자성**을 per-path 결과로 편다(M1 `bulk_apply`와 같은 자세): 청크가 성공하면
+/// 그 경로들 전부 `on_ok`, 실패하면 전부 그 청크의 에러(복제). 결과는 원본 index 자리에 쓴다.
+async fn run_chunked(
+    runner: &GitRunner,
+    worktree: &Path,
+    items: &[(usize, &str)],
+    prefix: &[&str],
+    on_ok: DiscardOutcome,
+    results: &mut [Option<Result<DiscardOutcome, GitError>>],
+) {
+    for chunk in items.chunks(BULK_CHUNK_SIZE) {
+        let specs: Vec<String> = chunk.iter().map(|(_, p)| literal_pathspec(p)).collect();
+        let mut args: Vec<&str> = prefix.to_vec();
+        args.extend(specs.iter().map(String::as_str));
+        match runner.run(worktree, &args).await {
+            Ok(_) => {
+                for (idx, _) in chunk {
+                    results[*idx] = Some(Ok(on_ok.clone()));
+                }
+            }
+            Err(e) => {
+                for (idx, _) in chunk {
+                    results[*idx] = Some(Err(duplicate_error(&e)));
+                }
+            }
+        }
+    }
+}
+
+/// 여러 경로의 워크트리 변경을 discard한다. **비-트랜잭션**(plan F5): per-path 결과 벡터를
+/// 입력과 같은 순서·길이로 돌려준다.
+///
+/// (1) **모든 경로를 먼저 검증**한다 — 거부는 `Err`로 그 자리에 기록되고 **git 명령에
+/// 절대 실리지 않는다**(escape가 다른 경로의 discard를 막지도, 바깥 타깃을 지우지도 않게
+/// 하는 핵심 불변식); NotFound는 `NothingToDiscard`. (2) 유효 경로를 `list_tracked`로
+/// tracked/untracked 파티션. (3) untracked는 **clean 직전 재검증**(TOCTOU) 후 청크
+/// `clean -ffdx`, tracked는 청크 `restore --worktree --source=HEAD`. 각 청크는 원자적이다.
+pub async fn bulk_discard(
+    runner: &GitRunner,
+    worktree: &Path,
+    paths: &[&str],
+) -> Vec<(String, Result<DiscardOutcome, GitError>)> {
+    // 1. 전부 선-검증. 거부/NotFound는 즉시 확정, 유효 경로의 원본 index만 모은다.
+    let mut results: Vec<Option<Result<DiscardOutcome, GitError>>> =
+        Vec::with_capacity(paths.len());
+    let mut valid_idx: Vec<usize> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        match validate_target(worktree, p) {
+            Validation::Valid => {
+                results.push(None);
+                valid_idx.push(i);
+            }
+            Validation::NothingToDiscard => {
+                results.push(Some(Ok(DiscardOutcome::NothingToDiscard)))
+            }
+            Validation::Rejected(e) => results.push(Some(Err(GitError::Io(e)))),
+        }
+    }
+
+    // 2. 유효 경로만 tracked/untracked 파티션(`git ls-files -z`). ls-files 자체가 실패하면
+    //    유효 경로 전부에 그 에러를 실어 반환(git을 못 돌린 상황).
+    let valid_paths: Vec<&str> = valid_idx.iter().map(|&i| paths[i]).collect();
+    let tracked_paths = match list_tracked(runner, worktree, &valid_paths).await {
+        Ok(t) => t,
+        Err(e) => {
+            for &i in &valid_idx {
+                results[i] = Some(Err(duplicate_error(&e)));
+            }
+            return finalize_bulk(paths, results);
+        }
+    };
+
+    // 3a. untracked: clean 직전 재검증(TOCTOU). 실패한 경로는 청크에서 제외하고 즉시 확정 —
+    //     **검증 못 통과한 경로는 clean 명령에 절대 안 실린다.**
+    let mut untracked_items: Vec<(usize, &str)> = Vec::new();
+    let mut tracked_items: Vec<(usize, &str)> = Vec::new();
+    for &i in &valid_idx {
+        let p = paths[i];
+        if is_tracked_pathspec(p, &tracked_paths) {
+            tracked_items.push((i, p));
+        } else {
+            match validate_target(worktree, p) {
+                Validation::Valid => untracked_items.push((i, p)),
+                Validation::NothingToDiscard => {
+                    results[i] = Some(Ok(DiscardOutcome::NothingToDiscard))
+                }
+                Validation::Rejected(e) => results[i] = Some(Err(GitError::Io(e))),
+            }
+        }
+    }
+
+    // 3b. 청크 실행. tracked는 재검증 안 한다(restore는 rm이 아니라 pathspec-bounded 복원이라
+    //     심링크 부모로 내려가지 않고, plan TOCTOU 재검증은 `clean` 직전만 요구).
+    run_chunked(
+        runner,
+        worktree,
+        &tracked_items,
+        &["restore", "--worktree", "--source=HEAD", "--"],
+        DiscardOutcome::RestoredTracked,
+        &mut results,
+    )
+    .await;
+    run_chunked(
+        runner,
+        worktree,
+        &untracked_items,
+        &["clean", "-ffdx", "--"],
+        DiscardOutcome::RemovedUntracked,
+        &mut results,
+    )
+    .await;
+
+    finalize_bulk(paths, results)
+}
+
+/// per-path 결과를 입력 순서로 조립한다. 모든 index가 채워졌어야 한다(유효 경로는 청크
+/// 실행 또는 TOCTOU 제외에서, 나머지는 선-검증에서).
+fn finalize_bulk(
+    paths: &[&str],
+    results: Vec<Option<Result<DiscardOutcome, GitError>>>,
+) -> Vec<(String, Result<DiscardOutcome, GitError>)> {
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                paths[i].to_string(),
+                r.expect("every path must have an outcome"),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_commit, literal_pathspec, literal_pathspec_impl, pick_commit_error, CommitOutcome,
+        classify_commit, is_tracked_pathspec, literal_pathspec, literal_pathspec_impl,
+        pick_commit_error, validate_target, CommitOutcome, Validation,
     };
 
     // literal_pathspec: 평범한 경로 → :(literal) 접두.
@@ -308,6 +601,107 @@ mod tests {
             CommitOutcome::Failed {
                 message: "hook failed".to_string()
             }
+        );
+    }
+
+    // --- M4 crux: bulk 파티션 술어(순수) ---
+
+    // 정확히 같은 경로는 tracked.
+    #[test]
+    fn tracked_pathspec_exact_match() {
+        assert!(is_tracked_pathspec("a.txt", &["a.txt".to_string()]));
+    }
+
+    // 디렉터리 input은 하위 tracked 파일이 있으면 tracked(ls-files가 하위 파일을 냄).
+    #[test]
+    fn tracked_pathspec_directory_prefix() {
+        assert!(is_tracked_pathspec(
+            "dir",
+            &["dir/a.txt".to_string(), "dir/sub/b.txt".to_string()]
+        ));
+        // 후행 슬래시가 붙은 input도 정규화되어 매칭.
+        assert!(is_tracked_pathspec("dir/", &["dir/a.txt".to_string()]));
+    }
+
+    // **`input/`(슬래시 경계)로만 접두 매칭한다.** `dir`이 `dirother/...`를 tracked로
+    // 오판하면 안 된다 — startsWith(normalized+"/")를 startsWith(normalized)로 바꾸는
+    // mutation을 이 단언이 죽인다.
+    #[test]
+    fn tracked_pathspec_prefix_requires_slash_boundary() {
+        assert!(!is_tracked_pathspec("dir", &["dirother/a.txt".to_string()]));
+    }
+
+    // 어떤 tracked 경로와도 안 겹치면 untracked.
+    #[test]
+    fn tracked_pathspec_no_match_is_untracked() {
+        assert!(!is_tracked_pathspec(
+            "u.txt",
+            &["a.txt".to_string(), "dir/b.txt".to_string()]
+        ));
+        // 빈 tracked 목록도 untracked.
+        assert!(!is_tracked_pathspec("a.txt", &[]));
+    }
+
+    // --- M4 SECURITY: `validate_target` 게이트 단독 pin (git 백스톱 무관) ---
+    //
+    // 통합 테스트의 일부 escape(절대경로/`..`/null-byte)는 git·OS 백스톱에도 가려
+    // suaegi 첫 게이트를 단독으로 pin하지 못한다(hollow-by-backstop 리스크). 여기서는
+    // **git을 개입시키지 않고** tempdir+실제 fs만으로 `validate_target`을 직접 친다 —
+    // `resolve_preserve_symlink`의 거부 arm을 `Valid`로 바꾸는 게이트-우회 mutation을
+    // 이 유닛 테스트들이 git과 무관하게 죽인다.
+
+    // 어휘 escape는 전부 Rejected(NothingToDiscard도 Valid도 아님). syscall 전에 거부되므로
+    // worktree는 빈 tempdir이면 충분하다.
+    #[test]
+    fn validate_target_rejects_lexical_escapes() {
+        let wt = tempfile::tempdir().unwrap();
+        for bad in ["../outside", "a/../../b", "/etc/passwd", ".", "", "a\0b"] {
+            assert!(
+                matches!(validate_target(wt.path(), bad), Validation::Rejected(_)),
+                "{bad:?}는 Rejected여야 한다(게이트-우회 mutation이면 Valid로 새어 FAIL)"
+            );
+        }
+    }
+
+    // 존재하지 않는 leaf → NothingToDiscard(멱등). Rejected 아님.
+    #[test]
+    fn validate_target_notfound_is_nothing_to_discard() {
+        let wt = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            validate_target(wt.path(), "does-not-exist"),
+            Validation::NothingToDiscard
+        ));
+    }
+
+    // worktree 안 실존 정상 파일 → Valid.
+    #[test]
+    fn validate_target_existing_file_is_valid() {
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::write(wt.path().join("real.txt"), b"x").unwrap();
+        assert!(matches!(
+            validate_target(wt.path(), "real.txt"),
+            Validation::Valid
+        ));
+    }
+
+    // **핵심 pin(git 백스톱 없음):** worktree 안 `link -> 바깥` 심링크 부모를 지나는
+    // `link/victim`은 `Validation::Rejected`여야 한다. git은 이걸 못 잡으므로(어휘적으로
+    // repo 안) 오직 suaegi의 컴포넌트별 walk만이 방어한다 — 거부 arm을 `Valid`로 바꾸는
+    // mutation을 이 단언이 단독으로 죽인다.
+    #[cfg(unix)]
+    #[test]
+    fn validate_target_rejects_symlink_parent_escape() {
+        use std::os::unix::fs::symlink;
+        let wt = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim"), b"x").unwrap();
+        symlink(outside.path(), wt.path().join("link")).unwrap();
+        assert!(
+            matches!(
+                validate_target(wt.path(), "link/victim"),
+                Validation::Rejected(_)
+            ),
+            "심링크 부모 escape는 Rejected여야 한다(Valid/NothingToDiscard면 게이트-우회 mutation)"
         );
     }
 }

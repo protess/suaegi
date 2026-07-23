@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use suaegi_git::runner::GitRunner;
 use suaegi_git::write_ops::{
-    bulk_stage, bulk_unstage, commit_changes, stage, unstage, CommitOutcome,
+    bulk_discard, bulk_stage, bulk_unstage, commit_changes, discard, stage, unstage, CommitOutcome,
+    DiscardOutcome,
 };
 
 /// 격리된 repo tempdir + `GitRunner`.
@@ -373,4 +374,304 @@ async fn commit_respects_failing_pre_commit_hook_no_bypass() {
         cached.contains("k.txt"),
         "hook이 막았으니 k.txt는 인덱스에 스테이징된 채여야 한다"
     );
+}
+
+// ============================================================================
+// M4: discard — DATA-LOSS / SECURITY. 적대적 매트릭스. 각 거부 케이스는 **바깥 타깃이
+// 살아남음**을 단언한다. 실제 심링크/디렉터리를 소유한 tempdir 안에서만 만든다.
+// ============================================================================
+
+/// tracked 파일 하나를 커밋한다(격리된 fixture git으로).
+fn commit_file(wt: &Path, name: &str, content: &str) {
+    std::fs::write(wt.join(name), content).unwrap();
+    fixture::run(wt, &["add", "--", name]);
+    fixture::run(wt, &["commit", "-m", &format!("add {name}")]);
+}
+
+/// 워크트리를 소유 tempdir **안에** 중첩해 만든다 — `../victim` escape 타깃을 그 소유
+/// tempdir 안(워크트리 밖)에 둘 수 있게. 시스템 temp 루트를 오염시키지 않는다.
+fn setup_nested() -> (tempfile::TempDir, std::path::PathBuf, GitRunner) {
+    let root = tempfile::tempdir().unwrap();
+    let wt = root.path().join("wt");
+    std::fs::create_dir(&wt).unwrap();
+    fixture::init_repo(&wt);
+    (root, wt, GitRunner::new())
+}
+
+// --- SECURITY: 심링크 부모 escape 거부, 바깥 victim 생존 ---
+// worktree 안 `link -> 바깥 디렉터리`; discard("link/victim")는 중간 심링크를 만나 거부.
+// 검증(resolve_preserve_symlink)을 건너뛰는 mutant는 Err를 안 내 이 단언이 FAIL하고,
+// 바깥 victim이 지워질 위험에 노출된다.
+#[cfg(unix)]
+#[tokio::test]
+async fn discard_symlink_parent_escape_rejected_outside_survives() {
+    use std::os::unix::fs::symlink;
+    let (repo, r) = setup();
+    let wt = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "important\n").unwrap();
+    symlink(outside.path(), wt.join("link")).unwrap();
+
+    let res = discard(&r, wt, "link/victim").await;
+    assert!(
+        res.is_err(),
+        "심링크 부모 escape는 거부되어야 한다: {res:?}"
+    );
+    assert!(victim.exists(), "바깥 victim이 살아남아야 한다");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "important\n");
+}
+
+// --- SECURITY: `..` escape 거부(어휘적), 바깥 victim 생존 ---
+#[tokio::test]
+async fn discard_dotdot_escape_rejected_outside_survives() {
+    let (root, wt, r) = setup_nested();
+    let victim = root.path().join("victim"); // 워크트리 밖(소유 tempdir 안)
+    std::fs::write(&victim, "keep\n").unwrap();
+
+    let res = discard(&r, &wt, "../victim").await;
+    assert!(res.is_err(), "../ escape는 거부되어야 한다: {res:?}");
+    assert!(victim.exists(), "바깥 victim이 살아남아야 한다");
+}
+
+// --- SECURITY: 절대경로 거부, 바깥 타깃 생존 ---
+#[tokio::test]
+async fn discard_absolute_path_rejected_outside_survives() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "keep\n").unwrap();
+
+    let res = discard(&r, wt, victim.to_str().unwrap()).await;
+    assert!(res.is_err(), "절대경로는 거부되어야 한다: {res:?}");
+    assert!(victim.exists(), "바깥 절대경로 타깃이 살아남아야 한다");
+}
+
+// --- SECURITY: 워크트리 루트/`.`/빈 문자열 거부(루트 강제삭제 금지) ---
+#[tokio::test]
+async fn discard_worktree_root_dot_empty_rejected() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    for bad in ["", "."] {
+        let res = discard(&r, wt, bad).await;
+        assert!(
+            res.is_err(),
+            "{bad:?}는 거부되어야 한다(워크트리 루트 강제삭제 금지)"
+        );
+    }
+    assert!(
+        wt.join("README.md").exists(),
+        "워크트리 루트가 삭제되면 안 된다"
+    );
+}
+
+// --- SECURITY: null 바이트 거부 ---
+#[tokio::test]
+async fn discard_null_byte_rejected() {
+    let (repo, r) = setup();
+    assert!(discard(&r, repo.path(), "a\0b").await.is_err());
+}
+
+// --- SECURITY: leaf 심링크는 **링크 자체**만 제거, 바깥 타깃 생존 ---
+// 미추적 leaf 심링크 `link -> 바깥 target`. discard("link")는 clean이 링크를 지우고
+// (심링크를 따라가지 않음) target은 남는다. 둘 다 단언.
+#[cfg(unix)]
+#[tokio::test]
+async fn discard_leaf_symlink_removes_link_target_survives() {
+    use std::os::unix::fs::symlink;
+    let (repo, r) = setup();
+    let wt = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("target");
+    std::fs::write(&target, "keep\n").unwrap();
+    symlink(&target, wt.join("link")).unwrap();
+
+    let outcome = discard(&r, wt, "link").await.unwrap();
+    assert_eq!(outcome, DiscardOutcome::RemovedUntracked);
+    assert!(
+        wt.join("link").symlink_metadata().is_err(),
+        "링크 자체가 제거되어야 한다"
+    );
+    assert!(target.exists(), "바깥 타깃은 살아남아야 한다(링크만 지움)");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+}
+
+// --- crux: tracked-modified는 HEAD로 복원, 인덱스는 보존(`--worktree`만) ---
+// HEAD=A, staged=B, worktree=C. discard → worktree A(복원), index B(보존).
+// mutant restore→clean: clean은 tracked를 안 지워 worktree가 C로 남아 FAIL.
+// mutant `--worktree`에 `--staged` 추가: index가 A로 리셋돼 인덱스 단언 FAIL.
+#[tokio::test]
+async fn discard_tracked_restore_worktree_only_preserves_index() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    commit_file(wt, "f.txt", "A\n");
+    std::fs::write(wt.join("f.txt"), "B\n").unwrap();
+    stage(&r, wt, "f.txt").await.unwrap();
+    std::fs::write(wt.join("f.txt"), "C\n").unwrap();
+
+    let outcome = discard(&r, wt, "f.txt").await.unwrap();
+    assert_eq!(outcome, DiscardOutcome::RestoredTracked);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("f.txt")).unwrap(),
+        "A\n",
+        "워크트리가 HEAD로 복원(restore→clean이면 C로 남아 FAIL)"
+    );
+    let staged = r.run(wt, &["show", ":f.txt"]).await.unwrap().stdout;
+    assert_eq!(
+        staged, "B\n",
+        "인덱스 staged 내용은 보존(--worktree only; --staged면 A로 리셋돼 FAIL)"
+    );
+}
+
+// --- crux: 미추적 파일 제거 ---
+#[tokio::test]
+async fn discard_untracked_removed() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("u.txt"), "x\n").unwrap();
+
+    let outcome = discard(&r, wt, "u.txt").await.unwrap();
+    assert_eq!(outcome, DiscardOutcome::RemovedUntracked);
+    assert!(!wt.join("u.txt").exists());
+}
+
+// --- crux: `-x`가 ignored 파일도 제거(mutant -ffdx→-ffd면 살아남아 FAIL) ---
+#[tokio::test]
+async fn discard_ignored_file_removed_proves_x() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    let gi = wt.join(".gitignore");
+    let mut content = std::fs::read_to_string(&gi).unwrap();
+    content.push_str("ignored.txt\n");
+    std::fs::write(&gi, content).unwrap();
+    std::fs::write(wt.join("ignored.txt"), "x\n").unwrap();
+    // 사전조건: git이 실제로 무시하는가.
+    let st = r
+        .run(
+            wt,
+            &["status", "--porcelain", "--ignored", "--", "ignored.txt"],
+        )
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        st.contains("!!"),
+        "사전조건: ignored.txt가 무시되어야 한다: {st:?}"
+    );
+
+    let outcome = discard(&r, wt, "ignored.txt").await.unwrap();
+    assert_eq!(outcome, DiscardOutcome::RemovedUntracked);
+    assert!(
+        !wt.join("ignored.txt").exists(),
+        "-x로 ignored 파일이 제거되어야 한다(-ffdx→-ffd면 살아남아 FAIL)"
+    );
+}
+
+// --- crux: 존재하지 않는 타깃은 멱등 no-op 성공 ---
+#[tokio::test]
+async fn discard_nonexistent_is_idempotent() {
+    let (repo, r) = setup();
+    let outcome = discard(&r, repo.path(), "does-not-exist.txt")
+        .await
+        .unwrap();
+    assert_eq!(outcome, DiscardOutcome::NothingToDiscard);
+}
+
+// --- edge(플랜 F6): staged-add(HEAD에 없음) discard ---
+// 플랜/Codex는 restore가 **실패**한다고 봤으나 git 2.50.1 실측은 exit 0 + 워크트리 파일
+// 제거, 인덱스 staged 유지(워크트리를 HEAD 상태로 맞춤). 이 실제 동작을 못 박는다.
+// (restore가 non-zero인 git 버전에서는 discard가 Err로 표면화 — 조용한 미검 경로 없음.)
+#[tokio::test]
+async fn discard_staged_add_removes_worktree_keeps_index() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("added.txt"), "NEW\n").unwrap();
+    stage(&r, wt, "added.txt").await.unwrap(); // index엔 있으나 HEAD엔 없음
+
+    let outcome = discard(&r, wt, "added.txt").await.unwrap();
+    assert_eq!(outcome, DiscardOutcome::RestoredTracked);
+    assert!(
+        !wt.join("added.txt").exists(),
+        "staged-add의 워크트리 파일은 제거된다(HEAD엔 없으므로)"
+    );
+    let staged = r.run(wt, &["show", ":added.txt"]).await.unwrap().stdout;
+    assert_eq!(staged, "NEW\n", "staged 항목은 인덱스에 보존");
+}
+
+// --- bulk: tracked+untracked+없는-경로 혼합, 파티션 검증 ---
+#[tokio::test]
+async fn bulk_discard_mixed_tracked_untracked_all_discarded() {
+    let (repo, r) = setup();
+    let wt = repo.path();
+    commit_file(wt, "t.txt", "A\n");
+    std::fs::write(wt.join("t.txt"), "MOD\n").unwrap();
+    std::fs::write(wt.join("u.txt"), "x\n").unwrap();
+
+    let results = bulk_discard(&r, wt, &["t.txt", "u.txt", "gone.txt"]).await;
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].0, "t.txt");
+    assert_eq!(
+        results[0].1.as_ref().unwrap(),
+        &DiscardOutcome::RestoredTracked
+    );
+    assert_eq!(results[1].0, "u.txt");
+    assert_eq!(
+        results[1].1.as_ref().unwrap(),
+        &DiscardOutcome::RemovedUntracked
+    );
+    assert_eq!(results[2].0, "gone.txt");
+    assert_eq!(
+        results[2].1.as_ref().unwrap(),
+        &DiscardOutcome::NothingToDiscard
+    );
+    assert_eq!(std::fs::read_to_string(wt.join("t.txt")).unwrap(), "A\n");
+    assert!(!wt.join("u.txt").exists());
+}
+
+// --- SECURITY bulk: 부분 escape — 심링크 escape는 rejected, 유효 경로는 discard,
+//     바깥 victim 생존. per-path 벡터가 순서대로 반영. ---
+#[cfg(unix)]
+#[tokio::test]
+async fn bulk_discard_partial_symlink_escape_valids_discarded_outside_survives() {
+    use std::os::unix::fs::symlink;
+    let (repo, r) = setup();
+    let wt = repo.path();
+    std::fs::write(wt.join("u.txt"), "x\n").unwrap();
+    commit_file(wt, "t.txt", "A\n");
+    std::fs::write(wt.join("t.txt"), "MOD\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "keep\n").unwrap();
+    symlink(outside.path(), wt.join("link")).unwrap();
+
+    let results = bulk_discard(&r, wt, &["u.txt", "link/victim", "t.txt"]).await;
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].1.as_ref().unwrap(),
+        &DiscardOutcome::RemovedUntracked
+    );
+    assert!(results[1].1.is_err(), "심링크 escape는 rejected여야 한다");
+    assert_eq!(
+        results[2].1.as_ref().unwrap(),
+        &DiscardOutcome::RestoredTracked
+    );
+
+    assert!(!wt.join("u.txt").exists(), "valid untracked는 제거");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("t.txt")).unwrap(),
+        "A\n",
+        "valid tracked는 복원"
+    );
+    assert!(victim.exists(), "바깥 victim은 살아남아야 한다");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+}
+
+// --- bulk: 빈 입력은 git 미호출, 빈 벡터 ---
+#[tokio::test]
+async fn bulk_discard_empty_is_empty_vec() {
+    let (repo, r) = setup();
+    assert!(bulk_discard(&r, repo.path(), &[]).await.is_empty());
 }
