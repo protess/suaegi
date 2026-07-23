@@ -1,0 +1,13 @@
+[package]
+name = "suaegi-fuzzy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's Quick Open fuzzy scorer
+# (quick-open-search.ts). The ranking weights ARE the UX, so this is a pure
+# String -> score layer with ZERO dependencies (not even serde). Keeping it
+# dependency-free makes every scoring rule mutation-verifiable in isolation and
+# guarantees it never sits behind any other suaegi crate. suaegi-keys precedent.
+[dependencies]

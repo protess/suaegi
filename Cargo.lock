@@ -3987,6 +3987,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-fuzzy"
+version = "0.1.0"
+
+[[package]]
 name = "suaegi-git"
 version = "0.1.0"
 dependencies = [
