@@ -516,7 +516,7 @@ fn finalize_bulk(
 mod tests {
     use super::{
         classify_commit, is_tracked_pathspec, literal_pathspec, literal_pathspec_impl,
-        pick_commit_error, CommitOutcome,
+        pick_commit_error, validate_target, CommitOutcome, Validation,
     };
 
     // literal_pathspec: 평범한 경로 → :(literal) 접두.
@@ -640,5 +640,68 @@ mod tests {
         ));
         // 빈 tracked 목록도 untracked.
         assert!(!is_tracked_pathspec("a.txt", &[]));
+    }
+
+    // --- M4 SECURITY: `validate_target` 게이트 단독 pin (git 백스톱 무관) ---
+    //
+    // 통합 테스트의 일부 escape(절대경로/`..`/null-byte)는 git·OS 백스톱에도 가려
+    // suaegi 첫 게이트를 단독으로 pin하지 못한다(hollow-by-backstop 리스크). 여기서는
+    // **git을 개입시키지 않고** tempdir+실제 fs만으로 `validate_target`을 직접 친다 —
+    // `resolve_preserve_symlink`의 거부 arm을 `Valid`로 바꾸는 게이트-우회 mutation을
+    // 이 유닛 테스트들이 git과 무관하게 죽인다.
+
+    // 어휘 escape는 전부 Rejected(NothingToDiscard도 Valid도 아님). syscall 전에 거부되므로
+    // worktree는 빈 tempdir이면 충분하다.
+    #[test]
+    fn validate_target_rejects_lexical_escapes() {
+        let wt = tempfile::tempdir().unwrap();
+        for bad in ["../outside", "a/../../b", "/etc/passwd", ".", "", "a\0b"] {
+            assert!(
+                matches!(validate_target(wt.path(), bad), Validation::Rejected(_)),
+                "{bad:?}는 Rejected여야 한다(게이트-우회 mutation이면 Valid로 새어 FAIL)"
+            );
+        }
+    }
+
+    // 존재하지 않는 leaf → NothingToDiscard(멱등). Rejected 아님.
+    #[test]
+    fn validate_target_notfound_is_nothing_to_discard() {
+        let wt = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            validate_target(wt.path(), "does-not-exist"),
+            Validation::NothingToDiscard
+        ));
+    }
+
+    // worktree 안 실존 정상 파일 → Valid.
+    #[test]
+    fn validate_target_existing_file_is_valid() {
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::write(wt.path().join("real.txt"), b"x").unwrap();
+        assert!(matches!(
+            validate_target(wt.path(), "real.txt"),
+            Validation::Valid
+        ));
+    }
+
+    // **핵심 pin(git 백스톱 없음):** worktree 안 `link -> 바깥` 심링크 부모를 지나는
+    // `link/victim`은 `Validation::Rejected`여야 한다. git은 이걸 못 잡으므로(어휘적으로
+    // repo 안) 오직 suaegi의 컴포넌트별 walk만이 방어한다 — 거부 arm을 `Valid`로 바꾸는
+    // mutation을 이 단언이 단독으로 죽인다.
+    #[cfg(unix)]
+    #[test]
+    fn validate_target_rejects_symlink_parent_escape() {
+        use std::os::unix::fs::symlink;
+        let wt = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim"), b"x").unwrap();
+        symlink(outside.path(), wt.path().join("link")).unwrap();
+        assert!(
+            matches!(
+                validate_target(wt.path(), "link/victim"),
+                Validation::Rejected(_)
+            ),
+            "심링크 부모 escape는 Rejected여야 한다(Valid/NothingToDiscard면 게이트-우회 mutation)"
+        );
     }
 }
