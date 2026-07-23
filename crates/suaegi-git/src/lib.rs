@@ -6,3 +6,4 @@ pub mod runner;
 pub mod status;
 pub mod worktree;
 pub mod worktree_name;
+pub mod write_ops;
