@@ -541,6 +541,37 @@ fn crux_altgr_text_entry_not_hijacked() {
     assert!(!matches(A::EditorCopyContext, &altgr_c, Win32));
 }
 
+// Crux (`is_latin_shortcut_key` verbatim uppercase-expansion port): on a
+// German/Austrian/Swiss QWERTZ layout the ß key's physical code is `Minus`, and
+// `zoom.out` is Mod+Minus. JS `'ß'.toUpperCase() === "SS"` (in the A-Z string
+// range), so Orca counts `ß` as Latin and BLOCKS the non-Latin physical fallback
+// — Ctrl+ß must NOT fire zoom.out. Reverting `is_latin_shortcut_key` to the naive
+// `is_ascii_alphanumeric` form (for which `ß`/ligatures are non-Latin) fires the
+// fallback -> `Ctrl+ß` misfires zoom.out -> this test FAILS. Ligature `ﬀ`
+// (uppercases to "FF") exercises the same expansion.
+#[test]
+fn crux_latin_shortcut_key_uppercase_expansion() {
+    for platform in [Linux, Win32] {
+        // Ctrl+ß (physical Minus) must not be hijacked into zoom.out (Mod+Minus).
+        let ctrl_eszett = ev("\u{df}", "Minus", false, true, false, false); // 'ß'
+        assert!(
+            !matches(A::ZoomOut, &ctrl_eszett, platform),
+            "Ctrl+ß must not misfire zoom.out on {platform:?}"
+        );
+        // Ligature ﬀ (uppercases to "FF") is likewise Latin -> fallback blocked.
+        let ctrl_ff = ev("\u{fb00}", "Minus", false, true, false, false); // 'ﬀ'
+        assert!(
+            !matches(A::ZoomOut, &ctrl_ff, platform),
+            "Ctrl+ﬀ must not misfire zoom.out on {platform:?}"
+        );
+    }
+    // Regression guard: a genuinely non-Latin key (Cyrillic 'с' on physical KeyC)
+    // still fires its shortcut via the physical fallback — the fix must not break
+    // the legitimate non-Latin path.
+    let cyrillic_ctrl_c = ev("\u{441}", "KeyC", false, true, false, false); // 'с'
+    assert!(matches(A::BrowserGrabElement, &cyrillic_ctrl_c, Win32));
+}
+
 // ===========================================================================
 // punctuation semantic vs physical fallback (JIS + shifted aliases)
 // ===========================================================================

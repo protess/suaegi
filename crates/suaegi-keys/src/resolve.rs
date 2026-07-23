@@ -204,14 +204,27 @@ fn can_use_physical_code_fallback(input: &KeybindingInput) -> bool {
     is_physical_code_fallback_key(input.key.as_str())
 }
 
-/// Whether `key` is a single A-Z / 0-9 char — the only chars a Latin shortcut
-/// names. Mirror of Orca `isLatinShortcutKey` (`keybindings.ts:1589-1596`).
+/// Whether `key` names a Latin shortcut char (A-Z / 0-9), in which case the
+/// non-Latin physical-code fallback must NOT fire. Mirror of Orca
+/// `isLatinShortcutKey` (`keybindings.ts:1589-1596`).
+///
+/// Ported **verbatim**, including the `toUpperCase()` string-range comparison
+/// (not `is_ascii_alphanumeric`). This is load-bearing: JS `'ß'.toUpperCase()`
+/// is `"SS"`, and `"SS" >= "A" && "SS" <= "Z"` is `true`, so Orca counts `ß` as
+/// Latin and blocks the physical fallback. Using `is_ascii_alphanumeric` would
+/// call `ß` non-Latin and wrongly fire the fallback — on a German/Austrian/Swiss
+/// QWERTZ layout `ß`'s physical code is `Minus`, so `Ctrl+ß` would misfire
+/// `zoom.out` (Mod+Minus). Ligatures expand the same way (`'ﬀ'.toUpperCase()`
+/// is `"FF"`). The `key.length !== 1` guard (Orca `:1591`) is present, so
+/// multi-char logical keys (e.g. `"Dead"`) are correctly not Latin.
 fn is_latin_shortcut_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
+    if key.chars().count() != 1 {
         return false;
-    };
-    c.is_ascii_alphanumeric()
+    }
+    // The verbatim Orca range compares (`upper >= 'A' && upper <= 'Z'`, etc.),
+    // expressed as inclusive-range `contains` on the string slices.
+    let upper = key.to_uppercase();
+    ("A"..="Z").contains(&upper.as_str()) || ("0"..="9").contains(&key)
 }
 
 /// Whether a non-Latin layout (e.g. Cyrillic/Greek) reported a non-Latin logical
