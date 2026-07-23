@@ -158,7 +158,7 @@ pub fn parse_modifier_token(raw_part: &str) -> Option<ModifierToken> {
 /// F1-F24 function-key token (no leading zero, matching Orca's regex
 /// `^F([1-9]|1[0-9]|2[0-4])$` at `keybindings.ts:1134`). `upper` is expected
 /// already uppercased.
-fn is_function_key_token(upper: &str) -> bool {
+pub(crate) fn is_function_key_token(upper: &str) -> bool {
     let Some(rest) = upper.strip_prefix('F') else {
         return false;
     };
