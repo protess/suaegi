@@ -12,9 +12,13 @@
 //!   - M2: normalize/validate (`normalize_keybinding*`, `KeybindingValidationResult`)
 //!     plus the digit-index (`1`-`9` -> `1`) canonicalization and per-action
 //!     bare/shift-only rules.
+//!   - M3: the event->action resolver (`keybinding_from_input*`,
+//!     `keybinding_matches_input`, `keybinding_matches_action`,
+//!     `match_keybinding_digit_index`) with the macOS Option-compose, non-Latin /
+//!     AltGr physical-code fallbacks, and terminal-shortcut policy.
 //!
-//! The event->action resolver (M3), conflict detection
-//! (M4), and the on-disk file layer (M5) land in later milestones. The templated
+//! Conflict detection (M4) and the on-disk file layer (M5) land in later
+//! milestones. The templated
 //! `tab.newAgent.${agent}` family (Orca `keybindings.ts:26,1059`) is intentionally
 //! **excluded** here (see F2 in the plan) and gets wired at the app boundary in M6.
 
@@ -22,6 +26,7 @@ mod chord;
 mod format;
 mod normalize;
 mod registry;
+mod resolve;
 
 pub use chord::{
     canonicalize_parsed_keybinding, is_double_tap_binding, normalize_key_token, parse_keybinding,
@@ -37,4 +42,10 @@ pub use normalize::{
 pub use registry::{
     is_digit_index_action_id, KeybindingActionId, KeybindingDefinition, KeybindingPlatform,
     PerPlatform, Scope, DIGIT_INDEX_ACTION_IDS, KEYBINDING_DEFINITIONS,
+};
+pub use resolve::{
+    get_effective_keybindings_for_action, keybinding_from_input, keybinding_from_input_for_action,
+    keybinding_matches_action, keybinding_matches_input, match_keybinding_digit_index,
+    KeybindingContext, KeybindingInput, KeybindingMatchOptions, KeybindingOverrides,
+    TerminalShortcutPolicy,
 };
