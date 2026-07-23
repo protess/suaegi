@@ -162,6 +162,11 @@ pub fn read_file(worktree: &Path, rel_path: &str) -> io::Result<FileRead> {
 /// `size`(`metadata.len()`) + `mtime`(`metadata.modified()`). 콘텐츠 해시가 아니라
 /// stat 기반이라 값싸고, 편집기가 저장 후 재베이스라인하는 데 충분하다
 /// (Orca `editor-autosave-controller.ts:143-145`). `SystemTime`은 `Eq`라 그대로 비교한다.
+///
+/// **블라인드 스팟(Orca 패리티, follow-up)**: size와 mtime이 **둘 다** 안 바뀐 외부
+/// 편집은 못 잡는다 — 같은 mtime tick(파일시스템 해상도) 안에서 같은 바이트 수로 덮어쓰면
+/// staleness 검사를 통과해 clobber될 수 있다. content-hash(또는 inode+ctime) 추가는
+/// `docs/follow-ups.md`에 기록된 후속 작업이다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSignature {
     pub size: u64,
@@ -225,9 +230,19 @@ pub fn write_file(
     // 2. `.git/` denylist — 어느 컴포넌트든. resolve가 모든 컴포넌트를 `Normal`로
     //    보장했으므로 여기선 이름만 본다. 첫 컴포넌트만이 아니라 전부 검사한다:
     //    `submodule/.git/hooks/pre-commit`도 훅 코드실행 벡터다.
+    //
+    //    **ASCII 케이스 무시로 비교한다**(`eq_ignore_ascii_case`): macOS(APFS/HFS+
+    //    기본)와 Windows(NTFS)는 대소문자무시 FS라 `.GIT`/`.Git`/`.gIt`가 실제로는
+    //    `.git`으로 resolve된다. exact `== ".git"`이면 `.GIT/hooks/pre-commit` 쓰기가
+    //    통과해 진짜 훅 파일을 심어 **임의 코드 실행**이 된다(RCE).
+    //
+    //    TODO(더 깊은 티어): HFS+ ignorable-unicode(`.gi\u{200c}t`)나 NTFS 8.3 short
+    //    name(`GIT~1`)까지 같은 경로로 resolve될 수 있으나, 그건 git core 자신이
+    //    거부한다(`core.protectHFS`/`core.protectNTFS`). 즉시 악용 가능한 건 ASCII-case
+    //    뿐이라 여기선 그것만 막고 나머지는 git core에 위임한다.
     if Path::new(rel_path)
         .components()
-        .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
+        .any(|c| matches!(c, Component::Normal(name) if name.eq_ignore_ascii_case(".git")))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -291,6 +306,8 @@ pub fn write_file(
 
     // 7. 원자적 쓰기: 형제 temp → 바이트 기록 → fsync → rename. temp는 실패 시
     //    `NamedTempFile` drop이 정리한다(`persistence.rs:200-206` 패턴).
+    //    NOTE(follow-up): persist 직전에 **크래시**하면 `.tmpXXXXXX` 형제가 남아
+    //    `branch_compare`의 untracked 수집에 뜬다(잔존 정리는 `docs/follow-ups.md` 기록).
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(content)?;
     tmp.as_file().sync_all()?;
@@ -529,6 +546,57 @@ mod tests {
         let target = wt.path().join("sub/.git/config");
         assert!(write_file(wt.path(), "sub/.git/config", b"[core]\n", None).is_err());
         assert!(!target.exists(), "중첩 .git denylist가 뚫렸다");
+    }
+
+    // --- F1 (CRITICAL/RCE): 대소문자무시 FS에서 `.GIT`/`.Git`가 `.git`으로 resolve된다 ---
+    // (mutant: `eq_ignore_ascii_case`를 exact `== ".git"`로 되돌리면 `.GIT` 변형이 통과해
+    //  parent가 있는 한 write가 성공한다 → 파일 생성 → 이 테스트 FAIL. 소문자 `.git`
+    //  기존 테스트는 exact-match로도 계속 통과하므로 이 테스트만이 케이스무시를 고정한다.)
+    //
+    // parent를 **쓰기 경로와 똑같은 케이스**(`.GIT/hooks` 등)로 만든다 — 그래야 대소문자
+    // 구분 FS(Linux CI)든 무시 FS(macOS)든 mutant-off일 때 parent-missing으로 마스킹되지
+    // 않고 실제로 파일이 생겨 mutant가 죽는다.
+    #[test]
+    fn write_rejects_dot_git_case_insensitive() {
+        // 첫 컴포넌트 대문자.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join(".GIT/hooks")).unwrap();
+            let target = wt.path().join(".GIT/hooks/pre-commit");
+            assert!(
+                write_file(
+                    wt.path(),
+                    ".GIT/hooks/pre-commit",
+                    b"#!/bin/sh\nevil\n",
+                    None
+                )
+                .is_err(),
+                ".GIT denylist가 뚫렸다(RCE)"
+            );
+            assert!(!target.exists(), ".GIT/hooks/pre-commit이 생성됐다(RCE)");
+        }
+        // 혼합 케이스 `.Git`.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join(".Git")).unwrap();
+            let target = wt.path().join(".Git/config");
+            assert!(
+                write_file(wt.path(), ".Git/config", b"[core]\n", None).is_err(),
+                ".Git denylist가 뚫렸다"
+            );
+            assert!(!target.exists(), ".Git/config가 생성됐다");
+        }
+        // 중첩 + 대문자 `sub/.GIT/hooks/x`.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join("sub/.GIT/hooks")).unwrap();
+            let target = wt.path().join("sub/.GIT/hooks/x");
+            assert!(
+                write_file(wt.path(), "sub/.GIT/hooks/x", b"evil\n", None).is_err(),
+                "중첩 .GIT denylist가 뚫렸다(RCE)"
+            );
+            assert!(!target.exists(), "sub/.GIT/hooks/x가 생성됐다(RCE)");
+        }
     }
 
     // --- M5 crux: leaf-symlink 거부 (따라가면 밖에 쓰거나 링크를 망가뜨린다) ---
