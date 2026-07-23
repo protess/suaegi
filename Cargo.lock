@@ -4006,6 +4006,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-keys"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "suaegi-secrets"
 version = "0.1.0"
 dependencies = [
