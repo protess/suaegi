@@ -14,8 +14,12 @@ use std::sync::Arc;
 use iced::Task;
 use suaegi_http::ReqwestTransport;
 use suaegi_secrets::{Secret, SecretRequest};
+use suaegi_tracker::jira::KEYCHAIN_SERVICE as JIRA_KEYCHAIN_SERVICE;
 use suaegi_tracker::linear::KEYCHAIN_SERVICE;
-use suaegi_tracker::{IssuePage, LinearClient, LinearWorkspace, Lookup};
+use suaegi_tracker::{
+    IssuePage, JiraClient, JiraConnection, JiraIssue, JiraIssueFilter, JiraPage, JiraViewer,
+    LinearClient, LinearWorkspace, Lookup,
+};
 
 use crate::state::{Message, OpId};
 
@@ -70,5 +74,66 @@ pub fn connect(op: OpId, token: Secret) -> Task<Message> {
 pub fn list_issues(op: OpId, token: Secret) -> Task<Message> {
     Task::perform(list_issues_now(token), move |result| {
         Message::LinearIssuesFetched { op, result }
+    })
+}
+
+// ============================ N2: Jira ============================
+//
+// Linear와 **같은 패턴**(async fn → `Task::perform` → `Message`), 같은 토큰 규율(`Secret`만,
+// 키체인 저장, `expose()`는 tracker의 `JiraClient::authorization`에서만). 차이는 클라이언트가
+// non-secret 연결 설정([`JiraConnection`]: site/email/auth_type)을 함께 받고, 키체인 account가
+// 고정값이 아니라 **사이트 URL**이라는 점(사용자가 여러 사이트를 가질 수 있다).
+
+/// Jira 토큰 키체인 miss/부재 시 fallback env 변수(헤드리스/CI). Linear의 `LINEAR_API_KEY` 관례 미러.
+pub const JIRA_ENV_VAR: &str = "JIRA_API_TOKEN";
+
+/// 저장된(또는 env fallback) Jira 토큰 요청. account는 **사이트 URL**이다 — 부팅 시 재연결에 쓴다.
+pub fn jira_secret_request(site_url: &str) -> SecretRequest {
+    SecretRequest::new(JIRA_KEYCHAIN_SERVICE, site_url).with_env_vars(&[JIRA_ENV_VAR])
+}
+
+/// 실 전송으로 인증된 Jira 클라이언트를 만든다. 전송은 stateless라 매 호출 새로 만든다(Linear 미러).
+fn jira_client(connection: JiraConnection, token: Secret) -> JiraClient {
+    JiraClient::with_transport(Arc::new(ReqwestTransport::new()), connection, Some(token))
+}
+
+/// 연결 확인 + (성공 시) 토큰 저장. **저장은 성공했을 때만** — 무효 토큰을 키체인에 남기지 않는다
+/// (Linear `connect_now`와 같은 "store → test" 강화). account는 사이트 URL. best-effort 저장이라
+/// 키체인이 없어도(헤드리스) 이번 세션은 메모리 토큰으로 동작한다.
+pub async fn jira_connect_now(connection: JiraConnection, token: Secret) -> Lookup<JiraViewer> {
+    let site = connection.site_url.clone();
+    let result = jira_client(connection, token.clone())
+        .test_connection()
+        .await;
+    if matches!(result, Lookup::Found(_)) {
+        // 저장 실패는 삼킨다: 표면화할 raw 에러가 토큰을 흘릴 수 있고, 이번 세션은 메모리 토큰으로
+        // 이미 동작한다. 저장은 다음 실행의 재연결 편의일 뿐이다.
+        let _ = suaegi_secrets::store(JIRA_KEYCHAIN_SERVICE, &site, &token);
+    }
+    result
+}
+
+/// 이슈 목록. v1은 **나에게 배정된 미해결**(`Assigned`) 프리셋을 쓴다 — 워크트리에 링크할 "내 일"이
+/// 가장 흔한 뷰다(다른 프리셋은 후속). `has_more`는 tracker 클라이언트가 표면화한다.
+pub async fn jira_list_issues_now(
+    connection: JiraConnection,
+    token: Secret,
+) -> Lookup<JiraPage<JiraIssue>> {
+    jira_client(connection, token)
+        .list_issues(JiraIssueFilter::Assigned)
+        .await
+}
+
+/// 연결(또는 부팅 시 재연결)을 발급한다.
+pub fn jira_connect(op: OpId, connection: JiraConnection, token: Secret) -> Task<Message> {
+    Task::perform(jira_connect_now(connection, token), move |result| {
+        Message::JiraConnected { op, result }
+    })
+}
+
+/// 이슈 목록 조회를 발급한다(연결 성공 직후 + 수동 새로고침).
+pub fn jira_list_issues(op: OpId, connection: JiraConnection, token: Secret) -> Task<Message> {
+    Task::perform(jira_list_issues_now(connection, token), move |result| {
+        Message::JiraIssuesFetched { op, result }
     })
 }

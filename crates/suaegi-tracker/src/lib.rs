@@ -16,5 +16,7 @@ pub use jira::{
     JiraAuthType, JiraClient, JiraComment, JiraConnection, JiraIssue, JiraIssueFilter, JiraPage,
     JiraProject, JiraViewer,
 };
-pub use link::{resolve_current_issue, LinkedLinearIssue};
+pub use link::{
+    resolve_current_issue, resolve_current_jira_issue, LinkedJiraIssue, LinkedLinearIssue,
+};
 pub use linear::{Comment, Issue, IssuePage, LinearClient, LinearWorkspace};

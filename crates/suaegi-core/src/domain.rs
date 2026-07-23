@@ -71,6 +71,17 @@ pub struct Worktree {
     /// `linear.app/{urlKey}/...` 딥링크·재연결 식별자.
     #[serde(default)]
     pub linked_linear_issue_organization_url_key: Option<String>,
+    /// 이 워크트리에 링크된 Jira 이슈 키(예: `PROJ-123`, Plan N2). Jira의 식별자는 Linear보다
+    /// **단순하다** — 이슈 키 하나 + 어느 사이트(연결)냐, 두 조각뿐이다(Linear의 워크스페이스
+    /// id/url_key 좌표 대신). **`#[serde(default)]`가 데이터 손실 방어다** — 이 필드 없는 옛
+    /// 저장본이 `None`으로 조용히 로드돼야지, 하나의 역직렬화 실패가 `PersistedState` 전체를
+    /// 손상 판정으로 떨어뜨리면 안 된다(`linked_linear_issue`와 같은 등급).
+    #[serde(default)]
+    pub linked_jira_issue: Option<String>,
+    /// 어느 Jira 사이트(연결)의 이슈인지 — 사용자가 여러 사이트를 가질 수 있으므로 딥링크·재연결에
+    /// 필요하다. 정규화된 `site_url`(예: `https://acme.atlassian.net`).
+    #[serde(default)]
+    pub linked_jira_site: Option<String>,
 }
 
 /// `pane_grid::Axis`의 serde 거울. iced 타입은 `Serialize`를 갖지 않고, 갖게
@@ -125,15 +136,37 @@ pub struct SessionState {
     pub panes: Option<PersistedPane>,
 }
 
+/// 부팅 시 Jira 재연결에 필요한 **non-secret** 연결 설정(Plan N2). 토큰은 여기 없다 —
+/// `suaegi-secrets` 키체인(service `suaegi-jira`, account=`site_url`)에서 별도로 온다(Orca가
+/// `jira-sites.json`을 평문으로, 토큰만 keychain에 두는 것과 동형). `suaegi-core`는
+/// `suaegi-tracker`를 모르므로 `JiraAuthType`(Cloud/Server) 대신 `is_cloud: bool`로 평평하게
+/// 담는다 — 매핑은 앱 레이어가 한다. **토큰은 절대 이 구조체에 들어가지 않는다.**
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JiraConnectionConfig {
+    /// 정규화된 사이트 URL(예: `https://acme.atlassian.net`), 끝 슬래시 없음. 키체인 account이기도.
+    pub site_url: String,
+    /// 로그인 이메일(Cloud/Server-Basic). Server PAT면 빈 문자열(→ Bearer).
+    pub email: String,
+    /// Cloud면 true(`/rest/api/3`, ADF), Server/DC면 false(`/rest/api/2`, plain).
+    pub is_cloud: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub workspace_root: PathBuf,
+    /// Plan N2: 활성 Jira 연결(있으면). 부팅이 이걸로 클라이언트를 재조립하고 키체인 토큰으로
+    /// 재검증한다 — "연결"이 앱 재시작을 넘어 지속되게 한다. **토큰은 절대 여기 없다**(키체인 전용).
+    /// **`#[serde(default)]`가 데이터 손실 방어다** — 이 필드 없는 옛 저장본이 `None`으로 조용히
+    /// 로드돼야 `Settings` 역직렬화가 실패해 파일 전체가 손상 판정으로 떨어지지 않는다.
+    #[serde(default)]
+    pub jira_connection: Option<JiraConnectionConfig>,
 }
 
 impl Settings {
     pub fn default_with_home(home: &Path) -> Self {
         Self {
             workspace_root: home.join("suaegi-workspaces"),
+            jira_connection: None,
         }
     }
 }
@@ -191,6 +224,8 @@ mod tests {
                 linked_linear_issue: Some("ENG-123".into()),
                 linked_linear_issue_workspace_id: Some("org-1".into()),
                 linked_linear_issue_organization_url_key: Some("acme".into()),
+                linked_jira_issue: Some("PROJ-99".into()),
+                linked_jira_site: Some("https://acme.atlassian.net".into()),
             }],
             session: SessionState {
                 active_worktree_id: Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
@@ -208,6 +243,11 @@ mod tests {
             },
             settings: Settings {
                 workspace_root: PathBuf::from("/tmp/ws"),
+                jira_connection: Some(JiraConnectionConfig {
+                    site_url: "https://acme.atlassian.net".into(),
+                    email: "ada@acme.com".into(),
+                    is_cloud: true,
+                }),
             },
         };
         let json = serde_json::to_string(&state).unwrap();
@@ -337,6 +377,8 @@ mod tests {
             linked_linear_issue: None,
             linked_linear_issue_workspace_id: None,
             linked_linear_issue_organization_url_key: None,
+            linked_jira_issue: None,
+            linked_jira_site: None,
         };
         let json = serde_json::to_string(&wt).unwrap();
         let back: Worktree = serde_json::from_str(&json).unwrap();
@@ -367,6 +409,12 @@ mod tests {
         );
         assert_eq!(wt.linked_linear_issue_workspace_id, None);
         assert_eq!(wt.linked_linear_issue_organization_url_key, None);
+        // N2도 같은 등급: Jira 링크 두 키가 없어도 `None`으로 읽힌다(파싱 실패 아님).
+        assert_eq!(
+            wt.linked_jira_issue, None,
+            "a missing linked_jira_issue key means 'no issue linked', not a parse failure"
+        );
+        assert_eq!(wt.linked_jira_site, None);
         // 대조군: 존재하던 필드는 실제로 읽혔다 — 위의 default가 "전부 기본값으로 뭉갰다"로도
         // 설명되면 안 된다.
         assert_eq!(wt.branch, "fix-bug", "control: present fields must be read");
@@ -388,6 +436,8 @@ mod tests {
             linked_linear_issue: Some("ENG-7".into()),
             linked_linear_issue_workspace_id: Some("org-9".into()),
             linked_linear_issue_organization_url_key: Some("acme".into()),
+            linked_jira_issue: None,
+            linked_jira_site: None,
         };
         let json = serde_json::to_string(&wt).unwrap();
         let back: Worktree = serde_json::from_str(&json).unwrap();
@@ -396,6 +446,68 @@ mod tests {
         assert_eq!(
             back.linked_linear_issue_organization_url_key.as_deref(),
             Some("acme")
+        );
+    }
+
+    /// Jira 링크 두 필드가 JSON을 왕복해도 보존돼야 한다(딥링크·재연결의 근거, N1 미러).
+    #[test]
+    fn jira_link_fields_round_trip() {
+        let wt = Worktree {
+            id: WorktreeId("/tmp/ws/demo/fix-bug".into()),
+            repo_id: RepoId("/tmp/demo".into()),
+            path: PathBuf::from("/tmp/ws/demo/fix-bug"),
+            branch: "fix-bug".into(),
+            display_name: "fix-bug".into(),
+            created_with_agent: None,
+            created_at_unix_ms: 0,
+            linked_github_pr: None,
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
+            linked_jira_issue: Some("PROJ-123".into()),
+            linked_jira_site: Some("https://acme.atlassian.net".into()),
+        };
+        let json = serde_json::to_string(&wt).unwrap();
+        let back: Worktree = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.linked_jira_issue.as_deref(), Some("PROJ-123"));
+        assert_eq!(
+            back.linked_jira_site.as_deref(),
+            Some("https://acme.atlassian.net")
+        );
+    }
+
+    /// N2 이전 빌드가 쓴 `Settings`에는 `jira_connection` 키가 아예 없다. `#[serde(default)]`가
+    /// 그걸 `None`으로 채워야 한다 — 아니면 `Settings` 역직렬화가 실패해 파일 전체가 손상으로
+    /// 판정돼 백업 폴백으로 떨어진다(data-loss 등급).
+    #[test]
+    fn settings_written_before_the_jira_connection_field_still_loads() {
+        let legacy = r#"{ "workspace_root": "/tmp/ws" }"#;
+        let settings: Settings =
+            serde_json::from_str(legacy).expect("a pre-N2 settings object must still parse");
+        assert_eq!(
+            settings.jira_connection, None,
+            "a missing jira_connection key means 'not connected', not a parse failure"
+        );
+        // 대조군: 존재하던 필드는 실제로 읽혔다.
+        assert_eq!(settings.workspace_root, PathBuf::from("/tmp/ws"));
+    }
+
+    /// Jira 연결 설정이 JSON을 왕복해도 보존돼야 한다(부팅 재연결의 근거). **토큰은 이 구조체에
+    /// 없다** — site/email/is_cloud만 담긴다(키체인 account를 짚고 클라이언트를 재조립하는 데 충분).
+    #[test]
+    fn jira_connection_config_round_trips() {
+        let cfg = JiraConnectionConfig {
+            site_url: "https://acme.atlassian.net".into(),
+            email: "ada@acme.com".into(),
+            is_cloud: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: JiraConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+        // 이 구조체가 실수로 토큰류 필드를 얻지 않았는지 확인(non-secret 계약).
+        assert!(
+            !json.to_lowercase().contains("token") && !json.to_lowercase().contains("secret"),
+            "the persisted Jira connection config must never carry a credential: {json}"
         );
     }
 
