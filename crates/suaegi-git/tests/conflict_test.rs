@@ -182,6 +182,60 @@ async fn merge_head_wins_over_cherry_pick_marker() {
     );
 }
 
+// --- crux(precedence mutation, synthetic): MERGE_HEAD + rebase-merge/ 동시 → Merge ---
+// 실제 git은 merge와 rebase 마커를 공존시키지 않지만, merge arm이 rebase arm보다 먼저
+// 검사돼야 한다는 **방어 분기**를 미래 리팩터 대비 pin한다. git init 없이 `.git`
+// 디렉터리에 두 마커를 직접 만든다(resolve_git_dir이 `.git` 디렉터리를 그대로 쓴다).
+// merge/rebase arm 순서를 뒤집으면(Rebase 먼저) 이 테스트가 Rebase를 내며 FAIL한다.
+#[tokio::test]
+async fn merge_head_wins_over_rebase_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let git_dir = p.join(".git");
+    std::fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+    std::fs::write(git_dir.join("MERGE_HEAD"), "deadbeef\n").unwrap();
+    assert_eq!(
+        detect_conflict_operation(p).unwrap(),
+        ConflictOperation::Merge,
+        "MERGE_HEAD가 rebase-merge/보다 우선해야 한다"
+    );
+}
+
+// --- crux(relative-pointer mutation, synthetic): 상대 gitdir: 포인터를 worktree 기준 해석 ---
+// `git worktree add`는 절대 포인터를 쓰므로 상대 분기(`worktree.join(p)`)와 빈-포인터
+// 가드가 실제 git 경로로는 미탐이다. 상대 포인터를 담은 `.git` **파일**을 직접 만들어
+// pin한다. else 분기를 `Ok(p.to_path_buf())`(join 생략)로 바꾸면 resolved가 상대 경로가
+// 되어 worktree.join(...)와 달라 이 단언이 FAIL한다.
+#[tokio::test]
+async fn resolve_git_dir_joins_relative_pointer_to_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    // `.git`을 파일로 만들어 linked-worktree 간접을 흉내낸다(디렉터리가 아님).
+    std::fs::write(p.join(".git"), "gitdir: relative/sub/path\n").unwrap();
+    let resolved = resolve_git_dir(p).unwrap();
+    assert_eq!(
+        resolved,
+        p.join("relative/sub/path"),
+        "상대 포인터가 worktree 기준으로 해석되지 않았다: {resolved:?}"
+    );
+}
+
+// 빈/공백-only `gitdir:` 포인터는 fallback(`<wt>/.git`)으로 간다 — `if !trimmed.is_empty()`
+// 가드를 pin한다(가드를 지우면 빈 포인터가 `worktree.join("")` = worktree 자체로 새어
+// 엉뚱한 경로가 된다).
+#[tokio::test]
+async fn resolve_git_dir_empty_pointer_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    std::fs::write(p.join(".git"), "gitdir:   \n").unwrap();
+    let resolved = resolve_git_dir(p).unwrap();
+    assert_eq!(
+        resolved,
+        p.join(".git"),
+        "빈 포인터가 fallback으로 안 갔다: {resolved:?}"
+    );
+}
+
 // --- crux(pointer mutation): linked worktree의 .git 파일 포인터를 따라간다 ---
 // `git worktree add`가 만든 linked worktree는 `.git`이 파일(gitdir: 포인터)이다.
 // resolve_git_dir이 포인터를 무시하고 `<wt>/.git`을 그대로 쓰면(파일인데 디렉터리처럼),
