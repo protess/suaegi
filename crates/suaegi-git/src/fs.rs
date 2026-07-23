@@ -1,11 +1,12 @@
-//! 워크트리 안의 파일시스템 리스팅과 안전 read. 모든 진입점은 M1 경로 안전 코어
-//! (`compare.rs`의 `resolve_for_read`)를 **먼저** 통과한다 — traversal/심링크-escape/
-//! null-byte를 거기서 거른다. 이 모듈은 그 위에서 디렉터리 한 레벨을 읽고(M2) 파일
-//! 하나를 안전하게 읽는다(M4).
+//! 워크트리 안의 파일시스템 리스팅과 안전 read/write. 모든 진입점은 M1 경로 안전 코어
+//! (`compare.rs`의 `resolve_for_read`/`resolve_for_write`)를 **먼저** 통과한다 —
+//! traversal/심링크-escape/null-byte를 거기서 거른다. 이 모듈은 그 위에서 디렉터리 한
+//! 레벨을 읽고(M2) 파일 하나를 안전하게 읽고(M4) 원자적으로 쓴다(M5).
 
-use crate::compare::{resolve_for_read, Resolved, BINARY_SNIFF_BYTES};
-use std::io;
-use std::path::Path;
+use crate::compare::{resolve_for_read, resolve_for_write, Resolved, BINARY_SNIFF_BYTES};
+use std::io::{self, Write};
+use std::path::{Component, Path};
+use std::time::SystemTime;
 
 /// 텍스트 파일 read 상한. Orca `MAX_TEXT_FILE_SIZE`(`filesystem.ts:130`)와 동일한
 /// 50 MB. **버퍼링 전에** stat 크기로 걸러 큰 파일을 통째로 메모리에 올리지 않는다
@@ -157,11 +158,176 @@ pub fn read_file(worktree: &Path, rel_path: &str) -> io::Result<FileRead> {
     read_file_with_cap(worktree, rel_path, MAX_TEXT_FILE_SIZE)
 }
 
+/// 파일이 우리가 마지막으로 본 이후 **밖에서 바뀌었는지**만 감지하기 위한 최소 지문.
+/// `size`(`metadata.len()`) + `mtime`(`metadata.modified()`). 콘텐츠 해시가 아니라
+/// stat 기반이라 값싸고, 편집기가 저장 후 재베이스라인하는 데 충분하다
+/// (Orca `editor-autosave-controller.ts:143-145`). `SystemTime`은 `Eq`라 그대로 비교한다.
+///
+/// **블라인드 스팟(Orca 패리티, follow-up)**: size와 mtime이 **둘 다** 안 바뀐 외부
+/// 편집은 못 잡는다 — 같은 mtime tick(파일시스템 해상도) 안에서 같은 바이트 수로 덮어쓰면
+/// staleness 검사를 통과해 clobber될 수 있다. content-hash(또는 inode+ctime) 추가는
+/// `docs/follow-ups.md`에 기록된 후속 작업이다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSignature {
+    pub size: u64,
+    pub mtime: SystemTime,
+}
+
+impl FileSignature {
+    fn from_metadata(meta: &std::fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            size: meta.len(),
+            mtime: meta.modified()?,
+        })
+    }
+}
+
+/// `write_file`의 결과. 손실 없이 썼거나(`Written`), 밖에서 바뀐 파일을 덮어쓰지 않고
+/// 멈췄거나(`StaleConflict`) 둘 중 하나다 — 에러(권한/traversal/denylist)는 `Err`로 별도.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// 성공. `signature`는 **새 on-disk 지문**이다 — 편집기가 이걸로 재베이스라인해
+    /// 다음 저장의 staleness 기준으로 삼는다(Orca autosave-controller:143-145).
+    Written { signature: FileSignature },
+    /// `expected`가 주어졌는데 on-disk 지문이 달라(밖에서 편집됨) **쓰지 않았다.**
+    /// `disk`는 현재 디스크 지문이거나, 파일이 우리 밑에서 삭제됐으면 `None`이다
+    /// (스펙은 `FileSignature`지만 삭제 케이스를 손실 없이 담으려 `Option`으로 확장).
+    StaleConflict { disk: Option<FileSignature> },
+}
+
+/// 워크트리 상대 `rel_path`에 `content`를 **원자적으로** 쓴다. 임의의 바이트를 받는다
+/// (`&[u8]`) — 편집기가 UTF-8이 아닌 파일도 저장할 수 있어야 하므로 텍스트를 강요하지 않는다.
+///
+/// `expected`가 `Some(sig)`면 쓰기 전에 현재 디스크 지문과 대조해, 다르면
+/// `StaleConflict`로 빠지고 **밖의 편집을 절대 덮어쓰지 않는다**(데이터 손실 crux).
+/// `None`이면 무조건 쓴다(첫 저장/새 파일).
+///
+/// 검사 순서:
+/// 1. `resolve_for_write`로 경로 재검증(traversal/중간-심링크/null-byte/없는-parent-심링크
+///    거부 — M1 게이트). 렌더러가 준 raw 경로를 신뢰하지 않는다.
+/// 2. `.git/` denylist: **어느 컴포넌트든** `.git`이면 거부(중첩 `sub/.git/hooks/...`도
+///    똑같이 위험한 코드실행 벡터). M1 containment는 워크트리 *안쪽*이라 통과시키므로
+///    여기서 별도로 막는다(M1 리뷰 이월).
+/// 3. leaf-symlink 거부: 기존 leaf가 심링크면 따라가지 않고 거부한다 — 따라가면 밖에
+///    쓰거나 심링크를 일반 파일로 망가뜨린다(M1 리뷰 이월).
+/// 4. 디렉터리 가드: 대상이 이미 디렉터리면 거부(`filesystem.ts:816`).
+/// 5. parent 존재 요구: 원자적 쓰기는 형제 temp가 필요하다. M5는 `mkdir -p` 안 한다
+///    (별도 create-dir 연산).
+/// 6. staleness 검사(위 참조).
+/// 7. 원자적 쓰기: 같은 디렉터리에 temp 작성 → `sync_all` → `persist`(rename).
+///
+/// staleness stat과 persist 사이에는 경계 있는 TOCTOU가 남는다(동시 로컬 쓰기). Orca와
+/// 같고 M2/M4 리뷰에서 수용됐다 — 락을 걸지 않고 문서화만 한다.
+pub fn write_file(
+    worktree: &Path,
+    rel_path: &str,
+    content: &[u8],
+    expected: Option<&FileSignature>,
+) -> io::Result<WriteOutcome> {
+    // 1. M1 경로 게이트. raw 경로를 절대 신뢰하지 않는다.
+    let resolved = resolve_for_write(worktree, rel_path)?;
+
+    // 2. `.git/` denylist — 어느 컴포넌트든. resolve가 모든 컴포넌트를 `Normal`로
+    //    보장했으므로 여기선 이름만 본다. 첫 컴포넌트만이 아니라 전부 검사한다:
+    //    `submodule/.git/hooks/pre-commit`도 훅 코드실행 벡터다.
+    //
+    //    **ASCII 케이스 무시로 비교한다**(`eq_ignore_ascii_case`): macOS(APFS/HFS+
+    //    기본)와 Windows(NTFS)는 대소문자무시 FS라 `.GIT`/`.Git`/`.gIt`가 실제로는
+    //    `.git`으로 resolve된다. exact `== ".git"`이면 `.GIT/hooks/pre-commit` 쓰기가
+    //    통과해 진짜 훅 파일을 심어 **임의 코드 실행**이 된다(RCE).
+    //
+    //    TODO(더 깊은 티어): HFS+ ignorable-unicode(`.gi\u{200c}t`)나 NTFS 8.3 short
+    //    name(`GIT~1`)까지 같은 경로로 resolve될 수 있으나, 그건 git core 자신이
+    //    거부한다(`core.protectHFS`/`core.protectNTFS`). 즉시 악용 가능한 건 ASCII-case
+    //    뿐이라 여기선 그것만 막고 나머지는 git core에 위임한다.
+    if Path::new(rel_path)
+        .components()
+        .any(|c| matches!(c, Component::Normal(name) if name.eq_ignore_ascii_case(".git")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to write inside a .git directory: {rel_path:?}"),
+        ));
+    }
+
+    // 3. leaf-symlink 거부. 따라가면 밖에 쓰거나 심링크를 일반 파일로 덮어써 망가뜨린다.
+    let target = match resolved {
+        Resolved::Regular(p) => p,
+        Resolved::Symlink(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to write through an existing symlink: {rel_path:?}"),
+            ));
+        }
+    };
+
+    // 4. 디렉터리 가드. `symlink_metadata`(lstat)로 대상 자체를 본다 — 디렉터리를
+    //    temp-rename으로 덮으려 하면 안 된다(`filesystem.ts:816`).
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to overwrite a directory: {rel_path:?}"),
+            ));
+        }
+    }
+
+    // 5. parent 존재 요구. 원자적 쓰기는 같은 디렉터리에 형제 temp를 만든다.
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("write target has no parent directory: {rel_path:?}"),
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("parent directory does not exist: {rel_path:?}"),
+        ));
+    }
+
+    // 6. staleness 검사(데이터 손실 crux). `expected`가 있으면 현재 디스크 지문과
+    //    대조 — 다르면 밖에서 편집된 것이므로 덮어쓰지 않는다. 삭제됐으면(NotFound)
+    //    그것도 conflict(우리 밑에서 사라짐).
+    if let Some(expected_sig) = expected {
+        match std::fs::metadata(&target) {
+            Ok(meta) => {
+                let disk = FileSignature::from_metadata(&meta)?;
+                if disk != *expected_sig {
+                    return Ok(WriteOutcome::StaleConflict { disk: Some(disk) });
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(WriteOutcome::StaleConflict { disk: None });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // 7. 원자적 쓰기: 형제 temp → 바이트 기록 → fsync → rename. temp는 실패 시
+    //    `NamedTempFile` drop이 정리한다(`persistence.rs:200-206` 패턴).
+    //    NOTE(follow-up): persist 직전에 **크래시**하면 `.tmpXXXXXX` 형제가 남아
+    //    `branch_compare`의 untracked 수집에 뜬다(잔존 정리는 `docs/follow-ups.md` 기록).
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map_err(|e| e.error)?;
+
+    // 새 on-disk 지문을 돌려준다 — 편집기가 재베이스라인한다.
+    let meta = std::fs::metadata(&target)?;
+    Ok(WriteOutcome::Written {
+        signature: FileSignature::from_metadata(&meta)?,
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     //! 실제 파일/디렉터리/심링크를 `tempdir`에 만들어 검증한다(모킹 금지). 각 crux
     //! 테스트는 하나의 mutant를 죽이도록 설계됐다.
-    use super::{list_dir, read_file, read_file_with_cap, FileContent, FileRead};
+    use super::{
+        list_dir, read_file, read_file_with_cap, write_file, FileContent, FileRead, FileSignature,
+        WriteOutcome,
+    };
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -339,5 +505,233 @@ mod tests {
             }
             other => panic!("leaf 심링크가 링크 내용으로 읽히지 않았다: {other:?}"),
         }
+    }
+
+    // ============================ M5: 안전 파일 write ============================
+
+    fn written_sig(outcome: WriteOutcome) -> FileSignature {
+        match outcome {
+            WriteOutcome::Written { signature } => signature,
+            other => panic!("Written을 기대했으나 {other:?}"),
+        }
+    }
+
+    // --- M5 crux: `.git/` denylist — 어느 컴포넌트든 (코드실행 벡터) ---
+    // (mutant: denylist를 떼면 parent가 있는 한 write가 성공한다. 그래서 parent(.git/hooks,
+    //  sub/.git)를 실제로 만들어, mutation-off 시 파일이 생기게 해서 이 테스트가 깨지게 한다)
+    #[test]
+    fn write_rejects_dot_git_first_component() {
+        let wt = worktree();
+        // denylist가 없으면 write가 성공하도록 parent를 실존시킨다.
+        fs::create_dir_all(wt.path().join(".git/hooks")).unwrap();
+        let target = wt.path().join(".git/hooks/pre-commit");
+        assert!(write_file(
+            wt.path(),
+            ".git/hooks/pre-commit",
+            b"#!/bin/sh\nevil\n",
+            None
+        )
+        .is_err());
+        assert!(
+            !target.exists(),
+            "denylist가 뚫려 .git/hooks/pre-commit이 생성됐다"
+        );
+    }
+
+    #[test]
+    fn write_rejects_dot_git_nested_component() {
+        let wt = worktree();
+        // 중첩 `sub/.git`도 훅 코드실행 벡터 — 첫 컴포넌트만 검사하면 뚫린다.
+        fs::create_dir_all(wt.path().join("sub/.git")).unwrap();
+        let target = wt.path().join("sub/.git/config");
+        assert!(write_file(wt.path(), "sub/.git/config", b"[core]\n", None).is_err());
+        assert!(!target.exists(), "중첩 .git denylist가 뚫렸다");
+    }
+
+    // --- F1 (CRITICAL/RCE): 대소문자무시 FS에서 `.GIT`/`.Git`가 `.git`으로 resolve된다 ---
+    // (mutant: `eq_ignore_ascii_case`를 exact `== ".git"`로 되돌리면 `.GIT` 변형이 통과해
+    //  parent가 있는 한 write가 성공한다 → 파일 생성 → 이 테스트 FAIL. 소문자 `.git`
+    //  기존 테스트는 exact-match로도 계속 통과하므로 이 테스트만이 케이스무시를 고정한다.)
+    //
+    // parent를 **쓰기 경로와 똑같은 케이스**(`.GIT/hooks` 등)로 만든다 — 그래야 대소문자
+    // 구분 FS(Linux CI)든 무시 FS(macOS)든 mutant-off일 때 parent-missing으로 마스킹되지
+    // 않고 실제로 파일이 생겨 mutant가 죽는다.
+    #[test]
+    fn write_rejects_dot_git_case_insensitive() {
+        // 첫 컴포넌트 대문자.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join(".GIT/hooks")).unwrap();
+            let target = wt.path().join(".GIT/hooks/pre-commit");
+            assert!(
+                write_file(
+                    wt.path(),
+                    ".GIT/hooks/pre-commit",
+                    b"#!/bin/sh\nevil\n",
+                    None
+                )
+                .is_err(),
+                ".GIT denylist가 뚫렸다(RCE)"
+            );
+            assert!(!target.exists(), ".GIT/hooks/pre-commit이 생성됐다(RCE)");
+        }
+        // 혼합 케이스 `.Git`.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join(".Git")).unwrap();
+            let target = wt.path().join(".Git/config");
+            assert!(
+                write_file(wt.path(), ".Git/config", b"[core]\n", None).is_err(),
+                ".Git denylist가 뚫렸다"
+            );
+            assert!(!target.exists(), ".Git/config가 생성됐다");
+        }
+        // 중첩 + 대문자 `sub/.GIT/hooks/x`.
+        {
+            let wt = worktree();
+            fs::create_dir_all(wt.path().join("sub/.GIT/hooks")).unwrap();
+            let target = wt.path().join("sub/.GIT/hooks/x");
+            assert!(
+                write_file(wt.path(), "sub/.GIT/hooks/x", b"evil\n", None).is_err(),
+                "중첩 .GIT denylist가 뚫렸다(RCE)"
+            );
+            assert!(!target.exists(), "sub/.GIT/hooks/x가 생성됐다(RCE)");
+        }
+    }
+
+    // --- M5 crux: leaf-symlink 거부 (따라가면 밖에 쓰거나 링크를 망가뜨린다) ---
+    // (mutant: 거부를 떼면 persist가 심링크를 일반 파일로 교체한다 — `link`가 더 이상
+    //  심링크가 아니게 되어 이 테스트가 깨진다. 밖 타깃도 안 바뀜을 함께 확인한다.)
+    #[test]
+    fn write_refuses_existing_leaf_symlink() {
+        let wt = worktree();
+        let outside = worktree();
+        let outside_target = outside.path().join("target");
+        fs::write(&outside_target, b"ORIGINAL").unwrap();
+        // 워크트리 안 `link` -> 밖 파일.
+        symlink(&outside_target, wt.path().join("link")).unwrap();
+
+        assert!(write_file(wt.path(), "link", b"clobber", None).is_err());
+
+        // 밖 타깃은 건드리지 않았다.
+        assert_eq!(
+            fs::read(&outside_target).unwrap(),
+            b"ORIGINAL",
+            "심링크를 따라가 밖 파일을 덮어썼다"
+        );
+        // 심링크는 일반 파일로 교체되지 않았다.
+        assert!(
+            fs::symlink_metadata(wt.path().join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "심링크가 일반 파일로 교체됐다"
+        );
+    }
+
+    // --- M5 crux: 디렉터리 가드 ---
+    // (mutant: 가드를 떼도 persist(file->dir) rename은 OS 에러라 여전히 Err다. 그래서
+    //  `is_err`만으로는 mutant를 못 죽인다 — 우리 가드가 낸 **구체 메시지**를 확인한다.)
+    #[test]
+    fn write_refuses_directory_target() {
+        let wt = worktree();
+        fs::create_dir(wt.path().join("somedir")).unwrap();
+        let e = write_file(wt.path(), "somedir", b"x", None).unwrap_err();
+        assert!(
+            e.to_string().contains("refusing to overwrite a directory"),
+            "우리 디렉터리 가드가 아니라 다른 경로로 거부됐다: {e}"
+        );
+    }
+
+    // --- M5 crux: staleness — 밖에서 바뀐 파일을 덮어쓰지 않는다 (데이터 손실) ---
+    // (mutant: 지문 비교를 always-equal로 바꾸면 stale write가 밖 편집을 덮어써
+    //  파일 내용이 "clobber"가 되어 이 테스트가 깨진다.)
+    #[test]
+    fn write_stale_conflict_does_not_clobber_external_edit() {
+        let wt = worktree();
+        let sig = written_sig(write_file(wt.path(), "f.txt", b"aaaa", None).unwrap());
+        // 밖에서 편집(크기까지 달라 mtime 해상도와 무관하게 지문이 다르다).
+        fs::write(wt.path().join("f.txt"), b"EXTERNAL-EDIT").unwrap();
+
+        let out = write_file(wt.path(), "f.txt", b"clobber", Some(&sig)).unwrap();
+        assert!(
+            matches!(out, WriteOutcome::StaleConflict { .. }),
+            "밖에서 바뀐 파일에 StaleConflict가 아니라 {out:?}"
+        );
+        assert_eq!(
+            fs::read(wt.path().join("f.txt")).unwrap(),
+            b"EXTERNAL-EDIT",
+            "stale write가 밖 편집을 덮어썼다"
+        );
+    }
+
+    // --- M5: 파일이 우리 밑에서 삭제됐으면 그것도 conflict(disk=None) ---
+    #[test]
+    fn write_stale_conflict_when_deleted_underneath() {
+        let wt = worktree();
+        let sig = written_sig(write_file(wt.path(), "gone.txt", b"data", None).unwrap());
+        fs::remove_file(wt.path().join("gone.txt")).unwrap();
+        let out = write_file(wt.path(), "gone.txt", b"x", Some(&sig)).unwrap();
+        assert_eq!(out, WriteOutcome::StaleConflict { disk: None });
+    }
+
+    // --- M5: 원자적 happy-path + 재베이스라인 지문이 false conflict를 안 낸다 ---
+    #[test]
+    fn write_happy_path_and_rebaseline_signature() {
+        let wt = worktree();
+        let out = write_file(wt.path(), "new.txt", b"hi", None).unwrap();
+        let sig = written_sig(out);
+        // 정확히 b"hi"가 쓰였다.
+        assert_eq!(fs::read(wt.path().join("new.txt")).unwrap(), b"hi");
+        // 돌려준 지문이 on-disk 파일과 일치한다.
+        let disk = fs::metadata(wt.path().join("new.txt")).unwrap();
+        assert_eq!(sig.size, disk.len());
+        assert_eq!(sig.mtime, disk.modified().unwrap());
+        // 밖 변경 없이 그 지문으로 다시 쓰면 false conflict 없이 또 Written.
+        let out2 = write_file(wt.path(), "new.txt", b"hi", Some(&sig)).unwrap();
+        assert!(
+            matches!(out2, WriteOutcome::Written { .. }),
+            "변경 없는 재저장이 false conflict를 냈다: {out2:?}"
+        );
+    }
+
+    // --- M5: parent가 없으면 에러 (M5는 mkdir -p 안 한다) ---
+    #[test]
+    fn write_requires_existing_parent() {
+        let wt = worktree();
+        // `missing/` 디렉터리가 없다.
+        assert!(write_file(wt.path(), "missing/file.txt", b"x", None).is_err());
+        assert!(!wt.path().join("missing").exists());
+    }
+
+    // --- M5: traversal은 여전히 거부(M1 재사용을 write 진입점에서 고정) ---
+    #[test]
+    fn write_rejects_traversal() {
+        let wt = worktree();
+        assert!(write_file(wt.path(), "../../etc/evil", b"x", None).is_err());
+        assert!(write_file(wt.path(), "/etc/evil", b"x", None).is_err());
+    }
+
+    // --- M5: read_file과의 round-trip ---
+    #[test]
+    fn write_then_read_round_trip() {
+        let wt = worktree();
+        write_file(wt.path(), "note.txt", "héllo 안녕".as_bytes(), None).unwrap();
+        match read_file(wt.path(), "note.txt").unwrap() {
+            FileRead::Ready {
+                content: FileContent::Text(s),
+                ..
+            } => assert_eq!(s, "héllo 안녕"),
+            other => panic!("write 후 read가 Text가 아니다: {other:?}"),
+        }
+    }
+
+    // --- M5: 임의 바이트(비-UTF8)도 그대로 쓴다 — 편집기가 바이너리 저장 가능 ---
+    #[test]
+    fn write_accepts_arbitrary_bytes() {
+        let wt = worktree();
+        let bytes = &[0xFFu8, 0x00, 0xFE, 0x42];
+        write_file(wt.path(), "raw.bin", bytes, None).unwrap();
+        assert_eq!(fs::read(wt.path().join("raw.bin")).unwrap(), bytes);
     }
 }
