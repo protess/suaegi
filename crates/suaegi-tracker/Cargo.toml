@@ -1,0 +1,20 @@
+[package]
+name = "suaegi-tracker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# leaf HTTP 전송(§Q5) — forge와 공유. tracker는 forge에 의존하지 않는다(레이어링 스멜 회피).
+suaegi-http = { path = "../suaegi-http" }
+suaegi-secrets = { path = "../suaegi-secrets" }
+# 워크트리↔이슈 링크 필드(§1.3)를 읽는 순수 resolver가 Worktree를 본다.
+suaegi-core = { path = "../suaegi-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# FakeTransport로 real api.linear.app를 안 친다. test-support 피처는 dev에서만 → 프로덕션 미포함.
+suaegi-http = { path = "../suaegi-http", features = ["test-support"] }
+tokio = { workspace = true }

@@ -59,6 +59,18 @@ pub struct Worktree {
     /// `PersistedState` 전체를 손상 판정으로 떨어뜨리면 안 된다(위 두 필드와 같은 등급).
     #[serde(default)]
     pub linked_github_pr: Option<u64>,
+    /// 이 워크트리에 링크된 Linear 이슈 식별자(예: `ENG-123`, Plan N1 §1.3). Orca는
+    /// provider별 슬롯을 분리한다(`types.ts:479-489`) — GitHub PR과 나란히 **세 필드**로.
+    /// 셋 다 **`#[serde(default)]`** — 이 필드 없는 옛 저장본이 `None`으로 조용히 로드돼야
+    /// `PersistedState` 전체 손상 판정을 피한다(`linked_github_pr`과 같은 등급).
+    #[serde(default)]
+    pub linked_linear_issue: Option<String>,
+    /// 다중 워크스페이스 구분(organization id). 딥링크/재연결 식별에 필요.
+    #[serde(default)]
+    pub linked_linear_issue_workspace_id: Option<String>,
+    /// `linear.app/{urlKey}/...` 딥링크·재연결 식별자.
+    #[serde(default)]
+    pub linked_linear_issue_organization_url_key: Option<String>,
 }
 
 /// `pane_grid::Axis`의 serde 거울. iced 타입은 `Serialize`를 갖지 않고, 갖게
@@ -176,6 +188,9 @@ mod tests {
                 created_with_agent: Some("claude".into()),
                 created_at_unix_ms: 1_700_000_000_000,
                 linked_github_pr: Some(42),
+                linked_linear_issue: Some("ENG-123".into()),
+                linked_linear_issue_workspace_id: Some("org-1".into()),
+                linked_linear_issue_organization_url_key: Some("acme".into()),
             }],
             session: SessionState {
                 active_worktree_id: Some(WorktreeId("/tmp/ws/demo/fix-bug".into())),
@@ -319,10 +334,69 @@ mod tests {
             created_with_agent: None,
             created_at_unix_ms: 0,
             linked_github_pr: Some(1234),
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
         };
         let json = serde_json::to_string(&wt).unwrap();
         let back: Worktree = serde_json::from_str(&json).unwrap();
         assert_eq!(back.linked_github_pr, Some(1234));
+    }
+
+    /// Plan N1 이전 빌드가 쓴 worktree 객체에는 `linked_linear_issue*` 세 키가 아예 없다.
+    /// `#[serde(default)]`가 그걸 `None`으로 채워야 한다 — 아니면 이 worktree 하나의 파싱
+    /// 실패가 저장 파일 전체를 손상으로 판정해 백업 폴백으로 떨어뜨린다(data-loss 등급,
+    /// `a_worktree_written_before_the_linked_pr_field_still_loads` 미러).
+    #[test]
+    fn a_worktree_written_before_the_linear_link_fields_still_loads() {
+        let legacy = r#"{
+            "id": "/tmp/ws/demo/fix-bug",
+            "repo_id": "/tmp/demo",
+            "path": "/tmp/ws/demo/fix-bug",
+            "branch": "fix-bug",
+            "display_name": "fix-bug",
+            "created_with_agent": "claude",
+            "created_at_unix_ms": 1700000000000,
+            "linked_github_pr": 42
+        }"#;
+        let wt: Worktree =
+            serde_json::from_str(legacy).expect("a pre-N1 worktree object must still parse");
+        assert_eq!(
+            wt.linked_linear_issue, None,
+            "a missing linked_linear_issue key means 'no issue linked', not a parse failure"
+        );
+        assert_eq!(wt.linked_linear_issue_workspace_id, None);
+        assert_eq!(wt.linked_linear_issue_organization_url_key, None);
+        // 대조군: 존재하던 필드는 실제로 읽혔다 — 위의 default가 "전부 기본값으로 뭉갰다"로도
+        // 설명되면 안 된다.
+        assert_eq!(wt.branch, "fix-bug", "control: present fields must be read");
+        assert_eq!(wt.linked_github_pr, Some(42));
+    }
+
+    /// Linear 링크 세 필드가 JSON을 왕복해도 보존돼야 한다(딥링크·재연결의 근거).
+    #[test]
+    fn linear_link_fields_round_trip() {
+        let wt = Worktree {
+            id: WorktreeId("/tmp/ws/demo/fix-bug".into()),
+            repo_id: RepoId("/tmp/demo".into()),
+            path: PathBuf::from("/tmp/ws/demo/fix-bug"),
+            branch: "fix-bug".into(),
+            display_name: "fix-bug".into(),
+            created_with_agent: None,
+            created_at_unix_ms: 0,
+            linked_github_pr: None,
+            linked_linear_issue: Some("ENG-7".into()),
+            linked_linear_issue_workspace_id: Some("org-9".into()),
+            linked_linear_issue_organization_url_key: Some("acme".into()),
+        };
+        let json = serde_json::to_string(&wt).unwrap();
+        let back: Worktree = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.linked_linear_issue.as_deref(), Some("ENG-7"));
+        assert_eq!(back.linked_linear_issue_workspace_id.as_deref(), Some("org-9"));
+        assert_eq!(
+            back.linked_linear_issue_organization_url_key.as_deref(),
+            Some("acme")
+        );
     }
 
     #[test]

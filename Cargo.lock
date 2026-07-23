@@ -3972,10 +3972,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
- "reqwest",
  "serde",
  "serde_json",
  "suaegi-git",
+ "suaegi-http",
  "suaegi-secrets",
  "tempfile",
  "thiserror 2.0.19",
@@ -3992,6 +3992,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "suaegi-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
 ]
 
 [[package]]
@@ -4014,6 +4022,18 @@ dependencies = [
  "suaegi-core",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "suaegi-tracker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "suaegi-core",
+ "suaegi-http",
+ "suaegi-secrets",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "suaegi-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+
+[features]
+# `test-support`는 [`fake::FakeTransport`]를 켠다. **프로덕션 빌드엔 안 실린다** — 이 크레이트를
+# 쓰는 크레이트가 dev-dependencies에서만 이 피처를 켜므로, `cargo build`(비-test)에는 fake가
+# 컴파일되지 않는다. suaegi-secrets의 `FakeKeychain`이 늘 pub인 것과 달리, HTTP fake는
+# 응답 큐라는 테스트 전용 표면이라 피처 뒤에 둔다.
+test-support = []

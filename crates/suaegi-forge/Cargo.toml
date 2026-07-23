@@ -8,19 +8,24 @@ license.workspace = true
 [dependencies]
 suaegi-git = { path = "../suaegi-git" }
 suaegi-secrets = { path = "../suaegi-secrets" }
+# HTTP 전송은 §Q5에서 leaf-크레이트로 추출됨(원래 여기 github_http/transport.rs). forge와
+# tracker가 둘 다 이걸 의존해 이슈트래커→PR-forge 레이어링 스멜을 피한다.
+suaegi-http = { path = "../suaegi-http" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
-reqwest = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# FakeTransport는 suaegi-http의 `test-support` 피처 뒤에 있다. dev-dependencies에서만 켜므로
+# 프로덕션 빌드엔 fake가 안 실린다(비-test `cargo build`는 dev-deps 피처를 활성화하지 않는다).
+suaegi-http = { path = "../suaegi-http", features = ["test-support"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }

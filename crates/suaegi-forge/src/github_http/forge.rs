@@ -21,7 +21,7 @@ use super::classify::{classify_http_merge_failure, classify_http_unavailable};
 use super::parse::{
     api_base, parse_github_remote, user_login, HttpComment, HttpPr, HttpReview,
 };
-use super::transport::{
+use suaegi_http::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportError,
 };
 use crate::github::read_pr_template;
@@ -580,7 +580,7 @@ async fn current_branch(worktree: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::transport::fake::FakeTransport;
+    use suaegi_http::FakeTransport;
     use super::*;
 
     fn repo() -> RepoCoords {
