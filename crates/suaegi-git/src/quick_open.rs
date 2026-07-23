@@ -8,6 +8,23 @@
 //! - excludePaths 정규화: `shared/quick-open-filter.ts`(`buildExcludePathPrefixes` 내부 규칙)
 //!
 //! `-z` 스트림은 `status.rs`의 NUL-split 규율(`stdout.split('\0')`, 빈 조각 skip)을 재사용한다.
+//!
+//! M2b(이 파일 하단)는 위 순수 표면을 호출하는 **드라이버 캐스케이드**를 더한다:
+//! rg → git ls-files → raw walk. 핵심 규율은 **transient≠empty**(Codex fix 5/6): 실패/타임아웃
+//! 티어는 부분 버퍼를 **버리고** 캐스케이드하거나 하드-에러한다 — 절대 잘린 목록을 완전한 것처럼
+//! 반환하지 않는다(무성 절단 = Quick Open이 파일을 놓침 = 저장소의 대죄).
+
+use crate::fs::list_dir;
+use crate::runner::GitRunner;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 
 // ─── glob 이스케이프 (Orca quick-open-filter.ts:157-171) ───────────────
 
@@ -71,6 +88,66 @@ pub fn rg_args(include_ignored: bool, excludes: &[String]) -> Vec<String> {
         args.push(format!("!**/{}", escape_glob_path(ex)));
     }
     args
+}
+
+// ─── rg 항상-on hidden-dir blocklist (Orca quick-open-filter.ts:27-53,222-234) ─
+
+/// caller `excludes`와 **무관하게 항상** rg에서 prune하는 dot-dir 이름들(Orca
+/// `HIDDEN_DIR_BLOCKLIST`, quick-open-filter.ts:27-45). 도구-생성 캐시/상태 디렉터리라
+/// 사람이 손대지 않는다. `.config`/`.ssh`/`.github` 같은 사용자-저작 dotdir는 **넣지 않는다**
+/// (그 안 파일을 연다). 순서는 Orca 목록 그대로.
+const HIDDEN_DIR_BLOCKLIST: &[&str] = &[
+    ".git",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".stably",
+    ".vscode",
+    ".idea",
+    ".yarn",
+    ".pnpm-store",
+    ".terraform",
+    ".docker",
+    ".husky",
+    ".npm",
+    ".npm-global",
+    ".gvfs",
+];
+
+/// dot-dir가 아니라 별도(Orca `HIDDEN_PATH_BLOCKLIST`, :49) — 생성된 desktop 런타임 subtree만.
+/// `.local` 자체는 사용자 파일을 담을 수 있어 통째로 막지 않는다.
+const HIDDEN_PATH_BLOCKLIST: &[&str] = &[".local/share"];
+
+/// node_modules는 dotfile 디렉터리가 아니지만 모든 traversal에서 prune돼야 한다
+/// (Orca `NON_DOTTED_PRUNE`, :53). blocklist glob에서 **맨 앞**에 온다(:225).
+const NON_DOTTED_PRUNE: &str = "node_modules";
+
+/// rg의 **항상-on** hidden-dir prune glob들(Orca `buildHiddenDirExcludeGlobs`,
+/// quick-open-filter.ts:224-234). caller `excludes`와 **별개로** 두 rg 패스 모두에 주입한다.
+///
+/// **F1(HIGH)**: 이게 없으면 ignored 패스(`--no-ignore-vcs --hidden`)가 `.git/` 전체(hook
+/// 샘플 등 20개+)·`node_modules`·`.next`를 Quick Open 결과로 노출한다(리뷰어 실측 재현).
+/// primary 패스는 `--exclude-standard` 없이 rg 자체 gitignore 존중이라 `.git`은 걸러지지만,
+/// blocklist는 두 패스 모두에 걸어 ignored 패스의 노출을 원천 차단한다.
+///
+/// directory-match form `!**/<name>`(contents-form 아님) — rg는 contents-form만 매칭된
+/// 디렉터리로 여전히 내려가므로 directory-form만 실제 traversal을 prune한다(:217-222).
+/// 이름/경로는 `escape_glob`/`escape_glob_path`로 escape하고 항상 `!` 접두다.
+pub fn rg_hidden_dir_exclude_globs() -> Vec<String> {
+    let mut out = Vec::new();
+    // node_modules 먼저(Orca :225), 그다음 dot-dir blocklist.
+    out.push("--glob".to_string());
+    out.push(format!("!**/{}", escape_glob(NON_DOTTED_PRUNE)));
+    for name in HIDDEN_DIR_BLOCKLIST {
+        out.push("--glob".to_string());
+        out.push(format!("!**/{}", escape_glob(name)));
+    }
+    // multi-segment 경로 blocklist는 escape_glob_path(구분자 `/`는 escape 안 함).
+    for p in HIDDEN_PATH_BLOCKLIST {
+        out.push("--glob".to_string());
+        out.push(format!("!**/{}", escape_glob_path(p)));
+    }
+    out
 }
 
 // ─── git ls-files argv 빌더 (Orca quick-open-filter.ts:312-344) ────────
@@ -397,6 +474,567 @@ pub fn collapse_expansion_paths(paths: Vec<ExpansionPath>) -> Vec<ExpansionPath>
     collapsed
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// M2b — 드라이버 캐스케이드 (Orca filesystem-list-files.ts / -git-fallback.ts /
+//        quick-open-readdir-walk.ts / rg-availability.ts)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// raw walk의 하드 파일 상한. 넘기면 **truncate가 아니라 throw**한다(Codex fix 6).
+/// Orca `QUICK_OPEN_READDIR_MAX_FILES`(quick-open-readdir-budget.ts:1).
+pub const QUICK_OPEN_READDIR_MAX_FILES: usize = 10_000;
+
+/// raw walk의 데드라인. 넘기면 **throw**한다. Orca `QUICK_OPEN_READDIR_TIMEOUT_MS`(:2).
+pub const QUICK_OPEN_READDIR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// rg 가용성 프로브 타임아웃(Orca `RG_AVAILABILITY_TIMEOUT_MS`, rg-availability.ts:3).
+const RG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// rg 리스팅 패스 타임아웃(Orca 각 패스 10s, filesystem-list-files.ts:193).
+const RG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// git 호출 타임아웃. **GitRunner 기본 30s가 아니라 10s**(Codex fix 4) — Orca는 rev-parse/
+/// ls-files를 10s로 돌린다(-git-fallback.ts:73,231). 기본 30s를 쓰면 3배 느린 실패=UX 회귀.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Quick Open 리스터 캐스케이드의 실패 분류. UI가 각 클래스에 맞는 안내(예: rg 설치)를
+/// 띄울 수 있도록 구분한다. Orca는 walk budget 초과/타임아웃만 "install ripgrep" 안내로
+/// 번역한다(`isQuickOpenReaddirBudgetError`, quick-open-readdir-budget.ts:22) — `suggests_install_rg`.
+#[derive(Debug, thiserror::Error)]
+pub enum QuickOpenError {
+    /// rg 런이 실패(타임아웃/시그널-킬/비정상 종료/exit2-무결과). **git 폴백 없이 하드 에러**
+    /// — upfront 프로브만 git 캐스케이드를 트리거한다(Codex fix 5).
+    #[error("ripgrep listing failed: {detail}")]
+    RgFailed { detail: String },
+    /// git ls-files primary 패스가 실패. **walk 캐스케이드 없이 하드 리젝트**(Codex fix 5).
+    #[error("git ls-files failed: {detail}")]
+    GitLsFilesFailed { detail: String },
+    /// raw walk가 `max` 파일 상한을 넘겼다. **truncate가 아니라 에러**(Codex fix 6).
+    #[error("file listing exceeded {max} files")]
+    WalkCapExceeded { max: usize },
+    /// raw walk가 데드라인을 넘겼다. **부분 목록이 아니라 에러**(Codex fix 6).
+    #[error("file listing timed out")]
+    WalkTimeout,
+    /// 프로세스 스폰 IO 실패(rg 패스 spawn 등).
+    #[error("failed to spawn {program}: {source}")]
+    Spawn {
+        program: &'static str,
+        source: std::io::Error,
+    },
+}
+
+impl QuickOpenError {
+    /// UI가 "ripgrep을 설치하면 더 빠릅니다" 안내를 띄워야 하는가. Orca 패리티:
+    /// walk budget(초과/타임아웃)만 그 안내로 번역된다(quick-open-readdir-budget.ts:21-25).
+    pub fn suggests_install_rg(&self) -> bool {
+        matches!(self, Self::WalkCapExceeded { .. } | Self::WalkTimeout)
+    }
+}
+
+/// **캐스케이드 진입점**. worktree-상대 경로(forward-slash)를 돌려준다.
+///
+/// 1. rg 가용성 **upfront 1회** 프로브(5s). 없으면 → **git 캐스케이드**(Orca가 upfront로
+///    프로브하는 이유: spawn('rg')의 error/close 경쟁으로 무성 빈결과가 나던 버그를 없애려고,
+///    filesystem-list-files.ts:39-52).
+/// 2. rg 있으면 → rg 2패스. 런 실패는 **하드 에러**(second-chance git 폴백 금지).
+/// 3. git 티어는 rev-parse가 not-a-worktree면 walk로 soft-fail; 확정 워크트리면 ls-files
+///    실패는 하드 리젝트.
+///
+/// **F7(M3 선결 조건)**: `excludes`는 지금 rg(`rg_args` → basename-anywhere `!**/{p}`)와
+/// git(`ls_files_args` → rooted `:(exclude,glob){p}`) 양쪽에 **그대로** 전달되는데, 두
+/// 빌더의 exclude 의미가 다르다: 멀티세그먼트 값(`packages/app`)을 rg에 `!**/packages/app`으로
+/// 넣으면 트리 어디에 있는 동명 경로든 over-prune(=파일 누락)한다. M3가 nested-worktree
+/// prefix를 배선하기 전에 **반드시** rg는 rooted `!<p>`+`!<p>/**`, git은 rooted pathspec으로
+/// 분기해 조율해야 한다(현재 M2b는 basename blocklist 이름만 안전하게 통과시키는 전제).
+/// 항상-on hidden-dir blocklist(`rg_hidden_dir_exclude_globs`)는 이 `excludes`와 무관하다.
+pub async fn list_quick_open_files(
+    worktree: &Path,
+    excludes: &[String],
+) -> Result<Vec<String>, QuickOpenError> {
+    let rg = rg_available(worktree).await;
+    dispatch(worktree, excludes, rg).await
+}
+
+/// rg 가용성 비트를 **주입 가능**하게 분리한 캐스케이드 코어(테스트가 프로브 없이 분기를 고정).
+/// rg 없음(upfront) → git; 있음 → rg 하드-에러 경로. 이 함수가 캐스케이드 결정을 담는다.
+async fn dispatch(
+    worktree: &Path,
+    excludes: &[String],
+    rg_available: bool,
+) -> Result<Vec<String>, QuickOpenError> {
+    if rg_available {
+        // rg 있으면 rg만 — 런 실패해도 git으로 새지 않는다(Codex fix 5).
+        list_with_rg(worktree, excludes).await
+    } else {
+        list_with_git(worktree, excludes).await
+    }
+}
+
+// ─── Tier 1: rg (Orca filesystem-list-files.ts, rg-availability.ts) ────
+
+/// `rg --version`을 5s 타임아웃으로 스폰해 가용성을 본다. spawn ENOENT(rg 없음)나 비-0 종료나
+/// 타임아웃 → `false`(→ git 캐스케이드). Node의 error/close 경쟁을 위한 settled-guard는
+/// Rust에선 불필요하다 — `spawn()`이 즉시 `Err`을 주거나 `wait()`이 단일 status를 주므로
+/// 이중 resolve가 원천적으로 없다(rg-availability.ts:6-15의 문제가 여기선 발생 불가).
+async fn rg_available(worktree: &Path) -> bool {
+    rg_available_program(worktree, "rg").await
+}
+
+async fn rg_available_program(worktree: &Path, program: &str) -> bool {
+    let mut cmd = Command::new(program);
+    cmd.arg("--version")
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        // spawn ENOENT = rg 미설치 → 캐스케이드(하드 에러 아님).
+        Err(_) => return false,
+    };
+    match tokio::time::timeout(RG_PROBE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) => false,
+        Err(_) => {
+            kill_child(&mut child);
+            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+            false
+        }
+    }
+}
+
+/// rg 2패스(primary, ignored)를 돌려 합집합을 돌려준다. **어느 패스든 하드 실패하면 전체가
+/// 하드 에러**(Orca `Promise.all` reject 패리티, filesystem-list-files.ts:226/235-237).
+async fn list_with_rg(worktree: &Path, excludes: &[String]) -> Result<Vec<String>, QuickOpenError> {
+    list_with_rg_using(worktree, "rg", excludes, RG_TIMEOUT).await
+}
+
+/// program/timeout 주입 버전(테스트가 가짜 rg 스크립트 + 짧은 타임아웃으로 각 종료 시나리오를
+/// 고정한다). Orca는 두 패스를 병렬로 돌리지만 여기선 순차다 — 결과 합집합은 동일하고
+/// 첫 패스 하드 실패 시 즉시 반환(둘째 패스 스킵)은 `Promise.all` 조기 reject와 동치다.
+async fn list_with_rg_using(
+    worktree: &Path,
+    program: &str,
+    excludes: &[String],
+    timeout: Duration,
+) -> Result<Vec<String>, QuickOpenError> {
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for include_ignored in [false, true] {
+        let mut args = rg_args(include_ignored, excludes);
+        // F1: 항상-on hidden-dir blocklist를 caller excludes와 별개로 두 패스 모두에 주입한다
+        // — 이게 없으면 ignored 패스가 `.git/`·node_modules·.next를 노출한다(Orca:269 hiddenDirGlobs).
+        args.extend(rg_hidden_dir_exclude_globs());
+        // searchRoot('.')는 M2b가 붙인다(cwd=worktree, cwd-상대 출력). Orca filesystem-list-files.ts:68.
+        args.push(".".to_string());
+        // `?`: 하드 실패는 즉시 전파(둘째 패스로 절대 넘어가지 않음).
+        let paths = run_rg_pass(worktree, program, &args, timeout).await?;
+        files.extend(paths);
+    }
+    Ok(files.into_iter().collect())
+}
+
+/// 한 rg 패스를 스폰·수집한다. **transient≠empty(Codex fix 5)**:
+/// - 타임아웃 → 킬 + 버퍼 폐기 + `RgFailed`.
+/// - 시그널-킬 종료 → 버퍼 폐기 + `RgFailed`.
+/// - exit 0/1 → 파싱 결과 resolve.
+/// - exit 2 & 파싱 경로 ≥1 → resolve(권한 없는 하위 디렉터리 부분 성공 허용, Orca:153-155).
+/// - exit 2 & 0경로 → `RgFailed`.
+/// - 그 외 종료 코드 → `RgFailed`.
+async fn run_rg_pass(
+    worktree: &Path,
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<Vec<String>, QuickOpenError> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|e| QuickOpenError::Spawn {
+        program: "rg",
+        source: e,
+    })?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // stdout 읽기·stderr 배출·wait를 **동시에** — 파이프가 가득 차 자식이 블록되는 교착 방지
+    // (runner.rs의 read/wait 동시 규율과 같다).
+    let collected = tokio::time::timeout(timeout, async {
+        let mut out = Vec::new();
+        let read_out = stdout.read_to_end(&mut out);
+        let drain_err = drain_to_end(&mut stderr);
+        let (status, read_res, _) = tokio::join!(child.wait(), read_out, drain_err);
+        (status, out, read_res)
+    })
+    .await;
+
+    match collected {
+        // 타임아웃: 버퍼는 경로 중간에서 잘렸을 수 있다 → 폐기하고 하드 에러(Orca:187-193).
+        Err(_) => {
+            kill_child(&mut child);
+            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+            Err(QuickOpenError::RgFailed {
+                detail: "rg list timed out".to_string(),
+            })
+        }
+        Ok((status, out, read_res)) => {
+            let status = status.map_err(|e| QuickOpenError::RgFailed {
+                detail: format!("rg wait failed: {e}"),
+            })?;
+            read_res.map_err(|e| QuickOpenError::RgFailed {
+                detail: format!("rg read failed: {e}"),
+            })?;
+
+            // 시그널-킬 종료(타임아웃/OOM/외부 킬): 스트림된 접두를 돌려주면 무성 빈결과 버그를
+            // 재현한다 → 폐기 + 하드 에러(Orca:137-144).
+            #[cfg(unix)]
+            if let Some(sig) = status.signal() {
+                return Err(QuickOpenError::RgFailed {
+                    detail: format!("rg killed by signal {sig}"),
+                });
+            }
+
+            let paths = parse_rg_stdout(&out);
+            let code = status.code().unwrap_or(-1);
+            if code == 0 || code == 1 {
+                Ok(paths)
+            } else if code == 2 && !paths.is_empty() {
+                // exit 2 = 일부 하위 디렉터리 읽기 실패지만 나머지는 유효 → 부분 성공 허용.
+                Ok(paths)
+            } else {
+                Err(QuickOpenError::RgFailed {
+                    detail: format!("rg exited with code {code}"),
+                })
+            }
+        }
+    }
+}
+
+/// rg `--files` stdout(줄바꿈 구분, git ls-files의 `-z`와 다르다)을 worktree-상대 경로로.
+/// cwd-상대 모드: 끝-`\r` 제거, `./` 접두 제거, `.`/빈/절대/`..` 라인은 스킵
+/// (Orca `normalizeQuickOpenRgLine` cwd-relative, quick-open-filter.ts:327-337).
+fn parse_rg_stdout(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() {
+            continue;
+        }
+        let normalized = line.replace('\\', "/");
+        let rel = normalized.strip_prefix("./").unwrap_or(&normalized);
+        if rel.is_empty() || rel == "." || rel.starts_with('/') || is_parent_rel(rel) {
+            continue;
+        }
+        out.push(rel.to_string());
+    }
+    out
+}
+
+/// `..` 또는 `../…`(root 밖) 여부. `..name`은 유효한 child(Orca `isParentRelativePath`, :210-213).
+fn is_parent_rel(rel: &str) -> bool {
+    rel == ".." || rel.starts_with("../")
+}
+
+// ─── Tier 2: git ls-files (Orca filesystem-list-files-git-fallback.ts) ─
+
+/// git 티어. rev-parse가 not-a-worktree면 walk로 soft-fail; 확정 워크트리면 primary ls-files
+/// 실패는 **하드 리젝트**(walk 캐스케이드 금지). ignored 패스는 best-effort(실패해도 primary 유지).
+async fn list_with_git(
+    worktree: &Path,
+    excludes: &[String],
+) -> Result<Vec<String>, QuickOpenError> {
+    let runner = GitRunner::new();
+
+    // rev-parse probe: 에러/타임아웃/non-zero/"false"는 **soft-fail → Tier3 walk**(reject 안 함,
+    // Orca -git-fallback.ts:62-64,70-73). `run_with_timeout`은 non-zero면 `Err`을 주므로 그
+    // 자체가 not-a-worktree 신호다. Orca는 exit 0을 무조건 worktree로 보지만 여기선 stdout
+    // "true"까지 확인(확정-워크트리) — bare repo("false")는 walk로 내려간다.
+    let inside = matches!(
+        runner
+            .run_with_timeout(worktree, &["rev-parse", "--is-inside-work-tree"], GIT_TIMEOUT)
+            .await,
+        Ok(o) if o.stdout.trim() == "true"
+    );
+    if !inside {
+        return list_with_walk(worktree, WalkBudget::new());
+    }
+
+    // primary ls-files: 실패(타임아웃/시그널/스폰/비정상 종료)는 **하드 리젝트**(Codex fix 5).
+    let primary_args = ls_files_args(false, excludes);
+    let primary_out = runner
+        .run_with_timeout(worktree, &to_argv("ls-files", &primary_args), GIT_TIMEOUT)
+        .await
+        .map_err(|e| QuickOpenError::GitLsFilesFailed {
+            detail: e.to_string(),
+        })?;
+
+    // ignored 패스: **best-effort** — 실패해도 primary 결과를 절대 버리지 않는다
+    // (Orca:264-271 `.catch(...)` keeping primary). 성공 stdout만 취하고 실패는 삼킨다.
+    let ignored_args = ls_files_args(true, excludes);
+    let ignored_stdout = runner
+        .run_with_timeout(worktree, &to_argv("ls-files", &ignored_args), GIT_TIMEOUT)
+        .await
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+
+    // 두 패스의 레코드를 keep(즉시 수집) / expansion(placeholder 확장)으로 분류.
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    let mut expansions: Vec<ExpansionPath> = Vec::new();
+    for stdout in [primary_out.stdout.as_str(), ignored_stdout.as_str()] {
+        for entry in parse_ls_files_stream(stdout) {
+            classify_entry(worktree, entry, &mut files, &mut expansions);
+        }
+    }
+
+    // placeholder 확장: 하나의 공유 budget으로 collapse된 모든 subtree를 walk
+    // (Orca expandQuickOpenGitFileListing의 단일 budget, quick-open-readdir-walk.ts:277).
+    let mut budget = WalkBudget::new();
+    for ep in collapse_expansion_paths(expansions) {
+        walk(
+            worktree,
+            &ep.rel,
+            ep.include_symlinks,
+            &mut budget,
+            &mut files,
+        )?;
+    }
+
+    Ok(files.into_iter().collect())
+}
+
+/// 한 `ls-files` 레코드를 keep/drop/expansion으로 라우팅(Orca -git-fallback.ts:113-139 +
+/// expandQuickOpenGitFileListing:292-326). **untracked 디렉터리 placeholder는 classify를 거치지
+/// 않고 무조건 확장(include_symlinks=true)** — git이 이미 untracked 트리로 확인해줬고, collapse
+/// 전 untracked 심링크를 leaf로 보여줬으므로 재확장 시 누락 금지(Orca directoryPaths, :308-326).
+/// gitlink만 `classify_quick_open_git_entry` 4분기를 탄다(fill이면 include_symlinks=false).
+fn classify_entry(
+    worktree: &Path,
+    entry: GitLsFilesEntry<'_>,
+    files: &mut BTreeSet<String>,
+    expansions: &mut Vec<ExpansionPath>,
+) {
+    // normalizeGitEntry: 끝 `/` 제거(quick-open-readdir-walk.ts:67).
+    let rel = entry.path.trim_end_matches('/');
+    if rel.is_empty() {
+        return;
+    }
+
+    // untracked 디렉터리 → directoryPaths: lstat/classify 없이 강제 확장(true).
+    if entry.is_untracked_dir {
+        expansions.push(ExpansionPath::untracked_dir(rel));
+        return;
+    }
+
+    // gitPaths(평범 파일/untracked 파일/gitlink): classify 4분기.
+    let probe = if entry.is_gitlink {
+        probe_dir(worktree, rel)
+    } else {
+        GitEntryProbe::OrdinaryFile
+    };
+    match classify_quick_open_git_entry(probe) {
+        GitEntryAction::Keep => {
+            files.insert(rel.to_string());
+        }
+        GitEntryAction::DropPlaceholder => {}
+        // gitlink 중첩 저장소 → 확장하되 심링크 leaf는 제외(include_symlinks=false).
+        GitEntryAction::FillNestedRepo => expansions.push(ExpansionPath::gitlink(rel)),
+    }
+}
+
+/// gitlink placeholder를 lstat해 `GitEntryProbe`로 요약(Orca classifyQuickOpenGitEntry의
+/// lstat 분기, quick-open-readdir-walk.ts:111-126). lstat은 `symlink_metadata`(링크 미추적).
+fn probe_dir(worktree: &Path, rel: &str) -> GitEntryProbe {
+    let abs = join_rel(worktree, rel);
+    let meta = match std::fs::symlink_metadata(&abs) {
+        Ok(m) => m,
+        Err(_) => return GitEntryProbe::LstatFailed,
+    };
+    if !meta.file_type().is_dir() {
+        return GitEntryProbe::NotADir;
+    }
+    // hasGitEntry: `.git`이 파일 또는 디렉터리로 존재(Orca hasGitEntry, :88-95). 심링크 `.git`은
+    // isFile/isDirectory 어느 쪽도 아니라 false.
+    let git = abs.join(".git");
+    let has_git = std::fs::symlink_metadata(&git)
+        .map(|m| m.file_type().is_dir() || m.file_type().is_file())
+        .unwrap_or(false);
+    if has_git {
+        GitEntryProbe::DirWithGit
+    } else {
+        GitEntryProbe::DirWithoutGit
+    }
+}
+
+// ─── Tier 3: raw walk (Orca quick-open-readdir-walk.ts:163-264) ────────
+
+/// raw walk의 예산: 남은 파일 수 + 데드라인. Orca `QuickOpenReaddirBudget`
+/// (quick-open-readdir-budget.ts:4-16). `max_files`는 에러 메시지용으로 함께 보관한다.
+struct WalkBudget {
+    remaining: usize,
+    max_files: usize,
+    deadline: Instant,
+}
+
+impl WalkBudget {
+    fn new() -> Self {
+        Self::with_limits(
+            QUICK_OPEN_READDIR_MAX_FILES,
+            Instant::now() + QUICK_OPEN_READDIR_TIMEOUT,
+        )
+    }
+
+    /// 테스트가 작은 cap/과거 데드라인을 주입해 10k 실파일 없이 경계를 검증하도록 분리.
+    fn with_limits(max_files: usize, deadline: Instant) -> Self {
+        Self {
+            remaining: max_files,
+            max_files,
+            deadline,
+        }
+    }
+
+    /// 데드라인 체크포인트. 넘겼으면 **truncate가 아니라 에러**(Orca `assertQuickOpenReaddirDeadline`).
+    fn check_deadline(&self) -> Result<(), QuickOpenError> {
+        if Instant::now() > self.deadline {
+            Err(QuickOpenError::WalkTimeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 파일 하나를 예산에서 차감. 남은 게 0이면 **에러**(Orca `consumeQuickOpenReaddirFileBudget`).
+    fn consume(&mut self) -> Result<(), QuickOpenError> {
+        if self.remaining == 0 {
+            return Err(QuickOpenError::WalkCapExceeded {
+                max: self.max_files,
+            });
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+/// Tier3 진입: worktree 루트를 walk(비-git 폴백). include_symlinks=false(Orca 비-git walk 기본).
+fn list_with_walk(worktree: &Path, mut budget: WalkBudget) -> Result<Vec<String>, QuickOpenError> {
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    walk(worktree, "", false, &mut budget, &mut files)?;
+    Ok(files.into_iter().collect())
+}
+
+/// bounded BFS. `fs::list_dir`(심링크-디렉터리 refuse) 위에서 `is_dir`만 재귀 — 심링크 dir로는
+/// 절대 traverse하지 않는다(무료). 심링크 **leaf**는 `include_symlinks`일 때만 결과에 넣는다.
+///
+/// **이중 체크포인트(Codex fix 6)**: 데드라인을 각 디렉터리 batch마다(빈 배치·엔트리 0개여도)
+/// AND 엔트리별로 검사한다. 빈 디렉터리가 몰린 구간이 데드라인 근처에서 체크포인트를 건너뛰고
+/// 무성으로 불완전 목록을 반환하지 못하게 한다(Orca:189/218-219 배치 + :223-224 엔트리).
+///
+/// 이 walker는 **Tier3와 Tier2 placeholder 확장이 공유**하는 단일 primitive다(별도 구현 아님).
+fn walk(
+    worktree: &Path,
+    start_rel: &str,
+    include_symlinks: bool,
+    budget: &mut WalkBudget,
+    out: &mut BTreeSet<String>,
+) -> Result<(), QuickOpenError> {
+    let mut queue: Vec<String> = vec![start_rel.to_string()];
+
+    while !queue.is_empty() {
+        let mut next: Vec<String> = Vec::new();
+        for dir_rel in &queue {
+            // 배치 체크포인트 ①: 리스팅 **전**(빈 디렉터리도 여기서 걸린다).
+            budget.check_deadline()?;
+            // 개별 subtree 읽기 실패(권한 거부/심링크 root 등)는 그 디렉터리만 스킵 —
+            // budget 에러가 아니라 정상 degrade(Orca readdir catch → entries=[], :210-213).
+            let entries = match list_dir(worktree, dir_rel) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            // 배치 체크포인트 ②: 리스팅 **후**(readdir 도중 데드라인이 지나도 reject).
+            budget.check_deadline()?;
+
+            for entry in entries {
+                // 엔트리별 체크포인트(단일 거대 디렉터리가 batch 경계 없이 오래 도는 경우 대비).
+                budget.check_deadline()?;
+
+                let child_rel = if dir_rel.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{dir_rel}/{}", entry.name)
+                };
+
+                if entry.is_dir {
+                    // `.git` 내부는 절대 나열하지 않는다(중첩 저장소 확장 시 git 내부 폭발 방지).
+                    if entry.name != ".git" {
+                        next.push(child_rel);
+                    }
+                    continue;
+                }
+                // leaf: 일반 파일은 항상, 심링크는 include_symlinks일 때만(Orca:241-243).
+                if entry.is_symlink && !include_symlinks {
+                    continue;
+                }
+                budget.consume()?;
+                out.insert(child_rel);
+            }
+        }
+        queue = next;
+    }
+    Ok(())
+}
+
+// ─── 공유 스폰 헬퍼 ────────────────────────────────────────────────────
+
+/// 킬 후 자식을 거둘 상한(runner.rs `REAP_TIMEOUT`과 같은 5s).
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unix: 프로세스 **그룹** 전체에 SIGKILL(자식이 스폰한 손자까지) + start_kill.
+/// runner.rs `kill_process_tree`와 같은 규율.
+fn kill_child(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+}
+
+/// 남은 바이트를 버리며 EOF까지 읽는다(stderr 배출용 — 담지 않으므로 상한 무관).
+async fn drain_to_end<R: AsyncRead + Unpin>(reader: &mut R) {
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = reader.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// `Vec<String>` args를 `[subcommand, ...args]` 형태의 `Vec<&str>`로(GitRunner argv용).
+fn to_argv<'a>(subcommand: &'a str, args: &'a [String]) -> Vec<&'a str> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(subcommand);
+    argv.extend(args.iter().map(String::as_str));
+    argv
+}
+
+/// worktree-상대 `/`-경로를 절대 경로로 join(세그먼트별 — 플랫폼 구분자 안전).
+fn join_rel(worktree: &Path, rel: &str) -> std::path::PathBuf {
+    let mut p = worktree.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +1078,36 @@ mod tests {
     fn rg_exclude_multi_segment_keeps_slash() {
         let args = rg_args(false, &[".local/share".to_string()]);
         assert_eq!(args.last().unwrap(), "!**/.local/share");
+    }
+
+    // F1: 항상-on hidden-dir blocklist glob. node_modules가 맨 앞, `.git`·`.next` 포함,
+    // multi-segment `.local/share`도. mutation: 목록에서 `.git`(또는 node_modules)을 빼면
+    // 아래 단언이 FAIL. 각 값은 directory-form `!**/name`.
+    #[test]
+    fn rg_hidden_dir_blocklist_globs_shape() {
+        let globs = rg_hidden_dir_exclude_globs();
+        // node_modules가 첫 `--glob` 값(Orca :225 순서).
+        assert_eq!(&globs[0], "--glob");
+        assert_eq!(&globs[1], "!**/node_modules");
+        // 핵심 항목이 directory-form으로 존재.
+        assert!(
+            globs.iter().any(|g| g == "!**/.git"),
+            "blocklist에 .git 누락"
+        );
+        assert!(
+            globs.iter().any(|g| g == "!**/.next"),
+            "blocklist에 .next 누락"
+        );
+        assert!(
+            globs.iter().any(|g| g == "!**/.local/share"),
+            "blocklist에 .local/share 누락"
+        );
+        // 전부 `--glob`/`!**/…` 쌍(홀짝) — argv 주입 불가(항상 `!` 접두).
+        assert_eq!(globs.len() % 2, 0);
+        for pair in globs.chunks(2) {
+            assert_eq!(pair[0], "--glob");
+            assert!(pair[1].starts_with("!**/"));
+        }
     }
 
     // ─── git ls-files argv ─────────────────────────────────────────
@@ -823,5 +1491,530 @@ mod tests {
         assert!(a.include_symlinks, "a/b/c(true)가 a로 OR");
         assert!(out.iter().any(|e| e.rel == "a-b"));
         assert!(!out.iter().any(|e| e.rel == "a/b/c"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// M2b 드라이버 테스트 — 실제 git/rg를 tempdir에서, 제어 불가한 실패는 가짜 rg 스크립트로
+// 주입한다. 각 crux는 하나의 mutant를 죽인다. 모든 파일 쓰기는 tempdir 안에서만.
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(all(test, unix))]
+mod driver_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::PathBuf;
+    use std::process::Command as StdCommand;
+
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// tempdir에 실행 가능한 가짜 `rg` 스크립트를 만든다.
+    fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        p
+    }
+
+    /// tempdir에서 git 서브커맨드를 돌린다(테스트 픽스처 구성용, async runner와 무관).
+    fn git(wt: &Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(wt)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} 실패");
+    }
+
+    // ─── Tier 3 walk: cap THROWS, 이중 체크포인트 (Codex fix 6) ─────────
+
+    // THE crux(cap): cap을 넘기면 **truncate가 아니라 에러**. 작은 cap으로 10k 실파일 없이 검증.
+    // mutation: consume을 "cap 도달 시 조용히 스킵 후 Ok" 로 바꾸면(=truncate) 이 assert가 FAIL.
+    #[test]
+    fn walk_cap_throws_not_truncates() {
+        let wt = tempdir();
+        for i in 0..5 {
+            std::fs::write(wt.path().join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        // cap=3, 데드라인은 넉넉 → 4번째 파일에서 cap 에러.
+        let budget = WalkBudget::with_limits(3, Instant::now() + Duration::from_secs(30));
+        let r = list_with_walk(wt.path(), budget);
+        assert!(
+            matches!(r, Err(QuickOpenError::WalkCapExceeded { max: 3 })),
+            "cap 초과가 truncate-Ok가 아니라 에러여야 한다: {r:?}"
+        );
+    }
+
+    // THE crux(이중 체크포인트): 파일이 **하나도 없는** 빈-디렉터리 트리 + 지난 데드라인 →
+    // 여전히 WalkTimeout. consume(파일별)에서만 데드라인을 봤다면 파일이 없어 절대 안 걸리고
+    // Ok([])를 반환한다 → 이 assert가 죽인다. mutation: 배치 체크포인트 제거 → Ok([]) → FAIL.
+    #[test]
+    fn walk_empty_dirs_still_checkpoint_deadline() {
+        let wt = tempdir();
+        std::fs::create_dir_all(wt.path().join("a/b")).unwrap();
+        std::fs::create_dir(wt.path().join("c")).unwrap();
+        // 지난 데드라인 → 파일이 없어도 배치 체크포인트가 잡아야 한다.
+        let past = WalkBudget::with_limits(10_000, Instant::now() - Duration::from_secs(1));
+        let r = list_with_walk(wt.path(), past);
+        assert!(
+            matches!(r, Err(QuickOpenError::WalkTimeout)),
+            "빈 디렉터리 트리 + 지난 데드라인은 무성 Ok([])가 아니라 WalkTimeout: {r:?}"
+        );
+        // 대조군: 미래 데드라인 → 파일 없음 → Ok([]).
+        let future = WalkBudget::with_limits(10_000, Instant::now() + Duration::from_secs(30));
+        assert_eq!(
+            list_with_walk(wt.path(), future).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    // crux(include_symlinks): 심링크 leaf는 flag가 true일 때만 결과에 든다.
+    // mutation: `is_symlink && !include_symlinks` 스킵을 지우면 false일 때도 link가 나와 FAIL.
+    #[test]
+    fn walk_includes_symlink_leaf_only_when_flag_set() {
+        let wt = tempdir();
+        std::fs::write(wt.path().join("real.txt"), b"x").unwrap();
+        symlink("real.txt", wt.path().join("link")).unwrap();
+
+        let mut b1 = WalkBudget::new();
+        let mut out1 = BTreeSet::new();
+        walk(wt.path(), "", false, &mut b1, &mut out1).unwrap();
+        assert!(out1.contains("real.txt"));
+        assert!(
+            !out1.contains("link"),
+            "flag=false인데 심링크 leaf가 나왔다"
+        );
+
+        let mut b2 = WalkBudget::new();
+        let mut out2 = BTreeSet::new();
+        walk(wt.path(), "", true, &mut b2, &mut out2).unwrap();
+        assert!(
+            out2.contains("link"),
+            "flag=true인데 심링크 leaf가 누락됐다"
+        );
+    }
+
+    // walk는 심링크 **디렉터리**로 traverse하지 않는다(list_dir가 refuse) — 밖 내용 유출 방지.
+    #[test]
+    fn walk_never_traverses_symlink_dir() {
+        let wt = tempdir();
+        let outside = tempdir();
+        std::fs::create_dir(outside.path().join("secret")).unwrap();
+        std::fs::write(outside.path().join("secret/leak.txt"), b"x").unwrap();
+        symlink(outside.path().join("secret"), wt.path().join("slink")).unwrap();
+
+        let mut b = WalkBudget::new();
+        let mut out = BTreeSet::new();
+        walk(wt.path(), "", true, &mut b, &mut out).unwrap();
+        // slink는 심링크 leaf로 나올 순 있어도, 그 안의 leak.txt는 절대 나오면 안 된다.
+        assert!(
+            !out.iter().any(|p| p.contains("leak.txt")),
+            "심링크 dir로 traverse했다"
+        );
+    }
+
+    // ─── Tier 2 git: rev-parse soft-fail → walk (Codex fix 5) ──────────
+
+    // crux: 비-git 디렉터리 → rev-parse 실패 → **walk로 soft-fail**(에러 아님).
+    // mutation: "rev-parse 실패 → error" 로 바꾸면 Err → 이 assert(Ok+파일)가 FAIL.
+    #[tokio::test]
+    async fn non_git_dir_soft_fails_to_walk() {
+        let wt = tempdir();
+        std::fs::write(wt.path().join("a.txt"), b"x").unwrap();
+        std::fs::write(wt.path().join("b.txt"), b"x").unwrap();
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(files.contains(&"a.txt".to_string()));
+        assert!(files.contains(&"b.txt".to_string()));
+    }
+
+    // ─── Tier 2 git: ls-files 확정-워크트리 실패 → 하드 리젝트 (Codex fix 5) ─
+
+    // THE crux(하드 리젝트): 확정 워크트리에서 primary ls-files가 실패하면 **walk로 캐스케이드
+    // 하지 않고 하드 에러**. 실제 git으로: index를 손상시키면 rev-parse는 여전히 exit 0("true")
+    // 이지만 ls-files는 index를 읽다 exit 128로 죽는다 — 비대칭을 실물로 재현.
+    // mutation: 실패 시 walk로 캐스케이드하게 바꾸면 walk가 repo를 나열해 Ok → 이 assert가 FAIL.
+    #[tokio::test]
+    async fn git_ls_files_failure_hard_rejects_no_walk() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::write(wt.path().join("tracked.txt"), b"x").unwrap();
+        git(wt.path(), &["add", "tracked.txt"]);
+        // index 손상: rev-parse는 통과, ls-files는 실패.
+        std::fs::write(wt.path().join(".git/index"), b"garbage-not-an-index").unwrap();
+
+        let r = list_with_git(wt.path(), &[]).await;
+        assert!(
+            matches!(r, Err(QuickOpenError::GitLsFilesFailed { .. })),
+            "ls-files 실패가 walk 캐스케이드나 Ok가 아니라 하드 리젝트여야 한다: {r:?}"
+        );
+    }
+
+    // ─── Tier 2 git: happy path + untracked-dir 확장 + 심링크 전파 ─────
+
+    // real happy path: tracked + untracked 파일이 dedup/forward-slash로 나온다.
+    #[tokio::test]
+    async fn git_tier_real_happy_path() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::create_dir(wt.path().join("src")).unwrap();
+        std::fs::write(wt.path().join("src/main.rs"), b"x").unwrap();
+        git(wt.path(), &["add", "src/main.rs"]);
+        std::fs::write(wt.path().join("README.md"), b"x").unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"src/main.rs".to_string()),
+            "tracked 누락: {files:?}"
+        );
+        assert!(
+            files.contains(&"README.md".to_string()),
+            "untracked 누락: {files:?}"
+        );
+        // 정렬·dedup(BTreeSet) 확인.
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted, "결과가 정렬돼 있어야 한다");
+    }
+
+    // crux(untracked-dir 확장 + include_symlinks 전파): 완전-untracked 디렉터리는 git이 `stuff/`
+    // 로 collapse한다 → 확장 walk가 안의 파일 **그리고 심링크**를 surface(untracked-dir는
+    // include_symlinks=true). mutation: untracked-dir를 gitlink처럼 false로 확장하면 link 누락 FAIL.
+    #[tokio::test]
+    async fn git_untracked_dir_expands_and_surfaces_symlink() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::create_dir(wt.path().join("stuff")).unwrap();
+        std::fs::write(wt.path().join("stuff/inner.txt"), b"x").unwrap();
+        symlink("inner.txt", wt.path().join("stuff/link")).unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"stuff/inner.txt".to_string()),
+            "untracked-dir 확장이 내부 파일을 안 냈다: {files:?}"
+        );
+        assert!(
+            files.contains(&"stuff/link".to_string()),
+            "untracked-dir 확장이 심링크 leaf를 누락(include_symlinks 전파 실패): {files:?}"
+        );
+    }
+
+    // ─── classify 라우팅: gitlink→false, untracked-dir→true (M2b 추가 배선) ─
+
+    // crux: classify_entry가 gitlink을 include_symlinks=false로, untracked-dir를 true로 확장 경로에
+    // 넣는다. mutation: 두 flag를 뒤집으면 이 assert가 FAIL.
+    #[test]
+    fn classify_entry_routes_flags() {
+        let wt = tempdir();
+        // .git을 품은 디렉터리 → gitlink 확장 대상(DirWithGit → FillNestedRepo).
+        std::fs::create_dir(wt.path().join("sub")).unwrap();
+        std::fs::write(wt.path().join("sub/.git"), b"gitdir: ...").unwrap();
+
+        let mut files = BTreeSet::new();
+        let mut exps = Vec::new();
+        classify_entry(
+            wt.path(),
+            GitLsFilesEntry {
+                path: "sub",
+                is_gitlink: true,
+                is_untracked_dir: false,
+            },
+            &mut files,
+            &mut exps,
+        );
+        assert_eq!(exps, vec![ExpansionPath::gitlink("sub")]);
+        assert!(
+            !exps[0].include_symlinks,
+            "gitlink 확장은 include_symlinks=false"
+        );
+
+        let mut exps2 = Vec::new();
+        classify_entry(
+            wt.path(),
+            GitLsFilesEntry {
+                path: "things/",
+                is_gitlink: false,
+                is_untracked_dir: true,
+            },
+            &mut files,
+            &mut exps2,
+        );
+        assert_eq!(exps2, vec![ExpansionPath::untracked_dir("things")]);
+        assert!(
+            exps2[0].include_symlinks,
+            "untracked-dir 확장은 include_symlinks=true"
+        );
+    }
+
+    // probe_dir 4-상태(mutation: is_dir/hasGitEntry 검사 뒤집기).
+    #[test]
+    fn probe_dir_four_states() {
+        let wt = tempdir();
+        std::fs::create_dir(wt.path().join("withgit")).unwrap();
+        std::fs::write(wt.path().join("withgit/.git"), b"x").unwrap();
+        std::fs::create_dir(wt.path().join("plain")).unwrap();
+        std::fs::write(wt.path().join("afile"), b"x").unwrap();
+
+        assert_eq!(probe_dir(wt.path(), "withgit"), GitEntryProbe::DirWithGit);
+        assert_eq!(probe_dir(wt.path(), "plain"), GitEntryProbe::DirWithoutGit);
+        assert_eq!(probe_dir(wt.path(), "afile"), GitEntryProbe::NotADir);
+        assert_eq!(probe_dir(wt.path(), "gone"), GitEntryProbe::LstatFailed);
+    }
+
+    // ─── Tier 1 rg: 종료 시나리오 (가짜 rg 주입) ───────────────────────
+
+    // rg exit 0 → 파싱 경로 resolve(`./` 접두 제거, dedup, 정렬).
+    #[tokio::test]
+    async fn rg_exit0_resolves_paths() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(bin.path(), "rg", "#!/bin/sh\nprintf './b.rs\\n./a.rs\\n'\n");
+        let files =
+            list_with_rg_using(wt.path(), rg.to_str().unwrap(), &[], Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(files, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    // THE cardinal-sin(part 1): exit 2 & 0경로 → **하드 에러**(부분/빈 목록 아님).
+    // mutation: exit2-empty에서 버퍼(빈)를 Ok로 반환하면 Ok([]) → 이 assert가 FAIL.
+    #[tokio::test]
+    async fn rg_exit2_empty_hard_errors() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(bin.path(), "rg", "#!/bin/sh\nexit 2\n");
+        let r =
+            list_with_rg_using(wt.path(), rg.to_str().unwrap(), &[], Duration::from_secs(5)).await;
+        assert!(
+            matches!(r, Err(QuickOpenError::RgFailed { .. })),
+            "exit2-무결과는 하드 에러여야 한다: {r:?}"
+        );
+    }
+
+    // exit 2 & ≥1경로 → resolve(권한 없는 하위 디렉터리 부분 성공).
+    // mutation: "exit2는 항상 에러"로 굳히면 Err → 이 assert가 FAIL.
+    #[tokio::test]
+    async fn rg_exit2_with_paths_resolves() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(bin.path(), "rg", "#!/bin/sh\nprintf './x\\n'\nexit 2\n");
+        let files =
+            list_with_rg_using(wt.path(), rg.to_str().unwrap(), &[], Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(files, vec!["x".to_string()]);
+    }
+
+    // THE cardinal-sin(part 2): 타임아웃 → **버퍼 폐기 + 하드 에러**(부분 목록 절대 아님) +
+    // git 폴백 없음. 가짜 rg가 한 줄 내고 sleep 30 → 짧은 타임아웃으로 킬.
+    // mutation: 타임아웃 시 스트림된 접두를 Ok로 반환하면 Ok(["partial"]) → 이 assert가 FAIL.
+    #[tokio::test]
+    async fn rg_timeout_hard_errors_not_partial() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(
+            bin.path(),
+            "rg",
+            "#!/bin/sh\nprintf './partial\\n'\nsleep 30\n",
+        );
+        let start = Instant::now();
+        let r = list_with_rg_using(
+            wt.path(),
+            rg.to_str().unwrap(),
+            &[],
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(QuickOpenError::RgFailed { .. })),
+            "타임아웃은 부분 목록이 아니라 하드 에러: {r:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "타임아웃이 sleep 30을 그대로 기다렸다(킬 실패)"
+        );
+    }
+
+    // ─── 캐스케이드 dispatch: rg 없음 → git (Codex fix 5) ──────────────
+
+    // crux: rg 미가용(upfront) → **git 캐스케이드**가 파일을 낸다.
+    // mutation: "rg 없음 → error"(else 분기를 Err로)로 바꾸면 Err → 이 assert가 FAIL.
+    #[tokio::test]
+    async fn rg_missing_cascades_to_git() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::write(wt.path().join("f.txt"), b"x").unwrap();
+        git(wt.path(), &["add", "f.txt"]);
+
+        let files = dispatch(wt.path(), &[], false).await.unwrap();
+        assert!(
+            files.contains(&"f.txt".to_string()),
+            "rg 없음이 git 캐스케이드로 이어지지 않았다: {files:?}"
+        );
+    }
+
+    // rg 있음(upfront) → rg 티어 사용(git 아님). 실제 rg가 있을 때만; 없으면 스킵.
+    #[tokio::test]
+    async fn rg_present_uses_rg_tier() {
+        let wt = tempdir();
+        // rg가 없는 환경이면 이 테스트는 의미 없음(가짜 rg 테스트가 rg 경로를 이미 커버).
+        if !rg_available(wt.path()).await {
+            return;
+        }
+        std::fs::write(wt.path().join("hello.txt"), b"x").unwrap();
+        // rg는 non-git 디렉터리도 나열한다(git 티어라면 walk로 감). 결과에 파일이 있으면 충분.
+        let files = dispatch(wt.path(), &[], true).await.unwrap();
+        assert!(
+            files.contains(&"hello.txt".to_string()),
+            "rg 티어 결과 누락: {files:?}"
+        );
+    }
+
+    // ─── 타임아웃 상수: 10s(기본 30s 아님) (Codex fix 4) ───────────────
+
+    // crux: git 호출은 10s 타임아웃을 쓴다(GitRunner 기본 30s가 아니라).
+    // mutation: GIT_TIMEOUT을 30s로 바꾸면 이 assert가 FAIL.
+    #[test]
+    fn git_timeout_is_ten_seconds_not_default_thirty() {
+        assert_eq!(GIT_TIMEOUT, Duration::from_secs(10));
+        assert_ne!(GIT_TIMEOUT, crate::runner::DEFAULT_TIMEOUT);
+        assert_eq!(RG_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(RG_PROBE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    // ─── F1(HIGH): rg 티어 항상-on hidden-dir blocklist (실 rg) ────────
+
+    // THE F1 crux: rg 티어 결과에 `.git/`·node_modules·.next 경로가 **없다**. 실 rg 필요
+    // (없으면 스킵). mutation: 드라이버에서 `rg_hidden_dir_exclude_globs()` 주입을 제거하면
+    // ignored 패스가 이들을 노출해 이 단언이 FAIL(리뷰어 실측: .git 내부 20개+ 노출).
+    #[tokio::test]
+    async fn rg_tier_excludes_hidden_dirs() {
+        let wt = tempdir();
+        if !rg_available(wt.path()).await {
+            return; // 실 rg 없으면 이 crux는 검증 불가 — 스킵.
+        }
+        git(wt.path(), &["init", "-q"]);
+        std::fs::create_dir_all(wt.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.path().join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::fs::create_dir(wt.path().join(".next")).unwrap();
+        std::fs::write(wt.path().join(".next/build.txt"), b"x").unwrap();
+        std::fs::create_dir(wt.path().join("src")).unwrap();
+        std::fs::write(wt.path().join("src/main.rs"), b"x").unwrap();
+
+        let files = list_with_rg(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"src/main.rs".to_string()),
+            "정상 파일 누락: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.starts_with(".git/")),
+            ".git/ 내부가 노출됐다(F1): {:?}",
+            files
+                .iter()
+                .filter(|p| p.starts_with(".git/"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.split('/').any(|seg| seg == "node_modules")),
+            "node_modules가 노출됐다(F1): {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.split('/').any(|seg| seg == ".next")),
+            ".next가 노출됐다(F1): {files:?}"
+        );
+    }
+
+    // ─── F2: walk batch 체크포인트 격리 (빈 루트) ─────────────────────
+
+    // THE F2 crux: 엔트리가 **0개인 빈 루트** + 지난 데드라인 → WalkTimeout. 루트에 엔트리가
+    // 없어 per-entry 체크포인트는 절대 안 돈다 → **batch 체크포인트만이** 잡을 수 있다.
+    // mutation: batch 체크포인트(리스팅 전/후 두 개)를 제거하면 per-entry가 못 잡아 Ok([]) → FAIL.
+    // (엔트리가 있는 트리로는 per-entry가 잡아 mutation이 살아남으므로 반드시 빈 루트여야 한다.)
+    #[test]
+    fn walk_empty_root_batch_checkpoint_catches_deadline() {
+        let wt = tempdir(); // 완전히 빈 디렉터리 — list_dir이 [] 반환.
+        let past = WalkBudget::with_limits(10_000, Instant::now() - Duration::from_secs(1));
+        let r = list_with_walk(wt.path(), past);
+        assert!(
+            matches!(r, Err(QuickOpenError::WalkTimeout)),
+            "빈 루트 + 지난 데드라인은 batch 체크포인트가 잡아 WalkTimeout이어야 한다(per-entry 불가): {r:?}"
+        );
+    }
+
+    // ─── F3: git ignored 패스가 gitignore된 파일을 표면화 ─────────────
+
+    // crux: gitignore된 untracked 파일이 ignored 패스(--others --ignored)로 결과에 든다.
+    // mutation: ignored 패스 실행을 제거하면 ignored.txt가 안 나와 FAIL(best-effort swallow는 유지).
+    #[tokio::test]
+    async fn git_ignored_pass_surfaces_ignored_file() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "-q"]);
+        std::fs::write(wt.path().join(".gitignore"), b"ignored.txt\n").unwrap();
+        std::fs::write(wt.path().join("ignored.txt"), b"x").unwrap();
+        std::fs::write(wt.path().join("tracked.txt"), b"x").unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"ignored.txt".to_string()),
+            "ignored 패스가 gitignore된 파일을 표면화하지 않았다: {files:?}"
+        );
+        assert!(files.contains(&"tracked.txt".to_string()));
+    }
+
+    // ─── F4: rg exit 1(빈 레포/매치 0) → Ok([]) 하드에러 아님 ──────────
+
+    // crux: rg exit 1은 정상(매치 0) → Ok(빈). mutation: `code == 0 || code == 1`에서 `|| code == 1`
+    // 을 빼면 exit1이 else로 떨어져 RgFailed → 이 단언이 FAIL.
+    #[tokio::test]
+    async fn rg_exit1_empty_is_ok_not_error() {
+        let wt = tempdir();
+        let bin = tempdir();
+        let rg = write_exec(bin.path(), "rg", "#!/bin/sh\nexit 1\n");
+        let files =
+            list_with_rg_using(wt.path(), rg.to_str().unwrap(), &[], Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert!(files.is_empty(), "exit1은 빈 Ok여야 한다: {files:?}");
+    }
+
+    // ─── F5: bare repo("false") → walk 라우팅 ──────────────────────────
+
+    // crux: bare repo의 rev-parse는 exit0 "false" → **walk로 라우팅**(worktree 아님).
+    // 나는 stdout=="true"만 worktree로 보므로 bare는 walk로 간다. mutation: `=="true"`를
+    // Orca식 `is_ok()`로 되돌리면 bare repo에서 ls-files가 "work tree 아님"으로 실패해
+    // GitLsFilesFailed → 이 단언(Ok + walk 파일)이 FAIL.
+    #[tokio::test]
+    async fn bare_repo_routes_to_walk() {
+        let wt = tempdir();
+        git(wt.path(), &["init", "--bare", "-q", "."]);
+        std::fs::write(wt.path().join("plain-marker.txt"), b"x").unwrap();
+
+        let files = list_with_git(wt.path(), &[]).await.unwrap();
+        assert!(
+            files.contains(&"plain-marker.txt".to_string()),
+            "bare repo가 walk로 라우팅돼 파일을 나열해야 한다(worktree 취급 아님): {files:?}"
+        );
+    }
+
+    // ─── rg stdout 파싱 ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_rg_stdout_normalizes() {
+        let out = parse_rg_stdout(b"./src/main.rs\r\n./a.rs\n.\n\n/abs\n../esc\nsrc/lib.rs\n");
+        // `./` 제거, CRLF의 `\r` 제거, `.`/빈/절대/`..` 스킵.
+        assert_eq!(
+            out,
+            vec![
+                "src/main.rs".to_string(),
+                "a.rs".to_string(),
+                "src/lib.rs".to_string(),
+            ]
+        );
     }
 }
