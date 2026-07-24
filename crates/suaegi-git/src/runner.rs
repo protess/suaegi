@@ -59,6 +59,59 @@ pub enum GitError {
 #[derive(Debug, Clone, Default)]
 pub struct GitRunner;
 
+/// 모든 git 호출에 붙는 credential-prompt 가드 config(F2). `-c key=val`을 subcommand
+/// **앞에** 끼우는 argv-순서 버그 클래스를 피하려고 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
+/// `GIT_CONFIG_VALUE_n` env 프로토콜로 주입한다(Orca `appendGitConfigEnv`,
+/// `git-credential-prompt-env.ts:62-79`). credential **helper는 유지**하고 대화형
+/// fallback만 끈다 — 캐시된 credential은 계속 동작한다.
+const CREDENTIAL_PROMPT_GUARD_CONFIG: &[(&str, &str)] = &[
+    ("credential.interactive", "false"),
+    ("credential.guiPrompt", "false"),
+];
+
+/// 모든 git 호출에 적용하는 비대화형 env(F1). Orca `nonInteractiveGitEnv`처럼 **전역**
+/// 정책이다 — 로컬 ops엔 무해(credential 미접촉)하고 원격 ops는 credential 프롬프트로
+/// 행 걸리는 대신 **빠르게 실패**한다.
+///
+/// 순수 함수라 구조 테스트로 mutation 검증할 수 있다. `run_full`이 spawn 전에 이 목록을
+/// 그대로 `Command::env`로 흘려 넣는다.
+///
+/// - `GIT_ASKPASS`/`SSH_ASKPASS`를 비워 askpass 헬퍼가 GUI를 못 띄우게 한다.
+/// - `GIT_SSH_COMMAND`에 `BatchMode=yes`로 SSH가 비밀번호 프롬프트 대신 즉시 실패하게 한다.
+/// - `GCM_INTERACTIVE=never`로 Git Credential Manager의 자체 GUI를 막는다.
+/// - `credential.interactive=false`/`guiPrompt=false`를 GIT_CONFIG env 프로토콜로 주입한다.
+///
+/// **credential helper·사용자 전역 gitconfig는 절대 건드리지 않는다** — 대화형 UI만 끈다.
+pub fn non_interactive_git_env() -> Vec<(String, String)> {
+    let mut env = vec![
+        // 파서가 항상 영어 출력을 보도록
+        ("LC_ALL".to_string(), "C".to_string()),
+        // 터미널 인증 프롬프트로 행 걸리지 않도록
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        // askpass 헬퍼가 GUI를 못 띄우게 비운다
+        ("GIT_ASKPASS".to_string(), String::new()),
+        ("SSH_ASKPASS".to_string(), String::new()),
+        // SSH가 프롬프트 대신 즉시 실패하도록
+        (
+            "GIT_SSH_COMMAND".to_string(),
+            "ssh -o BatchMode=yes".to_string(),
+        ),
+        // GCM은 터미널/askpass 가드를 무시하고 자체 GUI를 열 수 있다
+        ("GCM_INTERACTIVE".to_string(), "never".to_string()),
+    ];
+    // GIT_CONFIG_COUNT/KEY_n/VALUE_n 프로토콜. base=0에서 시작하지만, 미래에 config를
+    // 더할 때 count가 합성되도록 슬라이스 길이로 계산한다(고정 상수 대신).
+    env.push((
+        "GIT_CONFIG_COUNT".to_string(),
+        CREDENTIAL_PROMPT_GUARD_CONFIG.len().to_string(),
+    ));
+    for (i, (key, value)) in CREDENTIAL_PROMPT_GUARD_CONFIG.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), (*key).to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), (*value).to_string()));
+    }
+    env
+}
+
 /// 리더가 바깥 상태기계에 보고하는 중단 사유. **리더는 킬하지 않는다** —
 /// `child.wait()`가 `child`를 가변 대여하고 있어 조인 안에서는 킬할 수 없다.
 enum RunAbort {
@@ -235,11 +288,13 @@ impl GitRunner {
     ) -> Result<GitBytes, GitError> {
         let args_str = args.join(" ");
         let mut cmd = Command::new("git");
-        cmd.args(args)
-            .current_dir(cwd)
-            // 파서가 항상 영어 출력을 보도록; 인증 프롬프트로 행 걸리지 않도록
-            .env("LC_ALL", "C")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        cmd.args(args).current_dir(cwd);
+        // 비대화형 env 가드(F1/F2)를 **모든** 호출에 전역 적용한다. 로컬 ops엔 무해,
+        // 원격 ops는 credential 프롬프트로 행 걸리는 대신 빠르게 실패한다.
+        for (key, value) in non_interactive_git_env() {
+            cmd.env(key, value);
+        }
+        cmd
             // stdin을 줄 때만 파이프한다. 없으면 기존 그대로 null — 인증 프롬프트로
             // 행 걸리지 않게 하는 불변식을 유지한다.
             .stdin(if stdin.is_some() {
@@ -341,5 +396,50 @@ fn lossy(bytes: GitBytes) -> GitOutput {
         stdout: String::from_utf8_lossy(&bytes.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&bytes.stderr).into_owned(),
         code: bytes.code,
+    }
+}
+
+#[cfg(test)]
+mod env_guard_tests {
+    use super::*;
+
+    fn find<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// 전역 비대화형 가드가 4개 프롬프트-억제 var를 모두 세팅하는지(F1). 어느 하나를
+    /// 지우는 mutation은 그 var의 단언에서 실패한다.
+    #[test]
+    fn guard_sets_all_prompt_suppressors() {
+        let env = non_interactive_git_env();
+        assert_eq!(find(&env, "LC_ALL"), Some("C"));
+        assert_eq!(find(&env, "GIT_TERMINAL_PROMPT"), Some("0"));
+        // askpass 헬퍼는 **비워야** GUI를 못 띄운다 — 없으면(None) mutation.
+        assert_eq!(find(&env, "GIT_ASKPASS"), Some(""));
+        assert_eq!(find(&env, "SSH_ASKPASS"), Some(""));
+        assert_eq!(find(&env, "GIT_SSH_COMMAND"), Some("ssh -o BatchMode=yes"));
+        assert_eq!(find(&env, "GCM_INTERACTIVE"), Some("never"));
+    }
+
+    /// GIT_CONFIG env 프로토콜(F2)이 정합적인지: COUNT == 쌍 개수이고 각 KEY_n/VALUE_n이
+    /// credential.interactive=false / guiPrompt=false를 담는다. COUNT를 어긋내거나 키를
+    /// 바꾸는 mutation은 여기서 실패하고, 실제 git도 count 불일치로 config를 거부한다.
+    #[test]
+    fn guard_config_env_protocol_is_consistent() {
+        let env = non_interactive_git_env();
+        // 고정 상수가 아니라 슬라이스 길이로 계산돼야 확장 시 합성된다.
+        assert_eq!(find(&env, "GIT_CONFIG_COUNT"), Some("2"));
+        assert_eq!(
+            find(&env, "GIT_CONFIG_KEY_0"),
+            Some("credential.interactive")
+        );
+        assert_eq!(find(&env, "GIT_CONFIG_VALUE_0"), Some("false"));
+        assert_eq!(find(&env, "GIT_CONFIG_KEY_1"), Some("credential.guiPrompt"));
+        assert_eq!(find(&env, "GIT_CONFIG_VALUE_1"), Some("false"));
+        // credential.helper는 절대 세팅하지 않는다 — 캐시된 credential 유지.
+        assert!(
+            !env.iter().any(|(k, _)| k == "GIT_CONFIG_KEY_2"),
+            "M1은 정확히 2쌍이어야 한다 (dangling index는 git이 거부)"
+        );
     }
 }
