@@ -225,7 +225,7 @@ pub struct GitLsFilesEntry<'a> {
 }
 
 /// hex 소문자 자릿수(`[0-9a-f]`)인가.
-fn is_lower_hex(b: u8) -> bool {
+pub(crate) fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
 }
 
