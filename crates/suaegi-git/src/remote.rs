@@ -3,6 +3,13 @@
 //!
 //! Orca 포트 출처: `src/shared/git-remote-error.ts`(정제·정규화), `src/main/git/remote.ts`
 //! (argv). 실제 git 호출과 전역 env-guard(F1/F2)는 [`crate::runner`]에 있다.
+//!
+//! M2는 여기에 `fetch`/`pull` **드라이버**(실제 git 호출)를 얹는다 — 로컬 bare remote로
+//! AV 가능하다(라이브 auth만 사람눈). pull은 `--ff-only`(F4)라 divergent pull이
+//! merge로 워크트리를 stuck시키는 대신 clean하게 abort한다.
+
+use crate::runner::{GitError, GitRunner};
+use std::path::Path;
 
 /// 원격 작업 종류. 에러 정규화가 **push에만** 적용해야 하는 힌트(non-fast-forward)를
 /// 게이트하는 데 쓴다 — fetch/pull에서 같은 문자열이 나와도 오발화하면 안 된다.
@@ -32,6 +39,26 @@ pub enum PushOutcome {
     NetworkFailed,
     /// 그 밖의 실패.
     Other,
+}
+
+/// pull(`--ff-only`) 시도의 분류된 결과.
+///
+/// **`NotFastForward`는 clean 실패다** — suaegi엔 충돌해결 UI가 없어 divergent pull은
+/// merge로 워크트리를 stuck시키는 대신 loud하게 abort한다(F4). 로컬 git이 fast-forward
+/// 불가를 스스로 판정해 **아무것도 건드리지 않고** 멈추므로, 워크트리·HEAD는 미변경으로
+/// 남는다(half-merge·MERGE_HEAD·conflict marker 없음). **절대 `Ok`가 아니다** — 성공으로
+/// 오분류하면 divergent 상태를 "동기화됨"으로 착각하는 워크플로 파괴다.
+///
+/// push의 [`PushOutcome::NonFastForwardRejected`](PushOutcome)와 다르다: 저건 **원격이**
+/// 우리 push를 거부하는 것이고, 이건 **로컬 git이** ff 불가로 pull을 abort하는 것이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullOutcome {
+    /// exit 0, fast-forward로 로컬 ref가 원격까지 전진함.
+    Ok,
+    /// exit 0, 이미 최신("Already up to date").
+    UpToDate,
+    /// `--ff-only`가 fast-forward 불가로 거부(diverged). clean 실패, 워크트리 미변경.
+    NotFastForward,
 }
 
 // ── credential 정제 ──────────────────────────────────────────────────────────
@@ -287,6 +314,87 @@ pub fn pull_args() -> Vec<String> {
 /// remote-tracking ref를 지우지 않도록 prune을 생략한다(원한다면 후속에서 opt-in).
 pub fn fetch_args() -> Vec<String> {
     vec!["fetch".to_string(), "origin".to_string()]
+}
+
+// ── fetch/pull 드라이버(M2, 실제 git 호출) ───────────────────────────────────
+
+/// `git pull`이 낸 "이미 최신" 메시지 판정. 신형("Already up to date.")과 구형 git의
+/// ("Already up-to-date.")를 모두 수용한다. git은 이 문구를 stdout에 낸다.
+fn is_already_up_to_date(stdout: &str) -> bool {
+    let lower = stdout.to_ascii_lowercase();
+    lower.contains("already up to date") || lower.contains("already up-to-date")
+}
+
+/// `git pull --ff-only`이 **diverged로 fast-forward 불가** 거부됐는지 stderr로 판정한다(F4).
+///
+/// 이건 **clean 실패**다 — 로컬 git이 ff 불가를 스스로 판정하고 워크트리를 건드리지 않고
+/// abort한다(half-merge·MERGE_HEAD·conflict marker 없음). unrelated-histories 거부
+/// ("refusing to merge unrelated histories")나 no-remote/네트워크 실패는 여기 해당하지
+/// 않는다 — 그건 진짜 에러로 표면화돼야 한다.
+pub fn is_ff_only_rejected(stderr: &str) -> bool {
+    stderr.contains("Not possible to fast-forward")
+}
+
+/// `git fetch origin`을 실행한다([`fetch_args`]). 성공 = exit 0.
+///
+/// fetch는 remote-tracking ref(`origin/<branch>`)만 갱신하고 **워크트리·HEAD는 건드리지
+/// 않는** 안전한 read op다. 실패(no remote/네트워크)는 **삼키지 않고** `Err`로 표면화한다
+/// — [`normalize_git_error_message`]로 credential을 정제하고 fetch 문맥 메시지를 붙인다
+/// (push 전용 non-ff 힌트는 붙지 않는다). transient 실패가 조용한 no-op가 되면 안 된다.
+pub async fn fetch(runner: &GitRunner, worktree: &Path) -> Result<(), GitError> {
+    let owned = fetch_args();
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+    match runner.run(worktree, &argv).await {
+        Ok(_) => Ok(()),
+        Err(GitError::Failed { args, code, stderr }) => Err(GitError::Failed {
+            args,
+            code,
+            stderr: normalize_git_error_message(&stderr, RemoteOp::Fetch),
+        }),
+        Err(other) => Err(other),
+    }
+}
+
+/// `git pull --ff-only`을 실행하고([`pull_args`]) 결과를 [`PullOutcome`]으로 분류한다(F4).
+///
+/// - exit 0 + "Already up to date" → [`PullOutcome::UpToDate`].
+/// - exit 0 그 외 → [`PullOutcome::Ok`](fast-forward로 HEAD 전진).
+/// - `--ff-only`가 ff 불가로 abort → [`PullOutcome::NotFastForward`] (**clean 실패**,
+///   워크트리·HEAD 미변경. 절대 `Ok`가 아니다).
+/// - 그 밖의 실패(no remote/네트워크/overwrite 등) → `Err` — [`normalize_git_error_message`]로
+///   credential 정제 + pull 문맥 메시지(push 전용 non-ff 힌트는 **안** 붙는다).
+///
+/// **transient≠false-negative**: 원격 도달 실패를 절대 "up to date"로 삼키지 않는다 —
+/// 그건 `Err`다. divergent는 [`PullOutcome::NotFastForward`]로, 역시 `Ok`가 아니다.
+///
+/// `git pull`은 그 자체가 fetch + integrate라 별도 fetch 선행이 필요 없다(Orca `gitPull`도
+/// 동일).
+pub async fn pull(runner: &GitRunner, worktree: &Path) -> Result<PullOutcome, GitError> {
+    let owned = pull_args();
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+    match runner.run(worktree, &argv).await {
+        Ok(out) => {
+            if is_already_up_to_date(&out.stdout) {
+                Ok(PullOutcome::UpToDate)
+            } else {
+                Ok(PullOutcome::Ok)
+            }
+        }
+        // 비-0 exit. `--ff-only`가 diverged로 abort한 건 clean 실패(워크트리 미변경)라
+        // `NotFastForward` **값**으로 돌린다 — 진짜 에러(`Err`)와 구분된다.
+        Err(GitError::Failed { args, code, stderr }) => {
+            if is_ff_only_rejected(&stderr) {
+                Ok(PullOutcome::NotFastForward)
+            } else {
+                Err(GitError::Failed {
+                    args,
+                    code,
+                    stderr: normalize_git_error_message(&stderr, RemoteOp::Pull),
+                })
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 // ── upstream 파스 ────────────────────────────────────────────────────────────
@@ -564,6 +672,38 @@ mod tests {
     #[test]
     fn fetch_args_is_origin() {
         assert_eq!(fetch_args(), vec!["fetch", "origin"]);
+    }
+
+    // ── pull outcome 분류 헬퍼(F4) ───────────────────────────────────────────
+
+    /// ff-only 거부 stderr → NotFastForward로 분류할 신호. Mutation: 판정을 false
+    /// 상수로 바꾸면 divergent pull이 `Err`로 새어 이 단언 + AV 테스트가 FAIL.
+    #[test]
+    fn ff_only_rejection_detected() {
+        assert!(is_ff_only_rejected(
+            "fatal: Not possible to fast-forward, aborting."
+        ));
+    }
+
+    /// unrelated-histories 거부는 ff-only 거부가 **아니다** — 진짜 에러로 표면화돼야 한다.
+    /// 이걸 NotFastForward로 삼키면 실패 원인이 뭉개진다.
+    #[test]
+    fn unrelated_histories_is_not_ff_rejection() {
+        assert!(!is_ff_only_rejected(
+            "fatal: refusing to merge unrelated histories"
+        ));
+        assert!(!is_ff_only_rejected(
+            "fatal: Could not resolve host: github.com"
+        ));
+    }
+
+    #[test]
+    fn already_up_to_date_both_spellings() {
+        assert!(is_already_up_to_date("Already up to date."));
+        assert!(is_already_up_to_date("Already up-to-date."));
+        assert!(!is_already_up_to_date(
+            "Updating a1b2c3..d4e5f6\nFast-forward"
+        ));
     }
 
     // ── upstream 파스 ────────────────────────────────────────────────────────
