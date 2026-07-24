@@ -4,8 +4,8 @@
 //! Open file-name scorer (`suaegi-fuzzy`), for grepping file *contents* via
 //! ripgrep (`--json`) with a git-grep fallback.
 //!
-//! # Milestone M1 — pure foundation
-//! This crate currently contains only the pure, infallible foundation:
+//! # Milestones M1–M2 — pure foundation + argv builders
+//! This crate currently contains the pure, IO-free half of Orca's module:
 //! - **Types** ([`SearchMatch`], [`SearchFileResult`], [`SearchResult`],
 //!   [`SearchOptions`]) — verbatim from `src/shared/types.ts:3543-3574`, plus
 //!   the internal [`SearchAccumulator`] used by the M3 stream parser.
@@ -16,9 +16,14 @@
 //!   the JS oracle).
 //! - **Match-count normalization** — [`normalize_search_result`] &friends
 //!   (`src/shared/search-match-count.ts:3-30`).
+//! - **M2 — argv builders + submatch locator** — [`build_rg_args`],
+//!   [`build_git_grep_args`], [`to_git_glob_pathspec`] (verbatim argv order; the
+//!   `--`/`-e … --` terminators are the argv-injection guard), and
+//!   [`build_submatch_regex`] (the `regex`-crate best-effort locator, plan
+//!   C2/C3). This is where the `regex` dependency lands.
 //!
-//! The argv builder (M2), stream parser (M3), and tokio drivers (M4) — and their
-//! `serde_json`/`regex`/`tokio` dependencies — are intentionally NOT here yet.
+//! The stream parser (M3) and tokio drivers (M4) — and their `serde_json`/`tokio`
+//! dependencies — are intentionally NOT here yet.
 //!
 //! # JS→Rust boundary shape
 //! The wire types serialize with `rename_all = "camelCase"` so they match Orca's
@@ -26,18 +31,24 @@
 //! field names stay `snake_case`.
 
 mod constants;
+mod git_grep_args;
 mod glob;
 mod js_trim;
 mod match_count;
 mod path;
 mod regex_escape;
+mod rg_args;
+mod submatch;
 mod types;
 
 pub use constants::{
     DEFAULT_SEARCH_MAX_RESULTS, MAX_LINE_CONTENT_LENGTH, MAX_MATCHES_PER_FILE,
     SEARCH_MAX_FILE_SIZE, SEARCH_TIMEOUT_MS, TRUNCATION_MARKER,
 };
+pub use git_grep_args::{build_git_grep_args, to_git_glob_pathspec};
 pub use glob::split_search_glob_patterns;
+pub use rg_args::build_rg_args;
+pub use submatch::build_submatch_regex;
 pub use match_count::{
     is_valid_match_count, normalize_search_file_match_count, normalize_search_result,
 };

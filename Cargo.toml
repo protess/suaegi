@@ -11,6 +11,10 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Best-effort submatch locator for the git-grep path (suaegi-search M2). NOT a
+# JS/ERE validator — it re-scans a matched line for all occurrence columns; a
+# compile failure falls back to whole-line highlight. See buildSubmatchRegex.
+regex = "1"
 thiserror = "2"
 async-trait = "0.1"
 tokio = { version = "1", features = ["process", "time", "rt-multi-thread", "macros", "io-util", "fs"] }
