@@ -237,15 +237,31 @@ where
     let mut acc = create_accumulator();
 
     let read = tokio::time::timeout(timeout, async {
-        let mut lines = BufReader::new(stdout).lines();
+        // Read raw bytes and lossy-decode each line, rather than `lines()`, which
+        // errors on invalid UTF-8. rg `--json` is always valid UTF-8 (it escapes
+        // non-UTF8), but `git grep -I` streams raw bytes — a single latin1 line
+        // would otherwise fail the WHOLE search (dropping valid matches around it).
+        // Lossy decoding matches Orca/quick_open, which decode leniently.
+        let mut reader = BufReader::new(stdout);
+        let mut buf: Vec<u8> = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => return Ok(ReadOutcome::Eof),
+                Ok(_) => {
+                    // Strip the line delimiter to match `next_line()` semantics
+                    // (a trailing `\n`, and a single preceding `\r`).
+                    if buf.last() == Some(&b'\n') {
+                        buf.pop();
+                        if buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&buf);
                     if ingest_line(&line, &mut acc) == Ingest::Stop {
                         return Ok(ReadOutcome::Stopped);
                     }
                 }
-                Ok(None) => return Ok(ReadOutcome::Eof),
                 Err(e) => {
                     return Err(SearchError::Io {
                         program,
@@ -298,11 +314,23 @@ where
                         });
                     }
                     let code = status.code().unwrap_or(-1);
-                    // 0 = matches, 1 = no matches (SUCCESS-empty). Anything else
-                    // (rg 2, git-grep >1) is a real error.
+                    // 0 = matches, 1 = no matches (SUCCESS-empty).
                     if code == 0 || code == 1 {
                         Ok(finalize(&acc))
+                    } else if acc.total_matches > 0 {
+                        // rg exit 2 / git-grep >1 = a read error (e.g. an
+                        // unreadable/permission-denied file in the tree) occurred,
+                        // but real matches were already streamed. Surface them,
+                        // flagged `truncated` so the incompleteness is honest —
+                        // matching the quick_open precedent. Discarding them (Err)
+                        // would lose real results; presenting them as complete
+                        // (truncated:false) would be silent truncation.
+                        acc.truncated = true;
+                        Ok(finalize(&acc))
                     } else {
+                        // Error exit with NO matches: we cannot distinguish
+                        // "genuinely none" from "a read error hid them" → hard
+                        // error (transient), never a silent-looking empty Ok.
                         Err(SearchError::Exit {
                             program,
                             code: Some(code),
@@ -662,6 +690,156 @@ mod tests {
         assert!(
             matches!(err, SearchError::Spawn { program: "rg", .. }),
             "rg-present-failed must be a hard rg error, got {err:?}"
+        );
+    }
+
+    // ─── exit-code / signal / non-UTF8 branches (review H1/H2/M1 coverage) ───
+
+    /// Write an executable `sh` script that stands in for the `git` binary (it
+    /// ignores its args and emits fixed git-grep `\0`-delimited output).
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// **H1 — exit 2 WITH matches is a truncated success, not a discard.** rg
+    /// exits 2 on a read error (e.g. an unreadable file) while still emitting the
+    /// matches it found; git-grep `>1` likewise. Those real matches must surface,
+    /// flagged `truncated`. *Mutation:* the old `else => Err` (discarding matches)
+    /// fails this — total would be 0 via unwrap_err.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_error_with_matches_is_truncated_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        // One valid git-grep match line, then a read-error exit (2).
+        let script = write_script(
+            dir.path(),
+            "git.sh",
+            "printf 'a.txt\\0'; printf '1\\0'; printf 'needle here\\n'\nexit 2\n",
+        );
+        let res = run_search_impl(
+            &opts_for(dir.path(), "needle"),
+            "rg",
+            script.to_str().unwrap(),
+            false, // rg absent → git-grep path
+            TEST_TIMEOUT,
+        )
+        .await
+        .expect("exit-2-with-matches must be Ok, not a discard");
+        assert_eq!(res.total_matches, 1, "the streamed match is preserved");
+        assert!(res.truncated, "exit-2 incompleteness must be flagged truncated");
+    }
+
+    /// **H2 — exit 2 with NO matches is a hard error (transient≠empty).** We can't
+    /// tell "genuinely none" from "a read error hid them" → `Err`, never a silent
+    /// empty `Ok`. *Mutation:* treating exit 2 as success (`code==2 => Ok`) makes
+    /// this an `Ok(empty)` — the cardinal sin — and this test fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_error_without_matches_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "git.sh", "exit 2\n");
+        let err = run_search_impl(
+            &opts_for(dir.path(), "needle"),
+            "rg",
+            script.to_str().unwrap(),
+            false,
+            TEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SearchError::Exit { program: "git", code: Some(2), .. }),
+            "exit-2-no-matches must be Err(Exit 2), got {err:?}"
+        );
+    }
+
+    /// **H2 — a killed-by-signal child (clean EOF) is a hard error, not empty.**
+    /// The script closes stdout then SIGKILLs itself. *Mutation:* deleting the
+    /// `#[cfg(unix)] signal()` branch makes this `Ok(empty)` (code is None → -1 →
+    /// not 0/1, but the branch is what catches signals explicitly).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_killed_child_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        // Close stdout (exec with no output), then kill self with SIGKILL (9).
+        let script = write_script(dir.path(), "git.sh", "kill -9 $$\n");
+        let err = run_search_impl(
+            &opts_for(dir.path(), "needle"),
+            "rg",
+            script.to_str().unwrap(),
+            false,
+            TEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SearchError::Exit { .. }),
+            "signal-killed child must be Err(Exit), got {err:?}"
+        );
+    }
+
+    /// **H2 — timeout PRESERVES already-streamed partial matches (C5).** The
+    /// script emits one match then hangs; the short timeout fires. The result is
+    /// `Ok(truncated)` and the partial match is kept. *Mutation:* finalizing a
+    /// fresh accumulator on timeout (discarding partials) makes total 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_preserves_partial_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        // perl with `$|=1` (autoflush) so the match line reaches us BEFORE the
+        // hang — a plain `printf` would sit in the child's block-buffered stdout
+        // until exit (defeating the partial-before-timeout premise).
+        let script = write_script(
+            dir.path(),
+            "git.sh",
+            "exec perl -e '$|=1; print \"a.txt\\0001\\0needle here\\n\"; sleep 30'\n",
+        );
+        let res = run_search_impl(
+            &opts_for(dir.path(), "needle"),
+            "rg",
+            script.to_str().unwrap(),
+            false,
+            Duration::from_millis(2000),
+        )
+        .await
+        .expect("timeout is a truncated Ok, not Err");
+        assert!(res.truncated, "timeout must flag truncated");
+        assert_eq!(res.total_matches, 1, "the pre-timeout match is preserved");
+    }
+
+    /// **M1 — a non-UTF8 git-grep line must not fail the whole search.** `git grep`
+    /// streams raw bytes; a latin1 line (raw `0xE9`) must be lossy-decoded, not
+    /// error out and drop the valid matches around it. *Mutation:* reverting the
+    /// read loop to `lines()` (UTF-8-strict) makes the middle line an `Err(Io)` →
+    /// the whole search fails and this `expect` panics.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_git_line_is_lossy_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            dir.path(),
+            "git.sh",
+            "printf 'a.txt\\0'; printf '1\\0'; printf 'needle one\\n'\n\
+             printf 'b.txt\\0'; printf '1\\0'; printf 'needle \\351 two\\n'\n\
+             printf 'c.txt\\0'; printf '1\\0'; printf 'needle three\\n'\n",
+        );
+        let res = run_search_impl(
+            &opts_for(dir.path(), "needle"),
+            "rg",
+            script.to_str().unwrap(),
+            false,
+            TEST_TIMEOUT,
+        )
+        .await
+        .expect("a non-UTF8 line must be lossy-decoded, not fail the search");
+        assert_eq!(
+            res.total_matches, 3,
+            "all three matches survive; the 0xE9 line is lossy-decoded"
         );
     }
 }
