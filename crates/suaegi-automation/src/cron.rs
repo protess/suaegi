@@ -355,10 +355,12 @@ pub(crate) fn js_trim(s: &str) -> &str {
 // Local wall-clock helpers (F2: explicit timezone, never ambient Local).
 // ---------------------------------------------------------------------------------------
 
-/// Resolve a naive local datetime to a concrete instant in `tz`, tolerating DST folds/gaps
-/// (M1's oracle pins `Etc/UTC`, so this always resolves to a single instant; the DST
-/// branches are M3's concern and only guard against a panic here).
-fn resolve_local(tz: Tz, naive: NaiveDateTime) -> chrono::DateTime<Tz> {
+/// Resolve a naive local datetime to a concrete instant in `tz`, tolerating DST folds/gaps.
+/// Fold (ambiguous, fall-back) policy: pick `.earliest()`. Gap (nonexistent, spring-forward)
+/// policy: advance one hour past the gap — mirroring JS `Date.setHours`, which rolls a
+/// nonexistent local time FORWARD. M3's occurrence math reuses this exact helper so its
+/// `at_local_time`/`floor_to_minute` share one DST policy with `start_of_local_day`.
+pub(crate) fn resolve_local(tz: Tz, naive: NaiveDateTime) -> chrono::DateTime<Tz> {
     if let Some(dt) = tz.from_local_datetime(&naive).earliest() {
         return dt;
     }
@@ -369,7 +371,7 @@ fn resolve_local(tz: Tz, naive: NaiveDateTime) -> chrono::DateTime<Tz> {
 }
 
 /// Civil datetime for `ms` in `tz`. A UTC instant maps to exactly one local time.
-fn civil(tz: Tz, ms: i64) -> chrono::DateTime<Tz> {
+pub(crate) fn civil(tz: Tz, ms: i64) -> chrono::DateTime<Tz> {
     tz.timestamp_millis_opt(ms)
         .single()
         .expect("timestamp maps to a single local time")
