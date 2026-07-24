@@ -7,6 +7,14 @@
 //! M2는 여기에 `fetch`/`pull` **드라이버**(실제 git 호출)를 얹는다 — 로컬 bare remote로
 //! AV 가능하다(라이브 auth만 사람눈). pull은 `--ff-only`(F4)라 divergent pull이
 //! merge로 워크트리를 stuck시키는 대신 clean하게 abort한다.
+//!
+//! M4(**SAFETY-CRITICAL**)는 `--force-with-lease` push를 **patch-equivalence 게이트 뒤에서만**
+//! 허용한다(F3). force-push는 원격을 **덮어쓴다** — 원격의 "behind" 커밋이 에이전트 **자신의**
+//! 로컬 히스토리를 rebase-rewrite한 것(patch-equivalent)일 때만 안전하고, 남이 push한 진짜
+//! divergent 기여는 **절대** 덮어쓰면 안 된다. Orca 포트: `shouldForcePushWithLeaseForUpstream`
+//! (`git-upstream-status.ts:39-48`), `behindCommitsArePatchEquivalent`(`upstream.ts:20-36`).
+//! **bare `--force`는 절대 쓰지 않는다** — `--force-with-lease`(원격이 우리 마지막 fetch 이후
+//! 움직였으면 거부)만, 게이트가 열렸을 때만.
 
 use crate::runner::{GitError, GitRunner};
 use std::path::Path;
@@ -461,6 +469,247 @@ pub async fn push(
     }
 }
 
+// ── force-with-lease + patch-equivalence 게이트(M4, SAFETY-CRITICAL) ──────────
+//
+// force-push는 원격을 **덮어쓴다**. Orca는 bare `--force`를 절대 쓰지 않고
+// `--force-with-lease`(원격이 우리 마지막 fetch 이후 움직였으면 거부)를 **auto**로만,
+// 그리고 오직 `shouldForcePushWithLeaseForUpstream` 게이트가 열렸을 때만 낸다. 게이트는
+// "원격의 behind 커밋이 전부 내 로컬 히스토리를 rebase-rewrite한 patch-equivalent"임을
+// 요구한다 — 즉 **자기 자신의** 작업을 rebase-then-push하는 경우에 한한다. 남이 push한 진짜
+// upstream-only 커밋이 하나라도 섞이면 게이트가 닫혀 그 기여를 절대 덮어쓰지 않는다.
+
+/// force-with-lease를 시도한 push의 분류된 결과. **`--force`를 우연히도 내지 못하게** 하는
+/// 값 모델이다: 게이트가 닫히면 [`NotSafeToForce`](LeasePushOutcome::NotSafeToForce)로
+/// 아무것도 전송하지 않고 돌아온다 — 호출부가 이 값을 성공으로 오독할 수 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasePushOutcome {
+    /// 게이트가 열림(내 작업의 rebase-rewrite) → `--force-with-lease`를 실행했다. 그 push의
+    /// 분류 결과를 담는다([`PushOutcome`]). lease가 거부하면(원격이 움직임)
+    /// `NonFastForwardRejected` — force가 **먹지 않았고** 원격 미변경이라는 뜻이다.
+    ForcedWithLease(PushOutcome),
+    /// 게이트가 닫힘(남의 기여이거나 프로브 불확실) → **force를 시도하지 않았다**. 원격은 어떤
+    /// force로도 건드려지지 않았다. 호출부는 force하지 말고 pull로 reconcile해야 한다.
+    NotSafeToForce,
+}
+
+/// `git push --force-with-lease origin HEAD:<branch>`. **bare `--force`는 절대 없다**
+/// (F3 — Orca 안전바). 단일 refspec, `--force-with-lease`(인자 없는 형태 = 원격이 우리
+/// 마지막 fetch 이후 움직였으면 거부)만 쓴다.
+pub fn push_with_lease_args(branch: &str) -> Vec<String> {
+    vec![
+        "push".to_string(),
+        "--force-with-lease".to_string(),
+        "origin".to_string(),
+        format!("HEAD:{branch}"),
+    ]
+}
+
+/// `git rev-list --left-right --count HEAD...<upstream>`의 stdout을 `(ahead, behind)`로
+/// 파스한다(Orca `parseGitRevListAheadBehindCounts`). 정확히 2개의 non-negative 정수 필드가
+/// 아니면 `None`(호출부가 파스 에러로 취급). `ahead`=HEAD에만 있는 커밋 수(left),
+/// `behind`=upstream에만 있는 커밋 수(right).
+pub fn parse_rev_list_ahead_behind(stdout: &str) -> Option<(u32, u32)> {
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    if fields.len() != 2 {
+        return None;
+    }
+    let ahead = fields[0].parse::<u32>().ok()?;
+    let behind = fields[1].parse::<u32>().ok()?;
+    Some((ahead, behind))
+}
+
+/// `git log --oneline --cherry-mark --right-only HEAD...<upstream> --`의 출력을 파스해,
+/// **behind(upstream-only) 커밋이 전부 patch-equivalent**한지 판정한다(Orca
+/// `upstreamOnlyCommitsArePatchEquivalent`, `upstream.ts:3-16`).
+///
+/// `--cherry-mark`는 반대편에 patch-equivalent 짝이 있는 커밋을 `=`로, upstream 고유(짝이 없는
+/// 진짜 기여) 커밋을 `+`/`>`로 마킹한다. `--right-only`라 upstream 쪽 커밋만 나온다. 규칙:
+/// **비어있지 않은 라인이 하나라도 있고(has_commit) 그 전부가 `=`로 시작**해야 true. `=`가
+/// 아닌 라인이 하나라도 있으면(남의 기여) false, 커밋이 아예 없어도 false.
+///
+/// *load-bearing*: 이게 true면 게이트가 열려 force-with-lease가 원격을 덮어쓴다. `=` 검사가
+/// 느슨해지면(예: 항상 true) 남의 커밋을 rebase-rewrite로 오인해 **클로버**한다.
+pub fn upstream_only_commits_are_patch_equivalent(cherry_mark_output: &str) -> bool {
+    let mut has_commit = false;
+    for raw in cherry_mark_output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        has_commit = true;
+        // `=`가 아니면 upstream 고유 커밋(남의 기여) → 덮어쓰면 안 된다.
+        if !line.starts_with('=') {
+            return false;
+        }
+    }
+    has_commit
+}
+
+/// force-with-lease 게이트의 **순수** 판정(Orca `shouldForcePushWithLeaseForUpstream`,
+/// `git-upstream-status.ts:39-48`). `has_upstream && ahead>0 && behind>0 && patch_equivalent`
+/// 네 조건이 **모두** 참일 때만 true.
+///
+/// - `has_upstream=false` → 비교 대상 없음.
+/// - `ahead==0` → push할 로컬 고유 커밋이 없음(force 불필요).
+/// - `behind==0` → 덮어쓸 원격 커밋이 없음(force 불필요, 일반 push로 충분).
+/// - `patch_equivalent=false` → behind 커밋에 남의 진짜 기여가 섞임 → **절대 force 금지**.
+pub fn should_force_push_with_lease_gate(
+    has_upstream: bool,
+    ahead: u32,
+    behind: u32,
+    behind_commits_are_patch_equivalent: bool,
+) -> bool {
+    has_upstream && ahead > 0 && behind > 0 && behind_commits_are_patch_equivalent
+}
+
+/// `git rev-parse --abbrev-ref --symbolic-full-name @{upstream}`으로 현재 브랜치의 upstream
+/// 이름(`origin/main` 등)을 얻는다. upstream이 없으면 `Ok(None)`(에러 아님, 예상된 상태 —
+/// [`is_no_upstream_error`]로 판정). 그 밖의 실패(corrupt/네트워크 등)는 삼키지 않고 `Err`.
+async fn resolve_upstream(runner: &GitRunner, worktree: &Path) -> Result<Option<String>, GitError> {
+    let argv = [
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ];
+    match runner.run(worktree, &argv).await {
+        Ok(out) => Ok(parse_upstream(&out.stdout)),
+        Err(GitError::Failed { args, code, stderr }) => {
+            if is_no_upstream_error(&stderr) {
+                Ok(None)
+            } else {
+                Err(GitError::Failed { args, code, stderr })
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// `git rev-list --left-right --count HEAD...<upstream>`을 실행해 `(ahead, behind)`를 얻는다.
+/// 파스 불가는 삼키지 않고 [`GitError::Parse`]로 표면화한다(Orca도 throw).
+async fn ahead_behind(
+    runner: &GitRunner,
+    worktree: &Path,
+    upstream: &str,
+) -> Result<(u32, u32), GitError> {
+    let range = format!("HEAD...{upstream}");
+    let argv = ["rev-list", "--left-right", "--count", range.as_str()];
+    let out = runner.run(worktree, &argv).await?;
+    parse_rev_list_ahead_behind(&out.stdout).ok_or_else(|| GitError::Parse {
+        args: format!("rev-list --left-right --count {range}"),
+        detail: format!("unparseable ahead/behind counts: {:?}", out.stdout),
+    })
+}
+
+/// behind(upstream-only) 커밋이 전부 patch-equivalent한지 **실제 git으로** 프로브한다(Orca
+/// `getBehindCommitsArePatchEquivalent`, `upstream.ts:20-36`). `git log --oneline --cherry-mark
+/// --right-only HEAD...<upstream> --`를 돌려 [`upstream_only_commits_are_patch_equivalent`]로
+/// 판정한다.
+///
+/// **프로브 실패 → 보수적 false**(Orca `catch { return false }`). patch-equivalence는 rebase
+/// 케이스를 위한 최적화일 뿐 — 프로브가 에러나면 게이트를 닫아 force하지 않는다. 절대
+/// 불확실성 위에서 원격을 덮어쓰지 않는다.
+pub async fn behind_commits_are_patch_equivalent(
+    runner: &GitRunner,
+    worktree: &Path,
+    upstream: &str,
+) -> bool {
+    let range = format!("HEAD...{upstream}");
+    let argv = [
+        "log",
+        "--oneline",
+        "--cherry-mark",
+        "--right-only",
+        range.as_str(),
+        "--",
+    ];
+    match runner.run(worktree, &argv).await {
+        Ok(out) => upstream_only_commits_are_patch_equivalent(&out.stdout),
+        // 프로브 에러 → 보수적 false. 불확실하면 force하지 않는다.
+        Err(_) => false,
+    }
+}
+
+/// force-with-lease 게이트의 **드라이버**(실제 git 호출 + 순수 [`should_force_push_with_lease_gate`]).
+/// upstream 해석 → ahead/behind 계산 → (ahead>0 && behind>0일 때만) patch-equivalence 프로브 →
+/// 게이트 판정.
+///
+/// upstream이 없으면 `Ok(false)`(force 대상 아님). ahead/behind 계산이 실패하면 `Err`로
+/// 전파한다 — 호출부([`push_with_lease_if_safe`])는 `Err`를 만나면 force에 **도달하지 못한다**.
+pub async fn should_force_push_with_lease(
+    runner: &GitRunner,
+    worktree: &Path,
+) -> Result<bool, GitError> {
+    let Some(upstream) = resolve_upstream(runner, worktree).await? else {
+        // upstream 없음 → Orca: status undefined → false.
+        return Ok(false);
+    };
+    let (ahead, behind) = ahead_behind(runner, worktree, &upstream).await?;
+    // ahead>0 && behind>0일 때만 프로브를 돈다(Orca publish-target-status:60-63). behind==0이면
+    // 덮어쓸 게 없고, ahead==0이면 push할 게 없다 — 어느 쪽도 force가 필요 없다.
+    let patch_equivalent = if ahead > 0 && behind > 0 {
+        behind_commits_are_patch_equivalent(runner, worktree, &upstream).await
+    } else {
+        false
+    };
+    Ok(should_force_push_with_lease_gate(
+        true,
+        ahead,
+        behind,
+        patch_equivalent,
+    ))
+}
+
+/// `git push --force-with-lease origin HEAD:<branch>`를 **게이트가 열렸을 때만** 실행한다
+/// ([`should_force_push_with_lease`]). **SAFETY-CRITICAL 진입점.**
+///
+/// 게이트가 명시적으로 `true`가 아니면(닫혔거나 판정 중 `Err`가 나면) **아무것도 전송하지 않고**
+/// [`LeasePushOutcome::NotSafeToForce`](게이트 닫힘) 또는 `Err`(판정 실패)로 돌아온다 —
+/// force에 도달하는 유일한 경로는 게이트가 `Ok(true)`를 낸 경우뿐이다. 절대 우연히 force하지
+/// 않는다.
+///
+/// 게이트가 열리면 [`push_with_lease_args`](bare `--force` 없음)로 force-with-lease push하고
+/// [`classify_push_outcome`]으로 분류해 [`LeasePushOutcome::ForcedWithLease`]로 돌린다.
+/// `--force-with-lease`가 원격 이동으로 **거부**하면 stderr가 `[rejected]`를 담아
+/// `NonFastForwardRejected`로 분류된다 — force가 먹지 않았고 원격 미변경이다(성공 아님).
+pub async fn push_with_lease_if_safe(
+    runner: &GitRunner,
+    worktree: &Path,
+    branch: &str,
+) -> Result<LeasePushOutcome, GitError> {
+    // 게이트가 **명시적으로** true일 때만 force한다. 닫힘 → NotSafeToForce, 판정 Err → `?`로
+    // 전파. 어느 쪽도 force에 도달하지 않는다.
+    if !should_force_push_with_lease(runner, worktree).await? {
+        return Ok(LeasePushOutcome::NotSafeToForce);
+    }
+    let owned = push_with_lease_args(branch);
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+    match runner.run(worktree, &argv).await {
+        Ok(out) => Ok(LeasePushOutcome::ForcedWithLease(classify_push_outcome(
+            out.code,
+            &out.stderr,
+        ))),
+        // 비-0 exit. lease 거부(원격 이동)는 `[rejected]`로 NonFastForwardRejected 분류 — force가
+        // 먹지 않았다는 clean 값이다. 그 밖의 진짜 전송 실패는 credential 정제 후 `Err`.
+        Err(GitError::Failed { args, code, stderr }) => {
+            if classify_push_outcome(code.unwrap_or(1), &stderr)
+                == PushOutcome::NonFastForwardRejected
+            {
+                Ok(LeasePushOutcome::ForcedWithLease(
+                    PushOutcome::NonFastForwardRejected,
+                ))
+            } else {
+                Err(GitError::Failed {
+                    args,
+                    code,
+                    stderr: normalize_git_error_message(&stderr, RemoteOp::Push),
+                })
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 // ── upstream 파스 ────────────────────────────────────────────────────────────
 
 /// `git rev-parse --abbrev-ref --symbolic-full-name @{upstream}`의 stdout을 파스한다.
@@ -804,5 +1053,106 @@ mod tests {
             "hint: no upstream configured, just FYI"
         ));
         assert!(!is_no_upstream_error("fatal: not a git repository"));
+    }
+
+    // ── M4: patch-equivalence 파스(SAFETY crux) ──────────────────────────────
+
+    /// 모든 behind 커밋이 `=`(patch-equivalent) → true. 이게 rebase-then-push의 정당한
+    /// 케이스다. Mutation: `=` 검사를 항상 true로 바꾸면 아래 non-`=` 테스트가 FAIL.
+    #[test]
+    fn patch_equivalent_all_equals_is_true() {
+        let out = "= abc123 rebased commit one\n= def456 rebased commit two\n";
+        assert!(upstream_only_commits_are_patch_equivalent(out));
+    }
+
+    /// **load-bearing 안전 판정**: `>`(또는 `+`) 마킹 커밋이 하나라도 있으면(남의 진짜 기여)
+    /// false — 그 커밋을 절대 덮어쓰면 안 된다. Mutation: 이 함수를 항상 true로 바꾸면
+    /// (또는 `!starts_with('=')` early-return을 지우면) 이 단언 FAIL → 남의 커밋을 클로버하는
+    /// 게이트가 열린다.
+    #[test]
+    fn patch_equivalent_any_non_equals_is_false() {
+        // `>`(right-only 고유) 섞임.
+        assert!(!upstream_only_commits_are_patch_equivalent(
+            "= abc123 my rebased commit\n> deadbee someone else's real commit\n"
+        ));
+        // `+`(cherry-mark의 non-equivalent 마킹) 섞임.
+        assert!(!upstream_only_commits_are_patch_equivalent(
+            "+ deadbee someone else's real commit\n"
+        ));
+    }
+
+    /// behind 커밋이 아예 없으면(빈 출력) false — has_commit=false. Mutation: `has_commit`
+    /// 초기값을 true로 바꾸면 이 단언 FAIL(빈 프로브를 "전부 equivalent"로 오인).
+    #[test]
+    fn patch_equivalent_empty_is_false() {
+        assert!(!upstream_only_commits_are_patch_equivalent(""));
+        assert!(!upstream_only_commits_are_patch_equivalent("   \n\n  \n"));
+    }
+
+    // ── M4: rev-list ahead/behind 파스 ───────────────────────────────────────
+
+    #[test]
+    fn ahead_behind_parses_two_fields() {
+        assert_eq!(parse_rev_list_ahead_behind("1\t2\n"), Some((1, 2)));
+        assert_eq!(parse_rev_list_ahead_behind("0\t0"), Some((0, 0)));
+        assert_eq!(parse_rev_list_ahead_behind("3   5"), Some((3, 5)));
+    }
+
+    /// 필드 수가 2가 아니거나 non-integer면 None(호출부가 파스 에러로 취급). Mutation: 필드
+    /// 개수 검사를 지우면 엉뚱한 출력을 (0,0) 등으로 오인.
+    #[test]
+    fn ahead_behind_rejects_malformed() {
+        assert_eq!(parse_rev_list_ahead_behind(""), None);
+        assert_eq!(parse_rev_list_ahead_behind("1"), None);
+        assert_eq!(parse_rev_list_ahead_behind("1\t2\t3"), None);
+        assert_eq!(parse_rev_list_ahead_behind("x\ty"), None);
+        assert_eq!(parse_rev_list_ahead_behind("-1\t2"), None);
+    }
+
+    // ── M4: 게이트(순수) — Orca shouldForcePushWithLeaseForUpstream ────────────
+
+    /// 네 조건 모두 참일 때만 true(정당한 rebase-then-push). Mutation: 어느 한 조건을
+    /// 지우거나 `&&`를 `||`로 바꾸면 아래 개별-거부 테스트가 FAIL.
+    #[test]
+    fn gate_true_only_when_all_four_hold() {
+        assert!(should_force_push_with_lease_gate(true, 1, 1, true));
+    }
+
+    /// patch-equivalent=false면(남의 기여) 게이트 닫힘 — **THE 안전 조건**.
+    #[test]
+    fn gate_false_when_not_patch_equivalent() {
+        assert!(!should_force_push_with_lease_gate(true, 1, 1, false));
+    }
+
+    /// ahead==0(push할 게 없음) / behind==0(덮어쓸 게 없음) / no-upstream → 각각 닫힘.
+    /// Mutation: `ahead > 0`→`ahead >= 0` 또는 `behind > 0`→`behind >= 0`로 느슨하게 하면
+    /// 해당 단언 FAIL.
+    #[test]
+    fn gate_false_on_ahead_behind_or_no_upstream() {
+        assert!(!should_force_push_with_lease_gate(true, 0, 1, true));
+        assert!(!should_force_push_with_lease_gate(true, 1, 0, true));
+        assert!(!should_force_push_with_lease_gate(false, 1, 1, true));
+    }
+
+    // ── M4: force-with-lease argv — bare --force 금지(F3) ─────────────────────
+
+    /// `--force-with-lease`를 쓰고 **bare `--force`는 절대 없다**. Mutation: `--force-with-lease`를
+    /// bare `--force`로 바꾸면 두 단언이 모두 FAIL(존재해야 할 `--force-with-lease`가 사라지고,
+    /// 금지된 `--force`가 나타난다).
+    #[test]
+    fn lease_push_args_uses_force_with_lease_never_bare_force() {
+        let args = push_with_lease_args("main");
+        assert_eq!(
+            args,
+            vec!["push", "--force-with-lease", "origin", "HEAD:main"]
+        );
+        assert!(
+            args.iter().any(|a| a == "--force-with-lease"),
+            "force-with-lease를 써야 한다: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--force"),
+            "bare --force 절대 금지(원격 무조건 클로버): {args:?}"
+        );
     }
 }
