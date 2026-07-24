@@ -6,6 +6,7 @@ pub mod fs;
 pub mod history;
 pub mod quick_open;
 pub mod refname;
+pub mod remote;
 pub mod repo_probe;
 pub mod runner;
 pub mod status;
