@@ -231,6 +231,24 @@ fn leap_day_schedule_is_valid() {
     assert!(is_valid_automation_cron_schedule("0 0 29 2 *", anchor(), UTC));
 }
 
+#[test]
+fn leap_century_gap_schedule_is_valid_pins_scan_window() {
+    // Pins CRON_SCAN_DAYS (= 9*366 = 3294) near its true value. Anchored just after the
+    // Feb-29-2096 occurrence, the NEXT Feb 29 is 2104 — because 2100 is NOT a leap year
+    // (divisible by 100, not 400). That gap is exactly 2920 days, the ~8-year worst case
+    // the 9-year window exists to cover. So `0 0 29 2 *` must still be valid here.
+    //
+    // *Mutation:* shrinking CRON_SCAN_DAYS to <= 2920 makes the scan miss 2104-02-29 →
+    // this schedule reads as invalid → FAIL. (The other leap-day test only needs ~655
+    // days, so it can't catch such a shrink; this one closes that gap.)
+    let after_feb29_2096 = ms(2096, 3, 1, 0, 0);
+    assert!(is_valid_automation_cron_schedule(
+        "0 0 29 2 *",
+        after_feb29_2096,
+        UTC
+    ));
+}
+
 // -------------------------------------------------------------------------------------
 // Name tables.
 // -------------------------------------------------------------------------------------
