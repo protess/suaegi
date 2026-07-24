@@ -1,0 +1,21 @@
+[package]
+name = "suaegi-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: content-search backend (rg `--json` + git-grep fallback) — the pure
+# arg-builder + stream-parser half of Orca's `src/shared/text-search.ts`. Peer
+# of the already-ported Quick Open (suaegi-fuzzy). M1 is the pure foundation:
+# types, constants, path/glob/regex string helpers, match-count normalization —
+# ZERO suaegi-crate deps, serde only (the types cross the IPC boundary later).
+# serde_json/tokio/regex arrive with M2/M3/M4 (argv builder, stream parser,
+# drivers), NOT here.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+# Why: pin the camelCase wire shape (Orca IPC parity) in a committed test. serde_json
+# becomes a real dependency in M3 (rg `--json` parsing); here it is test-only.
+serde_json = { workspace = true }
