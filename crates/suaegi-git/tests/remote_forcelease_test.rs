@@ -201,6 +201,79 @@ async fn unsafe_someone_else_pushed_is_not_clobbered() {
     );
 }
 
+// ── Layer 2: lease backstop — 게이트가 stale tracking ref에 열려도 lease가 막는다 ─
+//
+// **TOCTOU 방어**(보안리뷰 nit 1). 게이트(Layer 1)는 fetch된 남의 커밋만 막는다 — B가
+// **re-fetch하지 않으면** origin/main이 낡아(=X) 게이트가 잘못 열릴 수 있다. 이때 유일한
+// 방어선이 bare `--force-with-lease`(Layer 2): 원격이 우리 마지막 fetch 이후 움직였으면
+// (origin/main=X인데 실제 원격=Y) "stale info"로 **거부**해 남의 Y를 보존한다.
+//
+// 시나리오: B가 X push→amend X'(same tree). A가 fetch로 X를 받아 그 위에 진짜 커밋 Y를
+// push(원격=Y). **B는 re-fetch 안 함** → B의 origin/main은 여전히 X → 게이트 열림
+// (ahead=1 X', behind=1 X, patch-equivalent). force-with-lease가 실행되지만 원격=Y≠X라
+// lease가 거부 → 원격은 여전히 Y.
+//
+// 죽이는 mutation: `--force-with-lease`→bare `--force`면 lease 검사가 사라져 원격이 X'로
+// 클로버되고 Y가 사라진다 → "원격이 여전히 Y" 단언 FAIL. (argv 문자열 테스트와 달리
+// 이건 lease의 **런타임 행위**를 못 박는다.)
+#[tokio::test]
+async fn lease_backstop_rejects_when_remote_moved_after_stale_fetch() {
+    let env = setup();
+    let (bare, a, b, r) = (&env.bare, &env.a, &env.b, &env.r);
+
+    // B가 X를 push → 원격=X, B의 origin/main tracking=X.
+    commit_local(b, "X content\n", "commit-X");
+    assert_eq!(
+        push(r, b, "main", false).await.expect("X push"),
+        PushOutcome::Ok
+    );
+    // B가 X를 amend → X'(같은 트리 = patch-equivalent). B의 origin/main은 아직 X.
+    fixture::run(b, &["commit", "--amend", "-m", "commit-X-prime-same-tree"]);
+    let x_prime = rev_parse(r, b, "HEAD").await;
+
+    // A가 fetch로 X를 받아 그 위에 진짜 커밋 Y를 push → 원격=Y.
+    fixture::run(a, &["fetch", "origin"]);
+    fixture::run(a, &["reset", "--hard", "origin/main"]);
+    commit_local(a, "A real work Y on top of X\n", "A-real-Y");
+    fixture::run(a, &["push", "origin", "main"]);
+    let a_y = rev_parse(r, a, "HEAD").await;
+    assert_eq!(
+        bare_rev_parse(bare, "main"),
+        a_y,
+        "사전조건: 원격 main이 A의 Y를 가리켜야 한다"
+    );
+
+    // **B는 re-fetch하지 않는다** → B의 origin/main은 낡은 X → 게이트가 (stale하게) 열린다.
+    assert!(
+        should_force_push_with_lease(r, b)
+            .await
+            .expect("게이트 판정"),
+        "낡은 tracking ref(origin/main=X) 위에서 게이트는 열린다 — Layer 2가 유일한 방어선"
+    );
+
+    // force-with-lease가 실행되지만 원격=Y≠origin/main=X라 lease가 거부한다.
+    let outcome = push_with_lease_if_safe(r, b, "main")
+        .await
+        .expect("lease 거부는 clean 값(NonFastForwardRejected)");
+    assert_eq!(
+        outcome,
+        LeasePushOutcome::ForcedWithLease(PushOutcome::NonFastForwardRejected),
+        "lease가 stale info로 거부해야 한다(원격이 fetch 이후 움직임)"
+    );
+
+    // **THE 단언**: A의 Y가 원격에 그대로 — bare `--force`였다면 X'로 클로버됐을 것이다.
+    assert_eq!(
+        bare_rev_parse(bare, "main"),
+        a_y,
+        "lease 거부 후 원격 main이 A의 Y로 남아야 한다(클로버 금지)"
+    );
+    assert_ne!(
+        bare_rev_parse(bare, "main"),
+        x_prime,
+        "원격이 B의 X'로 덮이면 안 된다(lease가 막았어야 한다)"
+    );
+}
+
 // ── 프로브 실패 → 보수적 false ───────────────────────────────────────────────
 //
 // upstream 이름이 해석되지 않으면(없는 브랜치) `git log ...`가 에러 → 프로브는 **false**를

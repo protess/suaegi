@@ -593,7 +593,9 @@ async fn ahead_behind(
     upstream: &str,
 ) -> Result<(u32, u32), GitError> {
     let range = format!("HEAD...{upstream}");
-    let argv = ["rev-list", "--left-right", "--count", range.as_str()];
+    // `--` pathspec 종결자: rev arg가 항상 `HEAD...`로 시작해 flag 오인 위험은 없지만, log
+    // 프로브와 동일하게 두어 pathspec 모호성에 대한 future-proofing을 맞춘다.
+    let argv = ["rev-list", "--left-right", "--count", range.as_str(), "--"];
     let out = runner.run(worktree, &argv).await?;
     parse_rev_list_ahead_behind(&out.stdout).ok_or_else(|| GitError::Parse {
         args: format!("rev-list --left-right --count {range}"),
