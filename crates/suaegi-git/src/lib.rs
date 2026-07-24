@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod commit_show;
 pub mod compare;
 pub mod conflict;
