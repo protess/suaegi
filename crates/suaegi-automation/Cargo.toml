@@ -1,0 +1,21 @@
+[package]
+name = "suaegi-automation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's automation scheduling engine
+# (src/shared/automation-schedules.ts). Cron parsing/validation + (later) RRULE +
+# occurrence math. ZERO dependencies on other suaegi crates (suaegi-fuzzy/suaegi-keys
+# precedent). The ONLY external deps are chrono + chrono-tz: every date computation in
+# Orca is LOCAL WALL-CLOCK (getHours/getDate/getDay/setHours, no UTC-family calls), so
+# per Codex fix F2 we inject an explicit IANA timezone instead of ambient Local. Keeping
+# the surface small and deterministic makes each cron rule mutation-verifiable.
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
