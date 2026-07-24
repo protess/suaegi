@@ -136,6 +136,114 @@ fn parse_count(token: &str, args: &str) -> Result<Option<u32>, GitError> {
     })
 }
 
+/// numstat 카운트 맵: 경로 -> (추가 줄 수, 삭제 줄 수). `-`(바이너리)는 각각 None.
+pub(crate) type NumstatCounts = HashMap<String, (Option<u32>, Option<u32>)>;
+
+/// `--numstat -z` 스트림을 `path -> (adds, dels)` 맵으로 판다. rename/copy는
+/// `"adds\tdels\t"`(빈 경로) 뒤에 from, to가 각각 **별도 NUL 레코드**로 이어지는
+/// 두-레코드 형태다 — 한 레코드만 소비하면 이후 전부 밀린다.
+///
+/// `branch_compare`(working-tree diff)와 `commit_show`(commit..commit / `diff-tree
+/// --root`)가 공유한다: `-z` numstat 출력 형태가 세 경우 모두 동일하다.
+pub(crate) fn parse_numstat_z(stdout: &str) -> Result<NumstatCounts, GitError> {
+    let args = "diff --numstat -z";
+    let mut counts: NumstatCounts = HashMap::new();
+    let mut records = stdout.split('\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        // splitn(3): 파일명에 탭이 있어도 세 번째 조각(경로)이 절단되지 않게
+        let mut parts = record.splitn(3, '\t');
+        let (Some(a), Some(d)) = (parts.next(), parts.next()) else {
+            return Err(GitError::Parse {
+                args: args.to_string(),
+                detail: format!("truncated record {record:?}"),
+            });
+        };
+        let adds = parse_count(a, args)?;
+        let dels = parse_count(d, args)?;
+        match parts.next() {
+            Some(path) if !path.is_empty() => {
+                counts.insert(path.to_string(), (adds, dels));
+            }
+            _ => {
+                // rename/copy: from, to가 이어지는 별도 레코드
+                let _from = records.next();
+                let to = records.next().ok_or_else(|| GitError::Parse {
+                    args: args.to_string(),
+                    detail: "rename record missing target path".to_string(),
+                })?;
+                counts.insert(to.to_string(), (adds, dels));
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// `--name-status -z` 스트림을 `ChangedFile` 목록으로 판다. `R`/`C`는 **경로가 둘**인
+/// 두-레코드 형태(하나만 소비하면 이후 레코드가 한 칸씩 밀린다). 카운트는 미리 판
+/// numstat 맵(`counts`)에서 경로로 조인한다.
+///
+/// `branch_compare`와 `commit_show`가 공유한다: 세 diff 형태(working-tree,
+/// commit..commit, `diff-tree --root`)의 `-z` name-status 출력이 동일하다.
+pub(crate) fn parse_name_status_z(
+    stdout: &str,
+    counts: &NumstatCounts,
+) -> Result<Vec<ChangedFile>, GitError> {
+    let args = "diff --name-status -z";
+    let mut files = Vec::new();
+    let mut records = stdout.split('\0');
+    while let Some(code) = records.next() {
+        if code.is_empty() {
+            continue;
+        }
+        let status_char = code.chars().next().unwrap_or('?');
+        let (status, path) = match status_char {
+            // R과 C는 **같은 모양**이다. C를 Other로 떨어뜨리면 경로를 하나만
+            // 소비해 이후 모든 레코드가 한 칸씩 밀린다.
+            'R' | 'C' => {
+                let from = records.next().ok_or_else(|| GitError::Parse {
+                    args: args.to_string(),
+                    detail: format!("record {code:?} missing source path"),
+                })?;
+                let to = records.next().ok_or_else(|| GitError::Parse {
+                    args: args.to_string(),
+                    detail: format!("record {code:?} missing target path"),
+                })?;
+                let from = from.to_string();
+                let status = if status_char == 'R' {
+                    ChangeStatus::Renamed { from }
+                } else {
+                    ChangeStatus::Copied { from }
+                };
+                (status, to.to_string())
+            }
+            c => {
+                let path = records.next().ok_or_else(|| GitError::Parse {
+                    args: args.to_string(),
+                    detail: format!("record {code:?} missing path"),
+                })?;
+                let status = match c {
+                    'A' => ChangeStatus::Added,
+                    'M' => ChangeStatus::Modified,
+                    'D' => ChangeStatus::Deleted,
+                    other => ChangeStatus::Other(other),
+                };
+                (status, path.to_string())
+            }
+        };
+        let (additions, deletions) = counts.get(&path).copied().unwrap_or((None, None));
+        files.push(ChangedFile {
+            path,
+            status,
+            additions,
+            deletions,
+        });
+    }
+    Ok(files)
+}
+
 /// `rev-parse --verify --quiet <rev>`가 그 리비전을 풀 수 있는가.
 ///
 /// **`--quiet`가 분류의 핵심이다**(실측, git 2.50.1): 풀리지 않는 리비전은 exit 1에
@@ -232,91 +340,11 @@ pub async fn branch_compare(
         .await?;
 
     // numstat -z 레코드: "adds\tdels\tpath" 또는 rename/copy 시 "adds\tdels\t" 뒤에
-    // from, to가 각각 별도 NUL 레코드로 이어진다.
-    let numstat_args = format!("diff --numstat -z -M -C {mb}");
-    let mut counts: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
-    let mut numstat_records = numstat.stdout.split('\0');
-    while let Some(record) = numstat_records.next() {
-        if record.is_empty() {
-            continue;
-        }
-        // splitn(3): 파일명에 탭이 있어도 세 번째 조각(경로)이 절단되지 않게
-        let mut parts = record.splitn(3, '\t');
-        let (Some(a), Some(d)) = (parts.next(), parts.next()) else {
-            return Err(GitError::Parse {
-                args: numstat_args.clone(),
-                detail: format!("truncated record {record:?}"),
-            });
-        };
-        let adds = parse_count(a, &numstat_args)?;
-        let dels = parse_count(d, &numstat_args)?;
-        match parts.next() {
-            Some(path) if !path.is_empty() => {
-                counts.insert(path.to_string(), (adds, dels));
-            }
-            _ => {
-                // rename/copy: from, to가 이어지는 별도 레코드
-                let _from = numstat_records.next();
-                let to = numstat_records.next().ok_or_else(|| GitError::Parse {
-                    args: numstat_args.clone(),
-                    detail: "rename record missing target path".to_string(),
-                })?;
-                counts.insert(to.to_string(), (adds, dels));
-            }
-        }
-    }
-
-    // name-status -z 레코드: "X\0path\0", rename "R100\0from\0to\0", copy "C100\0from\0to\0"
-    let ns_args = format!("diff --name-status -z -M -C {mb}");
-    let mut files = Vec::new();
-    let mut records = name_status.stdout.split('\0');
-    while let Some(code) = records.next() {
-        if code.is_empty() {
-            continue;
-        }
-        let status_char = code.chars().next().unwrap_or('?');
-        let (status, path) = match status_char {
-            // R과 C는 **같은 모양**이다. C를 Other로 떨어뜨리면 경로를 하나만
-            // 소비해 이후 모든 레코드가 한 칸씩 밀린다.
-            'R' | 'C' => {
-                let from = records.next().ok_or_else(|| GitError::Parse {
-                    args: ns_args.clone(),
-                    detail: format!("record {code:?} missing source path"),
-                })?;
-                let to = records.next().ok_or_else(|| GitError::Parse {
-                    args: ns_args.clone(),
-                    detail: format!("record {code:?} missing target path"),
-                })?;
-                let from = from.to_string();
-                let status = if status_char == 'R' {
-                    ChangeStatus::Renamed { from }
-                } else {
-                    ChangeStatus::Copied { from }
-                };
-                (status, to.to_string())
-            }
-            c => {
-                let path = records.next().ok_or_else(|| GitError::Parse {
-                    args: ns_args.clone(),
-                    detail: format!("record {code:?} missing path"),
-                })?;
-                let status = match c {
-                    'A' => ChangeStatus::Added,
-                    'M' => ChangeStatus::Modified,
-                    'D' => ChangeStatus::Deleted,
-                    other => ChangeStatus::Other(other),
-                };
-                (status, path.to_string())
-            }
-        };
-        let (additions, deletions) = counts.get(&path).copied().unwrap_or((None, None));
-        files.push(ChangedFile {
-            path,
-            status,
-            additions,
-            deletions,
-        });
-    }
+    // from, to가 각각 별도 NUL 레코드로 이어진다. name-status -z 레코드:
+    // "X\0path\0", rename "R100\0from\0to\0", copy "C100\0from\0to\0". 두 파서는
+    // commit_show와 공유하는 pub(crate) 함수로 추출돼 있다(M0).
+    let counts = parse_numstat_z(&numstat.stdout)?;
+    let mut files = parse_name_status_z(&name_status.stdout, &counts)?;
 
     // untracked 파일 수집: status --porcelain -z에서 "?? path" 레코드
     if cancel.is_stopped() {
@@ -610,6 +638,62 @@ pub async fn working_tree_dirty(
         .run(worktree_path, &["status", "--porcelain"])
         .await?;
     Ok(!out.stdout.trim().is_empty())
+}
+
+#[cfg(test)]
+mod parser_tests {
+    //! M0에서 추출한 `-z` 파서의 직접 단위 테스트. `branch_compare`의 통합
+    //! 테스트가 같은 코드를 간접적으로 덮지만(rename/copy 케이스), 추출 함수를
+    //! **직접** 못박아 두 레코드 소비 mutant를 이 레벨에서도 죽인다.
+    use super::{parse_name_status_z, parse_numstat_z, ChangeStatus};
+
+    /// rename의 numstat `-z`는 `"adds\tdels\t"`(빈 경로) 뒤 from, to가 각각 별도
+    /// NUL 레코드로 온다 — 실측 `git diff --numstat -z -M` 출력 그대로.
+    /// name-status는 `R075\0from\0to\0`. 두 파서가 각각 두 레코드를 소비하고
+    /// to 경로에 카운트를 조인해야 한다.
+    #[test]
+    fn rename_two_record_form_yields_one_changed_file_with_counts() {
+        let numstat = "1\t0\t\0orig.txt\0renamed.txt\0";
+        let name_status = "R075\0orig.txt\0renamed.txt\0";
+        let counts = parse_numstat_z(numstat).unwrap();
+        let files = parse_name_status_z(name_status, &counts).unwrap();
+
+        assert_eq!(
+            files.len(),
+            1,
+            "rename must collapse to a single file: {files:?}"
+        );
+        let f = &files[0];
+        assert_eq!(f.path, "renamed.txt");
+        assert_eq!(
+            f.status,
+            ChangeStatus::Renamed {
+                from: "orig.txt".into()
+            }
+        );
+        // to 경로("renamed.txt")로 카운트가 조인돼야 한다. from/빈 경로에 잘못
+        // 넣으면 여기가 (None,None)이 된다.
+        assert_eq!(f.additions, Some(1));
+        assert_eq!(f.deletions, Some(0));
+    }
+
+    /// rename 레코드 뒤에 오는 평범한 레코드가 **밀리지 않는지**. from/to를 한
+    /// 레코드만 소비하면 뒤따르는 add가 상태·경로 어긋남으로 무너진다.
+    #[test]
+    fn record_after_rename_stays_aligned() {
+        let numstat = "1\t0\t\0orig.txt\0renamed.txt\02\t0\tafter.txt\0";
+        let name_status = "R100\0orig.txt\0renamed.txt\0A\0after.txt\0";
+        let counts = parse_numstat_z(numstat).unwrap();
+        let files = parse_name_status_z(name_status, &counts).unwrap();
+
+        assert_eq!(files.len(), 2, "{files:?}");
+        let after = files
+            .iter()
+            .find(|f| f.path == "after.txt")
+            .expect("record after the rename went missing — misaligned");
+        assert_eq!(after.status, ChangeStatus::Added);
+        assert_eq!(after.additions, Some(2));
+    }
 }
 
 #[cfg(all(test, unix))]
