@@ -129,8 +129,8 @@ type Normalize = fn(i64) -> i64;
 /// decimals, and exponents. Rust's `f64::from_str` covers decimals/exponents but rejects
 /// the radix prefixes (and would accept `inf`/`nan` spellings — harmless here since those
 /// are non-integers and get rejected downstream just as JS's `NaN`/`Infinity` do).
-fn js_number(raw: &str) -> f64 {
-    let s = raw.trim();
+pub(crate) fn js_number(raw: &str) -> f64 {
+    let s = js_trim(raw);
     if s.is_empty() {
         return 0.0;
     }
@@ -147,7 +147,7 @@ fn js_number(raw: &str) -> f64 {
 }
 
 /// True iff `value` is a finite integer — the `Number.isInteger` predicate.
-fn is_js_integer(value: f64) -> bool {
+pub(crate) fn is_js_integer(value: f64) -> bool {
     value.is_finite() && value.fract() == 0.0
 }
 
@@ -181,7 +181,7 @@ fn parse_cron_field(
     let mut result: HashSet<i64> = HashSet::new();
 
     for raw_part in value.split(',') {
-        let part = raw_part.trim();
+        let part = js_trim(raw_part);
         if part.is_empty() {
             return Err(invalid());
         }
@@ -340,6 +340,17 @@ fn is_automation_cron_field_whitespace(code: u32) -> bool {
         || code == 65279
 }
 
+/// JS-faithful trim. Rust's `str::trim()` strips the Unicode `White_Space` property, which
+/// **diverges** from ECMAScript `String.prototype.trim` / `Number()` at two codepoints:
+/// U+FEFF (JS strips, Rust keeps) and U+0085/NEL (Rust strips, JS keeps). Every `.trim()` in
+/// Orca's source is a JS trim, so we replicate its exact set — which is byte-for-byte the
+/// [`is_automation_cron_field_whitespace`] set (Orca deliberately built the tokenizer whitespace
+/// set to match JS trim). Use this wherever the JS source calls `.trim()` or relies on
+/// `Number()`'s leading/trailing-whitespace stripping — never bare `str::trim()`.
+pub(crate) fn js_trim(s: &str) -> &str {
+    s.trim_matches(|ch: char| is_automation_cron_field_whitespace(ch as u32))
+}
+
 // ---------------------------------------------------------------------------------------
 // Local wall-clock helpers (F2: explicit timezone, never ambient Local).
 // ---------------------------------------------------------------------------------------
@@ -424,7 +435,7 @@ pub fn cron_has_possible_occurrence(rule: &ParsedCron, anchor_ms: i64, tz: Tz) -
 /// the system clock. A parse error → `false` (but it is an `Err` internally, never silently
 /// empty).
 pub fn is_valid_automation_cron_schedule(expression: &str, now_ms: i64, tz: Tz) -> bool {
-    match parse_cron_expression(expression.trim()) {
+    match parse_cron_expression(js_trim(expression)) {
         Ok(rule) => cron_has_possible_occurrence(&rule, now_ms, tz),
         Err(_) => false,
     }
