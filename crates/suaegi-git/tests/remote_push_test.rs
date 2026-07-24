@@ -269,3 +269,52 @@ async fn push_errors_when_no_remote() {
         "원격 없는 push는 Err여야 한다(조용한 false 'up to date' 금지): {pushed:?}"
     );
 }
+
+// ── hook-reject / protected-branch: Err(NonFastForwardRejected도 Ok도 아님) ───
+//
+// bare remote에 **거부하는 pre-receive hook**을 심는다(exit 1) — 서버측 보호 브랜치/정책
+// 거부를 흉내낸다. B가 fast-forward 가능한 정상 커밋을 push해도 hook이 막는다. git은 이걸
+// `! [remote rejected] ... (pre-receive hook declined)`로 낸다 — **non-fast-forward가 아니다**.
+//
+// classify는 `"[rejected]"`/`"non-fast-forward"`/`"fetch first"`만 non-ff로 보므로
+// `"[remote rejected]"`는 매칭하지 않아 `Other`로 떨어지고, driver는 이를 `Err`로 표면화한다.
+// 이게 대죄 방지의 핵심: hook이 막아 **원격에 안 올라간** push를 절대 성공(Ok/UpToDate)으로도,
+// non-ff(값)로도 삼키지 않는다 — `Err`여야 워크플로가 stale ref에 PR을 만들지 않는다.
+//
+// 죽이는 mutation: classify에 `stderr.contains("[remote rejected]")`를 non-ff로 추가하면
+// (오분류) → driver가 `Ok(NonFastForwardRejected)`를 돌려 `.is_err()` 단언 FAIL. 또는 비-0
+// exit을 Ok로 매핑해도 FAIL. **`"[rejected]"` substring이 `"[remote rejected]"`를 매칭하지
+// 않음**을 이 테스트가 pin한다(둘은 별개 동작이며 조용히 회귀하면 안 된다).
+#[tokio::test]
+async fn push_rejected_by_server_hook_errors_never_ok() {
+    let env = setup();
+    let (bare, b, r) = (&env.bare, &env.b, &env.r);
+
+    // bare remote에 모든 push를 거부하는 pre-receive hook 설치(exit 1).
+    let hook = bare.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(bare.join("hooks")).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let bare_before = bare_rev_parse(bare, "main");
+
+    // B: fast-forward 가능한 정상 커밋(non-ff가 아니라 hook만이 거부 사유).
+    commit_local(b, "B ok change\n", "b-ok");
+
+    let pushed = push(r, b, "main", false).await;
+    assert!(
+        pushed.is_err(),
+        "hook이 거부한 push는 Err여야 한다(NonFastForwardRejected도 Ok/UpToDate도 아님): {pushed:?}"
+    );
+
+    // 원격 ref 미변경 — hook이 막았으므로 B의 커밋은 착지하지 않았다.
+    assert_eq!(
+        bare_rev_parse(bare, "main"),
+        bare_before,
+        "hook 거부 후 bare main이 미변경이어야 한다(B 커밋 미착지)"
+    );
+}
