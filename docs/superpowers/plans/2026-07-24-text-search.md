@@ -64,7 +64,7 @@ types(`SearchMatch`/`SearchFileResult`/`SearchResult`/`SearchOptions` — `types
 (`:33-35`, 세퍼레이터 런→단일 `/`, 선행 `/` 제거, **수동 문자열 연산 — `std::path` 금지**[실행-플랫폼 종속]),
 `split_search_glob_patterns`(`:143-175`, **escape 상태기계 C-정정 없음, verbatim**: `\`+다음문자 원형보존,
 미이스케이프 `,`만 분할, 후행 단독 `\` 보존, 빈 조각 drop, `chars()` 순회), `escape_regex`
-(`string-utils.ts:10-12`, 메타 12종), `normalize_search_result`/`normalize_search_file_match_count`
+(`string-utils.ts:10-12`, 메타 **14종** — `[.*+?^${}()|[\]\\]` 전개), `normalize_search_result`/`normalize_search_file_match_count`
 (`search-match-count.ts:3-30`, `max(matchCount, matches.len)` 하한 보정). *오라클:* 케이스 1(경로 정규화),
 6·7(glob escape: escaped-comma·trailing-backslash), 37·38(matchCount 보정·빈파일 필터). *mutation:* 세퍼레이터
 접기, escape 상태 전이, 빈조각 drop, matchCount 하한.

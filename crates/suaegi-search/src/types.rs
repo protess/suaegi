@@ -139,4 +139,81 @@ mod tests {
         assert_eq!(acc.total_matches, 0);
         assert!(!acc.truncated);
     }
+
+    /// Pin the camelCase IPC wire shape (the crate's central fidelity claim: it
+    /// matches Orca's `src/shared/types.ts` JSON). Serializes to the EXACT keys
+    /// Orca emits, and omits `None` optionals like `JSON.stringify` drops
+    /// `undefined`. *Mutation:* dropping `rename_all = "camelCase"` (→ snake_case
+    /// keys) or a wrong `rename` flips these key assertions.
+    #[test]
+    fn serializes_to_orca_camelcase_wire_keys() {
+        // A clamped match carries the display_* fields; an unclamped one omits them.
+        let clamped = SearchMatch {
+            line: 3,
+            column: 10,
+            match_length: 6,
+            line_content: "…snippet…".to_string(),
+            display_column: Some(2),
+            display_match_length: Some(6),
+        };
+        let v = serde_json::to_value(&clamped).unwrap();
+        let obj = v.as_object().unwrap();
+        // Exact wire keys, no snake_case leakage.
+        for k in [
+            "line",
+            "column",
+            "matchLength",
+            "lineContent",
+            "displayColumn",
+            "displayMatchLength",
+        ] {
+            assert!(obj.contains_key(k), "missing wire key {k}: {v}");
+        }
+        assert!(!obj.contains_key("match_length"), "snake_case leaked: {v}");
+
+        // Unclamped: display_* omitted (like JSON.stringify dropping undefined).
+        let plain = SearchMatch {
+            line: 1,
+            column: 1,
+            match_length: 3,
+            line_content: "abc".to_string(),
+            display_column: None,
+            display_match_length: None,
+        };
+        let pv = serde_json::to_value(&plain).unwrap();
+        assert!(!pv.as_object().unwrap().contains_key("displayColumn"));
+
+        let file = SearchFileResult {
+            file_path: "/root/a.ts".to_string(),
+            relative_path: "a.ts".to_string(),
+            matches: vec![plain],
+            match_count: Some(1),
+        };
+        let fv = serde_json::to_value(&file).unwrap();
+        let fobj = fv.as_object().unwrap();
+        for k in ["filePath", "relativePath", "matches", "matchCount"] {
+            assert!(fobj.contains_key(k), "missing file wire key {k}: {fv}");
+        }
+
+        let result = SearchResult {
+            files: vec![file],
+            total_matches: 1,
+            truncated: true,
+        };
+        let rv = serde_json::to_value(&result).unwrap();
+        let robj = rv.as_object().unwrap();
+        for k in ["files", "totalMatches", "truncated"] {
+            assert!(robj.contains_key(k), "missing result wire key {k}: {rv}");
+        }
+
+        // SearchOptions wire keys (deserialize from Orca's shape).
+        let opts: SearchOptions = serde_json::from_str(
+            r#"{"query":"q","rootPath":"/r","caseSensitive":true,"maxResults":50}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.query, "q");
+        assert_eq!(opts.root_path, "/r");
+        assert_eq!(opts.case_sensitive, Some(true));
+        assert_eq!(opts.max_results, Some(50));
+    }
 }

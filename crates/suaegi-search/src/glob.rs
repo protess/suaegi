@@ -1,11 +1,13 @@
 //! Include/exclude glob splitting — verbatim port of `splitSearchGlobPatterns`
 //! (`src/shared/text-search.ts:143-175`).
 
+use crate::js_trim::js_trim;
+
 /// Split a comma-separated glob string into individual patterns, honoring
 /// backslash escapes so an escaped comma (`foo\,bar`) stays inside one pattern.
 ///
-/// Verbatim state machine from `text-search.ts:143-175` (**no Codex
-/// correction** — ported exactly), iterating by Unicode scalar (`chars()`):
+/// Verbatim state machine from `text-search.ts:143-175`, iterating by Unicode
+/// scalar (`chars()`):
 /// - While `escaping`: append `\` **and** the char (escape preserved verbatim),
 ///   then clear `escaping`.
 /// - On an unescaped `\`: set `escaping`, consume (don't append yet).
@@ -14,7 +16,10 @@
 /// - After the loop: if still `escaping`, append a literal trailing `\`.
 /// - Finally: trim the last fragment, push if non-empty.
 ///
-/// Empty / whitespace-only fragments are dropped.
+/// Empty / whitespace-only fragments are dropped. **Fidelity note:** the two
+/// fragment trims use [`js_trim`], not Rust `str::trim()` — JS `.trim()` strips
+/// a different whitespace set (includes U+FEFF, excludes U+0085/NEL), so bare
+/// `str::trim()` would diverge from the oracle on those two codepoints.
 pub fn split_search_glob_patterns(patterns: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -33,7 +38,7 @@ pub fn split_search_glob_patterns(patterns: &str) -> Vec<String> {
             continue;
         }
         if ch == ',' {
-            let trimmed = current.trim();
+            let trimmed = js_trim(&current);
             if !trimmed.is_empty() {
                 out.push(trimmed.to_string());
             }
@@ -47,7 +52,7 @@ pub fn split_search_glob_patterns(patterns: &str) -> Vec<String> {
     if escaping {
         current.push('\\');
     }
-    let trimmed = current.trim();
+    let trimmed = js_trim(&current);
     if !trimmed.is_empty() {
         out.push(trimmed.to_string());
     }
@@ -111,5 +116,25 @@ mod tests {
     #[test]
     fn escaped_non_bmp_char_preserved() {
         assert_eq!(split_search_glob_patterns("\\\u{1F600}"), vec!["\\\u{1F600}"]);
+    }
+
+    /// Fragment trimming must use the JS whitespace set, not Rust's. JS `.trim()`
+    /// strips U+FEFF (so a BOM-only fragment becomes empty → dropped) but keeps
+    /// U+0085/NEL (so a NEL-delimited fragment survives with the NEL attached).
+    /// *Mutation:* reverting the two `js_trim` calls to `str::trim()` flips both
+    /// assertions (BOM kept, NEL stripped) → this test fails.
+    #[test]
+    fn fragment_trim_matches_js_whitespace_set() {
+        // U+FEFF-only fragment: JS trims to empty → dropped (Rust str::trim keeps it).
+        assert_eq!(
+            split_search_glob_patterns("a,\u{FEFF},b"),
+            vec!["a", "b"]
+        );
+        // U+0085/NEL is NOT JS-whitespace → the fragment survives with NEL intact
+        // (Rust str::trim would strip it, dropping the fragment).
+        assert_eq!(
+            split_search_glob_patterns("a,\u{0085}x,b"),
+            vec!["a", "\u{0085}x", "b"]
+        );
     }
 }

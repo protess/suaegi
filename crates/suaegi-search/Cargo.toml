@@ -14,3 +14,8 @@ license.workspace = true
 # drivers), NOT here.
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+# Why: pin the camelCase wire shape (Orca IPC parity) in a committed test. serde_json
+# becomes a real dependency in M3 (rg `--json` parsing); here it is test-only.
+serde_json = { workspace = true }

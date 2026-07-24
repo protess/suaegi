@@ -27,6 +27,7 @@
 
 mod constants;
 mod glob;
+mod js_trim;
 mod match_count;
 mod path;
 mod regex_escape;
