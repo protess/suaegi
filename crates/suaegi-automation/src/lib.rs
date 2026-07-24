@@ -9,6 +9,7 @@
 //! (F2). See `docs/superpowers/plans/2026-07-24-automation-schedules.md` §2 M1.
 
 mod cron;
+mod occurrence;
 mod rrule;
 
 pub use cron::{
@@ -25,6 +26,13 @@ pub use rrule::{
     parse_automation_rrule, parse_rrule, parse_schedule, try_parse_automation_rrule,
     AutomationRruleParts, AutomationSchedulePreset, ParsedRrule, ParsedSchedule, RruleError,
     RruleFreq, ScheduleError,
+};
+
+// M3 — occurrence math (next/latest run computation), the risky core. TZ is an explicit
+// param on every entry point (F2). See
+// `docs/superpowers/plans/2026-07-24-automation-schedules.md` §2 M3.
+pub use occurrence::{
+    latest_automation_occurrence_at_or_before, next_automation_occurrence_after, OccurrenceError,
 };
 
 // Re-export the timezone type so downstream crates and integration tests can name the
