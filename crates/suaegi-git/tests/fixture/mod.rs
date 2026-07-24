@@ -30,6 +30,39 @@ pub fn init_repo(dir: &Path) {
     run(dir, &["commit", "-m", "init"]);
 }
 
+/// 로컬 **bare** remote(네트워크 없이 AV). `dir`에 `git init --bare -b main`.
+/// clone/push/fetch/pull이 이걸 origin으로 왕복한다. 라이브 github auth만 사람눈이고,
+/// 로컬 bare 왕복은 자율 검증 가능하다.
+// M2 fetch/pull AV 하네스 전용 — 이 fixture를 include하는 다른 test 바이너리는 안 쓰므로
+// dead_code를 허용한다(공유 fixture를 부분집합만 쓰는 표준 idiom).
+#[allow(dead_code)]
+pub fn init_bare_remote(dir: &Path) {
+    run(dir, &["init", "--bare", "-b", "main"]);
+}
+
+/// bare remote를 `dest`로 clone하고 격리 identity/서명끄기/훅차단을 **로컬** config로 건다.
+///
+/// **로컬 config가 유일한 신뢰 격리다.** 실제 드라이버(`fetch`/`pull`)는 `GitRunner`를
+/// 거치는데, `GitRunner`는 (실 앱 정책상) `GIT_CONFIG_GLOBAL`을 세우지 않아 개발자 기계의
+/// 전역 config를 읽는다. 그래서 clone마다 로컬 config로 identity/`commit.gpgsign=false`/
+/// `pull.rebase=false`를 못 박아 개발자 전역 설정이 테스트를 오염시키지 못하게 한다.
+#[allow(dead_code)]
+pub fn clone_from(bare: &Path, dest: &Path) {
+    let parent = dest.parent().expect("dest has parent");
+    let name = dest.file_name().unwrap().to_str().unwrap();
+    run(parent, &["clone", bare.to_str().unwrap(), name]);
+    run(dest, &["config", "user.email", "t@example.com"]);
+    run(dest, &["config", "user.name", "test"]);
+    run(dest, &["config", "commit.gpgsign", "false"]);
+    run(dest, &["config", "tag.gpgsign", "false"]);
+    run(dest, &["config", "core.hooksPath", ".no-hooks"]);
+    // pull 전략을 명시적으로 고정 — 개발자 전역 `pull.rebase`/`pull.ff`가 어떻든
+    // divergent pull이 결정적으로 동작하게 한다. drop-`--ff-only` mutation을 드러내는
+    // merge 경로도 여기 설정 위에서 재현된다.
+    run(dest, &["config", "pull.rebase", "false"]);
+    std::fs::create_dir_all(dest.join(".no-hooks")).unwrap();
+}
+
 pub fn run(dir: &Path, args: &[&str]) {
     let cfg = dir.join(".test-gitconfig");
     if !cfg.exists() {
