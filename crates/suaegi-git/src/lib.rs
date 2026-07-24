@@ -1,6 +1,7 @@
 pub mod compare;
 pub mod conflict;
 pub mod fs;
+pub mod history;
 pub mod quick_open;
 pub mod refname;
 pub mod repo_probe;
