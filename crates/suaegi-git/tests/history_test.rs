@@ -332,3 +332,105 @@ async fn remote_ahead_is_incoming() {
     assert!(h.has_incoming, "리모트가 앞서면 incoming");
     assert!(!h.has_outgoing);
 }
+
+// ── F1: hasMore off-by-one 경계 ───────────────────────────────────────────────
+// 커밋 수 == limit인 케이스를 명시적으로 고정한다. `parsed.len() > limit`의
+// `>`→`>=` mutation은 이 경계(정확히 같을 때)에서만 갈린다.
+#[tokio::test]
+async fn has_more_boundary_when_commits_equal_limit() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    fixture::init_repo(p); // c1
+    commit(p, "a.txt", "a\n", &["c2"]);
+    commit(p, "b.txt", "b\n", &["c3"]); // 정확히 3 커밋
+
+    // 커밋 3 == limit 3 → 더 없음. `>`가 `>=`면 여기서 has_more=true로 깨진다.
+    let h = load_history(&runner(), p, 3).await.unwrap();
+    assert_eq!(h.items.len(), 3);
+    assert!(
+        !h.has_more,
+        "커밋수==limit면 has_more=false여야 한다 (off-by-one 경계)"
+    );
+
+    // 커밋 4 > limit 3 → 더 있음. 양방향으로 고정.
+    commit(p, "c.txt", "c\n", &["c4"]);
+    let h4 = load_history(&runner(), p, 3).await.unwrap();
+    assert_eq!(h4.items.len(), 3);
+    assert!(h4.has_more, "커밋수>limit면 has_more=true");
+}
+
+// ── F2: author_timestamp 필드 + 단위 ──────────────────────────────────────────
+// 알려진 author date로 커밋 후 author_timestamp가 **그 unix 초**와 일치하는지
+// 단언한다. `get(3)`(%at)→`get(4)`(%ct) mutation은 값이 달라져 깨진다. Orca는
+// ms(*1000)지만 suaegi는 의도적으로 초를 저장하므로 초로 단언한다.
+#[tokio::test]
+async fn author_timestamp_is_unix_seconds_from_at_field() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    fixture::init_repo(p);
+    // author date만 고정(committer date는 now라 %at≠%ct → 오프셋 mutation이 갈린다).
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    fixture::run(p, &["add", "a.txt"]);
+    fixture::run(p, &["commit", "--date=@1700000000", "-m", "fixed date"]);
+
+    let h = load_history(&runner(), p, DEFAULT_LIMIT).await.unwrap();
+    assert_eq!(
+        h.items[0].author_timestamp, 1_700_000_000,
+        "author_timestamp는 %at의 unix 초여야 한다 (필드/단위)"
+    );
+}
+
+// ── F3: author_name / author_email 핀 ─────────────────────────────────────────
+// name≠email인 커밋에서 두 필드를 정확히 단언한다. get(1)↔get(2) swap mutation이
+// 깨진다.
+#[tokio::test]
+async fn author_name_and_email_are_not_swapped() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    fixture::init_repo(p);
+    fixture::run(p, &["config", "user.name", "Alice Author"]);
+    fixture::run(p, &["config", "user.email", "alice@example.com"]);
+    commit(p, "a.txt", "a\n", &["by alice"]);
+
+    let h = load_history(&runner(), p, DEFAULT_LIMIT).await.unwrap();
+    let top = &h.items[0];
+    assert_eq!(top.author_name, "Alice Author");
+    assert_eq!(top.author_email, "alice@example.com");
+}
+
+// ── F4: origin/HEAD 심볼릭 ref 필터(is_remote_head) ───────────────────────────
+// `refs/remotes/origin/HEAD` 심볼릭 ref를 만들어 decoration에 노출시킨 뒤,
+// 리모트 브랜치 pill로 **새어 나오지 않는지** 단언한다. is_remote_head가 항상
+// false를 반환하면 origin/HEAD가 RemoteBranches로 잡혀 깨진다.
+#[tokio::test]
+async fn origin_head_symref_is_filtered_out() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    fixture::init_repo(p);
+    commit(p, "a.txt", "a\n", &["c2"]);
+    let c = git_out(p, &["rev-parse", "HEAD"]);
+    fixture::run(p, &["update-ref", "refs/remotes/origin/main", &c]);
+    fixture::run(
+        p,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let h = load_history(&runner(), p, DEFAULT_LIMIT).await.unwrap();
+    let refs = &h.items[0].references;
+    // origin/main 실 브랜치는 노출된다.
+    assert!(
+        refs.iter().any(|r| r.name == "origin/main"),
+        "origin/main은 pill로 보여야 한다"
+    );
+    // origin/HEAD 심볼릭은 걸러진다.
+    assert!(
+        !refs
+            .iter()
+            .any(|r| r.name == "origin/HEAD" || r.id.ends_with("/HEAD")),
+        "origin/HEAD 심볼릭 ref는 걸러져야 한다 (is_remote_head)"
+    );
+}
