@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-http", "crates/suaegi-secrets", "crates/suaegi-tracker", "crates/suaegi-term", "crates/suaegi-app", "crates/suaegi-keys", "crates/suaegi-fuzzy"]
+members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-http", "crates/suaegi-secrets", "crates/suaegi-tracker", "crates/suaegi-term", "crates/suaegi-app", "crates/suaegi-keys", "crates/suaegi-fuzzy", "crates/suaegi-automation"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,3 +28,8 @@ base64 = "0.22"
 # 7a-2b HTTP GitHub 백엔드용. rustls(ring)만 — native-tls/OpenSSL·cmake 의존을 피한다.
 # blocking이 아니라 async: forge 트레잇이 async_trait이고 앱이 tokio 위에서 돈다.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# suaegi-automation leaf crate. Orca의 스케줄 산술이 전부 로컬 wall-clock
+# (getHours/getDate/getDay/setHours)이라, ambient Local(F2 금지) 대신 명시 IANA TZ를
+# 주입해 결정론적으로 재현한다. clock 피처는 끈다 — Local/now 접근을 컴파일 단에서 차단.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
