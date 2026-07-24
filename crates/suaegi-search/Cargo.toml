@@ -10,9 +10,15 @@ license.workspace = true
 # of the already-ported Quick Open (suaegi-fuzzy). M1 was the pure foundation:
 # types, constants, path/glob/regex string helpers, match-count normalization —
 # serde only. M2 adds the argv builders + submatch locator (the `regex` dep).
-# serde_json/tokio arrive with M3/M4 (stream parser, drivers), NOT here.
+# tokio arrives with M4 (drivers), NOT here.
 [dependencies]
 serde = { workspace = true }
+# Why: M3 `ingest_rg_json_line` parses ripgrep `--json` events. Tolerant
+# deserialization (unknown fields ignored, missing fields defaulted, int-or-float
+# numeric fields) mirrors Orca's `JSON.parse` + `?? default` leniency; a malformed
+# line is skipped (returns Continue), never aborting the stream. Promoted from a
+# dev-dependency to a real dependency here (was test-only in M1/M2).
+serde_json = { workspace = true }
 # Why: M2 `build_submatch_regex` — best-effort locator that re-scans a git-grep
 # match line for all occurrence columns (git grep reports only the first hit per
 # line). NOT a JS/ERE validator: a compile failure yields `None` → whole-line
@@ -20,7 +26,3 @@ serde = { workspace = true }
 # `escape_regex` before compiling, so `.`/`*` match literally.
 regex = { workspace = true }
 
-[dev-dependencies]
-# Why: pin the camelCase wire shape (Orca IPC parity) in a committed test. serde_json
-# becomes a real dependency in M3 (rg `--json` parsing); here it is test-only.
-serde_json = { workspace = true }
