@@ -365,3 +365,50 @@ fn parse_schedule_wraps_cron_errors_on_the_cron_branch() {
         "cron-branch failure must be a Cron error, got {err:?}"
     );
 }
+
+// -------------------------------------------------------------------------------------
+// JS-faithful trim at the dispatch boundary (review lead defect). Rust `str::trim()` strips
+// the Unicode White_Space property, which DIVERGES from ECMAScript `String.prototype.trim`
+// at two codepoints: U+FEFF (JS strips, Rust keeps) and U+0085/NEL (Rust strips, JS keeps).
+// `parse_schedule` must use the JS set so it agrees with Orca byte-for-byte.
+// -------------------------------------------------------------------------------------
+
+#[test]
+fn leading_bom_is_trimmed_like_js() {
+    // U+FEFF (BOM/ZWNBSP): JS `trim` strips it → `FREQ=DAILY` is a valid schedule. Bare
+    // Rust `str::trim()` would KEEP it, making the key `\u{FEFF}FREQ` → FREQ absent → invalid.
+    // *Mutation:* revert `js_trim` to `str::trim()` → this assertion FAILS.
+    let with_bom = "\u{FEFF}FREQ=DAILY";
+    assert!(
+        is_valid_automation_schedule(with_bom, anchor(), UTC),
+        "leading U+FEFF must be trimmed (JS-faithful) so FREQ=DAILY is valid"
+    );
+    // And the cron path shares the same helper: a BOM-prefixed cron expr is valid too.
+    assert!(is_valid_automation_cron_schedule("\u{FEFF}0 9 * * *", anchor(), UTC));
+}
+
+#[test]
+fn leading_nel_is_not_trimmed_like_js() {
+    // U+0085 (NEL): ECMAScript `trim` does NOT strip it, so `\u{0085}FREQ=DAILY` keeps the
+    // NEL in the key → FREQ absent → invalid. Bare Rust `str::trim()` WOULD strip U+0085,
+    // wrongly making it valid. *Mutation:* revert to `str::trim()` → this assertion FAILS.
+    let with_nel = "\u{0085}FREQ=DAILY";
+    assert!(
+        !is_valid_automation_schedule(with_nel, anchor(), UTC),
+        "leading U+0085/NEL must NOT be trimmed (JS keeps it) so the rule is invalid"
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// Empty-value guard (review nit 2): `if (key && value)` skips empty values, so `BYHOUR=`
+// is never stored and the default 9 applies (NOT 0). Pins rrule.rs's `!value.is_empty()`.
+// -------------------------------------------------------------------------------------
+
+#[test]
+fn empty_byhour_value_falls_back_to_default_nine() {
+    // `BYHOUR=` (empty value) → guard skips it → default 9. *Mutation:* drop the
+    // `!value.is_empty()` guard → empty value stored → js_number("") == 0 → by_hour 0 → FAIL.
+    let parsed = parse_rrule("FREQ=DAILY;BYHOUR=;BYMINUTE=").unwrap();
+    assert_eq!(parsed.by_hour, 9, "empty BYHOUR must default to 9, not 0");
+    assert_eq!(parsed.by_minute, 0, "empty BYMINUTE default is 0");
+}

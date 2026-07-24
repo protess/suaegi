@@ -9,7 +9,8 @@
 use chrono_tz::Tz;
 
 use crate::cron::{
-    cron_has_possible_occurrence, is_js_integer, js_number, parse_cron_expression, CronError,
+    cron_has_possible_occurrence, is_js_integer, js_number, js_trim, parse_cron_expression,
+    CronError,
     ParsedCron, DAY_CODES, WEEKDAY_CODES,
 };
 
@@ -297,7 +298,7 @@ impl std::error::Error for ScheduleError {}
 /// trimmed input routes to the RRULE parser — even cron-looking input like `0 9 * * MON=1`.
 /// A `FREQ=...` string therefore never reaches the cron parser.
 pub fn parse_schedule(schedule: &str) -> Result<ParsedSchedule, ScheduleError> {
-    let trimmed = schedule.trim();
+    let trimmed = js_trim(schedule);
     if trimmed.contains('=') {
         parse_rrule(trimmed)
             .map(ParsedSchedule::Rrule)
