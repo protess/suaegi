@@ -292,3 +292,73 @@ fn latest_cron_none_when_no_match_at_or_after_dtstart() {
     .unwrap();
     assert_eq!(latest, None);
 }
+
+// =======================================================================================
+// Boundary-coverage pins (M3 review): four `<`/`<=` sub-clauses the source gets right but
+// no existing test would catch if inverted. Each mutant SURVIVES the rest of the suite —
+// these close that gap so a future drift away from the JS source is caught.
+// =======================================================================================
+
+/// HOURLY next `candidate <= after` sub-clause (occurrence.rs). When `dtstart <= after` the
+/// `< dtstart` clause is inert, so ONLY the `<= after` sub-clause advances an on-`after`
+/// candidate. dtstart 09:00, after exactly 10:00, byMinute 0 → base 10:00 == after → +HOUR →
+/// 11:00. *Mutation:* `<= after` → `< after` returns 10:00 (== after) → FAIL.
+#[test]
+fn hourly_next_candidate_equal_to_after_advances() {
+    let rrule = build_automation_rrule(AutomationSchedulePreset::Hourly, 9, 0, None);
+    let next = next_automation_occurrence_after(
+        &rrule,
+        ms(2026, 5, 13, 9, 0),
+        ms(2026, 5, 13, 10, 0),
+        UTC,
+    )
+    .unwrap();
+    assert_eq!(next, ms(2026, 5, 13, 11, 0));
+}
+
+/// latest-HOURLY `candidate > now` sub-clause. When the candidate equals `now` exactly it
+/// must NOT overshoot backward. now 14:30:00, byMinute 30 → base 14:30 == now → keep 14:30.
+/// *Mutation:* `> now` → `>= now` subtracts an hour → 13:30 → FAIL.
+#[test]
+fn latest_hourly_candidate_equal_to_now_is_kept() {
+    let rrule = build_automation_rrule(AutomationSchedulePreset::Hourly, 9, 30, None);
+    let latest = latest_automation_occurrence_at_or_before(
+        &rrule,
+        ms(2026, 5, 13, 0, 0),
+        ms(2026, 5, 13, 14, 30),
+        UTC,
+    )
+    .unwrap();
+    assert_eq!(latest, Some(ms(2026, 5, 13, 14, 30)));
+}
+
+/// latest early-return `now < dtstart`. When `now == dtstart` on a matching slot the result
+/// is `Some(dtstart)`, not `None`. `30 14 * * *`, dtstart == now == 14:30 (a match).
+/// *Mutation:* `now < dtstart` → `now <= dtstart` returns None → FAIL.
+#[test]
+fn latest_now_equal_to_dtstart_on_match_is_some() {
+    let latest = latest_automation_occurrence_at_or_before(
+        "30 14 * * *",
+        ms(2026, 5, 13, 14, 30),
+        ms(2026, 5, 13, 14, 30),
+        UTC,
+    )
+    .unwrap();
+    assert_eq!(latest, Some(ms(2026, 5, 13, 14, 30)));
+}
+
+/// latest-CRON loop guard `candidate >= dtstart`. When the matching minute lands exactly on
+/// `dtstart` and `now` is just after, the loop must still accept it. `30 14 * * *`,
+/// dtstart 14:30, now 14:31 → scan back to 14:30 == dtstart → Some(14:30).
+/// *Mutation:* `>= dtstart` → `> dtstart` stops the scan one minute early → None → FAIL.
+#[test]
+fn latest_cron_match_exactly_on_dtstart_is_included() {
+    let latest = latest_automation_occurrence_at_or_before(
+        "30 14 * * *",
+        ms(2026, 5, 13, 14, 30),
+        ms(2026, 5, 13, 14, 31),
+        UTC,
+    )
+    .unwrap();
+    assert_eq!(latest, Some(ms(2026, 5, 13, 14, 30)));
+}
