@@ -4072,6 +4072,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-search"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "suaegi-secrets"
 version = "0.1.0"
 dependencies = [
