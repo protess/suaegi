@@ -59,7 +59,7 @@ pub fn clamp_line_context(text: &str, match_start: usize, match_length: usize) -
     if text.len() <= MAX_LINE_CONTENT_LENGTH {
         return Clamped {
             line_content: text.to_string(),
-            column: match_start + 1,
+            column: match_start.saturating_add(1),
             match_length,
             display_column: None,
             display_match_length: None,
@@ -71,11 +71,19 @@ pub fn clamp_line_context(text: &str, match_start: usize, match_length: usize) -
     let clamped_match_length = match_length.min(MAX_LINE_CONTENT_LENGTH);
     let remaining = MAX_LINE_CONTENT_LENGTH - clamped_match_length;
     let left_budget = remaining / 2;
-    // `max(0, match_start - left_budget)` → saturating_sub.
-    let mut window_start = match_start.saturating_sub(left_budget);
+    // `max(0, match_start - left_budget)` → saturating_sub. Also clamp to
+    // `text.len()`: an out-of-range `match_start` (malformed rg submatch offset
+    // the tolerant parser accepts) would otherwise overflow the `+ 500` below in
+    // debug, or make the char-boundary snap loop walk billions of bytes in
+    // release. JS `String.slice` clamps out-of-range indices for free; we do it
+    // explicitly. `window_end`/`display_column` still use the raw `match_start`,
+    // matching JS's out-of-range (garbage-in-garbage-out) column.
+    let mut window_start = match_start.saturating_sub(left_budget).min(text.len());
     let mut window_end = text.len().min(window_start + MAX_LINE_CONTENT_LENGTH);
-    // Pull the left edge back when the right edge hit EOL, to fill the window (`:85`).
-    window_start = window_start.max(window_end.saturating_sub(MAX_LINE_CONTENT_LENGTH));
+    // Pull the left edge back when the right edge hit EOL, to fill the window
+    // (`:85` — `windowStart = max(0, windowEnd - 500)`, an UNCONDITIONAL reassign,
+    // not `max(windowStart, …)`; the latter is a no-op that never pulls back).
+    window_start = window_end.saturating_sub(MAX_LINE_CONTENT_LENGTH);
 
     // C1: snap to char boundaries *before* slicing — outward, so we never split a
     // scalar and never panic. `0` and `text.len()` are always boundaries, so both
@@ -94,12 +102,12 @@ pub fn clamp_line_context(text: &str, match_start: usize, match_length: usize) -
     let mut snippet = text[window_start..window_end].to_string();
     // Display column: 1-based byte offset of the match within the (pre-marker)
     // snippet. `window_start <= match_start` by construction, so no underflow.
-    let mut display_column = match_start.saturating_sub(window_start) + 1;
+    let mut display_column = match_start.saturating_sub(window_start).saturating_add(1);
     if window_start > 0 {
         snippet.insert_str(0, TRUNCATION_MARKER);
         // Byte-measured column: the marker adds its UTF-8 byte length (3), not
         // Orca's UTF-16 length (1). See module note.
-        display_column += TRUNCATION_MARKER.len();
+        display_column = display_column.saturating_add(TRUNCATION_MARKER.len());
     }
     if window_end < text.len() {
         snippet.push_str(TRUNCATION_MARKER);
@@ -107,7 +115,7 @@ pub fn clamp_line_context(text: &str, match_start: usize, match_length: usize) -
 
     Clamped {
         line_content: snippet,
-        column: match_start + 1,
+        column: match_start.saturating_add(1),
         match_length,
         display_column: Some(display_column),
         display_match_length: Some(clamped_match_length),
@@ -214,5 +222,52 @@ mod tests {
         let c = clamp_line_context(&text, 5000, 10_000);
         assert!(std::str::from_utf8(c.line_content.as_bytes()).is_ok());
         assert!(c.line_content.len() <= MAX_LINE_CONTENT_LENGTH + 2 * TRUNCATION_MARKER.len());
+    }
+
+    /// **Cardinal-rule guard (review BLOCKER):** an *extreme* out-of-range
+    /// `match_start` — a malformed rg submatch offset the tolerant parser accepts
+    /// — must neither PANIC (debug: `window_start + 500` overflow) nor HANG
+    /// (release: the char-boundary snap loop walking billions of bytes). The
+    /// windowing path only runs when the line exceeds the cap.
+    ///
+    /// *Mutation:* dropping the `.min(text.len())` clamp on `window_start` →
+    /// `usize::MAX` overflows the `+ 500` in debug and this test panics.
+    #[test]
+    fn extreme_out_of_range_match_start_never_panics_or_hangs() {
+        let text = "a".repeat(1000); // > MAX_LINE_CONTENT_LENGTH so windowing runs
+        for &start in &[2_000_000_000usize, usize::MAX, usize::MAX - 6] {
+            let c = clamp_line_context(&text, start, 6);
+            // Completes fast, valid UTF-8, bounded — window pinned to the line's tail.
+            assert!(std::str::from_utf8(c.line_content.as_bytes()).is_ok());
+            assert!(c.line_content.len() <= MAX_LINE_CONTENT_LENGTH + 2 * TRUNCATION_MARKER.len());
+        }
+    }
+
+    /// **Left-edge pull-back (review divergence):** for a match near EOL in an
+    /// over-cap ASCII line, Orca's `:85` (`windowStart = max(0, windowEnd-500)`)
+    /// pulls the left edge back to fill a full 500-wide window. A `match_start`
+    /// close to the end must still yield a ~500-byte snippet (plus a leading
+    /// marker), NOT a narrow right-aligned sliver.
+    ///
+    /// *Mutation:* the buggy `window_start.max(window_end.saturating_sub(500))`
+    /// (a no-op) leaves the window right-aligned at ~253 bytes → this fails.
+    #[test]
+    fn eol_match_pulls_left_edge_back_to_fill_window() {
+        let text = format!("{}NEEDLE", "x".repeat(600)); // len 606, > cap
+        let match_start = 600; // NEEDLE starts at EOL region
+        let c = clamp_line_context(&text, match_start, 6);
+
+        // Window filled: 500 content bytes + a leading "…" marker (left edge > 0),
+        // no trailing marker (right edge == EOL). The buggy no-op pull-back would
+        // give only ~253 content bytes.
+        assert!(
+            c.line_content.len() >= MAX_LINE_CONTENT_LENGTH,
+            "left edge not pulled back: snippet only {} bytes",
+            c.line_content.len()
+        );
+        assert_eq!(c.column, match_start + 1);
+        // Display coords still recover NEEDLE.
+        let dc = c.display_column.unwrap();
+        assert_eq!(&c.line_content.as_bytes()[dc - 1..dc - 1 + 6], b"NEEDLE");
     }
 }
