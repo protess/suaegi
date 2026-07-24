@@ -4,7 +4,7 @@
 //! Open file-name scorer (`suaegi-fuzzy`), for grepping file *contents* via
 //! ripgrep (`--json`) with a git-grep fallback.
 //!
-//! # Milestones M1–M2 — pure foundation + argv builders
+//! # Milestones M1–M3 — pure foundation + argv builders + stream parsers
 //! This crate currently contains the pure, IO-free half of Orca's module:
 //! - **Types** ([`SearchMatch`], [`SearchFileResult`], [`SearchResult`],
 //!   [`SearchOptions`]) — verbatim from `src/shared/types.ts:3543-3574`, plus
@@ -21,18 +21,27 @@
 //!   `--`/`-e … --` terminators are the argv-injection guard), and
 //!   [`build_submatch_regex`] (the `regex`-crate best-effort locator, plan
 //!   C2/C3). This is where the `regex` dependency lands.
+//! - **M3 — stream parsers + accumulator** — [`clamp_line_context`] (plan **C1**
+//!   byte-safety: canonical byte-derived source coords + char-boundary-safe render
+//!   window), [`ingest_rg_json_line`] (tolerant `serde_json` parse; **C6** byte-safe
+//!   empty-submatch fallback), [`ingest_git_grep_line`] (modern NUL + legacy colon
+//!   formats; git-confirmed-hit fallback), and [`finalize`]. The `push_match`
+//!   truncated invariant (**C5**) and `Ingest` verdict live here. This is where
+//!   `serde_json` becomes a real dependency.
 //!
-//! The stream parser (M3) and tokio drivers (M4) — and their `serde_json`/`tokio`
-//! dependencies — are intentionally NOT here yet.
+//! The tokio drivers (M4) — and their `tokio` dependency — are intentionally NOT
+//! here yet.
 //!
 //! # JS→Rust boundary shape
 //! The wire types serialize with `rename_all = "camelCase"` so they match Orca's
 //! IPC shape (`filePath`, `matchCount`, …) once M4 crosses the boundary. Rust
 //! field names stay `snake_case`.
 
+mod clamp;
 mod constants;
 mod git_grep_args;
 mod glob;
+mod ingest;
 mod js_trim;
 mod match_count;
 mod path;
@@ -41,10 +50,12 @@ mod rg_args;
 mod submatch;
 mod types;
 
+pub use clamp::{clamp_line_context, Clamped};
 pub use constants::{
     DEFAULT_SEARCH_MAX_RESULTS, MAX_LINE_CONTENT_LENGTH, MAX_MATCHES_PER_FILE,
     SEARCH_MAX_FILE_SIZE, SEARCH_TIMEOUT_MS, TRUNCATION_MARKER,
 };
+pub use ingest::{finalize, ingest_git_grep_line, ingest_rg_json_line, Ingest};
 pub use git_grep_args::{build_git_grep_args, to_git_glob_pathspec};
 pub use glob::split_search_glob_patterns;
 pub use rg_args::build_rg_args;
