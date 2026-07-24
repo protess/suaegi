@@ -401,6 +401,66 @@ pub async fn pull(runner: &GitRunner, worktree: &Path) -> Result<PullOutcome, Gi
     }
 }
 
+// ── push 드라이버(M3, 실제 git 호출) ─────────────────────────────────────────
+
+/// `git push [--set-upstream] origin HEAD:<branch>`을 실행하고([`push_args`]) 결과를
+/// [`PushOutcome`]으로 분류한다. **`--force` 절대 없음**(force-with-lease는 M4).
+///
+/// ## API 모양(NonFastForwardRejected는 값이지 성공이 아니다)
+/// M2 [`pull`]과 같은 계약이다 — **분류 가능한 결과는 `Ok(값)`, 진짜 전송 에러는 `Err`**:
+/// - exit 0 → [`PushOutcome::Ok`] 또는 [`PushOutcome::UpToDate`]("Everything up-to-date").
+/// - 원격이 non-fast-forward로 **거부** → [`PushOutcome::NonFastForwardRejected`]를 **값으로**
+///   돌린다(`Err`가 아니라). 호출부(미래 PR 생성 플로)가 "내가 생각하는 커밋이 원격에 **없다**"를
+///   판정해 stale ref에 PR을 만들지 않으려면 이 케이스를 auth/네트워크 실패와 **구분**해서
+///   inspect할 수 있어야 하기 때문이다. `Err`로 뭉개면 그 구분이 사라진다.
+/// - auth/네트워크/그 밖의 실패 → `Err(GitError)`([`normalize_git_error_message`]로 credential
+///   정제 + push 문맥). 이건 "원격 상태를 아예 모른다"는 진짜 전송 실패다.
+///
+/// **`NonFastForwardRejected`는 어떤 경로로도 성공으로 읽히지 않는다**(대죄 방지): 이건 `Ok`도
+/// `UpToDate`도 아닌 **별개의 enum variant**다. `Result`가 `Ok`로 감싸는 건 "git을 돌리는 데
+/// 성공했다"일 뿐, 값 자체는 거부를 명시한다. 호출부는 `Ok | UpToDate`만 "원격에 올라감"으로
+/// 취급하고 그 밖의 값은 전부 "PR 만들지 마라"로 읽어야 한다. classify가 이걸 `Ok`로 매핑하는
+/// mutation은 AV 테스트(원격 ref 미변경 단언 포함)가 죽인다.
+///
+/// ## --set-upstream
+/// `set_upstream`은 호출부가 정한다 — 새 브랜치의 **최초 push**(upstream 없음, M1
+/// [`parse_upstream`]/[`is_no_upstream_error`]로 판정)에 `true`. 이미 tracking 중인 브랜치엔
+/// 불필요하지만 `true`를 줘도 무해하다(git이 upstream을 다시 세울 뿐). Orca(`remote.ts:202-207`)는
+/// 항상 세운다 — suaegi는 파라미터화해 최초 publish 때만 붙이도록 남겨 둔다.
+pub async fn push(
+    runner: &GitRunner,
+    worktree: &Path,
+    branch: &str,
+    set_upstream: bool,
+) -> Result<PushOutcome, GitError> {
+    let owned = push_args(branch, set_upstream);
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+    match runner.run(worktree, &argv).await {
+        // exit 0. 성공(ref 갱신) 또는 up-to-date. stderr로만 가른다("Everything up-to-date").
+        Ok(out) => Ok(classify_push_outcome(out.code, &out.stderr)),
+        // 비-0 exit. non-fast-forward 거부는 **clean 값**(NonFastForwardRejected)으로 돌린다 —
+        // 원격이 우리 push를 거부한 것이고, 워크플로가 stale ref를 피하려면 auth/네트워크
+        // 실패(`Err`)와 반드시 구분돼야 한다. 진짜 전송 실패는 credential 정제해 `Err`로.
+        Err(GitError::Failed { args, code, stderr }) => {
+            // non-fast-forward 거부만 clean 값으로. 나머지(AuthFailed/NetworkFailed/Other,
+            // 그리고 비-0 exit이 논리상 낼 수 없는 Ok/UpToDate까지)는 전부 진짜 전송/기타
+            // 실패로 취급해 credential 정제 후 `Err` — 성공으로는 절대 새지 않는다.
+            if classify_push_outcome(code.unwrap_or(1), &stderr)
+                == PushOutcome::NonFastForwardRejected
+            {
+                Ok(PushOutcome::NonFastForwardRejected)
+            } else {
+                Err(GitError::Failed {
+                    args,
+                    code,
+                    stderr: normalize_git_error_message(&stderr, RemoteOp::Push),
+                })
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 // ── upstream 파스 ────────────────────────────────────────────────────────────
 
 /// `git rev-parse --abbrev-ref --symbolic-full-name @{upstream}`의 stdout을 파스한다.
