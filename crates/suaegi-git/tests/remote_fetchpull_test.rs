@@ -233,3 +233,48 @@ async fn fetch_and_pull_error_when_no_remote() {
         "원격 없는 pull은 Err여야 한다(false 'up to date' 금지): {pulled:?}"
     );
 }
+
+// ── pull FF가 uncommitted 편집을 덮을 상황: DATA-SAFETY 회귀 ───────────────────
+//
+// B는 원격보다 뒤처져 있고(FF 가능) FF 대상 파일에 **커밋 안 된 편집**을 갖고 있다 →
+// `git pull --ff-only`은 그 편집을 덮어쓰지 않으려고 **거부**한다("Your local changes ...
+// would be overwritten by merge"). 이건 `is_ff_only_rejected`("Not possible to
+// fast-forward")에 **안 걸린다** → `pull()`이 `Err`(NotFastForward도 Ok도 아님).
+// git이 아예 손대지 않으므로 uncommitted 편집·HEAD 미변경, MERGE_HEAD 없음(데이터손실 0).
+//
+// 죽이는 mutation: `is_ff_only_rejected`가 이 문구("would be overwritten")까지 매칭하도록
+// 확장하면 → pull이 이걸 NotFastForward(Ok 값)로 잘못 분류 → `is_err()` 단언 FAIL.
+#[tokio::test]
+async fn pull_ff_only_preserves_uncommitted_edit_and_errors() {
+    let env = setup();
+    let (a, b, r) = (&env.a, &env.b, &env.r);
+
+    // 원격이 README를 FF로 갱신하게 만든다(B는 이 커밋을 아직 안 가짐).
+    a_push_new_commit(a, "remote FF content\n", "c2");
+
+    // B: README에 **커밋 안 된** 편집(FF가 이 파일을 건드리므로 덮어쓰기 대상).
+    std::fs::write(b.join("README.md"), "B uncommitted edit\n").unwrap();
+    let b_head_before = rev_parse(r, b, "HEAD").await;
+
+    let pulled = pull(r, b).await;
+    assert!(
+        pulled.is_err(),
+        "uncommitted 편집을 덮을 FF pull은 Err여야 한다(NotFastForward도 false success도 아님): {pulled:?}"
+    );
+
+    // 데이터-안전: uncommitted 편집 보존 + HEAD 미변경 + stuck merge 상태 없음.
+    assert_eq!(
+        std::fs::read_to_string(b.join("README.md")).unwrap(),
+        "B uncommitted edit\n",
+        "uncommitted 편집이 클로버되면 안 된다(데이터손실)"
+    );
+    assert_eq!(
+        rev_parse(r, b, "HEAD").await,
+        b_head_before,
+        "거부된 FF는 HEAD를 건드리면 안 된다"
+    );
+    assert!(
+        !b.join(".git").join("MERGE_HEAD").exists(),
+        "MERGE_HEAD가 남으면 stuck 상태다 — FF 거부는 merge를 시작조차 하지 않는다"
+    );
+}

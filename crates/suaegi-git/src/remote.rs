@@ -331,6 +331,10 @@ fn is_already_up_to_date(stdout: &str) -> bool {
 /// abort한다(half-merge·MERGE_HEAD·conflict marker 없음). unrelated-histories 거부
 /// ("refusing to merge unrelated histories")나 no-remote/네트워크 실패는 여기 해당하지
 /// 않는다 — 그건 진짜 에러로 표면화돼야 한다.
+///
+/// 문구-결합(version-coupled)이지만 **fail-safe**다: 미래 git이 이 문구를 바꾸면 diverged
+/// pull이 `NotFastForward` 대신 `Err`로 떨어질 뿐이다 — git이 여전히 거부하므로 워크트리는
+/// 미변경이고 false success도 없다. 최악이라도 분류가 덜 세분화될 뿐 데이터 안전은 유지된다.
 pub fn is_ff_only_rejected(stderr: &str) -> bool {
     stderr.contains("Not possible to fast-forward")
 }
