@@ -5,12 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Why: content-search backend (rg `--json` + git-grep fallback) — the pure
-# arg-builder + stream-parser half of Orca's `src/shared/text-search.ts`. Peer
-# of the already-ported Quick Open (suaegi-fuzzy). M1 was the pure foundation:
-# types, constants, path/glob/regex string helpers, match-count normalization —
-# serde only. M2 adds the argv builders + submatch locator (the `regex` dep).
-# tokio arrives with M4 (drivers), NOT here.
+# Why: content-search backend (rg `--json` + git-grep fallback). M1 was the pure
+# foundation (types, constants, string helpers — serde only); M2 added the argv
+# builders + submatch locator (the `regex` dep); M3 added the byte-safe stream
+# parsers (`serde_json`). M4 (this milestone) adds the IMPURE drivers that spawn
+# `rg`/`git` and stream their output through M1–M3 — so `tokio`/`thiserror`/`libc`
+# land here now.
 [dependencies]
 serde = { workspace = true }
 # Why: M3 `ingest_rg_json_line` parses ripgrep `--json` events. Tolerant
@@ -25,4 +25,22 @@ serde_json = { workspace = true }
 # highlight fallback (plan C2/C3). fixed-string queries are escaped via
 # `escape_regex` before compiling, so `.`/`*` match literally.
 regex = { workspace = true }
+# Why: M4 drivers spawn `rg`/`git` and stream stdout line-by-line with a wall-clock
+# timeout + explicit kill/reap — the same tokio process discipline as
+# `suaegi-git`'s quick_open. Matches suaegi-git's feature set.
+tokio = { workspace = true }
+# Why: M4 `SearchError` taxonomy (spawn / io / exit-error) — the transient≠empty
+# distinction is a typed enum so a caller can never mistake a failure for an empty
+# result.
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Why: process-group SIGKILL (`kill(-pid)`) so a timed-out/cap-stopped `rg`/`git`
+# takes any grandchildren with it — same discipline as suaegi-git's runner.
+libc = { workspace = true }
+
+[dev-dependencies]
+# Why: M4 driver tests spawn REAL `rg`/`git` against throwaway repos built in a
+# `tempdir()` fixture (the impure layer is verified end to end, not mocked).
+tempfile = { workspace = true }
 

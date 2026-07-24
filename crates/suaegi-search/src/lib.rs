@@ -4,8 +4,8 @@
 //! Open file-name scorer (`suaegi-fuzzy`), for grepping file *contents* via
 //! ripgrep (`--json`) with a git-grep fallback.
 //!
-//! # Milestones M1–M3 — pure foundation + argv builders + stream parsers
-//! This crate currently contains the pure, IO-free half of Orca's module:
+//! # Milestones M1–M4 — pure foundation + argv builders + stream parsers + drivers
+//! The pure, IO-free half of Orca's module (M1–M3):
 //! - **Types** ([`SearchMatch`], [`SearchFileResult`], [`SearchResult`],
 //!   [`SearchOptions`]) — verbatim from `src/shared/types.ts:3543-3574`, plus
 //!   the internal [`SearchAccumulator`] used by the M3 stream parser.
@@ -29,8 +29,10 @@
 //!   truncated invariant (**C5**) and `Ingest` verdict live here. This is where
 //!   `serde_json` becomes a real dependency.
 //!
-//! The tokio drivers (M4) — and their `tokio` dependency — are intentionally NOT
-//! here yet.
+//! - **M4 — the IMPURE process drivers** — [`run_search`] spawns `rg` (or falls
+//!   back to `git grep`) and streams the child's stdout through the M1–M3 parsers,
+//!   with a wall-clock timeout, explicit kill/reap, and the **transient≠empty**
+//!   contract ([`SearchError`]). This is where `tokio`/`thiserror`/`libc` land.
 //!
 //! # JS→Rust boundary shape
 //! The wire types serialize with `rename_all = "camelCase"` so they match Orca's
@@ -39,6 +41,7 @@
 
 mod clamp;
 mod constants;
+mod driver;
 mod git_grep_args;
 mod glob;
 mod ingest;
@@ -51,6 +54,7 @@ mod submatch;
 mod types;
 
 pub use clamp::{clamp_line_context, Clamped};
+pub use driver::{run_search, SearchError};
 pub use constants::{
     DEFAULT_SEARCH_MAX_RESULTS, MAX_LINE_CONTENT_LENGTH, MAX_MATCHES_PER_FILE,
     SEARCH_MAX_FILE_SIZE, SEARCH_TIMEOUT_MS, TRUNCATION_MARKER,
