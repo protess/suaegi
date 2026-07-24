@@ -129,7 +129,7 @@ type Normalize = fn(i64) -> i64;
 /// decimals, and exponents. Rust's `f64::from_str` covers decimals/exponents but rejects
 /// the radix prefixes (and would accept `inf`/`nan` spellings — harmless here since those
 /// are non-integers and get rejected downstream just as JS's `NaN`/`Infinity` do).
-fn js_number(raw: &str) -> f64 {
+pub(crate) fn js_number(raw: &str) -> f64 {
     let s = raw.trim();
     if s.is_empty() {
         return 0.0;
@@ -147,7 +147,7 @@ fn js_number(raw: &str) -> f64 {
 }
 
 /// True iff `value` is a finite integer — the `Number.isInteger` predicate.
-fn is_js_integer(value: f64) -> bool {
+pub(crate) fn is_js_integer(value: f64) -> bool {
     value.is_finite() && value.fract() == 0.0
 }
 
