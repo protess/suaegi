@@ -17,6 +17,18 @@
 //!   treated as an object with no fields, NOT an error (C4 correction);
 //! - object → per-field parse with fallbacks.
 //!
+//! ## Sanctioned divergences (serde_json is *stricter* than `JSON.parse`)
+//! A security-review differential (~3,100 cases) found three pathological JSON
+//! classes where JS `JSON.parse` returns a value (→ `Ok(fallback)`) but
+//! serde_json rejects (→ `Err(InvalidJson)`). All are the **safe direction**
+//! (never garbage-as-success) on inputs no realistic LLM emits for a compact
+//! PR-fields response, so we accept them as documented divergences rather than
+//! hand-rolling a `JSON.parse`-bug-compatible parser:
+//! - **lone-surrogate escapes** (`{"base":"\uD800"}`) — JS keeps a lone
+//!   surrogate; serde_json rejects (a Rust `String` cannot hold one anyway);
+//! - **non-finite numbers** (`1e999` → `Infinity` in JS) — serde_json rejects;
+//! - **deep nesting ≥ 127** — serde_json's default recursion limit rejects.
+//!
 //! # Other ported quirks (C5/C6)
 //! - `strip_json_fence`/`get_json_fence_body` are hand-rolled (no `[\s\S]` match,
 //!   no `/\r\n/` replace — the oracle spies forbid them).
