@@ -11,6 +11,8 @@ serde = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
