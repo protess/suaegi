@@ -1,0 +1,15 @@
+[package]
+name = "suaegi-taskquery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's task-list search-query DSL parser
+# (src/shared/task-query.ts @ v1.4.150-rc.0). Pure String <-> struct, so it has
+# ZERO dependencies (not even serde: nothing serializes these types yet, the
+# module is a self-contained parser/serializer). No `regex` crate either — the
+# tokenizer is a hand-rolled char state machine and the two `\s`/`repo:` regexes
+# are re-derived as explicit predicates (see plan Codex decisions C1/C4).
+# suaegi-fuzzy / suaegi-keys precedent.
+[dependencies]
