@@ -4084,6 +4084,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-misc"
+version = "0.1.0"
+
+[[package]]
 name = "suaegi-search"
 version = "0.1.0"
 dependencies = [
