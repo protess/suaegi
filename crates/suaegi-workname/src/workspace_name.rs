@@ -321,7 +321,7 @@ fn compact_work_item_title(title: &str, item: &WorkspaceIntentWorkItem) -> Strin
         .unwrap();
         without_prefix = js_trim(&re.replace_all(&without_prefix, "")).to_string();
     }
-    if let Some(id) = identifier {
+    if let Some(id) = identifier.filter(|s| !s.is_empty()) {
         // Dynamic `^<escapeRegExp(identifier)>\s*[:-]?\s*` (C4-escaped, `(?i)`).
         let re = Regex::new(&format!(
             "(?i)^{}[{WS_CLASS}]*[:-]?[{WS_CLASS}]*",
@@ -355,10 +355,13 @@ fn detect_intent_action(source_text: &str) -> Option<&'static str> {
 
 /// `workItemIdentity` (`:162-176`).
 fn work_item_identity(item: &WorkspaceIntentWorkItem) -> String {
-    if let Some(l) = &item.linear_identifier {
+    // JS gates these with string-truthiness (`if (item.linearIdentifier)`), so an
+    // empty string is ABSENT, not present. `Option` presence alone would treat
+    // `Some("")` as present and emit `upper("") == ""` (a name starting `" - "`).
+    if let Some(l) = item.linear_identifier.as_deref().filter(|s| !s.is_empty()) {
         return upper(l);
     }
-    if let Some(j) = &item.jira_identifier {
+    if let Some(j) = item.jira_identifier.as_deref().filter(|s| !s.is_empty()) {
         return upper(j);
     }
     match item.item_type {
@@ -400,7 +403,7 @@ pub fn get_linked_work_item_workspace_name(
     } else {
         subject0
     };
-    if let Some(id) = identifier {
+    if let Some(id) = identifier.filter(|s| !s.is_empty()) {
         let re = Regex::new(&format!(
             "(?i)^{}[{WS_CLASS}]*[:-]?[{WS_CLASS}]*",
             regex::escape(id)
@@ -727,6 +730,34 @@ mod tests {
                 None
             ),
             Some(name("Issue 2635 - Fix", "issue-2635-fix"))
+        );
+    }
+
+    /// Review D1: JS gates identifiers with string-truthiness (`if
+    /// (item.linearIdentifier)`), so an EMPTY identifier is absent — the type
+    /// fallback (`PR {number}`) applies. An `Option`-presence port treats
+    /// `Some("")` as present and emits `upper("") == ""`, corrupting the name to
+    /// one starting `" - "`. *Mutation:* dropping the `.filter(|s| !s.is_empty())`
+    /// at the identity/prefix sites reverts to ` - Add` / `fix-bug` → this fails.
+    #[test]
+    fn intent_empty_identifier_is_absent_not_present() {
+        // Empty linear identifier: falls back to `PR 3`, not `""`.
+        assert_eq!(
+            get_workspace_intent_name(
+                Some("add feature"),
+                Some(&item(WorkItemType::Pr, 3, "add feature", None, Some(""))),
+                None
+            ),
+            Some(name("PR 3 - Add", "pr-3-add"))
+        );
+        // Empty jira identifier on an issue: identity is `Issue 9`, not dropped.
+        assert_eq!(
+            get_workspace_intent_name(
+                None,
+                Some(&item(WorkItemType::Issue, 9, "Fix the bug", Some(""), None)),
+                None
+            ),
+            Some(name("Issue 9 Fix Bug", "issue-9-fix-bug"))
         );
     }
 
