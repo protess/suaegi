@@ -1,0 +1,24 @@
+[package]
+name = "suaegi-gen-prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's AI commit/PR generation
+# prompt-build + response-parse helpers (commit-message-prompt.ts,
+# commit-message-agent-output.ts, commit-message-generation.ts,
+# pull-request-generation.ts @ v1.4.150-rc.0). Pure String -> String /
+# String -> struct layer with NO suaegi-crate deps and NO regex crate (every
+# pattern is hand-rolled per plan C6, to dodge Rust `regex`'s Unicode/`\s`
+# divergence from JS and the ReDoS surface). suaegi-fuzzy leaf-crate precedent.
+#
+# serde_json (a workspace dep) is the ONE external dependency, used ONLY by
+# `parse_generated_pull_request_fields` to mirror JS `JSON.parse`. See the C4
+# note in pull_request_generation.rs: a hand-rolled JSON parser faithful to
+# JSON.parse semantics (SyntaxError on malformed/trailing tokens, duplicate-key
+# last-wins, string-escape + \uXXXX handling, number edge cases) is a
+# hollow-test magnet, exactly the class of bug this repo has shipped >=5 times.
+# The plan C4 note explicitly authorizes serde_json here for correctness.
+[dependencies]
+serde_json = { workspace = true }

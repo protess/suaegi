@@ -4054,6 +4054,13 @@ name = "suaegi-fuzzy"
 version = "0.1.0"
 
 [[package]]
+name = "suaegi-gen-prompt"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "suaegi-git"
 version = "0.1.0"
 dependencies = [
