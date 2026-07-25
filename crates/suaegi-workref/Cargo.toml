@@ -1,0 +1,24 @@
+[package]
+name = "suaegi-workref"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's work-item-reference parser
+# (`work-item-reference.ts` @ v1.4.150-rc.0). It pulls the review target named in
+# a prompt (a PR/MR/issue/ticket) out of raw text, formats an identifier-first
+# label, and strips the identifier's own echo from a description. Pure and
+# self-contained apart from the one WHATWG `URL` dependency, which maps to the
+# `url` crate. ZERO suaegi-crate deps (a true leaf), so every parsing rule and
+# the ASCII `\d`-lock stay mutation-verifiable in isolation. No serde.
+[dependencies]
+# Why: the 14 static path/text regexes (+ the dynamic strip regex). Rust `regex`
+# defaults `\d`/`\b`/`\w` to Unicode, but Orca's JS semantics are ASCII — so every
+# `\d` is written `[0-9]` and every `\b` as `(?-u:\b)` (plan C1). Already a
+# workspace dep.
+regex = { workspace = true }
+# Why: WHATWG URL parser matching JS `new URL()` — `urlToIdentifier` inspects the
+# pathname, treats an invalid URL as a skip (JS try/catch), and relies on the
+# scheme being lowercased (plan C2). Added to `[workspace.dependencies]`.
+url = { workspace = true }
