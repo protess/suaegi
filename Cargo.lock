@@ -4065,11 +4065,13 @@ name = "suaegi-git"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "regex",
  "serde",
  "suaegi-core",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "url",
 ]
 
 [[package]]
