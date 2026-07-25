@@ -4151,6 +4151,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-workname"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "suaegi-workref",
+]
+
+[[package]]
 name = "suaegi-workref"
 version = "0.1.0"
 dependencies = [

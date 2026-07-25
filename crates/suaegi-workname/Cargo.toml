@@ -1,0 +1,23 @@
+[package]
+name = "suaegi-workname"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's work/branch/workspace name-generation
+# cluster (`marine-creatures.ts`, `branch-name-from-work.ts`,
+# `display-name-from-work.ts`, `workspace-name.ts`, and the hidden 5th dependency
+# `workspace-name-text-scanner.ts`, all @ v1.4.150-rc.0). Every module is pure and
+# deterministic (no I/O, randomness, or global state). Its one suaegi dep is the
+# already-merged `suaegi-workref` (identifier extraction / formatting). No serde.
+[dependencies]
+# Why: the slug/title cleanup regexes. Rust `regex` defaults `\d`/`\b`/`\w` to
+# Unicode; Orca's JS semantics are ASCII, so every `\d` is `[0-9]` and every `\b`
+# is `(?-u:\b)` (plan C4). Unicode stays ON globally because the apostrophe
+# `\p{L}\p{N}` classification (C2) needs exact General Category matching.
+regex = { workspace = true }
+# Why: consumes `extract_work_identifier` + `format_identifier_first` for
+# display-name and workspace-intent composition (research §6). `js_ws` is
+# private in workref, so its whitespace predicate is copied locally (plan C3).
+suaegi-workref = { path = "../suaegi-workref" }
