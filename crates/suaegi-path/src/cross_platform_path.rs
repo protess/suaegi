@@ -148,6 +148,16 @@ fn match_wsl_unc(normalized: &str) -> Option<(String, String)> {
 ///
 /// C5: uses Unicode [`str::to_lowercase`], NOT `to_ascii_lowercase` — JS
 /// `toLowerCase` is Unicode (e.g. `İ` -> `i̇`, a length change).
+///
+/// # Unicode-table version skew (security-reviewed, deny-safe)
+/// Rust's `to_lowercase` tables are pinned to the compiling rustc; JS
+/// `toLowerCase` uses V8/ICU. A security-review fold sweep over U+0020–U+2FFFF
+/// found ~28 rare epigraphic codepoints (e.g. U+A7D2, U+16EA0–U+16EB8) where JS
+/// folds and Rust does not. **The divergence is uniformly deny-safe**: across
+/// that whole range there are zero codepoints in the *escape* direction (Rust
+/// folding two paths JS keeps distinct), so this fold is only ever *more*
+/// restrictive than Orca's — never a containment escape. It can shift with the
+/// rustc version; that only ever tightens containment, never loosens it.
 pub fn normalize_runtime_path_for_comparison(value: &str) -> String {
     let is_windows_path = is_windows_absolute_path_like(value);
     // :17-19
