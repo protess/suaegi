@@ -1,8 +1,12 @@
 pub mod agent;
+pub mod bell_detector;
 pub mod encode;
 pub mod grid;
 pub mod input_types;
+pub mod partial_escape_tail;
 pub mod presence;
 pub mod pty;
 pub mod reply_query;
+pub mod scrollback_policy;
 pub mod session;
+pub mod zero_dimensions;
