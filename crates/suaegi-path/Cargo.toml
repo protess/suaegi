@@ -1,0 +1,20 @@
+[package]
+name = "suaegi-path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: security-load-bearing leaf crate — a VERBATIM port of Orca's hand-rolled
+# cross-platform path-containment primitives (src/shared/cross-platform-path.ts
+# @ v1.4.150-rc.0). `isPathInsideOrEqual`/`relativePathInsideRoot` are
+# path-escape defenses; a subtle error here is a containment-bypass
+# vulnerability. ZERO dependencies by design:
+#   - NO `regex` crate: every pattern (drive prefix, UNC `//`, `/+` collapse,
+#     trailing-slash trim, WSL alias) is hand-rolled as explicit char/byte
+#     predicates (plan Codex decision C1).
+#   - NO `std::path`: it is platform-fixed (Unix=`/`, Windows=`\`) and cannot
+#     model posix AND win32 semantics simultaneously — the whole point of this
+#     module (plan Codex decision C1). All logic is on `&str`/`String`.
+# suaegi-taskquery / suaegi-fuzzy precedent.
+[dependencies]
