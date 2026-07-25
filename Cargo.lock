@@ -4105,6 +4105,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-taskquery"
+version = "0.1.0"
+
+[[package]]
 name = "suaegi-term"
 version = "0.1.0"
 dependencies = [
