@@ -524,9 +524,14 @@ mod tests {
         assert_eq!(extract_work_identifier("JIRA-\u{0661}\u{0662}\u{0663}"), None);
         // Arabic-Indic digits after a bare `#`.
         assert_eq!(extract_work_identifier("#\u{0664}\u{0665}"), None);
-        // Full-width digits likewise stay out of `pr` / `issue` matches.
+        // Full-width digits likewise stay out of `issue` matches.
+        assert_eq!(extract_work_identifier("issue \u{FF11}\u{FF12}"), None);
+        // `pr` and the URL path regexes have NO trailing `(?-u:\b)` guard, so their
+        // `[0-9]` ASCII lock is the SOLE defense against a non-ASCII digit (review
+        // N1). A `[0-9]->\d` regression at either site would leak here.
+        assert_eq!(extract_work_identifier("pr \u{FF11}\u{FF12}"), None);
         assert_eq!(
-            extract_work_identifier("issue \u{FF11}\u{FF12}"),
+            extract_work_identifier("https://github.com/o/r/pull/\u{0661}\u{0662}\u{0663}"),
             None
         );
     }
