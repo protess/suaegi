@@ -154,7 +154,10 @@ pub struct LegacyNumericPaneKey {
 /// (Orca's `paneKey: unknown` typeof-string guard is modeled by the `&str`
 /// parameter — callers pass only strings.)
 pub fn parse_legacy_numeric_pane_key(pane_key: &str) -> Option<LegacyNumericPaneKey> {
-    if pane_key.chars().count() > 256 {
+    // JS `paneKey.length > 256` counts UTF-16 code units, not scalars — an astral
+    // char is 2 units. `encode_utf16().count()` reproduces that exactly (a scalar
+    // `chars().count()` would diverge on astral input).
+    if pane_key.encode_utf16().count() > 256 {
         return None;
     }
     let trimmed = js_trim(pane_key);
@@ -282,5 +285,15 @@ mod tests {
                 pane_key: "tab-1:12".to_string(),
             })
         );
+    }
+
+    /// Review nit: the `> 256` cap counts JS UTF-16 code units, not Rust scalars.
+    /// 200 astral chars = 400 UTF-16 units (> 256) → rejected, matching JS
+    /// `paneKey.length`. *Mutation:* `encode_utf16().count()` → `chars().count()`
+    /// counts 203 scalars (≤ 256) and wrongly returns `Some` → this fails.
+    #[test]
+    fn pin_length_cap_counts_utf16_units() {
+        let key = format!("{}:12", "\u{1F600}".repeat(200)); // 200 emoji + ":12"
+        assert_eq!(parse_legacy_numeric_pane_key(&key), None);
     }
 }
