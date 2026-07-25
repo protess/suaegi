@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-http", "crates/suaegi-secrets", "crates/suaegi-tracker", "crates/suaegi-term", "crates/suaegi-app", "crates/suaegi-keys", "crates/suaegi-fuzzy", "crates/suaegi-automation", "crates/suaegi-search", "crates/suaegi-taskquery", "crates/suaegi-misc", "crates/suaegi-path", "crates/suaegi-gen-prompt"]
+members = ["crates/suaegi-core", "crates/suaegi-git", "crates/suaegi-forge", "crates/suaegi-http", "crates/suaegi-secrets", "crates/suaegi-tracker", "crates/suaegi-term", "crates/suaegi-app", "crates/suaegi-keys", "crates/suaegi-fuzzy", "crates/suaegi-automation", "crates/suaegi-search", "crates/suaegi-taskquery", "crates/suaegi-misc", "crates/suaegi-path", "crates/suaegi-gen-prompt", "crates/suaegi-workref"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,3 +37,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # 주입해 결정론적으로 재현한다. clock 피처는 끈다 — Local/now 접근을 컴파일 단에서 차단.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
+# suaegi-workref leaf crate. WHATWG-compliant URL parser mirroring JS `new URL()`
+# — `urlToIdentifier` validates a provider link by its pathname (scheme lowercased,
+# invalid → skip like JS try/catch). Hand-rolling WHATWG parsing is a huge error
+# surface, so we lean on the standard crate. See work-item-reference plan C2.
+url = "2"
