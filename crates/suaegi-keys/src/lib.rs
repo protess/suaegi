@@ -36,6 +36,7 @@ mod chord;
 mod conflicts;
 mod file;
 mod format;
+mod modifier_double_tap;
 mod normalize;
 mod registry;
 mod resolve;
@@ -54,6 +55,11 @@ pub use file::{
     WriteError,
 };
 pub use format::{format_keybinding, format_keybinding_list};
+pub use modifier_double_tap::{
+    modifier_from_key_event, to_modifier_double_tap_event, DetectedDoubleTap,
+    ModifierDoubleTapDetector, ModifierDoubleTapEvent, ModifierDoubleTapEventType,
+    ModifierKeyEventLike, PhysicalModifierToken,
+};
 pub use normalize::{
     normalize_keybinding, normalize_keybinding_array_for_action, normalize_keybinding_list,
     normalize_keybinding_list_for_action, InvalidReason, KeybindingListResult,
