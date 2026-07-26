@@ -1365,4 +1365,35 @@ mod tests {
         candidate.worktree_id = String::new();
         assert!(!should_hide_workspace_cleanup_candidate(&candidate, None));
     }
+
+    // =======================================================================
+    // Mutation gap — can_queue_workspace_cleanup_candidate's reasons gate is
+    // never pinned by the oracle (every oracle call site uses
+    // make_candidate()'s default non-empty `reasons`).
+    // =======================================================================
+
+    /// Kills the surviving mutant that replaces the leading
+    /// `!candidate.reasons.is_empty()` conjunct with `true` in
+    /// `can_queue_workspace_cleanup_candidate` (`O:145-152`). Every existing
+    /// test calling this function supplies `make_candidate()`'s default
+    /// non-empty `reasons`, so that conjunct never decides the outcome; the
+    /// oracle never varies `reasons` on this function at all. This test
+    /// varies `reasons` directly, then contrasts with a non-empty-`reasons`
+    /// case that still fails via the second conjunct
+    /// (`WORKSPACE_CLEANUP_QUEUE_BLOCKERS`'s `Dismissed` member, the one
+    /// queue-blocker variant the oracle never exercises — it only covers
+    /// `MainWorktree` and `FolderRepo`).
+    #[test]
+    fn g12_can_queue_requires_at_least_one_reason() {
+        let mut candidate = make_candidate();
+        candidate.reasons = vec![];
+        candidate.blockers = vec![];
+        assert!(!can_queue_workspace_cleanup_candidate(&candidate));
+
+        candidate.reasons = vec![WorkspaceCleanupReason::IdleClean];
+        assert!(can_queue_workspace_cleanup_candidate(&candidate));
+
+        candidate.blockers = vec![WorkspaceCleanupBlocker::Dismissed];
+        assert!(!can_queue_workspace_cleanup_candidate(&candidate));
+    }
 }
