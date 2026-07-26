@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Why: leaf crate — a batch of fourteen small, self-contained pure helpers ported
+# Why: leaf crate — a batch of fifteen small, self-contained pure helpers ported
 # verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None of them import
 # anything (no clock, no fs, no base64, no hashing): they are pure string/number
 # transforms whose Vitest oracles port bit-for-bit. Kept dependency-free (not
