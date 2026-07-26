@@ -15,6 +15,7 @@ pub mod hosted_review_queue;
 pub mod parse;
 pub mod pr_actions;
 pub mod provider;
+pub mod repo_icon;
 pub mod runner;
 
 pub use any::AnyForge;
@@ -60,5 +61,10 @@ pub use pr_actions::{
 pub use provider::{
     ChecksSummary, CreateReviewInput, ForgeError, ForgeProvider, ForgeUnavailable, RepoCoords,
     Review, ReviewLookup, ReviewState,
+};
+pub use repo_icon::{
+    favicon_url_from_website, github_avatar_icon, sanitize_repo_icon, GithubAvatarSlug, RepoIcon,
+    RepoIconImageSource, SanitizedRepoIcon, MAX_REPO_ICON_DATA_URL_LENGTH,
+    MAX_REPO_ICON_UPLOAD_BYTES,
 };
 pub use runner::{GhError, GhOutput, GhRunner};
