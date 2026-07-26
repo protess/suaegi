@@ -739,6 +739,44 @@ mod tests {
         assert_eq!(summary.url.as_deref(), Some("https://example.com"));
     }
 
+    /// Kills the surviving mutant that adds
+    /// `Some(JsonValue::Bool(_)) => Some("local"),` (or an equivalent
+    /// coercion for numbers/null/unrecognized strings) to `resolve_transport`'s
+    /// `type_value` match. Every existing non-string-`type` case ALSO carries
+    /// a `command` or `url` that independently forces the same transport, so
+    /// the `type` read itself is never actually observed. Here `type` is the
+    /// ONLY field present — no `command`, no `url` — so a mutant that treats
+    /// a non-string (or unrecognized-string) `type` as `"local"` diverges:
+    /// real `resolve_transport` ignores it entirely and falls all the way
+    /// through to `Unknown`/`Invalid`/`"Missing command or URL."`, while a
+    /// coercing mutant would land on `Stdio`/`Invalid`/`"Missing command."`.
+    #[test]
+    fn x2_a_non_string_type_is_ignored_entirely_not_coerced() {
+        for entry in [
+            r#"{"type": true}"#,
+            r#"{"type": 42}"#,
+            r#"{"type": null}"#,
+            r#"{"type": "sse"}"#,
+        ] {
+            let summary = summarize(entry);
+            assert_eq!(
+                summary.transport,
+                McpServerTransport::Unknown,
+                "entry {entry} should resolve to Unknown"
+            );
+            assert_eq!(
+                summary.status,
+                McpServerStatus::Invalid,
+                "entry {entry} should be Invalid"
+            );
+            assert_eq!(
+                summary.issue,
+                Some("Missing command or URL.".to_string()),
+                "entry {entry} should carry the no-signal-at-all issue"
+            );
+        }
+    }
+
     // -- X3: asymmetric readers ---------------------------------------------------
 
     #[test]
@@ -763,6 +801,41 @@ mod tests {
     fn x3_read_url_prefers_url_over_http_url() {
         let entries = object_entries(r#"{"url": "a", "httpUrl": "b"}"#);
         assert_eq!(read_url(&entries).as_deref(), Some("a"));
+    }
+
+    /// Kills the surviving mutant that reorders `read_url` to check
+    /// `httpUrl` before `url`. No existing case supplies both keys with
+    /// distinct values, so that reordering was never actually exercised
+    /// end-to-end through `summarize_mcp_server`. This pins all three
+    /// directions: `url` wins when both are present strings; `httpUrl` is
+    /// still live as a fallback when `url` is absent; and `url` being an
+    /// ARRAY (which `read_url` has no array form for, per X3) does NOT match
+    /// the `url` branch, so the read falls through to `httpUrl` instead of
+    /// producing `None`.
+    #[test]
+    fn x3_url_wins_over_http_url_when_both_are_present() {
+        let both = summarize(
+            r#"{"url": "https://from-url.example", "httpUrl": "https://from-http-url.example"}"#,
+        );
+        assert_eq!(
+            both.url,
+            Some("https://from-url.example".to_string())
+        );
+        assert_eq!(both.transport, McpServerTransport::Http);
+
+        let http_url_only = summarize(r#"{"httpUrl": "https://from-http-url.example"}"#);
+        assert_eq!(
+            http_url_only.url,
+            Some("https://from-http-url.example".to_string())
+        );
+
+        let array_url_falls_through = summarize(
+            r#"{"url": ["https://array.example"], "httpUrl": "https://from-http-url.example"}"#,
+        );
+        assert_eq!(
+            array_url_falls_through.url,
+            Some("https://from-http-url.example".to_string())
+        );
     }
 
     // -- X4: falsy, not absent ----------------------------------------------------
