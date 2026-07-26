@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of fourteen small, self-contained pure helpers
+//! `suaegi-misc` — a batch of fifteen small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None import
 //! anything (no clock, no fs, no base64, no hashing); each has a Vitest
 //! oracle ported bit-for-bit, plus the oracle-silent "extra pins" that guard
@@ -7,6 +7,11 @@
 //! trim).
 //!
 //! # Modules
+//! - [`clipboard_text`] — clipboard text byte-length limits (UTF-8 byte
+//!   measurement vs. JS UTF-16 code-unit fast path, `...WithYield` reshaped
+//!   to synchronous + injected callback, `Option<f64>` JS numeric coercion
+//!   for `max_bytes`/`stop_after_bytes`, disjoint case-sensitive error-message
+//!   predicates, never trims).
 //! - [`codex_auth_errors`] — Codex CLI auth-error detection/extraction
 //!   (10 `/i` regexes expanded to 15 ASCII-lowercased literals, CSI-only ANSI
 //!   strip, UTF-16 4,000-unit cap, `<=`-guarded line iterator distinct from
@@ -43,6 +48,7 @@
 //! - [`tailnet_address`] — Tailnet/CGNAT IPv4 detection (ASCII-digit octets,
 //!   leading zeros allowed, `100.64.0.0/10` range check).
 
+pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
 pub mod harness_injected_user_turns;
@@ -59,6 +65,18 @@ pub mod stable_pane_id;
 pub mod tailnet_address;
 pub mod usage_percentage;
 
+pub use clipboard_text::{
+    assert_clipboard_text_within_limit, assert_clipboard_text_within_limit_with_yield,
+    assert_clipboard_text_write_within_limit, assert_clipboard_text_write_within_limit_with_yield,
+    get_clipboard_text_byte_length, get_clipboard_text_read_max_bytes,
+    get_clipboard_text_write_max_bytes, is_clipboard_text_byte_length_over_limit,
+    is_clipboard_text_byte_length_over_limit_with_yield, is_clipboard_text_too_large_message,
+    is_clipboard_text_write_too_large_message, measure_clipboard_text_byte_length,
+    measure_clipboard_text_byte_length_with_yield, ClipboardTextByteLengthMeasurement,
+    ClipboardTextError, CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS, CLIPBOARD_TEXT_READ_MAX_BYTES,
+    CLIPBOARD_TEXT_TOO_LARGE_ERROR, CLIPBOARD_TEXT_WRITE_MAX_BYTES,
+    CLIPBOARD_TEXT_WRITE_TOO_LARGE_ERROR,
+};
 pub use codex_auth_errors::{
     extract_codex_auth_error, is_codex_auth_error, iterate_codex_output_lines, CodexOutputLines,
 };
