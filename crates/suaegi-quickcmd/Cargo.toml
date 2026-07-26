@@ -1,0 +1,35 @@
+[package]
+name = "suaegi-quickcmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/terminal-quick-commands.ts`
+# (272L). This is NORMALIZATION + VALIDATION POLICY (six UTF-16 length caps,
+# id-collision uniquing, an exact-shape protocol-boundary check, and a
+# line-flattening transform) over the terminal quick-command list, not a
+# small self-contained pure helper — the same reason `suaegi-claude-roster`
+# and `suaegi-project-runtime` were split out as their own leaves rather than
+# folded into `suaegi-misc` (whose charter is small pure string/number
+# helpers with zero policy).
+#   - `serde`/`serde_json`: NOT needed, and NOT sufficient — J11's
+#     `hasExactKeys` check ("own enumerable key count equals expected AND
+#     every expected key present") requires telling "key absent" apart from
+#     "key present with value `undefined`" (the latter still counts toward
+#     the key total). `#[serde(deny_unknown_fields)]` catches extra keys but
+#     collapses "absent" and "present-but-undefined" into the same `None`,
+#     silently passing an input `serde`/`deny_unknown_fields` would accept
+#     but the JS source rejects. The input side is instead modeled as an
+#     untyped `JsValue`/`JsRecord` value tree carrying its own key set.
+#   - `regex`: NOT needed. `LINE_BREAK_RE = /\r\n|\r|\n/` (`O:254`) is a
+#     three-way ASCII alternation, hand-rolled as a byte scanner (J5).
+#   - `chrono`: NOT needed — the module reads no clock.
+#   - `tui-agent-config`'s surface used here is one line (`O:74`):
+#     `isTuiAgent(agent) && TUI_AGENT_CONFIG[agent].promptInjectionMode !==
+#     'stdin-after-start'`. Carried in locally as a small static table (all
+#     34 known agent ids + `promptInjectionMode`), documented as mirroring
+#     upstream (`suaegi-claude-roster` precedent for locally-mirrored
+#     one-line external surfaces).
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
