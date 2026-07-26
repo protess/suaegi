@@ -479,7 +479,7 @@ pub fn looks_like_search_query(input: &str) -> bool {
 /// `suaegi-forge`'s `repo_icon.rs` encoder (different crate, unreachable
 /// from here anyway, and its own header forbids cross-purpose reuse) — this
 /// is a fresh, independent implementation for this exact JS semantics.
-fn encode_uri_component(input: &str) -> String {
+pub(crate) fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         if is_encode_uri_component_unreserved(ch) {
