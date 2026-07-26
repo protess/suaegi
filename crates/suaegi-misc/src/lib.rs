@@ -1,10 +1,12 @@
-//! `suaegi-misc` — a batch of fifteen small, self-contained pure helpers
-//! ported verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None import
-//! anything (no clock, no fs, no base64, no hashing); each has a Vitest
-//! oracle ported bit-for-bit, plus the oracle-silent "extra pins" that guard
-//! the real JS↔Rust divergences (ECMAScript whitespace, ASCII-digit /
-//! lowercase-UUID rules, UTF-16-vs-byte scan caps, and the never-panic OSC
-//! trim).
+//! `suaegi-misc` — a batch of eighteen small, self-contained pure helpers
+//! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
+//! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
+//! [`ui_language`] are @ v1.4.146-rc.0. None import anything (no clock, no
+//! fs, no base64, no hashing); each has a Vitest oracle ported bit-for-bit,
+//! plus the oracle-silent "extra pins" that guard the real JS↔Rust
+//! divergences (ECMAScript whitespace, ASCII-digit / lowercase-UUID rules,
+//! UTF-16-vs-byte scan caps, the never-panic OSC trim, and NaN-absorbing vs.
+//! NaN-propagating min/max).
 //!
 //! # Modules
 //! - [`clipboard_text`] — clipboard text byte-length limits (UTF-8 byte
@@ -47,6 +49,13 @@
 //!   (case-sensitive code set vs. case-insensitive message-fragment scan).
 //! - [`tailnet_address`] — Tailnet/CGNAT IPv4 detection (ASCII-digit octets,
 //!   leading zeros allowed, `100.64.0.0/10` range check).
+//! - [`terminal_line_height`] — terminal line-height clamp (`Option<f64>`
+//!   modeling `unknown`, `is_finite` guard kept for `±Infinity` even though
+//!   Rust's NaN-absorbing `f64::min`/`max` make the oracle blind to it, no
+//!   rounding).
+//! - [`ui_language`] — UI language selection (`enum` + sentinel `System`
+//!   variant, exact-string closed-set membership, no trim/lowercase/locale-tag
+//!   splitting borrowed from the sibling `ui-locale` semantics).
 
 pub mod clipboard_text;
 pub mod codex_auth_errors;
@@ -63,6 +72,8 @@ pub mod rate_limit_reset;
 pub mod remote_runtime_error;
 pub mod stable_pane_id;
 pub mod tailnet_address;
+pub mod terminal_line_height;
+pub mod ui_language;
 pub mod usage_percentage;
 
 pub use clipboard_text::{
@@ -116,6 +127,13 @@ pub use stable_pane_id::{
     parse_pane_key, LegacyNumericPaneKey, MakePaneKeyError, ParsedPaneKey,
 };
 pub use tailnet_address::is_tailnet_ipv4_address;
+pub use terminal_line_height::{
+    normalize_terminal_line_height, MAX_TERMINAL_LINE_HEIGHT, MIN_TERMINAL_LINE_HEIGHT,
+};
+pub use ui_language::{
+    normalize_ui_language, UiLanguage, UI_LANGUAGE_CHINESE, UI_LANGUAGE_ENGLISH,
+    UI_LANGUAGE_JAPANESE, UI_LANGUAGE_KOREAN, UI_LANGUAGE_SPANISH, UI_LANGUAGE_SYSTEM,
+};
 pub use usage_percentage::{
     clamp_used_percent, get_displayed_usage_percentage, normalize_usage_percentage_display,
     UsagePercentageDisplay, DEFAULT_USAGE_PERCENTAGE_DISPLAY,
