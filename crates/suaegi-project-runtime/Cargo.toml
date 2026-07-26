@@ -1,0 +1,34 @@
+[package]
+name = "suaegi-project-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/project-execution-runtime.ts`
+# (294L, zero imports). This is a policy interpreter over a small 4-enum type
+# lattice (project preference / global default / resolved runtime / repair
+# reason) plus a project<->global "inherit or override" resolution and a
+# legacy-settings migration path, consumed by ~25 upstream call sites
+# (`local-project-runtime-resolution.ts`, `local-windows-terminal-runtime.ts`).
+#   - `serde_json`: NOT needed. The entire observable `unknown` input surface is
+#     just three questions — is it object-like (`typeof === 'object' &&
+#     !== null`; arrays count, functions don't), is `kind` a string and which
+#     one, is `distro` a string and what does it trim to. Key order, numeric
+#     formatting and duplicate keys are never observed, and parsing already
+#     happened upstream before these values reach us. A small hand-rolled input
+#     enum captures the whole surface (see `RawValue`/`RawObject` below).
+#     Precedent: `suaegi-mcp/Cargo.toml`'s bar for pulling in `serde_json` is
+#     "only when reproducing `JSON.parse` edge cases itself" — not the case here.
+#   - `regex`: NOT needed. The one regex in scope, `/[\\/]/` (`isWslShell`), is
+#     an unflagged 2-ASCII-char class — a plain `char` predicate suffices.
+#   - `thiserror`: NOT needed. Every function here is total; nothing fails,
+#     nothing has an error type to derive.
+#   - `suaegi-misc`: `js_trim` only — every `.trim()` in this module
+#     (`normalizeDistro`, `isWslShell`) is ECMAScript whitespace, which diverges
+#     from Rust `str::trim` at U+FEFF and U+0085.
+# Not folded into `suaegi-misc` itself: that crate's charter is small
+# self-contained pure string/number helpers with zero policy; this module is a
+# 4-enum type lattice plus a repair protocol, a different shape of thing.
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
