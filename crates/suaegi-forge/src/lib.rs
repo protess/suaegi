@@ -8,6 +8,7 @@ pub mod github;
 pub mod github_http;
 pub mod github_identity;
 pub mod gitlab;
+pub mod hosted_review;
 pub mod parse;
 pub mod pr_actions;
 pub mod provider;
@@ -24,6 +25,17 @@ pub use github_identity::{github_repo_identity_key, is_default_github_host};
 pub use gitlab::{
     glab_creation_eligibility, glab_preflight, GlabError, GlabForge, GlabOutput, GlabPreflight,
     GlabRunner, MIN_GLAB_VERSION,
+};
+pub use hosted_review::{
+    hosted_review_identity_key, is_positive_hosted_review_number, CheckStatus,
+    CreateHostedReviewArgs, CreateHostedReviewErrorCode, CreateHostedReviewInput,
+    CreateHostedReviewResult, HostedReviewCreationBlockedReason, HostedReviewCreationEligibility,
+    HostedReviewCreationNextAction, HostedReviewDecision, HostedReviewForBranchArgs,
+    HostedReviewIdentity, HostedReviewInfo, HostedReviewLookupOutcome, HostedReviewProvider,
+    HostedReviewQueueClassification, HostedReviewQueueKey, HostedReviewQueueState,
+    HostedReviewState, HostedReviewSummary, HostedReviewThreadDataCompleteness,
+    HostedReviewThreadSummary, HostedReviewUser, PrConflictLocalMergeState, PrConflictSummary,
+    PrMergeableState, PrReviewDecisionAggregate, PrState,
 };
 pub use pr_actions::{
     classify_merge_failure, mergeability_from_fields, CommentLookup, MergeFailure, MergeMethod,
