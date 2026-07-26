@@ -5,19 +5,34 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Why: leaf crate — M1 (path/candidate layer only) of a VERBATIM port of Orca's
-# `src/shared/mcp-config.ts` (@ v1.4.150-rc.0). The full source has exactly one
-# runtime dependency in the whole file: `JSON.parse` (used by
-# `inspectMcpConfigContent`, deferred to M2 alongside `serde_json`). Everything
-# ported here — the candidate table, parent-dir/basename splitting, and the
-# Windows-root inspectability check — is pure `&str`/`Vec` logic with zero
-# imports in the TS source, so this crate stays dependency-free.
-#   - NO `std::path`: `relative_parent_dir`/`relative_basename` deliberately do
-#     NOT trim trailing separators or resolve `.`/`..` (Orca doesn't either);
-#     `std::path::Path::{parent,file_name}` would silently add both behaviors.
-#   - NO `regex`: `can_inspect_local_mcp_config_root`'s drive/UNC prefix check
-#     is hand-rolled as explicit byte predicates, anchored at start only.
-#   - Deliberately does NOT reuse suaegi-path: its helpers are close but not
-#     bit-identical to this module's contract (see src/lib.rs doc comments).
-# suaegi-misc / suaegi-path precedent for zero-dependency leaf crates.
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/mcp-config.ts`
+# (@ v1.4.150-rc.0). M1 (path/candidate layer, src/lib.rs) was dependency-free.
+# M2a (value/coercion/masking layer, src/json.rs + src/env_mask.rs) adds the
+# JSON layer's one real runtime dependency: `JSON.parse`.
+#   - `serde` + `serde_json`: `parse_json` mirrors `JSON.parse` byte-for-byte
+#     (hand-rolling a JSON parser faithful to `JSON.parse`'s edge cases —
+#     duplicate keys, string escapes, number formats — is exactly the
+#     "hollow-test magnet" this repo has shipped >=5 times; see
+#     `suaegi-gen-prompt/src/pull_request_generation.rs`'s C4 note for the
+#     precedent). The STORED value type is NOT `serde_json::Value` — its `Map`
+#     is a `BTreeMap` and would silently re-sort object keys, breaking the
+#     oracle's document-order assertions. `src/json.rs`'s `JsonValue` is a
+#     hand-written `Deserialize` (`Vec<(String, JsonValue)>` for objects) that
+#     recovers `serde_json`'s document-order parse and then reshapes it to
+#     JS's actual property-enumeration order (array-index keys first).
+#   - NO `preserve_order` feature: it swaps `serde_json::Map` to an
+#     `IndexMap`-backed map via cargo feature unification, which is
+#     workspace-global — every other crate's `serde_json::Value` usage would
+#     silently change serialization order. `suaegi-keys/src/file.rs:41-46`
+#     rejected it for the identical reason; irrelevant here anyway since we
+#     never construct a `serde_json::Value` in the first place.
+#   - Still NO `regex`: the two sensitive-env patterns (`src/env_mask.rs`) are
+#     hand-rolled byte predicates. Both are deliberately unflagged/`/i`-only
+#     regexes in the TS source; Rust's `regex` crate's `(?i)` is Unicode-aware
+#     and would fold non-ASCII look-alikes (e.g. U+017F, U+212A) that JS's
+#     `/i`-without-`/u` does not, silently widening what counts as
+#     "sensitive". Same reasoning as M1's `can_inspect_local_mcp_config_root`.
+#   - NO `std::path` (unchanged from M1): see src/lib.rs doc comments.
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
