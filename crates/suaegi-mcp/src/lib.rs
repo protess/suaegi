@@ -8,13 +8,22 @@
 //! functions, and the private `getRelativeParentDir` / `getRelativeBasename`
 //! helpers.
 //!
-//! Deferred to M2 (needs `serde_json`): `inspectMcpConfigContent`,
-//! `maskMcpEnv`, `summarizeMcpServer`, `readCommand`/`readUrl`/
-//! `resolveTransport`, `extractObjectAtPath`, and the
+//! M2a (`src/json.rs` + `src/env_mask.rs`) has since landed: the
+//! order-preserving JSON value type, `js_string_of`/ECMAScript number
+//! formatting, the sensitive-pattern predicates, and `maskMcpEnv`.
+//!
+//! Still deferred to M2b: `inspectMcpConfigContent`, `summarizeMcpServer`,
+//! `readCommand`/`readUrl`/`resolveTransport`, `extractObjectAtPath`, and the
 //! `McpServerTransport`/`McpServerStatus`/`McpServerSummary`/
 //! `McpConfigInspection` types.
 
 use std::collections::HashMap;
+
+mod env_mask;
+mod json;
+
+pub use env_mask::{mask_mcp_env, MASKED_ENV_VALUE};
+pub use json::{parse_json, js_string_of, JsonNumber, JsonValue};
 
 // ---------------------------------------------------------------------------
 // O:1 McpConfigFormat
