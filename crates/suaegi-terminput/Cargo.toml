@@ -1,0 +1,33 @@
+[package]
+name = "suaegi-terminput"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/terminal-input.ts`
+# (109L, @ v1.4.146-rc.0). A CAP-2 byte-budget module (a hard total-size cap
+# plus a lazy chunk-size cap for PTY writes), same shape as `suaegi-filedrop`
+# (which made the identical call two days earlier — see that crate's own
+# `Cargo.toml` comment and `docs/superpowers/plans/2026-07-27-native-file-drop.md:10-15`).
+#   - `suaegi-misc`: the ONLY dependency, for `measure_clipboard_text_byte_length`
+#     (_with_yield) and `CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS` — this
+#     module's byte accounting and yield cadence are literal reuses, not
+#     reimplementations. `suaegi-misc` itself is NOT touched: one call site
+#     (`isTerminalInputTooLargeWithYield`) needs the TS `number` domain
+#     (NaN/negative/fractional `maxBytes`) that the crate's own `u64`-typed
+#     `is_clipboard_text_byte_length_over_limit_with_yield` cannot represent,
+#     so its 5-line body is inlined here instead of called (see the module
+#     doc comment's U7 entry).
+#   - `tokio`/`futures`: NOT needed — the four TS `async` functions become
+#     synchronous functions taking an injected `yield_to_event_loop: &mut dyn
+#     FnMut()` (S1 in `suaegi-misc::clipboard_text`), so this crate adds no
+#     runtime.
+#   - `unicode-segmentation`: NOT needed and would be WRONG — chunk
+#     boundaries are Unicode-**scalar**-atomic (never splitting a surrogate
+#     pair), not grapheme-cluster-atomic; combining marks/ZWJ sequences are
+#     deliberately split across chunks (U1).
+#   - `thiserror`: NOT needed — the single error variant is fieldless, with a
+#     hand-written `Display` (precedent: `clipboard_text.rs:116-133`).
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
