@@ -32,10 +32,16 @@
 - **F5 — harness 정규식은 수제 스캔으로 대체**(Codex D). `^<` → ASCII `a-z` 1자 → `a-z0-9-` 0자 이상 →
   다음 스칼라가 **`>` 또는 `is_js_whitespace(c)` 또는 문자열 끝**이면 매치. `\s`를 Rust regex로 쓰면
   **역방향 발산**(JS: U+FEFF 포함/U+0085 제외 ↔ Rust: 반대). `js_ws::is_js_whitespace` 재사용.
-- **F6 — 파이프라인 순서: `js_trim` → **ASCII 소문자화** → 길이-0 가드 → 태그 스캔 → 프리픽스.**
+- **F6 — 파이프라인 순서: `js_trim` → **full `to_lowercase()`** → 길이-0 가드 → 태그 스캔 → 프리픽스.**
   (`:55` `trim().toLowerCase()`가 먼저라 정규식에 `/i`가 없다 — 순서 뒤집으면 깨진다.)
-  ⚠ 소문자화는 태그/프리픽스가 전부 ASCII이므로 `to_ascii_lowercase`로 충분하고, full `to_lowercase`는
-  `İ`→2자 확장 등 불필요한 발산 위험. **ASCII 소문자화로 통일**(F1과 동일 판단).
+  **⚠ 정정(구현 중 리드가 적발, 최초 F6은 틀렸다):** 여기서는 **full `to_lowercase()`가 맞다. `to_ascii_lowercase`는 오답.**
+  근거: 이 모듈은 **`String.prototype.toLowerCase()`**(full Unicode)를 쓰고, full 소문자화는 **비-ASCII를 ASCII로
+  폴딩할 수 있다** — `U+212A`(KELVIN SIGN)→`k`. 알려진 태그 `user-prompt-submit-hook`에 **`k`가 있으므로 관측 가능**:
+  `"<user-prompt-submit-hoo\u{212A}>"`는 Orca에서 **true**(폴딩 후 태그 일치), ASCII 소문자화면 **false**(태그 스캔이
+  U+212A에서 끊김) = **실제 발산**.
+  **F1(codex)과 혼동 금지 — 메커니즘이 다르다:** codex는 **정규식 `/i`**(비-`u`)라 비-ASCII→ASCII 폴딩을 **하지 않고**
+  (`/k/i`는 U+212A 불매치), 그래서 거기서는 `to_ascii_lowercase`가 정답. **두 모듈을 통일하지 말 것.**
+  **핀:** harness `"<user-prompt-submit-hoo\u{212A}>"`→true; codex `"access to\u{212A}en could not be refreshed"`→false.
 - **F7 — 태그 19개 + 프리픽스 7개 정확 전사**(Codex verbatim 대조 완료).
   태그: `agent-message`,`bash-input`,`bash-stderr`,`bash-stdout`,`command-args`,`command-message`,`command-name`,
   `cross-session-message`,`fork-boilerplate`,`local-command-caveat`,`local-command-stderr`,`local-command-stdout`,
