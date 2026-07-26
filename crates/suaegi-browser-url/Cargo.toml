@@ -1,0 +1,33 @@
+[package]
+name = "suaegi-browser-url"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of the local-dev-address / certificate-host
+# cluster of Orca's `src/shared/browser-url.ts` (M1 only: lines 3-4 and 37-125 —
+# `LOCAL_ADDRESS_PATTERN`, `classifySchemeLessLocalDevAddress`,
+# `normalizeCertificateHostname`, `isValidDnsName`, `isIpv4Loopback`,
+# `isEligibleLocalCertificateHost`, `isWildcardBindHost`, `toHttpsRecoveryUrl`,
+# `toSecureCertificateEndpoint`). Everything at `browser-url.ts:130` and below
+# (the search-engine constants, Kagi session/redaction, and the navigation /
+# file-URL decision tree) is out of scope for M1 and lands in M2/M3.
+#   - `url`: WHATWG URL parser matching JS `new URL()` — `classifySchemeLessLocalDevAddress`
+#     re-parses a `http://` prefixed candidate and relies on the URL Standard's
+#     IPv4 canonicalization (e.g. `127.0.0.01` -> `127.0.0.1`) and default-port
+#     elision; `toHttpsRecoveryUrl` / `toSecureCertificateEndpoint` mutate an
+#     already-parsed URL's scheme. Already a workspace dep (`suaegi-workref`).
+#   - `suaegi-misc`: `js_trim` — every `.trim()` in this module must use the
+#     ECMAScript whitespace set (diverges from Rust `str::trim` at U+FEFF and
+#     U+0085), never `str::trim`.
+#   - NO `regex`: `LOCAL_ADDRESS_PATTERN` needs an ASCII-only case fold (JS
+#     `/i` without `/u` does NOT fold U+212A/U+017F to their ASCII look-alikes,
+#     but `regex`'s `(?i)` is Unicode-aware and would) and ASCII-only `\d`
+#     (JS `\d` is ASCII-only; Rust `regex`'s `\d` is Unicode `Nd` and would
+#     accept e.g. Arabic-Indic digits). Hand-rolling removes both risks at the
+#     source instead of fighting them with regex flags/escapes. Precedent:
+#     `suaegi-path`, `suaegi-taskquery`, `suaegi-mcp`, `suaegi-workname`.
+[dependencies]
+url = { workspace = true }
+suaegi-misc = { path = "../suaegi-misc" }
