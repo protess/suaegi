@@ -4122,6 +4122,13 @@ name = "suaegi-path"
 version = "0.1.0"
 
 [[package]]
+name = "suaegi-project-runtime"
+version = "0.1.0"
+dependencies = [
+ "suaegi-misc",
+]
+
+[[package]]
 name = "suaegi-search"
 version = "0.1.0"
 dependencies = [
