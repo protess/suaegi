@@ -4222,6 +4222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-termstream"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "suaegi-tracker"
 version = "0.1.0"
 dependencies = [
