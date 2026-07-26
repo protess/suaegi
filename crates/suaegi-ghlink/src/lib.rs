@@ -115,6 +115,9 @@
 use suaegi_misc::js_trim;
 use url::Url;
 
+mod pr_link_detector;
+pub use pr_link_detector::{TerminalGitHubPRLink, TerminalGitHubPRLinkDetector};
+
 /// An owner/repo slug. Both fields are case-preserved verbatim (P10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSlug {
