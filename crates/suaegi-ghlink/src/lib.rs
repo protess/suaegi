@@ -26,26 +26,39 @@
 //! see the plan's M1/M2 split.
 //!
 //! # Documented divergences from Orca (plan decisions P1-P13)
-//! - **P1 — ASCII-only case fold, hand-rolled (no `regex`).** `GH_ITEM_PATH_RE`
-//!   carries JS `/i` **without** `/u`, so ECMAScript's non-Unicode
-//!   `Canonicalize` refuses to fold a code point ≥128 down to ASCII: `ſ`
-//!   (U+017F) does NOT match `s`. Rust `regex`'s `(?i)` is Unicode simple
-//!   case folding and WOULD match. No oracle exercises route case at all
-//!   (`PULL`/`Issues` are never tried), so this divergence would ship
-//!   silently in a naive port. We hand-roll the path match and compare the
-//!   route segment with `eq_ignore_ascii_case`, which is exactly the
-//!   ASCII-only fold JS performs.
-//!   **Verified deviation from the plan's example:** the plan's illustration
-//!   (`https://github.com/o/r/iſſueſ/42`) does NOT actually reach the fold
-//!   decision through the public URL-based API — WHATWG `URL` percent-encodes
-//!   any code point > U+007E in the path (confirmed against Node:
-//!   `new URL(...).pathname` turns `iſſueſ` into `i%C5%BF%C5%BFue%C5%BF`, in
-//!   BOTH JS and the `url` crate), so that exact URL rejects for an unrelated
-//!   reason (percent-encoded bytes never equal `issues`) in every
-//!   implementation, ASCII-fold or not. The real hazard only shows up one
-//!   layer down, in the path-matcher itself once it has a literal `ſ` to
-//!   compare — see `p1_unicode_case_fold_rejected_at_path_matcher_level`,
-//!   which calls it directly instead of through a `Url`.
+//! - **P1 — ASCII-only case fold, hand-rolled (no `regex`), chosen for
+//!   faithfulness rather than because a divergence is reachable here.**
+//!   `GH_ITEM_PATH_RE` carries JS `/i` **without** `/u`, so ECMAScript's
+//!   non-Unicode `Canonicalize` folds ASCII only. A case-sensitive compare
+//!   would be a real bug — `PULL`/`Issues` **must** match `pull`/`issues`,
+//!   and that direction of the fold is genuinely load-bearing and pinned by
+//!   `p1_route_case_variants_accepted_and_unicode_fold_rejected`. What is
+//!   NOT reachable is the ASCII-vs-Unicode *distinction* itself, for two
+//!   independent reasons:
+//!   1. WHATWG `URL` percent-encodes any code point > U+007E in the path
+//!      (confirmed against Node: `new URL(...).pathname` turns `iſſueſ`
+//!      into `i%C5%BF%C5%BFue%C5%BF`, in BOTH JS and the `url` crate), so a
+//!      non-ASCII route segment can never reach the comparison as literal
+//!      letters through the public URL-based API — see
+//!      `p1_unicode_case_fold_rejected_at_path_matcher_level`, which calls
+//!      the matcher directly (bypassing `Url`) to even construct the input.
+//!   2. **Even bypassing the URL parser entirely, no input can distinguish
+//!      ASCII folding from Unicode folding here**, because the only two
+//!      words ever compared are `issues` and `pull`, and no character's
+//!      Unicode lowercase produces a letter outside `{i,s,u,e,p,l}` from one
+//!      outside that alphabet: `ſ` (U+017F) lowercases to itself, not `s`;
+//!      `K` (U+212A, KELVIN SIGN) lowercases to `k`, which appears in
+//!      neither word. Verified by mutation: swapping `eq_ignore_ascii_case`
+//!      for a `to_lowercase()` comparison kills no test, and cannot, since
+//!      the two are extensionally equal on this alphabet. `eq_ignore_ascii_case`
+//!      is still the right choice — it's the literal ASCII-only fold JS
+//!      performs, and it's defensive against a future third route word that
+//!      could make the distinction observable — but it is not fixing an
+//!      observable bug in the two current words. (This is also why we
+//!      didn't reach for `regex`'s `(?i)` here even though it's available in
+//!      the workspace: `(?i)` is Unicode-simple-case-folding, and reaching
+//!      for it would trade an explicit, auditable ASCII fold for an
+//!      implicit Unicode one with no compensating benefit.)
 //! - **P2 — ASCII-only digits.** JS `\d` is always `[0-9]`; Rust `regex`'s
 //!   `\d` defaults to Unicode `Nd` (Arabic-Indic `٤٢`, full-width `４２`).
 //!   The hand-rolled matcher checks `is_ascii_digit` directly. The bare-number
