@@ -1,0 +1,34 @@
+[package]
+name = "suaegi-ghlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — a verbatim port of Orca's `src/shared/github-links.ts`
+# (@ v1.4.146-rc.0, 102L; M1 of 2 — the detector half `pr_link_detector.rs`
+# lands separately). A path-SHAPE matcher for `owner/repo/(issues|pull)/N`
+# URLs plus a repo-URL builder. Deliberately NOT a GitHub-only matcher: the
+# host is never checked (P3), so any provider whose URL happens to have that
+# shape is accepted — only the `buildGitHubRepoUrl` builder hardcodes
+# `https://github.com/`. ZERO suaegi-crate deps besides `suaegi-misc` (for
+# `js_trim`), so every quirk below stays mutation-verifiable in isolation.
+# No serde.
+[dependencies]
+# Why: WHATWG URL parser matching JS `new URL()` (plan P13) — `Url::parse(x)
+# .ok()?` for the try/catch, the crate already lowercases the scheme, and
+# `url.path()` mirrors JS `url.pathname` (query/fragment excluded, percent
+# encoding already applied). Already a workspace dep (suaegi-workref
+# precedent).
+url = { workspace = true }
+# Why: `js_trim` — both `.trim()` call sites are ECMAScript whitespace
+# semantics (U+FEFF in, U+0085 out), which diverge from `str::trim` in both
+# directions (plan P11).
+suaegi-misc = { path = "../suaegi-misc" }
+
+# Why: NO `regex` dependency (plan §1). `GH_ITEM_PATH_RE` is a 4-token path
+# split on `/` — hand-rolling is shorter than a regex AND is the only way to
+# avoid two regex-specific hazards baked into the JS source: the `/i` flag
+# has no `/u`, so JS case-folding is ASCII-only (P1 — Rust's `(?i)` is
+# Unicode-simple-folding and would wrongly match `ſ` to `s`), and JS `\d` is
+# always `[0-9]` while Rust `regex`'s `\d` defaults to Unicode `Nd` (P2).
