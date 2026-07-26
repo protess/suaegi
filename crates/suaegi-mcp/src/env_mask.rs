@@ -252,6 +252,28 @@ mod tests {
         assert!(!sensitive_env_value("xoxb-abcdefghijk")); // 11 chars after `xoxb-`
     }
 
+    /// W6 — the three run-charsets (`is_sk_run_byte`, `is_gh_run_byte`,
+    /// `is_xox_run_byte`) must not be interchangeable: `sk` accepts `_` and
+    /// `-`, `gh` accepts only `_`, `xox` accepts only `-`. Each case below is
+    /// chosen so that swapping in a *different* family's charset flips the
+    /// verdict — e.g. an `xoxb-` value with an underscore in its run passes
+    /// under the `gh` charset but must fail under the real `xox` charset, and
+    /// vice versa for a hyphen in a `ghp_` run.
+    #[test]
+    fn w6_the_three_run_charsets_are_not_interchangeable() {
+        // xox charset allows `-`: run is 13 chars (`abcdefgh-ijkl`) >= 12.
+        assert!(sensitive_env_value("xoxb-abcdefgh-ijkl"));
+        // xox charset disallows `_`: run stops at 8 chars (`abcdefgh`) < 12.
+        assert!(!sensitive_env_value("xoxb-abcdefgh_ijkl"));
+        // gh charset allows `_`: run is 13 chars (`abcdefgh_ijkl`) >= 12.
+        assert!(sensitive_env_value("ghp_abcdefgh_ijkl"));
+        // gh charset disallows `-`: run stops at 8 chars (`abcdefgh`) < 12.
+        assert!(!sensitive_env_value("ghp_abcdefgh-ijkl"));
+        // sk charset allows both `-` and `_`: run is 14 chars
+        // (`abcdefgh-ij_kl`) >= 12.
+        assert!(sensitive_env_value("sk-abcdefgh-ij_kl"));
+    }
+
     #[test]
     fn w6_value_pattern_is_unanchored() {
         assert!(sensitive_env_value("prefix sk-abcdefghijkl suffix"));
