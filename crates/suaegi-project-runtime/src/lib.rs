@@ -1408,4 +1408,75 @@ mod tests {
         assert!(!is_wsl_shell(Some("mywsl"))); // not an exact segment match
         assert!(!is_wsl_shell(None)); // non-string input
     }
+
+    // =======================================================================
+    // E16 / E15 — the terminal-shell sniff, reached through the real entry
+    // point, must alone drive the WSL migration.
+    // =======================================================================
+
+    /// E16 (`O:127`) / E15: kills the mutation that drops the
+    /// `is_wsl_shell(terminal_shell)` half of the `||` in
+    /// `derive_global_windows_runtime_default_from_legacy_settings`. Every
+    /// Orca oracle case with a WSL-flavored `terminal_windows_shell` also
+    /// sets `local_agent_runtime: Some("wsl")`, so the left-hand side of the
+    /// `||` always decides and the right-hand side is never exercised by the
+    /// oracle. This pins that a user who never set `localAgentRuntime` at
+    /// all, but whose terminal shell sniffs as WSL, still migrates to a WSL
+    /// global default — and that a non-WSL shell in the same shape does not.
+    #[test]
+    fn e16_terminal_shell_sniff_alone_drives_the_wsl_migration() {
+        let wsl_settings = LegacyWindowsRuntimeSettings {
+            local_agent_runtime: None,
+            local_agent_wsl_distro: None,
+            terminal_windows_shell: Some(r"C:\Windows\System32\wsl.exe"),
+            terminal_windows_wsl_distro: Some("Ubuntu"),
+        };
+        let result = derive_global_windows_runtime_default_from_legacy_settings(
+            Some(&wsl_settings),
+            &LegacyWindowsRuntimeMigrationContext::default(),
+        );
+        assert_eq!(
+            result,
+            LegacyWindowsRuntimeDefaultMigration {
+                default_runtime: GlobalWindowsRuntimeDefault::Wsl {
+                    distro: Some("Ubuntu".to_string())
+                },
+                fallback_reason: None,
+            }
+        );
+
+        let non_wsl_settings = LegacyWindowsRuntimeSettings {
+            terminal_windows_shell: Some(r"C:\Windows\System32\cmd.exe"),
+            ..wsl_settings
+        };
+        let result = derive_global_windows_runtime_default_from_legacy_settings(
+            Some(&non_wsl_settings),
+            &LegacyWindowsRuntimeMigrationContext::default(),
+        );
+        assert_eq!(
+            result,
+            LegacyWindowsRuntimeDefaultMigration {
+                default_runtime: GlobalWindowsRuntimeDefault::WindowsHost,
+                fallback_reason: None,
+            }
+        );
+
+        let forward_slash_settings = LegacyWindowsRuntimeSettings {
+            terminal_windows_shell: Some("C:/Windows/System32/wsl.exe"),
+            ..wsl_settings
+        };
+        let result = derive_global_windows_runtime_default_from_legacy_settings(
+            Some(&forward_slash_settings),
+            &LegacyWindowsRuntimeMigrationContext::default(),
+        );
+        assert_eq!(
+            result,
+            LegacyWindowsRuntimeDefaultMigration {
+                default_runtime: GlobalWindowsRuntimeDefault::Wsl {
+                    distro: Some("Ubuntu".to_string())
+                },
+                fallback_reason: None,
+            }
+        );
+    }
 }
