@@ -16,9 +16,9 @@
 //!   - `failed`(확정 거부 — GraphQL이 입력이 나쁘다고 명시) → [`WriteOutcome::Rejected`]
 //!   - `network`(일시 전송 실패) → [`WriteOutcome::Unavailable`]
 //!   - `unconfirmed`(write는 보냈으나 readback 확인 불가) → [`WriteOutcome::Unconfirmed`]
-//!   **write POST의 네트워크 타임아웃은 절대 `failed`/Rejected가 아니다** — 확정 "실패"는 성공했을
-//!   수도 있는 write에 대한 정확성 거짓말이다(write가 랜딩했을 수 있다). Orca와 같이 timeout →
-//!   `unconfirmed`, connect-refused → `network`로 접는다.
+//!     **write POST의 네트워크 타임아웃은 절대 `failed`/Rejected가 아니다** — 확정 "실패"는 성공했을
+//!     수도 있는 write에 대한 정확성 거짓말이다(write가 랜딩했을 수 있다). Orca와 같이 timeout →
+//!     `unconfirmed`, connect-refused → `network`로 접는다.
 //!
 //! 분류 축은 읽기와 같은 [`super::classify::classify_graphql`]의 `errors[0].extensions.type`을
 //! 재사용한다(Orca의 message-substring 매칭은 미러하지 않는다). 예외는 duplicate 하나 —

@@ -973,7 +973,7 @@ fn python_module_matches(module: &str) -> Option<&'static AgentDef> {
 }
 
 fn is_launcher(basename: &str, launchers: &[&str]) -> bool {
-    launchers.iter().any(|l| basename == *l)
+    launchers.contains(&basename)
 }
 
 /// 명령줄에서 에이전트를 식별한다. **실행 파일 자리만** 본다 —
