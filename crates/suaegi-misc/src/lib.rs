@@ -1,11 +1,20 @@
-//! `suaegi-misc` — a batch of twelve small, self-contained pure helpers ported
-//! verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None import anything
-//! (no clock, no fs, no base64, no hashing); each has a Vitest oracle ported
-//! bit-for-bit, plus the oracle-silent "extra pins" that guard the real
-//! JS↔Rust divergences (ECMAScript whitespace, ASCII-digit / lowercase-UUID
-//! rules, UTF-16-vs-byte scan caps, and the never-panic OSC trim).
+//! `suaegi-misc` — a batch of fourteen small, self-contained pure helpers
+//! ported verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None import
+//! anything (no clock, no fs, no base64, no hashing); each has a Vitest
+//! oracle ported bit-for-bit, plus the oracle-silent "extra pins" that guard
+//! the real JS↔Rust divergences (ECMAScript whitespace, ASCII-digit /
+//! lowercase-UUID rules, UTF-16-vs-byte scan caps, and the never-panic OSC
+//! trim).
 //!
 //! # Modules
+//! - [`codex_auth_errors`] — Codex CLI auth-error detection/extraction
+//!   (10 `/i` regexes expanded to 15 ASCII-lowercased literals, CSI-only ANSI
+//!   strip, UTF-16 4,000-unit cap, `<=`-guarded line iterator distinct from
+//!   `process_output_field_scanner`'s `<` sibling).
+//! - [`harness_injected_user_turns`] — harness-injected user-turn text
+//!   classification (hand-scanned leading-tag-name match against 19 known
+//!   tags, 7 prefix literals, `channel` deliberately excluded from the tag
+//!   set).
 //! - [`usage_percentage`] — consumption-meter percentage (clamp → round →
 //!   complement order, #7574).
 //! - [`rate_limit_reset`] — rate-limit countdown copy (floor/modulo, the
@@ -34,7 +43,9 @@
 //! - [`tailnet_address`] — Tailnet/CGNAT IPv4 detection (ASCII-digit octets,
 //!   leading zeros allowed, `100.64.0.0/10` range check).
 
+pub mod codex_auth_errors;
 pub mod command_token_scanner;
+pub mod harness_injected_user_turns;
 pub mod image_data_uri;
 pub mod js_ws;
 pub mod markdown_toc_width;
@@ -48,9 +59,16 @@ pub mod stable_pane_id;
 pub mod tailnet_address;
 pub mod usage_percentage;
 
+pub use codex_auth_errors::{
+    extract_codex_auth_error, is_codex_auth_error, iterate_codex_output_lines, CodexOutputLines,
+};
 pub use command_token_scanner::{
     command_contains_token, get_command_token_path_basename, get_first_command_token,
     COMMAND_TOKEN_SCAN_MAX_CHARS,
+};
+pub use harness_injected_user_turns::{
+    is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
+    KNOWN_HARNESS_TAG_NAMES,
 };
 pub use image_data_uri::build_image_data_uri;
 pub use js_ws::{is_js_whitespace, js_trim};
