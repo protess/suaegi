@@ -1,0 +1,23 @@
+[package]
+name = "suaegi-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — M1 (path/candidate layer only) of a VERBATIM port of Orca's
+# `src/shared/mcp-config.ts` (@ v1.4.150-rc.0). The full source has exactly one
+# runtime dependency in the whole file: `JSON.parse` (used by
+# `inspectMcpConfigContent`, deferred to M2 alongside `serde_json`). Everything
+# ported here — the candidate table, parent-dir/basename splitting, and the
+# Windows-root inspectability check — is pure `&str`/`Vec` logic with zero
+# imports in the TS source, so this crate stays dependency-free.
+#   - NO `std::path`: `relative_parent_dir`/`relative_basename` deliberately do
+#     NOT trim trailing separators or resolve `.`/`..` (Orca doesn't either);
+#     `std::path::Path::{parent,file_name}` would silently add both behaviors.
+#   - NO `regex`: `can_inspect_local_mcp_config_root`'s drive/UNC prefix check
+#     is hand-rolled as explicit byte predicates, anchored at start only.
+#   - Deliberately does NOT reuse suaegi-path: its helpers are close but not
+#     bit-identical to this module's contract (see src/lib.rs doc comments).
+# suaegi-misc / suaegi-path precedent for zero-dependency leaf crates.
+[dependencies]

@@ -4098,6 +4098,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-mcp"
+version = "0.1.0"
+
+[[package]]
 name = "suaegi-misc"
 version = "0.1.0"
 
