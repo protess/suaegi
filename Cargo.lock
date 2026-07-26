@@ -4171,6 +4171,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-setupseq"
+version = "0.1.0"
+dependencies = [
+ "suaegi-misc",
+ "suaegi-path",
+]
+
+[[package]]
 name = "suaegi-taskquery"
 version = "0.1.0"
 

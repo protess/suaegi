@@ -1,0 +1,36 @@
+[package]
+name = "suaegi-setupseq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/setup-runner-command.ts`
+# (87L) and `src/shared/setup-agent-sequencing.ts` (257L) @ v1.4.146-rc.0.
+# These two modules BUILD SHELL COMMAND STRINGS (posix `bash -lc ...` and
+# Windows `cmd.exe`/PowerShell) that gate an agent's startup command behind a
+# repo setup script's completion. Quoting/escaping correctness is the
+# highest-value axis in this crate — see the plan's §2 (K1-K14) at
+# docs/superpowers/plans/2026-07-27-setup-agent-sequencing.md.
+#   - One crate, not two: `setup-agent-sequencing` cannot be reviewed without
+#     `setup-runner-command` (its `markerPath` derives from
+#     `runnerScriptPathForShell`, and its windows/posix branch IS
+#     `resolution.shell`), and `setup-runner-command` alone has only 6 oracle
+#     assertions — too thin for an independent leaf.
+#   - NO `regex`: every pattern (WSL UNC alias fold, the two quoting
+#     predicates, the leading-env-assignment check) is hand-rolled, matching
+#     `suaegi-path`'s C1 precedent — this crate's own WSL-UNC matcher is a
+#     separate hand-roll from `suaegi-path`'s (Orca itself has two distinct
+#     WSL-UNC regexes across these two files; unifying them would not be a
+#     faithful port).
+#   - NO `serde`: no serialization surface here.
+#   - NO `rand`: `createSetupAgentSequenceNonce`'s `crypto.randomUUID()`
+#     preference has no Rust std equivalent without an OS-RNG dependency;
+#     every oracle case that needs a deterministic nonce supplies one
+#     explicitly (matching every real call site in the oracle). See the
+#     module docs on `create_setup_agent_sequence_nonce` for the exact
+#     portability gap and `suaegi-quickcmd`'s "local mirror of an external
+#     surface" precedent for the same kind of documented narrowing.
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
+suaegi-path = { path = "../suaegi-path" }
