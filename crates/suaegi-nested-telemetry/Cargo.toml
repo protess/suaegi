@@ -1,0 +1,36 @@
+[package]
+name = "suaegi-nested-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/nested-repo-telemetry.ts`
+# (233L). Its three imports (`NestedRepoScanResult`, `ProjectGroupImportMode`,
+# `ProjectGroupImportResult`) are ALL type-only, so there is zero runtime
+# dependency to carry over — the first ported leaf where that's true of every
+# import, not just of the module itself (`suaegi-workspace-cleanup` had ZERO
+# imports; this one has three, but none of them is a value).
+#   - `serde`/`serde_json`: NOT needed. This crate never serializes; it only
+#     builds plain structs. (These ARE an IPC/telemetry payload shape in
+#     Orca — add serde as an optional feature later if/when this crate
+#     crosses a process boundary; at that point the `Option`-means-"key
+#     omitted" fields (`selected_path_kind`) will need
+#     `skip_serializing_if = "Option::is_none"` to preserve the TS
+#     conditional-spread semantics.)
+#   - `regex`: NOT needed. Zero regexes in the source (the oracle's own
+#     `/^[0-9a-f-]{36}$/` on the attempt-id generator is a TEST-side
+#     assertion, not something this crate needs to evaluate).
+#   - `rand`/`uuid`: NOT needed and FORBIDDEN — see the `suaegi-setupseq`
+#     precedent (`create_setup_agent_sequence_nonce`). The attempt-id
+#     generator is built on `std::collections::hash_map::RandomState` +
+#     `std::time::SystemTime`, never an OS-RNG crate.
+#   - `suaegi-misc`: NOT needed. Zero `.trim()` calls in the source, zero
+#     regexes, zero string-length work — this module is pure numeric
+#     bucketing/capping plus a handful of decision trees over string-literal
+#     vocabularies.
+#   - No other `suaegi-*` crate dependency: nothing here needs another
+#     crate's types; the narrow input structs below model only the fields
+#     this module actually reads from `NestedRepoScanResult` /
+#     `ProjectGroupImportResult` (see `src/lib.rs` module docs).
+[dependencies]

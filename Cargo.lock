@@ -4132,6 +4132,10 @@ name = "suaegi-misc"
 version = "0.1.0"
 
 [[package]]
+name = "suaegi-nested-telemetry"
+version = "0.1.0"
+
+[[package]]
 name = "suaegi-path"
 version = "0.1.0"
 
