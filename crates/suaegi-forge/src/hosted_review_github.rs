@@ -152,7 +152,7 @@ pub struct HostedReviewFromGitHubPrInfoArgs<'a> {
 /// "resolved" and are skipped. Surviving `thread_id`s are deduplicated via a
 /// `HashSet` (exact string equality, no case folding) and the set's `len()`
 /// is returned — matching JS `Set<string>.size`.
-fn unresolved_thread_count(comments: Option<&[HostedReviewCommentInput]>) -> Option<u32> {
+pub(crate) fn unresolved_thread_count(comments: Option<&[HostedReviewCommentInput]>) -> Option<u32> {
     let comments = comments?;
     let mut unresolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for comment in comments {

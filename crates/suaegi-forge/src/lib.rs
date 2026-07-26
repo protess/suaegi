@@ -10,6 +10,7 @@ pub mod github_identity;
 pub mod gitlab;
 pub mod hosted_review;
 pub mod hosted_review_github;
+pub mod hosted_review_gitlab;
 pub mod hosted_review_queue;
 pub mod parse;
 pub mod pr_actions;
@@ -43,6 +44,9 @@ pub use hosted_review_github::{
     hosted_review_info_from_github_pr_info, hosted_review_summary_from_github_pr_info,
     CheckConclusion, CheckRunStatus, GitHubPrInfo, HostedReviewCommentInput,
     HostedReviewFromGitHubPrInfoArgs, PrCheckDetail,
+};
+pub use hosted_review_gitlab::{
+    hosted_review_summary_from_gitlab_info, GitLabReviewInfo, HostedReviewFromGitLabInfoArgs,
 };
 pub use hosted_review_queue::{
     classify_hosted_review, review_needs_response, review_ready_to_merge,

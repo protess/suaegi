@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
