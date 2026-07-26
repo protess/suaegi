@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 suaegi-git = { path = "../suaegi-git" }
+suaegi-misc = { path = "../suaegi-misc" }
 suaegi-secrets = { path = "../suaegi-secrets" }
 # HTTP 전송은 §Q5에서 leaf-크레이트로 추출됨(원래 여기 github_http/transport.rs). forge와
 # tracker가 둘 다 이걸 의존해 이슈트래커→PR-forge 레이어링 스멜을 피한다.

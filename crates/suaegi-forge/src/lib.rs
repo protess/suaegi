@@ -6,6 +6,7 @@ pub mod classify;
 pub mod eligibility;
 pub mod github;
 pub mod github_http;
+pub mod github_identity;
 pub mod gitlab;
 pub mod parse;
 pub mod pr_actions;
@@ -19,6 +20,7 @@ pub use github_http::{
     choose_github_backend, http_creation_eligibility, GithubBackend, HttpGhForge, HttpTransport,
     ReqwestTransport,
 };
+pub use github_identity::{github_repo_identity_key, is_default_github_host};
 pub use gitlab::{
     glab_creation_eligibility, glab_preflight, GlabError, GlabForge, GlabOutput, GlabPreflight,
     GlabRunner, MIN_GLAB_VERSION,

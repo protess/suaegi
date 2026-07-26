@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of ten small, self-contained pure helpers ported
+//! `suaegi-misc` — a batch of twelve small, self-contained pure helpers ported
 //! verbatim from Orca's `src/shared/*` (@ v1.4.150-rc.0). None import anything
 //! (no clock, no fs, no base64, no hashing); each has a Vitest oracle ported
 //! bit-for-bit, plus the oracle-silent "extra pins" that guard the real
@@ -29,6 +29,10 @@
 //! - [`command_token_scanner`] — bounded first-command-token extraction with
 //!   quote-fallback semantics, path basename, and whole-token containment
 //!   (UTF-16 scan cap, `js_ws` reused).
+//! - [`remote_runtime_error`] — remote runtime client error classification
+//!   (case-sensitive code set vs. case-insensitive message-fragment scan).
+//! - [`tailnet_address`] — Tailnet/CGNAT IPv4 detection (ASCII-digit octets,
+//!   leading zeros allowed, `100.64.0.0/10` range check).
 
 pub mod command_token_scanner;
 pub mod image_data_uri;
@@ -39,7 +43,9 @@ pub mod powershell_argument;
 pub mod process_output_field_scanner;
 pub mod protocol_compat;
 pub mod rate_limit_reset;
+pub mod remote_runtime_error;
 pub mod stable_pane_id;
+pub mod tailnet_address;
 pub mod usage_percentage;
 
 pub use command_token_scanner::{
@@ -66,10 +72,14 @@ pub use protocol_compat::{
 pub use rate_limit_reset::{
     format_reset_countdown, format_reset_duration, get_reset_countdown_next_tick_delay,
 };
+pub use remote_runtime_error::{
+    is_recoverable_remote_runtime_connection_error, RemoteRuntimeClientErrorLike,
+};
 pub use stable_pane_id::{
     is_stable_pane_id, is_terminal_leaf_id, make_pane_key, parse_legacy_numeric_pane_key,
     parse_pane_key, LegacyNumericPaneKey, MakePaneKeyError, ParsedPaneKey,
 };
+pub use tailnet_address::is_tailnet_ipv4_address;
 pub use usage_percentage::{
     clamp_used_percent, get_displayed_usage_percentage, normalize_usage_percentage_display,
     UsagePercentageDisplay, DEFAULT_USAGE_PERCENTAGE_DISPLAY,
