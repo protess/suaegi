@@ -12,7 +12,8 @@
 //! order-preserving JSON value type, `js_string_of`/ECMAScript number
 //! formatting, the sensitive-pattern predicates, and `maskMcpEnv`.
 //!
-//! Still deferred to M2b: `inspectMcpConfigContent`, `summarizeMcpServer`,
+//! M2b (`src/inspection.rs`) has since landed too, completing the module:
+//! `inspectMcpConfigContent`, `summarizeMcpServer`,
 //! `readCommand`/`readUrl`/`resolveTransport`, `extractObjectAtPath`, and the
 //! `McpServerTransport`/`McpServerStatus`/`McpServerSummary`/
 //! `McpConfigInspection` types.
@@ -20,9 +21,14 @@
 use std::collections::HashMap;
 
 mod env_mask;
+mod inspection;
 mod json;
 
 pub use env_mask::{mask_mcp_env, MASKED_ENV_VALUE};
+pub use inspection::{
+    inspect_mcp_config_content, McpConfigInspection, McpConfigStatus, McpServerStatus,
+    McpServerSummary, McpServerTransport,
+};
 pub use json::{parse_json, js_string_of, JsonNumber, JsonValue};
 
 // ---------------------------------------------------------------------------
