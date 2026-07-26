@@ -4071,6 +4071,7 @@ dependencies = [
  "regex",
  "serde",
  "suaegi-core",
+ "suaegi-misc",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
