@@ -71,6 +71,11 @@ number를 키에서 누락, provider를 소문자화, trim 추가, G2의 `fract(
 
 ## 3. Deferred
 - **M2** queue 분류기(비대칭 null T9/T10·`Date.parse`·`includes('bot')`) — Q1/Q3/Q6/Q12 결정 필요.
+  **⚠ M2 주의 — `last_viewed_at: Option<u64>` 캐스팅 함정:** M1은 epoch-ms를 `u64`로 뒀다. M2의
+  `reviewNeedsResponse`(`queue.ts:88-89`)는 이걸 **`Date.parse` 결과와 비교**하는데 그 값은 **부호 있는**
+  값이다(1970 이전 날짜면 음수). 반드시 **`parsed_ms > last_viewed_at as i64`** 형태로 i64 공간에서 비교할 것 —
+  `parsed_ms as u64 > last_viewed_at`로 쓰면 음수가 거대한 u64로 wrap해 **거짓 true**가 된다(cardinal sin:
+  transient≠false-negative의 사촌). M2에서 이 캐스팅을 mutation으로 반드시 검증하거나, 그때 필드를 `i64`로 바꿀 것.
 - **M3** github 노멀라이저 + `PrComment` 확장(thread_id/is_resolved, T16) — 기존 타입 수정.
 - **M4** gitlab 노멀라이저 + `url` 크레이트(T25 포트 포함 host, T27/T28) — 새 의존성.
 - 소비자 배선(큐 뷰·정렬 Q5) = 사람눈.
