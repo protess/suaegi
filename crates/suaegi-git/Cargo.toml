@@ -9,6 +9,7 @@ license.workspace = true
 suaegi-core = { path = "../suaegi-core" }
 suaegi-misc = { path = "../suaegi-misc" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
