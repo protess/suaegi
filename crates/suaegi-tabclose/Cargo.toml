@@ -1,0 +1,29 @@
+[package]
+name = "suaegi-tabclose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's
+# `src/shared/workspace-session-terminal-tab-close.ts` (276L) @ v1.4.146-rc.0.
+# Its only import is type-only (`Tab`, `TabGroup`, `TabGroupLayoutNode`,
+# `WorkspaceSessionState`, `WorkspaceVisibleTabType` from `./types`), so there
+# is zero runtime dependency to carry over.
+#   - `serde`/`serde_json`: NOT needed. The input already arrives as typed
+#     Rust values from the caller; this crate never serializes anything.
+#   - `regex`: NOT needed. Zero regexes in the source.
+#   - `suaegi-misc`: NOT needed. Zero `.trim()` calls, zero string-length
+#     work — the source is pure set arithmetic (PTY ownership), array
+#     filtering (tab/group pruning), and a handful of decision trees over a
+#     small number of string-literal vocabularies (`TabContentType`,
+#     `WorkspaceVisibleTabType`, `TabGroupSplitDirection`).
+#   - No `indexmap`/other ordered-map crate: `ptyIdsByLeafId` (the one place
+#     insertion order is load-bearing — N10 in the plan) is modeled as
+#     `Vec<(String, String)>` instead of pulling in a dependency just to get
+#     an order-preserving map.
+#   - No other `suaegi-*` crate dependency: the narrow state/tab/group types
+#     below model only the fields this module actually reads or writes from
+#     `Tab` / `TabGroup` / `TabGroupLayoutNode` / `WorkspaceSessionState` /
+#     `TerminalTab` / `PersistedOpenFile` (see `src/lib.rs` module docs).
+[dependencies]
