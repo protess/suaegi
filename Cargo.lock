@@ -4136,6 +4136,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-quickcmd"
+version = "0.1.0"
+dependencies = [
+ "suaegi-misc",
+]
+
+[[package]]
 name = "suaegi-screencast"
 version = "0.1.0"
 dependencies = [
