@@ -4140,6 +4140,7 @@ dependencies = [
  "portable-pty",
  "regex",
  "serde",
+ "serde_json",
  "suaegi-core",
  "tempfile",
  "thiserror 2.0.19",
