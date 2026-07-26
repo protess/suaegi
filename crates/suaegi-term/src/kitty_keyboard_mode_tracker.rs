@@ -350,6 +350,13 @@ impl KittyKeyboardModeTracker {
         if tail.len() > KITTY_SCAN_TAIL_LIMIT {
             return Vec::new();
         }
+        // The `\xc2\x9b` arm here is redundant with the body-extraction path
+        // below: an empty body also passes `is_incomplete_sequence_body`, so
+        // this fast path and that path agree on every input for this arm.
+        // Kept because the TS source has this same three-way fast path
+        // verbatim; consequently, mutating just this line is an equivalent
+        // mutant — the body-extraction path is the load-bearing one (see
+        // `h1_c1_tail_with_a_nonempty_body_is_retained` below).
         if tail == b"\x1b" || tail == b"\x1b[" || tail == b"\xc2\x9b" {
             return tail.to_vec();
         }
@@ -602,6 +609,40 @@ mod tests {
         assert_eq!(t.flags(), 0);
         t.scan(b">5u");
         assert_eq!(t.flags(), 5);
+    }
+
+    /// H1/H2 mutation-catcher for the *body* half of the `\xc2\x9b` decision.
+    /// Mutating the body-extraction line `tail.strip_prefix(b"\xc2\x9b")` to
+    /// `tail.strip_prefix(b"\x9b")` kills no existing test:
+    /// `h2_bare_c1_introducer_retained_as_tail_across_chunks` only feeds a
+    /// *bare* `"\u{9b}"`, which the fast path (`tail == b"\xc2\x9b"`) above
+    /// catches and returns before the body-extraction line ever runs, so that
+    /// test cannot distinguish the two `strip_prefix` patterns. This test
+    /// forces a C1-introduced tail with a **non-empty body** so the fast
+    /// path does not match and the body-extraction line is actually
+    /// exercised: `"\u{9b}>"` is bytes `C2 9B 3E` (3 bytes, not the 2-byte
+    /// fast-path pattern). Correct: `strip_prefix(b"\xc2\x9b")` yields
+    /// `Some(b">")`, which is an incomplete-but-valid body, so the tail is
+    /// retained and the sequence completes on the next chunk. Mutated:
+    /// `strip_prefix(b"\x9b")` fails against `C2 9B 3E` (no leading `0x9b`),
+    /// the body is `None`, the tail is discarded, and the split sequence is
+    /// silently lost.
+    #[test]
+    fn h1_c1_tail_with_a_nonempty_body_is_retained() {
+        let mut t = KittyKeyboardModeTracker::default();
+        t.scan("\u{9b}>".as_bytes());
+        assert_eq!(t.flags(), 0); // nothing complete yet
+        t.scan(b"1u");
+        assert_eq!(t.flags(), 1); // C1 tail with a `>` body survived the split
+
+        // Longer-body case, `?`-prefixed rather than `<>=`-prefixed, to
+        // exercise the screen-switch body shape through the same path.
+        let mut t2 = KittyKeyboardModeTracker::default();
+        t2.scan("\u{9b}?10".as_bytes());
+        assert_eq!(t2.flags(), 0); // nothing complete yet
+        t2.scan(b"49h");
+        assert!(t2.is_alternate_screen());
+        assert!(t2.has_observed_alternate_screen_switch());
     }
 
     #[test]
