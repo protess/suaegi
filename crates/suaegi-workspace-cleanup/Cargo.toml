@@ -1,0 +1,35 @@
+[package]
+name = "suaegi-workspace-cleanup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/workspace-cleanup.ts`
+# (240L, ZERO imports). This is a policy module over a 16-variant blocker
+# vocabulary, a 3-tier selection lattice, a dismissal/fingerprint protocol,
+# and a two-threshold idle classifier — the same reason
+# `suaegi-project-runtime` was split out as its own leaf rather than folded
+# into `suaegi-misc` (whose charter is small self-contained pure
+# string/number helpers with zero policy).
+#   - `serde`/`serde_json`: NOT needed. Nothing here parses or serializes;
+#     the fingerprint is `Array.join('|')`, not `JSON.stringify`. (These
+#     types ARE an IPC payload shape in Orca — add serde as an optional
+#     feature later if/when this crate crosses a process boundary; at that
+#     point `created_at`'s absent-vs-null distinction will need
+#     `skip_serializing_if = "Option::is_none"`.)
+#   - `regex`: NOT needed. Zero regexes in the source.
+#   - `chrono`: NOT needed and would be actively harmful — the module reads
+#     no clock. `scannedAt` is always a caller-supplied parameter.
+#   - `thiserror`: NOT needed. Every function is total (no throw, no async,
+#     no IO).
+#   - `suaegi-misc`: NOT needed. Zero `.trim()` calls in the source (the
+#     first ported module of which that's true) — no case folding either.
+#   - No other `suaegi-*` crate dependency: this module has zero imports in
+#     Orca and nothing here needs another crate's types.
+# Numeric model: every timestamp (`last_activity_at`, `scanned_at`,
+# `checked_at`, `dismissed_at`, `newest_diff_comment_at`) and the classifier
+# version are modeled as `i64` milliseconds. That makes the TS `|| 0`
+# (`O:197`) a no-op and makes the fingerprint's number->string conversion
+# exactly `i64::to_string()` — no ECMAScript float-formatting shim needed.
+[dependencies]
