@@ -311,10 +311,29 @@ fn decode_frame_metadata(bytes: &[u8]) -> Option<BrowserScreencastFrameMetadata>
             continue;
         };
         // `isFiniteNumber`: `typeof value === 'number' && Number.isFinite(value)`.
-        // A JSON text has no NaN/Infinity literal, but an extreme exponent
-        // (e.g. `1e400`) parses to an infinite `f64` in both `serde_json`
-        // and JS's `Number()` — the explicit `is_finite()` check below is
-        // load-bearing, not redundant, for exactly that case.
+        // Unlike JS's `Number()`, `serde_json` REJECTS an out-of-range
+        // exponent (e.g. `1e400`) at PARSE time (`number out of range`)
+        // rather than producing an infinite `f64` — confirmed against this
+        // workspace's locked `serde_json` version. So a `serde_json::Number`
+        // that made it this far is always finite, and the `is_finite()`
+        // check below is DEFENSIVE, not load-bearing: it cannot currently be
+        // false (mutation-tested — replacing it with `if true` kills no
+        // test).
+        //
+        // Known, accepted divergence from Orca: `JSON.parse` on a document
+        // with an out-of-range exponent still SUCCEEDS, yielding `Infinity`
+        // for that field, so Orca's `isFiniteNumber` drops just that one key
+        // and decodes the rest of the metadata normally. Here the same
+        // exponent fails the whole-document `serde_json::from_str` in
+        // `decode_json`, so `decode_frame_metadata` returns `None` and
+        // `decode_browser_screencast_frame` rejects the ENTIRE frame (F8
+        // sub-case 7) — see
+        // `f7_out_of_range_exponent_rejects_the_whole_frame_unlike_orca`.
+        // Accepted rather than worked around: matching Orca here would mean
+        // hand-rolling a lenient number parser, which would reintroduce
+        // exactly the `JSON.parse`-fidelity risk that motivated using
+        // `serde_json` (rather than a hand-rolled parser) for decode in the
+        // first place.
         if let Some(n) = value.as_f64() {
             if n.is_finite() {
                 set_metadata_field(&mut metadata, key, n);
@@ -859,6 +878,47 @@ mod tests {
         let decoded =
             decode_browser_screencast_frame(&encoded).expect("BOM-prefixed JSON must parse");
         assert_eq!(decoded.metadata.device_width, Some(9.0));
+    }
+
+    /// Pins a known, accepted divergence from Orca (see the comment above
+    /// the `is_finite()` check in `decode_frame_metadata`): Orca's
+    /// `JSON.parse('{"deviceWidth":1e400}')` SUCCEEDS, yielding
+    /// `deviceWidth: Infinity`, so Orca's `isFiniteNumber` filter drops just
+    /// that one key and still decodes the frame with the rest of its
+    /// metadata intact. This port's `serde_json` instead REJECTS `1e400` as
+    /// an out-of-range number at parse time, so the whole metadata document
+    /// fails to parse and the ENTIRE frame is rejected — not just the one
+    /// field. This test pins THIS port's (divergent) behavior, not Orca's.
+    #[test]
+    fn f7_out_of_range_exponent_rejects_the_whole_frame_unlike_orca() {
+        fn build_frame(metadata_json: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![
+                BROWSER_SCREENCAST_KIND,
+                BROWSER_SCREENCAST_VERSION,
+                BrowserScreencastOpcode::Frame as u8,
+                1,
+            ];
+            encoded.extend_from_slice(&1u32.to_le_bytes());
+            encoded.extend_from_slice(&(metadata_json.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(&0u32.to_le_bytes());
+            encoded.extend_from_slice(metadata_json);
+            encoded.extend_from_slice(b"img");
+            encoded
+        }
+
+        let out_of_range = build_frame(br#"{"deviceWidth":1e400}"#);
+        assert_eq!(
+            decode_browser_screencast_frame(&out_of_range),
+            None,
+            "an out-of-range exponent must fail serde_json's whole-document \
+             parse and reject the entire frame, unlike Orca's JSON.parse \
+             (which would succeed and just drop the one key)"
+        );
+
+        let in_range = build_frame(br#"{"deviceWidth":1e308}"#);
+        let decoded = decode_browser_screencast_frame(&in_range)
+            .expect("1e308 is within f64 range and must decode successfully");
+        assert_eq!(decoded.metadata.device_width, Some(1e308));
     }
 
     // -- F9: seq clamp/floor/wrap exact values --------------------------------
