@@ -1,0 +1,38 @@
+[package]
+name = "suaegi-termstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/terminal-stream-protocol.ts`
+# (109L, v1.4.146-rc.0). A binary wire protocol carrying terminal
+# output/input/resize/snapshot/metadata frames between the Electron main
+# process and the renderer over a (possibly reused) socket buffer: a 16-byte
+# little-endian header (kind/version/opcode/pad/streamId/seq-high/seq-low)
+# followed by an opaque payload tail.
+#
+# This crate shares ZERO code with the sibling `suaegi-screencast` port
+# (`browser-screencast-protocol.ts`) despite the superficial similarity —
+# opcode count (15 vs 1), rejection-path count (3 vs 7), payload ownership
+# (copy vs view), byte-3/12 semantics (pad vs format byte / seq-low vs
+# reserved), and JSON codec shape (no shape check vs object-only) all differ.
+# See the module doc comment in `src/lib.rs` for the full trap catalogue
+# (R1-R11).
+#   - `serde_json`: DECODE ONLY. `decodeTerminalStreamJson` has no shape
+#     check (R7) and `serde_json::from_str` reproduces `JSON.parse`
+#     fidelity over attacker-influenced bytes without hand-rolling a parser
+#     (the exact hollow-test-magnet trap this repo's mutation-testing
+#     memory warns about).
+#   - `preserve_order` is NEVER enabled — 11+ crates already depend on
+#     `serde_json`; turning the feature on would unify it workspace-wide for
+#     no reason this crate needs. Because of this, `serde_json::Value`'s
+#     object map (`BTreeMap`) cannot preserve `JSON.stringify`'s insertion
+#     order, so ENCODE uses a hand-rolled `TerminalStreamJsonValue` (order
+#     is part of its representation) instead of feeding a `serde_json::Value`
+#     back through `serde_json::to_vec` (R10).
+#   - `serde` derive, `regex`, `thiserror`: NOT needed. No (de)serialize
+#     derive is required for the wire types, no regex is in scope, and
+#     decode is total — every failure path returns `None`, not `Result`.
+[dependencies]
+serde_json = { workspace = true }
