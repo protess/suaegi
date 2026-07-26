@@ -1,0 +1,41 @@
+[package]
+name = "suaegi-claude-roster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/claude-subagent-roster.ts`
+# (295L). This is a mutable-key-store reconciliation POLICY (upsert/fold/sweep
+# over a roster keyed by lifecycle id), not a small self-contained pure
+# helper — the same reason `suaegi-project-runtime` and
+# `suaegi-workspace-cleanup` were split out as their own leaves rather than
+# folded into `suaegi-misc` (whose charter is small pure string/number
+# helpers with zero policy).
+#   - `serde`/`serde_json`: NOT needed. The observable surface of the one
+#     "parses untyped input" function (`readClaudeBackgroundAgentTasks`) is
+#     only: is it an array; is each element object-like; is `type` one of
+#     two exact string literals; is `id` a string and is it empty after an
+#     ECMAScript trim; are `agent_type`/`description` strings; is `status`
+#     exactly `"running"`. Key order, duplicate keys, numeric formatting and
+#     nesting depth are never inspected. A hand-rolled input enum
+#     (`HookBackgroundTasksField`/`HookTaskElement`/`HookTaskObject`) models
+#     exactly that surface — parsing has already happened upstream.
+#   - `regex`: NOT needed (I6) — the hex-suffix check is
+#     `/^[0-9a-f]+$/i` with no `/u` flag, i.e. ASCII-only case folding, which
+#     `char::is_ascii_hexdigit` reproduces exactly. Rust `regex`'s `(?i)` is
+#     Unicode case folding and would silently widen the class.
+#   - `chrono`: NOT needed — the module reads no clock; every timestamp is a
+#     caller-supplied `i64` millisecond parameter.
+#   - `indexmap`: NOT needed — the one place insertion order is genuinely
+#     observable (`pendingRunningTasks`, I13) is small and hand-rolled as
+#     `Vec<(String, ClaudeBackgroundAgentTask)>` with last-wins upsert/removal
+#     helpers, mirroring `Map.set`/`Map.delete` order semantics exactly. The
+#     roster itself (`ClaudeSubagentRoster`) is provably order-independent
+#     (the emission path's sort is a total order over `(started_at, id)`, so
+#     no insertion order survives to any observable output) — see the I13
+#     note on `ClaudeSubagentRoster` in `src/lib.rs`.
+#   - `thiserror`: NOT needed. Every function here is total (no throw, no
+#     async, no IO).
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
