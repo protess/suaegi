@@ -681,7 +681,7 @@ mod parser_tests {
     /// 레코드만 소비하면 뒤따르는 add가 상태·경로 어긋남으로 무너진다.
     #[test]
     fn record_after_rename_stays_aligned() {
-        let numstat = "1\t0\t\0orig.txt\0renamed.txt\02\t0\tafter.txt\0";
+        let numstat = "1\t0\t\0orig.txt\0renamed.txt\x002\t0\tafter.txt\0";
         let name_status = "R100\0orig.txt\0renamed.txt\0A\0after.txt\0";
         let counts = parse_numstat_z(numstat).unwrap();
         let files = parse_name_status_z(name_status, &counts).unwrap();

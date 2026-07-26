@@ -969,7 +969,7 @@ mod tests {
         k.text = Some("안녕".to_string());
         assert_key(&k, TermMode::NONE, Some("안녕".as_bytes()));
         // 회귀 방어를 명시적으로: 6바이트 전부여야 한다(음절당 3).
-        assert_eq!("안녕".as_bytes().len(), 6);
+        assert_eq!("안녕".len(), 6);
     }
 
     /// `text`가 비어 있으면 논리 문자로 떨어진다.

@@ -274,7 +274,7 @@ struct CheckRun {
 fn summarize_check_runs(runs: &[CheckRun]) -> ChecksSummary {
     let mut s = ChecksSummary::default();
     for r in runs {
-        if r.status.to_ascii_lowercase() != "completed" {
+        if !r.status.eq_ignore_ascii_case("completed") {
             s.pending += 1;
             continue;
         }

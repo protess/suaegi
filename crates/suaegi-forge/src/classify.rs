@@ -39,7 +39,7 @@ pub fn classify_unavailable(stderr: &str) -> ForgeUnavailable {
         || lower.contains("secondary rate limit")
         || lower.contains("abuse detection")
         || lower.contains("you have triggered an abuse")
-        || ((is_403 || is_429) && has_retry_after)
+        || (is_403 && has_retry_after)
         || lower.contains("api rate limit exceeded")
         || lower.contains("rate limit")
     {

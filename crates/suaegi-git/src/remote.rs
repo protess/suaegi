@@ -154,7 +154,7 @@ fn match_https_token_at(chars: &[char], i: usize) -> Option<(usize, usize)> {
     }
     j += 4;
     // 선택적 `s`
-    if j < n && chars[j].to_ascii_lowercase() == 's' {
+    if j < n && chars[j].eq_ignore_ascii_case(&'s') {
         j += 1;
     }
     // 리터럴 `://`
@@ -177,9 +177,13 @@ fn match_https_token_at(chars: &[char], i: usize) -> Option<(usize, usize)> {
     Some((userinfo_start, j))
 }
 
+/// 문자 위치 `i`에서 토큰 매칭을 시도해 `(keep_end, after)`(캡처 종료 지점, 소비 종료 지점)를
+/// 돌려주는 매처. `match_userinfo_token_at`/`match_https_token_at`가 이 시그니처를 따른다.
+type TokenMatcher = fn(&[char], usize) -> Option<(usize, usize)>;
+
 /// 한 패스를 문자열 전체에 global 적용한다(정규식 `/g`). 각 위치에서 `matcher`를 시도해
 /// 매칭이면 캡처 그룹(scheme prefix)만 남기고 credential을 건너뛴다.
-fn scrub_pass(input: &str, matcher: fn(&[char], usize) -> Option<(usize, usize)>) -> String {
+fn scrub_pass(input: &str, matcher: TokenMatcher) -> String {
     let chars: Vec<char> = input.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(input.len());
