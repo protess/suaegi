@@ -4043,6 +4043,7 @@ dependencies = [
  "serde_json",
  "suaegi-git",
  "suaegi-http",
+ "suaegi-misc",
  "suaegi-secrets",
  "tempfile",
  "thiserror 2.0.19",
