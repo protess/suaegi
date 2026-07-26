@@ -1,0 +1,34 @@
+[package]
+name = "suaegi-screencast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/browser-screencast-protocol.ts`
+# (143L). A binary wire protocol (browser CDP screencast frame -> renderer):
+# a 16-byte little-endian header, a JSON metadata blob, then a raw image
+# tail. Decode is total (`Option`, never panics); encode targets the real
+# producer, `src/main/browser/browser-screencast-stream.ts:56-66`.
+#   - `serde_json`: legitimate for DECODE ONLY — it reproduces `JSON.parse`
+#     fidelity (string escapes, `\uXXXX`, duplicate-key last-wins, number
+#     grammar) over attacker-influenced bytes. Hand-rolling that parser is
+#     exactly the "hollow-test magnet" this repo's mutation-testing memory
+#     warns about. `serde_json::Value` (BTreeMap, not `IndexMap`) is safe
+#     here specifically because decode never observes metadata key order —
+#     `METADATA_KEYS` only does keyed *lookups* over the parsed map, and
+#     `Map::insert`'s last-wins matches `JSON.parse`'s duplicate-key rule.
+#   - `preserve_order` is NEVER enabled. 11 crates already depend on
+#     `serde_json`; turning the feature on here would unify it workspace-wide
+#     for no reason this crate needs.
+#   - Encode does NOT use `serde_json` (see plan F5): its `ryu`-based float
+#     formatting diverges from ECMAScript `Number::toString` in ways that
+#     change the wire-visible metadata length. The numeric formatter is a
+#     verbatim copy of `suaegi-mcp/src/json.rs:266`'s private
+#     `format_ecmascript_float` (precedent: `suaegi-workname/Cargo.toml`
+#     copying `js_ws` for the same "the source function isn't `pub`" reason).
+#   - `regex`, `serde` derive, `thiserror`: NOT needed. There is no regex in
+#     scope, no need to derive (de)serialize onto the wire types, and decode
+#     is total — every failure path returns `None`, not `Result`.
+[dependencies]
+serde_json = { workspace = true }
