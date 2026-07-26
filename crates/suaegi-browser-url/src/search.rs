@@ -215,27 +215,23 @@ fn set_first(pairs: &mut Vec<(String, String)>, name: &str, value: &str) {
 /// `(name, value)` pairs built by [`collect_query_pairs`] +
 /// [`delete_all`]/[`set_first`] (C2).
 ///
-/// C1: some `url`-crate query-mutation paths leave a bare `'?'` behind when
-/// the query becomes empty (WHATWG/JS instead nulls the query entirely, so
-/// `?` disappears too). This function is the single choke point for every
-/// query rewrite in this module, and always re-checks afterward — `if
-/// url.query() == Some("") { url.set_query(None); }` — so the bug can never
-/// surface through any caller.
+/// C1: an empty serialization means a NULL query in WHATWG/JS, not a bare
+/// `?`. The `url` crate would happily store `Some("")` and stringify the `?`
+/// anyway, so an empty `pairs` list (or a `serialize` call that happens to
+/// produce the empty string) must route through `set_query(None)` instead of
+/// `set_query(Some(""))`.
 fn rewrite_query_pairs(url: &mut Url, pairs: &[(String, String)]) {
-    if pairs.is_empty() {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in pairs {
+        serializer.append_pair(name, value);
+    }
+    let serialized = serializer.finish();
+    // C1: an empty serialization means a NULL query in WHATWG/JS, not a bare
+    // `?`. The url crate would happily store Some("") and stringify the `?`.
+    if serialized.is_empty() {
         url.set_query(None);
     } else {
-        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-        for (name, value) in pairs {
-            serializer.append_pair(name, value);
-        }
-        let serialized = serializer.finish();
         url.set_query(Some(&serialized));
-    }
-    // C1 belt-and-suspenders: whichever branch above ran, never leave a bare
-    // `?` where WHATWG/JS would have a null query.
-    if url.query() == Some("") {
-        url.set_query(None);
     }
 }
 
@@ -704,6 +700,30 @@ mod tests {
     // C4 — infallible passthrough, all four routes.
     // -----------------------------------------------------------------
 
+    // -----------------------------------------------------------------
+    // C4 — duplicate tokens: a partial delete would leak a live bearer
+    // token, so both occurrences must be removed by redaction.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn c4_duplicate_tokens_are_all_removed() {
+        // Security-relevant: if `delete_all` only dropped the FIRST matching
+        // pair (mirroring `set_first`'s single-slot semantics instead of
+        // `URLSearchParams.prototype.delete`'s "remove every occurrence"),
+        // the second `token=B` would survive redaction and leak a live
+        // bearer token to any consumer of the "redacted" URL.
+        assert_eq!(
+            redact_kagi_session_token("https://kagi.com/search?token=A&token=B&q=x"),
+            "https://kagi.com/search?q=x"
+        );
+        // Also re-covers C1: once both tokens are gone the query is empty,
+        // so no trailing bare `?` may remain.
+        assert_eq!(
+            redact_kagi_session_token("https://kagi.com/search?token=A&token=B"),
+            "https://kagi.com/search"
+        );
+    }
+
     #[test]
     fn c4_all_four_passthrough_routes_preserve_token_verbatim() {
         assert_eq!(
@@ -797,6 +817,20 @@ mod tests {
         assert!(!looks_like_search_query("localhost:3000"));
     }
 
+    #[test]
+    fn c7_dot_branch_without_colon_pins_the_dot_half_of_the_guard() {
+        // All four inputs below contain a `.` but do NOT match
+        // `LOOKS_LIKE_URL_PATTERN`, so — unlike every dotted input in the
+        // other oracle/pin cases — the `.` half of
+        // `input.contains('.') || input.contains(':')` is the check that
+        // actually decides the outcome here.
+        assert!(!looks_like_search_query("foo.")); // trailing dot: `[a-z]{2,}` needs >=2 letters after it
+        assert!(!looks_like_search_query("foo.a")); // single-letter TLD fails `{2,}`
+        assert!(!looks_like_search_query(".com")); // no `[^\s]+` before the dot
+        // Contrasting true case: no `.`, no `:`, no space.
+        assert!(looks_like_search_query("react"));
+    }
+
     // -----------------------------------------------------------------
     // C8 — js_trim on the token; `+` decodes to space before trimming.
     // -----------------------------------------------------------------
@@ -812,6 +846,29 @@ mod tests {
         let normalized =
             normalize_kagi_session_link(nel_link).expect("NEL is not ECMAScript whitespace");
         assert_ne!(normalized, "https://kagi.com/search?token=secret");
+    }
+
+    #[test]
+    fn c8_raw_link_side_feff_stripped_nel_kept_pins_js_trim_on_the_link() {
+        // The token-side `js_trim` is pinned by `c8_feff_padded_token_...`
+        // above; this pins the RAW-LINK side, which `str::trim` would also
+        // satisfy for ordinary whitespace, but diverges from on ECMAScript's
+        // exact set.
+        //
+        // U+FEFF (BOM) IS ECMAScript whitespace: `js_trim` strips it from
+        // the raw link and the URL parses normally.
+        assert_eq!(
+            normalize_kagi_session_link("\u{FEFF}https://kagi.com/search?token=secret"),
+            Some("https://kagi.com/search?token=secret".to_string())
+        );
+        // U+0085 (NEL) is NOT ECMAScript whitespace: `js_trim` leaves it in
+        // place, so it sits before the scheme and the URL fails to parse.
+        // Under `str::trim` (which DOES strip NEL) this would wrongly
+        // succeed — this pins the divergence in that direction.
+        assert_eq!(
+            normalize_kagi_session_link("\u{0085}https://kagi.com/search?token=secret"),
+            None
+        );
     }
 
     #[test]
