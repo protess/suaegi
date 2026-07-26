@@ -70,6 +70,13 @@
 use suaegi_misc::js_trim;
 use url::Url;
 
+mod search;
+pub use search::{
+    build_search_url, looks_like_search_query, normalize_kagi_session_link,
+    redact_kagi_session_token, SearchEngine, SearchUrlOptions, DEFAULT_SEARCH_ENGINE,
+    SEARCH_ENGINE_LABELS,
+};
+
 // ---------------------------------------------------------------------------
 // O:3-4 LOCAL_ADDRESS_PATTERN
 // ---------------------------------------------------------------------------
