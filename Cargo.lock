@@ -4031,6 +4031,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-claude-roster"
+version = "0.1.0"
+dependencies = [
+ "suaegi-misc",
+]
+
+[[package]]
 name = "suaegi-core"
 version = "0.1.0"
 dependencies = [
