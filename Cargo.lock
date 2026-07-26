@@ -4222,6 +4222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "suaegi-terminput"
+version = "0.1.0"
+dependencies = [
+ "suaegi-misc",
+]
+
+[[package]]
 name = "suaegi-termstream"
 version = "0.1.0"
 dependencies = [
