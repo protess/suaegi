@@ -1,0 +1,30 @@
+[package]
+name = "suaegi-filedrop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Why: leaf crate — VERBATIM port of Orca's `src/shared/native-file-drop.ts`
+# (269L, @ v1.4.146-rc.0). This is a CAP-2 + protocol-boundary type-guard +
+# 6-variant routing module (byte-cap accounting for a native OS file drag,
+# nearest-marker destination resolution, and an untyped IPC payload guard) —
+# the same shape `suaegi-quickcmd`/`suaegi-claude-roster`/`suaegi-project-runtime`/
+# `suaegi-workspace-cleanup` were each split out as their own leaf for, not
+# folded into `suaegi-misc` (whose charter is small pure helpers with zero
+# policy and zero intra-crate imports).
+#   - `suaegi-misc`: the ONLY dependency, for `measure_clipboard_text_byte_length`
+#     (already-ported, byte-accounting primitive this module's size cap reuses
+#     verbatim — see `L2` in the module doc comment).
+#   - `serde`/`serde_json`: NOT needed, and NOT sufficient — `serde_json::Number`
+#     cannot represent `NaN`/`±Infinity`, which the real IPC transport (structured
+#     clone) delivers and this module's numeric guards must handle (`L6`, `L10`).
+#     `#[serde(deny_unknown_fields)]` would also reject extra keys
+#     `isNativeFileDropPayload` tolerates at every branch, and the `rejected` arm
+#     never inspects `paths` at all — neither is derivable. The `unknown`-input
+#     side is instead modeled as a hand-rolled untyped `JsValue`/`JsRecord` tree.
+#   - `regex`: NOT needed — this module does no string matching, only exact
+#     equality against known wire literals.
+#   - `chrono`: NOT needed — the module reads no clock.
+[dependencies]
+suaegi-misc = { path = "../suaegi-misc" }
