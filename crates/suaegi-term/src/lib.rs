@@ -3,6 +3,7 @@ pub mod bell_detector;
 pub mod encode;
 pub mod grid;
 pub mod input_types;
+pub mod kitty_keyboard_mode_tracker;
 pub mod partial_escape_tail;
 pub mod presence;
 pub mod pty;
