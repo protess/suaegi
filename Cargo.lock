@@ -4154,6 +4154,7 @@ dependencies = [
  "serde_json",
  "suaegi-core",
  "suaegi-http",
+ "suaegi-misc",
  "suaegi-secrets",
  "tokio",
 ]

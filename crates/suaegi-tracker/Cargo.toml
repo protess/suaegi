@@ -11,6 +11,8 @@ suaegi-http = { path = "../suaegi-http" }
 suaegi-secrets = { path = "../suaegi-secrets" }
 # 워크트리↔이슈 링크 필드(§1.3)를 읽는 순수 resolver가 Worktree를 본다.
 suaegi-core = { path = "../suaegi-core" }
+# js_trim/is_js_whitespace for the Linear attribute filter port (P1, zero-dep leaf).
+suaegi-misc = { path = "../suaegi-misc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Jira Basic 인증 헤더 `base64(email:token)` 조립(§2, Orca `client.ts:338`). 엄격 표준 알파벳.

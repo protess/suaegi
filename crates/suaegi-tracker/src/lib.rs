@@ -21,6 +21,12 @@ pub use link::{
     resolve_current_issue, resolve_current_jira_issue, LinkedJiraIssue, LinkedLinearIssue,
 };
 pub use linear::{
-    Comment, CreatedAttachment, CreatedComment, InvalidWriteId, Issue, IssuePage, IssueUpdate,
-    LinearClient, LinearWorkspace, NewIssue, WriteId, WriteOutcome,
+    canonicalize_linear_issue_attribute_filter, is_empty_linear_issue_attribute_filter,
+    linear_issue_attribute_filter_signature, optional_parsed_linear_issue_attribute_filter,
+    parse_linear_issue_attribute_filter, Comment, CreatedAttachment, CreatedComment,
+    InvalidWriteId, Issue, IssuePage, IssueUpdate, LinearClient, LinearIssueAttributeAssignee,
+    LinearIssueAttributeFilter, LinearIssueAttributeFilterError, LinearWorkspace, NewIssue,
+    WriteId, WriteOutcome, LINEAR_ISSUE_ATTRIBUTE_FILTER_ID_MAX_LENGTH,
+    LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_LABEL_IDS, LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_PRIORITIES,
+    LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_STATE_IDS,
 };
