@@ -9,6 +9,7 @@ pub mod github_http;
 pub mod github_identity;
 pub mod gitlab;
 pub mod hosted_review;
+pub mod hosted_review_queue;
 pub mod parse;
 pub mod pr_actions;
 pub mod provider;
@@ -36,6 +37,10 @@ pub use hosted_review::{
     HostedReviewState, HostedReviewSummary, HostedReviewThreadDataCompleteness,
     HostedReviewThreadSummary, HostedReviewUser, PrConflictLocalMergeState, PrConflictSummary,
     PrMergeableState, PrReviewDecisionAggregate, PrState,
+};
+pub use hosted_review_queue::{
+    classify_hosted_review, review_needs_response, review_ready_to_merge,
+    HostedReviewClassificationOptions,
 };
 pub use pr_actions::{
     classify_merge_failure, mergeability_from_fields, CommentLookup, MergeFailure, MergeMethod,
