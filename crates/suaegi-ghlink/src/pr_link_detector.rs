@@ -826,6 +826,58 @@ mod tests {
         assert_eq!(d.observe(input), Vec::new());
     }
 
+    /// Q4, carry-side pin: `has_terminal_url_whitespace` (called from
+    /// `get_potential_github_pr_carry`) must use the ECMAScript whitespace
+    /// set, not Rust's `char::is_whitespace` — the two disagree at exactly
+    /// two code points (module doc Q4). This exercises the CARRY-side call
+    /// site directly; the terminator-side call site is already pinned by
+    /// `q4_non_ascii_ecmascript_whitespace_terminates_pr_url` /
+    /// `q4_nel_is_not_an_ecmascript_whitespace_terminator`.
+    #[test]
+    fn q4_carry_side_whitespace_uses_ecmascript_set() {
+        // U+FEFF: ECMAScript whitespace -> clears the carry. Under
+        // `char::is_whitespace` (which does NOT consider U+FEFF whitespace)
+        // the carry would be retained instead.
+        let feff_tail = "https://github.com/acme/orca/pull/42\u{feff}";
+        assert_eq!(get_potential_github_pr_carry(feff_tail), "");
+
+        // U+0085 (NEL): NOT ECMAScript whitespace -> the carry is retained
+        // whole. Under `char::is_whitespace` (which DOES consider U+0085
+        // whitespace) the carry would be incorrectly cleared to "".
+        let nel_tail = "https://github.com/acme/orca/pull/42\u{85}";
+        assert_eq!(get_potential_github_pr_carry(nel_tail), nel_tail);
+    }
+
+    /// Q5: the fast-path bail gate (`observe`'s
+    /// `!raw_combined.contains(GITHUB_PR_PATH_MARKER)` check) runs on the
+    /// RAW, unstripped chunk — before ANSI SGR stripping. A `/pull/` marker
+    /// split by an SGR sequence therefore bails out here even though
+    /// stripping would have joined the two halves back into a valid marker.
+    /// Kills the mutation that replaces the gate's condition with `false`
+    /// (i.e. deletes the fast path entirely): under that mutation, ANSI
+    /// stripping would run unconditionally, the split marker would get
+    /// joined, and a link WOULD be emitted — which Orca's real
+    /// implementation (gate runs before stripping) never does.
+    #[test]
+    fn q5_raw_gate_rejects_a_marker_split_by_an_sgr_sequence() {
+        let mut d = TerminalGitHubPRLinkDetector::default();
+        // The `/pull/` marker is split by an SGR sequence ("pu" + SGR +
+        // "ll/") — the raw-string gate bails before stripping ever gets a
+        // chance to join it back together.
+        assert_eq!(d.observe("https://github.com/acme/orca/pu\x1b[0mll/42\n"), Vec::new());
+
+        // Contrast: the identical URL, but with the SGR sequence placed
+        // where it does NOT split the marker (right after the PR number) —
+        // stripping still runs and this one IS emitted. This proves it is
+        // specifically the marker split (not SGR handling in general) that
+        // caused the bail above.
+        let mut d2 = TerminalGitHubPRLinkDetector::default();
+        assert_eq!(
+            d2.observe("https://github.com/acme/orca/pull/42\x1b[0m\n"),
+            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+        );
+    }
+
     /// Q10: the carry cap boundary (511/512/513) is measured in UTF-16 code
     /// units. Constructed with astral (surrogate-pair, 2 UTF-16 units per
     /// char) filler so byte length, `char` count, and UTF-16 length all
