@@ -217,20 +217,18 @@ pub fn classify_scheme_less_local_dev_address(raw_input: &str) -> Option<Url> {
 
 /// `O:49-53`. B5: order is contractual and each strip happens exactly once —
 /// js_trim -> `to_lowercase()` (full Unicode, B2) -> strip one leading `[`
-/// and one trailing `]` (only if BOTH are present) -> strip one trailing
+/// and one trailing `]` (only if BOTH are present, via
+/// `strip_prefix('[').and_then(strip_suffix(']'))`, falling back to the
+/// unmodified string when either delimiter is missing) -> strip one trailing
 /// `.`. Bracket-stripping precedes dot-stripping, so `"[::1]."` keeps its
 /// brackets (its `to_lowercase()` result doesn't end with `]`, it ends with
 /// `.`) while `"[::1]"` loses them.
 fn normalize_certificate_hostname(hostname: &str) -> String {
     let trimmed = js_trim(hostname);
     let lower = trimmed.to_lowercase();
-    let unbracketed: &str = if lower.starts_with('[') && lower.ends_with(']') {
-        lower
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .unwrap_or(lower.as_str())
-    } else {
-        lower.as_str()
+    let unbracketed: &str = match lower.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => lower.as_str(),
     };
     match unbracketed.strip_suffix('.') {
         Some(stripped) => stripped.to_string(),
@@ -571,6 +569,22 @@ mod tests {
             classify_scheme_less_local_dev_address("\u{0085}localhost:3000"),
             None
         );
+        // Kills `js_trim(hostname) -> hostname.trim()` on the
+        // certificate-host path: `str::trim` does NOT strip U+FEFF (so the
+        // BOM would survive into the DNS-label check and fail it) but DOES
+        // strip U+0085 NEL (so it would wrongly vanish) — both directions of
+        // the divergence pinned directly on `normalize_certificate_hostname`
+        // so a failure here points at the helper, not the classifier.
+        assert_eq!(
+            normalize_certificate_hostname("\u{FEFF}localhost"),
+            "localhost"
+        );
+        assert_eq!(
+            normalize_certificate_hostname("\u{0085}localhost"),
+            "\u{0085}localhost"
+        );
+        assert!(is_eligible_local_certificate_host("\u{FEFF}localhost"));
+        assert!(!is_eligible_local_certificate_host("\u{0085}localhost"));
     }
 
     // -----------------------------------------------------------------
@@ -585,6 +599,14 @@ mod tests {
         assert!(is_eligible_local_certificate_host("[::1]"));
         // Only one trailing dot is stripped, not a run of them.
         assert_eq!(normalize_certificate_hostname("localhost.."), "localhost.");
+        // Kills "strip '[' / strip ']' independently if present": an
+        // unbalanced bracket must leave the hostname untouched entirely —
+        // Orca's `browser-url.ts:51` only strips the pair when BOTH ends
+        // are present.
+        assert_eq!(normalize_certificate_hostname("[::1"), "[::1");
+        assert!(!is_eligible_local_certificate_host("[::1"));
+        assert_eq!(normalize_certificate_hostname("::1]"), "::1]");
+        assert!(!is_eligible_local_certificate_host("::1]"));
     }
 
     // -----------------------------------------------------------------
@@ -602,6 +624,14 @@ mod tests {
         assert!(is_eligible_local_certificate_host("127.255.255.255"));
         assert!(!is_ipv4_loopback("127.00.0.1")); // "00" != "0"
         assert!(!is_eligible_local_certificate_host("127.00.0.1"));
+        // Kills `values[0] == 127 || values[0] == 10`: only a first octet of
+        // exactly 127 is loopback — RFC1918 private space and the immediate
+        // neighbors of the 127.0.0.0/8 boundary must all be rejected.
+        assert!(!is_ipv4_loopback("10.0.0.1")); // RFC1918 private, not loopback
+        assert!(!is_ipv4_loopback("128.0.0.1")); // one above 127
+        assert!(!is_ipv4_loopback("126.255.255.255")); // one below 127
+        assert!(is_ipv4_loopback("127.0.0.0")); // low end of 127.0.0.0/8
+        assert!(!is_eligible_local_certificate_host("10.0.0.1"));
     }
 
     // -----------------------------------------------------------------
