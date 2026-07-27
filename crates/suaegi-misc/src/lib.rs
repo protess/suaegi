@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of thirty-four small, self-contained pure helpers
+//! `suaegi-misc` — a batch of thirty-five small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
@@ -8,7 +8,8 @@
 //! / [`github_work_items_query_bounds`] / [`github_project_ref_input`] /
 //! [`gitlab_projects`] / [`updater_windows_signature_check`] /
 //! [`agent_notification_id`] / [`orchestration_task_summary`] /
-//! [`native_chat_agent_support`] / [`native_chat_stream_unsubscribe`]
+//! [`native_chat_agent_support`] / [`native_chat_stream_unsubscribe`] /
+//! [`emulator_touch_frame`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -144,6 +145,13 @@
 //!   `encodeURIComponent`, since the server re-composes this token inline
 //!   and unencoded; nullish (`??`, not `||`) subscription-id fallback
 //!   keeping `Some("")` verbatim to avoid a connection-wide mass teardown).
+//! - [`emulator_touch_frame`] — `serve-sim` touch-simulation frame encoder
+//!   (variable-length `[tag, ...UTF-8 JSON]`, no `DataView`/endianness at
+//!   all; private per-module copy of ECMAScript `Number::toString` float
+//!   formatting in place of `ryu`/`serde_json`, `type, x, y[, edge]` key
+//!   order pinned as an explicit choice over the renderer path's `x, y,
+//!   type`, `edge: Option<f64>` omitting its key entirely on `None`,
+//!   encode-only with no decoder in this repo).
 
 pub mod agent_notification_id;
 pub mod agent_title_decoration;
@@ -151,6 +159,7 @@ pub mod base_ref_search_result;
 pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
+pub mod emulator_touch_frame;
 pub mod ephemeral_setup_terminal_worktree_id;
 pub mod github_project_ref_input;
 pub mod github_work_items_query_bounds;
@@ -205,6 +214,10 @@ pub use codex_auth_errors::{
 pub use command_token_scanner::{
     command_contains_token, get_command_token_path_basename, get_first_command_token,
     COMMAND_TOKEN_SCAN_MAX_CHARS,
+};
+pub use emulator_touch_frame::{
+    encode_serve_sim_touch_frame, ServeSimTouchFrame, ServeSimTouchType,
+    SERVE_SIM_TOUCH_MESSAGE_TAG,
 };
 pub use ephemeral_setup_terminal_worktree_id::{
     brand_ephemeral_setup_terminal_worktree_id, is_ephemeral_setup_terminal_worktree_id,
