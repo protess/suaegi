@@ -1,11 +1,12 @@
-//! `suaegi-misc` — a batch of twenty-eight small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty-nine small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
 //! / [`pi_overlay_ui_settings`] / [`hosted_review_refs`] /
 //! [`base_ref_search_result`] / [`worktree_base_ref`] /
 //! [`worktree_submodule_removal`] / [`ephemeral_setup_terminal_worktree_id`]
-//! / [`github_work_items_query_bounds`] / [`github_project_ref_input`]
+//! / [`github_work_items_query_bounds`] / [`github_project_ref_input`] /
+//! [`gitlab_projects`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -106,6 +107,12 @@
 //!   as its sibling, `js_ws`-based ECMAScript `\S` non-whitespace scan, a
 //!   cap term that is dead in the oracle but pinned directly, byte-length
 //!   export with zero production callers ported for surface parity only).
+//! - [`gitlab_projects`] — GitLab "recent projects" list computation
+//!   (caller-formatted `&str` timestamp in place of `toISOString`,
+//!   case-sensitive remove-all dedupe, a real `ToIntegerOrInfinity`-based
+//!   `Array.prototype.slice(0, max)` helper distinct from `Vec::truncate`,
+//!   surviving entries keep their original timestamp — only the new head is
+//!   stamped).
 
 pub mod agent_title_decoration;
 pub mod base_ref_search_result;
@@ -115,6 +122,7 @@ pub mod command_token_scanner;
 pub mod ephemeral_setup_terminal_worktree_id;
 pub mod github_project_ref_input;
 pub mod github_work_items_query_bounds;
+pub mod gitlab_projects;
 pub mod harness_injected_user_turns;
 pub mod hosted_review_refs;
 pub mod image_data_uri;
@@ -172,6 +180,9 @@ pub use github_project_ref_input::{
 };
 pub use github_work_items_query_bounds::{
     is_github_work_items_query_too_large, GITHUB_WORK_ITEMS_QUERY_MAX_BYTES,
+};
+pub use gitlab_projects::{
+    compute_next_gitlab_recents, GitLabRecentProject, GITLAB_RECENTS_MAX,
 };
 pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
