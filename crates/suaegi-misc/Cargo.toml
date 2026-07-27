@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Why: leaf crate — a batch of twenty-one small, self-contained pure helpers
+# Why: leaf crate — a batch of twenty-four small, self-contained pure helpers
 # ported verbatim from Orca's `src/shared/*`. Baselines differ per module: the
 # original sixteen are @ v1.4.150-rc.0, and terminal_line_height / ui_language /
-# opencode_terminal_title / agent_title_decoration / pi_overlay_ui_settings are
+# opencode_terminal_title / agent_title_decoration / pi_overlay_ui_settings /
+# hosted_review_refs / base_ref_search_result / worktree_base_ref are
 # @ v1.4.146-rc.0. None of them import anything (no clock, no fs, no base64, no
 # hashing): they are pure string/number/value-tree transforms whose Vitest
 # oracles port bit-for-bit. Kept dependency-free (not even serde, and
