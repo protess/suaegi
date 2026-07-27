@@ -1,10 +1,11 @@
-//! `suaegi-misc` — a batch of eighteen small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
-//! [`ui_language`] are @ v1.4.146-rc.0. None import anything (no clock, no
-//! fs, no base64, no hashing); each has a Vitest oracle ported bit-for-bit,
-//! plus the oracle-silent "extra pins" that guard the real JS↔Rust
-//! divergences (ECMAScript whitespace, ASCII-digit / lowercase-UUID rules,
+//! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
+//! are @ v1.4.146-rc.0. None import anything (no clock, no fs, no base64, no
+//! hashing); each has a Vitest oracle ported bit-for-bit, plus the
+//! oracle-silent "extra pins" that guard the real JS↔Rust divergences
+//! (ECMAScript whitespace, ASCII-digit / lowercase-UUID rules,
 //! UTF-16-vs-byte scan caps, the never-panic OSC trim, and NaN-absorbing vs.
 //! NaN-propagating min/max).
 //!
@@ -56,7 +57,15 @@
 //! - [`ui_language`] — UI language selection (`enum` + sentinel `System`
 //!   variant, exact-string closed-set membership, no trim/lowercase/locale-tag
 //!   splitting borrowed from the sibling `ui-locale` semantics).
+//! - [`opencode_terminal_title`] — OpenCode native-title detection (hand-scanned
+//!   `OC\s*\|\s*\S` marker, literal `" | "` multiplexer-prefix pipe distinct
+//!   from the marker's `\s*` pipe, prefix-group retry, pure alias delegator).
+//! - [`agent_title_decoration`] — leading agent-status glyph/text stripping
+//!   (no pre-trim, exactly-one replacement, never-empty raw fallback, fused
+//!   trailing `\s*`/`trimStart`, local `js_trim_start` mirroring
+//!   `suaegi-quickcmd`'s `js_trim_end`).
 
+pub mod agent_title_decoration;
 pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
@@ -64,6 +73,7 @@ pub mod harness_injected_user_turns;
 pub mod image_data_uri;
 pub mod js_ws;
 pub mod markdown_toc_width;
+pub mod opencode_terminal_title;
 pub mod osc_title_scan;
 pub mod powershell_argument;
 pub mod process_output_field_scanner;
@@ -76,6 +86,9 @@ pub mod terminal_line_height;
 pub mod ui_language;
 pub mod usage_percentage;
 
+pub use agent_title_decoration::{
+    strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty,
+};
 pub use clipboard_text::{
     assert_clipboard_text_within_limit, assert_clipboard_text_within_limit_with_yield,
     assert_clipboard_text_write_within_limit, assert_clipboard_text_write_within_limit_with_yield,
@@ -105,6 +118,9 @@ pub use markdown_toc_width::{
     clamp_markdown_toc_panel_width, compute_max_markdown_toc_panel_width,
     MARKDOWN_TOC_PANEL_DEFAULT_WIDTH, MARKDOWN_TOC_PANEL_MAX_WIDTH,
     MARKDOWN_TOC_PANEL_MIN_EDITOR_WIDTH, MARKDOWN_TOC_PANEL_MIN_WIDTH,
+};
+pub use opencode_terminal_title::{
+    is_meaningful_opencode_terminal_title, is_opencode_native_title,
 };
 pub use osc_title_scan::extract_osc_title_scan_tail;
 pub use powershell_argument::{quote_powershell_literal, quote_powershell_native_argument};
