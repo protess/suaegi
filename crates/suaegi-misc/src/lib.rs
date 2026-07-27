@@ -1,10 +1,11 @@
-//! `suaegi-misc` — a batch of twenty-six small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty-eight small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
 //! / [`pi_overlay_ui_settings`] / [`hosted_review_refs`] /
 //! [`base_ref_search_result`] / [`worktree_base_ref`] /
 //! [`worktree_submodule_removal`] / [`ephemeral_setup_terminal_worktree_id`]
+//! / [`github_work_items_query_bounds`] / [`github_project_ref_input`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -95,6 +96,16 @@
 //!   order pinned directly since the oracle's `toEqual` can't see it, array
 //!   top-level input guarded against index-key spreading, zero production
 //!   callers — ported for clone-completeness only, wired nowhere).
+//! - [`github_work_items_query_bounds`] — GitHub work-items search query byte
+//!   cap (delegate's `text.length > max || measure(...).exceededLimit`
+//!   collapses to one `text.len() as f64 > max_bytes` comparison across the
+//!   entire `f64` domain, `Option<f64>` cap, renderer re-export shim not
+//!   ported).
+//! - [`github_project_ref_input`] — GitHub project reference input byte cap
+//!   plus a submit-gate "non-trivial and within bounds" check (same collapse
+//!   as its sibling, `js_ws`-based ECMAScript `\S` non-whitespace scan, a
+//!   cap term that is dead in the oracle but pinned directly, byte-length
+//!   export with zero production callers ported for surface parity only).
 
 pub mod agent_title_decoration;
 pub mod base_ref_search_result;
@@ -102,6 +113,8 @@ pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
 pub mod ephemeral_setup_terminal_worktree_id;
+pub mod github_project_ref_input;
+pub mod github_work_items_query_bounds;
 pub mod harness_injected_user_turns;
 pub mod hosted_review_refs;
 pub mod image_data_uri;
@@ -151,6 +164,14 @@ pub use command_token_scanner::{
 pub use ephemeral_setup_terminal_worktree_id::{
     brand_ephemeral_setup_terminal_worktree_id, is_ephemeral_setup_terminal_worktree_id,
     EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX,
+};
+pub use github_project_ref_input::{
+    get_github_project_ref_input_byte_length, has_bounded_github_project_ref_input_text,
+    is_github_project_ref_input_too_large, GITHUB_PROJECT_REF_INPUT_MAX_BYTES,
+    GITHUB_PROJECT_REF_INPUT_TOO_LARGE_ERROR,
+};
+pub use github_work_items_query_bounds::{
+    is_github_work_items_query_too_large, GITHUB_WORK_ITEMS_QUERY_MAX_BYTES,
 };
 pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
