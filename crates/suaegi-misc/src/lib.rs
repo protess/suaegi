@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of thirty-two small, self-contained pure helpers
+//! `suaegi-misc` — a batch of thirty-four small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
@@ -7,7 +7,8 @@
 //! [`worktree_submodule_removal`] / [`ephemeral_setup_terminal_worktree_id`]
 //! / [`github_work_items_query_bounds`] / [`github_project_ref_input`] /
 //! [`gitlab_projects`] / [`updater_windows_signature_check`] /
-//! [`agent_notification_id`] / [`orchestration_task_summary`]
+//! [`agent_notification_id`] / [`orchestration_task_summary`] /
+//! [`native_chat_agent_support`] / [`native_chat_stream_unsubscribe`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -130,6 +131,19 @@
 //!   a ceiling and not an invariant, `js_ws`/local `js_trim_end` for the
 //!   three ECMAScript-whitespace sites, closure-based generic passthrough in
 //!   place of an unrepresentable `...task` spread).
+//! - [`native_chat_agent_support`] — native-chat agent support gating
+//!   (4-member set literal pinned directly against near-miss ids from
+//!   `agent-catalog.tsx`'s 34-id space, two independent set/resolver
+//!   mechanisms with an agreement pin that cannot observe a same-behavior
+//!   merge of one into the other, `resolve`-gated stepping rather than raw
+//!   agent-string gating).
+//! - [`native_chat_stream_unsubscribe`] — native-chat transcript-watcher
+//!   unsubscribe RPC (unguarded, non-injective `agent:sessionId` token
+//!   ported verbatim per the `ephemeral_setup_terminal_worktree_id`
+//!   precedent — the inverse of `agent_notification_id`'s load-bearing
+//!   `encodeURIComponent`, since the server re-composes this token inline
+//!   and unencoded; nullish (`??`, not `||`) subscription-id fallback
+//!   keeping `Some("")` verbatim to avoid a connection-wide mass teardown).
 
 pub mod agent_notification_id;
 pub mod agent_title_decoration;
@@ -146,6 +160,8 @@ pub mod hosted_review_refs;
 pub mod image_data_uri;
 pub mod js_ws;
 pub mod markdown_toc_width;
+pub mod native_chat_agent_support;
+pub mod native_chat_stream_unsubscribe;
 pub mod opencode_terminal_title;
 pub mod orchestration_task_summary;
 pub mod osc_title_scan;
@@ -216,6 +232,14 @@ pub use markdown_toc_width::{
     clamp_markdown_toc_panel_width, compute_max_markdown_toc_panel_width,
     MARKDOWN_TOC_PANEL_DEFAULT_WIDTH, MARKDOWN_TOC_PANEL_MAX_WIDTH,
     MARKDOWN_TOC_PANEL_MIN_EDITOR_WIDTH, MARKDOWN_TOC_PANEL_MIN_WIDTH,
+};
+pub use native_chat_agent_support::{
+    is_native_chat_supported_agent, resolve_native_chat_transcript_agent,
+    should_step_native_chat_ask_answer, NativeChatTranscriptAgent, NATIVE_CHAT_SUPPORTED_AGENTS,
+};
+pub use native_chat_stream_unsubscribe::{
+    build_native_chat_subscription_id, build_native_chat_unsubscribe, NativeChatUnsubscribeRpc,
+    NATIVE_CHAT_UNSUBSCRIBE_METHOD,
 };
 pub use opencode_terminal_title::{
     is_meaningful_opencode_terminal_title, is_opencode_native_title,
