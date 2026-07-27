@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of twenty-nine small, self-contained pure helpers
+//! `suaegi-misc` — a batch of thirty-two small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
@@ -6,7 +6,8 @@
 //! [`base_ref_search_result`] / [`worktree_base_ref`] /
 //! [`worktree_submodule_removal`] / [`ephemeral_setup_terminal_worktree_id`]
 //! / [`github_work_items_query_bounds`] / [`github_project_ref_input`] /
-//! [`gitlab_projects`]
+//! [`gitlab_projects`] / [`updater_windows_signature_check`] /
+//! [`agent_notification_id`] / [`orchestration_task_summary`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -113,7 +114,24 @@
 //!   `Array.prototype.slice(0, max)` helper distinct from `Vec::truncate`,
 //!   surviving entries keep their original timestamp — only the new head is
 //!   stamped).
+//! - [`updater_windows_signature_check`] — Windows updater signature-check
+//!   failure classification (a precedent INVERSION: `.toLowerCase()` here is
+//!   full-Unicode in both JS and Rust, so `str::to_lowercase()` is correct —
+//!   NOT the `to_ascii_lowercase` this crate uses for non-`u` `/…/i`
+//!   regex-derived modules; an oracle-unpinned security veto pinned directly
+//!   against a message containing both phrases).
+//! - [`agent_notification_id`] — agent-event notification id construction
+//!   (load-bearing `encodeURIComponent` disambiguating colon-bearing
+//!   `worktreeId`/`paneKey` fields, literal id pins since the oracle never
+//!   asserts one, `Option<f64>` accepting `stateStartedAt === 0`).
+//! - [`orchestration_task_summary`] — `--brief` orchestration task-spec
+//!   abbreviation (`\s+`-collapse + trim applied unconditionally, UTF-16
+//!   snap-down truncation reusing the `utf16_slice_prefix` technique, 160 as
+//!   a ceiling and not an invariant, `js_ws`/local `js_trim_end` for the
+//!   three ECMAScript-whitespace sites, closure-based generic passthrough in
+//!   place of an unrepresentable `...task` spread).
 
+pub mod agent_notification_id;
 pub mod agent_title_decoration;
 pub mod base_ref_search_result;
 pub mod clipboard_text;
@@ -129,6 +147,7 @@ pub mod image_data_uri;
 pub mod js_ws;
 pub mod markdown_toc_width;
 pub mod opencode_terminal_title;
+pub mod orchestration_task_summary;
 pub mod osc_title_scan;
 pub mod pi_overlay_ui_settings;
 pub mod powershell_argument;
@@ -140,10 +159,12 @@ pub mod stable_pane_id;
 pub mod tailnet_address;
 pub mod terminal_line_height;
 pub mod ui_language;
+pub mod updater_windows_signature_check;
 pub mod usage_percentage;
 pub mod worktree_base_ref;
 pub mod worktree_submodule_removal;
 
+pub use agent_notification_id::build_agent_notification_id;
 pub use agent_title_decoration::{
     strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty,
 };
@@ -199,6 +220,10 @@ pub use markdown_toc_width::{
 pub use opencode_terminal_title::{
     is_meaningful_opencode_terminal_title, is_opencode_native_title,
 };
+pub use orchestration_task_summary::{
+    abbreviate_orchestration_task_spec, abbreviate_orchestration_tasks, AbbreviatedSpec,
+    TASK_SPEC_BRIEF_LENGTH,
+};
 pub use osc_title_scan::extract_osc_title_scan_tail;
 pub use pi_overlay_ui_settings::{
     merge_pi_overlay_ui_settings, PI_OVERLAY_CLEAR_ON_SHRINK, PI_OVERLAY_HIDE_THINKING_BLOCK,
@@ -229,6 +254,9 @@ pub use terminal_line_height::{
 pub use ui_language::{
     normalize_ui_language, UiLanguage, UI_LANGUAGE_CHINESE, UI_LANGUAGE_ENGLISH,
     UI_LANGUAGE_JAPANESE, UI_LANGUAGE_KOREAN, UI_LANGUAGE_SPANISH, UI_LANGUAGE_SYSTEM,
+};
+pub use updater_windows_signature_check::{
+    is_windows_signature_check_unavailable_failure, is_windows_signature_mismatch_failure,
 };
 pub use usage_percentage::{
     clamp_used_percent, get_displayed_usage_percentage, normalize_usage_percentage_display,
