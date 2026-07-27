@@ -1,16 +1,30 @@
-//! `suaegi-misc` — a batch of twenty-one small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty-four small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
-//! / [`pi_overlay_ui_settings`] are @ v1.4.146-rc.0. None import anything (no
-//! clock, no fs, no base64, no hashing); each has a Vitest oracle ported
-//! bit-for-bit, plus the oracle-silent "extra pins" that guard the real
-//! JS↔Rust divergences (ECMAScript whitespace, ASCII-digit / lowercase-UUID
-//! rules, UTF-16-vs-byte scan caps, the never-panic OSC trim, NaN-absorbing
-//! vs. NaN-propagating min/max, and — for [`pi_overlay_ui_settings`] — `[[Set]]`
-//! key order becoming a real Rust choice instead of a free JS property).
+//! / [`pi_overlay_ui_settings`] / [`hosted_review_refs`] /
+//! [`base_ref_search_result`] / [`worktree_base_ref`] are @ v1.4.146-rc.0.
+//! None import anything (no clock, no fs, no base64, no hashing); each has a
+//! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
+//! guard the real JS↔Rust divergences (ECMAScript whitespace, ASCII-digit /
+//! lowercase-UUID rules, UTF-16-vs-byte scan caps, the never-panic OSC trim,
+//! NaN-absorbing vs. NaN-propagating min/max, anchored-once-vs-global regex
+//! replacement, and — for [`pi_overlay_ui_settings`] — `[[Set]]` key order
+//! becoming a real Rust choice instead of a free JS property).
 //!
 //! # Modules
+//! - [`hosted_review_refs`] — hosted-review head/base ref normalization
+//!   (anchored-once `strip_prefix` in place of global/unanchored regex ports,
+//!   two-step `refs/remotes/[^/]+/` scan requiring a non-empty segment,
+//!   `js_trim`, order-sensitive base-ref delegation).
+//! - [`base_ref_search_result`] — legacy base-ref search result derivation
+//!   (`length >` guard distinguishing exact-prefix input from a real strip,
+//!   literal prefix-list pin, derive-function wiring pin).
+//! - [`worktree_base_ref`] — `git worktree add` base-ref resolution
+//!   (injected `&mut dyn FnMut(&str) -> bool` probe callback replacing the
+//!   async original, short-circuiting first-match loop, remotes-before-heads
+//!   candidate order, deliberate `bool`-vs-`Result` divergence documented at
+//!   the module header).
 //! - [`clipboard_text`] — clipboard text byte-length limits (UTF-8 byte
 //!   measurement vs. JS UTF-16 code-unit fast path, `...WithYield` reshaped
 //!   to synchronous + injected callback, `Option<f64>` JS numeric coercion
@@ -72,10 +86,12 @@
 //!   callers — ported for clone-completeness only, wired nowhere).
 
 pub mod agent_title_decoration;
+pub mod base_ref_search_result;
 pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
 pub mod harness_injected_user_turns;
+pub mod hosted_review_refs;
 pub mod image_data_uri;
 pub mod js_ws;
 pub mod markdown_toc_width;
@@ -92,9 +108,13 @@ pub mod tailnet_address;
 pub mod terminal_line_height;
 pub mod ui_language;
 pub mod usage_percentage;
+pub mod worktree_base_ref;
 
 pub use agent_title_decoration::{
     strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty,
+};
+pub use base_ref_search_result::{
+    derive_legacy_local_branch_name, legacy_base_ref_search_result, BaseRefSearchResult,
 };
 pub use clipboard_text::{
     assert_clipboard_text_within_limit, assert_clipboard_text_within_limit_with_yield,
@@ -119,6 +139,7 @@ pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
     KNOWN_HARNESS_TAG_NAMES,
 };
+pub use hosted_review_refs::{normalize_hosted_review_base_ref, normalize_hosted_review_head_ref};
 pub use image_data_uri::build_image_data_uri;
 pub use js_ws::{is_js_whitespace, js_trim};
 pub use markdown_toc_width::{
@@ -164,3 +185,4 @@ pub use usage_percentage::{
     clamp_used_percent, get_displayed_usage_percentage, normalize_usage_percentage_display,
     UsagePercentageDisplay, DEFAULT_USAGE_PERCENTAGE_DISPLAY,
 };
+pub use worktree_base_ref::resolve_worktree_add_base_ref;
