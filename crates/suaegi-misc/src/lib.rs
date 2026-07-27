@@ -1,9 +1,11 @@
-//! `suaegi-misc` — a batch of twenty-four small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty-six small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
 //! / [`pi_overlay_ui_settings`] / [`hosted_review_refs`] /
-//! [`base_ref_search_result`] / [`worktree_base_ref`] are @ v1.4.146-rc.0.
+//! [`base_ref_search_result`] / [`worktree_base_ref`] /
+//! [`worktree_submodule_removal`] / [`ephemeral_setup_terminal_worktree_id`]
+//! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
 //! guard the real JS↔Rust divergences (ECMAScript whitespace, ASCII-digit /
@@ -25,6 +27,15 @@
 //!   async original, short-circuiting first-match loop, remotes-before-heads
 //!   candidate order, deliberate `bool`-vs-`Result` divergence documented at
 //!   the module header).
+//! - [`worktree_submodule_removal`] — submodule worktree-removal refusal
+//!   detection (structural twin of `remote_runtime_error`'s `…ErrorLike`
+//!   input struct; ASCII-only `/i`→`to_ascii_lowercase` case fold per
+//!   `codex_auth_errors`; `get_error_text` made `pub` to pin field order and
+//!   `\n` join that the unanchored substring match can't otherwise observe).
+//! - [`ephemeral_setup_terminal_worktree_id`] — inline setup/onboarding
+//!   terminal id branding (structural twin of `stable_pane_id`'s branded-id
+//!   validate/construct pair; bare `startsWith` predicate, non-injective
+//!   `brand`, no trim, ported-unchanged upstream collision hazard).
 //! - [`clipboard_text`] — clipboard text byte-length limits (UTF-8 byte
 //!   measurement vs. JS UTF-16 code-unit fast path, `...WithYield` reshaped
 //!   to synchronous + injected callback, `Option<f64>` JS numeric coercion
@@ -90,6 +101,7 @@ pub mod base_ref_search_result;
 pub mod clipboard_text;
 pub mod codex_auth_errors;
 pub mod command_token_scanner;
+pub mod ephemeral_setup_terminal_worktree_id;
 pub mod harness_injected_user_turns;
 pub mod hosted_review_refs;
 pub mod image_data_uri;
@@ -109,6 +121,7 @@ pub mod terminal_line_height;
 pub mod ui_language;
 pub mod usage_percentage;
 pub mod worktree_base_ref;
+pub mod worktree_submodule_removal;
 
 pub use agent_title_decoration::{
     strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty,
@@ -134,6 +147,10 @@ pub use codex_auth_errors::{
 pub use command_token_scanner::{
     command_contains_token, get_command_token_path_basename, get_first_command_token,
     COMMAND_TOKEN_SCAN_MAX_CHARS,
+};
+pub use ephemeral_setup_terminal_worktree_id::{
+    brand_ephemeral_setup_terminal_worktree_id, is_ephemeral_setup_terminal_worktree_id,
+    EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX,
 };
 pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
@@ -186,3 +203,6 @@ pub use usage_percentage::{
     UsagePercentageDisplay, DEFAULT_USAGE_PERCENTAGE_DISPLAY,
 };
 pub use worktree_base_ref::resolve_worktree_add_base_ref;
+pub use worktree_submodule_removal::{
+    get_error_text, is_submodule_worktree_removal_refusal, GitErrorFields, GitErrorLike,
+};
