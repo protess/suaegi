@@ -1,13 +1,14 @@
-//! `suaegi-misc` — a batch of twenty small, self-contained pure helpers
+//! `suaegi-misc` — a batch of twenty-one small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
-//! are @ v1.4.146-rc.0. None import anything (no clock, no fs, no base64, no
-//! hashing); each has a Vitest oracle ported bit-for-bit, plus the
-//! oracle-silent "extra pins" that guard the real JS↔Rust divergences
-//! (ECMAScript whitespace, ASCII-digit / lowercase-UUID rules,
-//! UTF-16-vs-byte scan caps, the never-panic OSC trim, and NaN-absorbing vs.
-//! NaN-propagating min/max).
+//! / [`pi_overlay_ui_settings`] are @ v1.4.146-rc.0. None import anything (no
+//! clock, no fs, no base64, no hashing); each has a Vitest oracle ported
+//! bit-for-bit, plus the oracle-silent "extra pins" that guard the real
+//! JS↔Rust divergences (ECMAScript whitespace, ASCII-digit / lowercase-UUID
+//! rules, UTF-16-vs-byte scan caps, the never-panic OSC trim, NaN-absorbing
+//! vs. NaN-propagating min/max, and — for [`pi_overlay_ui_settings`] — `[[Set]]`
+//! key order becoming a real Rust choice instead of a free JS property).
 //!
 //! # Modules
 //! - [`clipboard_text`] — clipboard text byte-length limits (UTF-8 byte
@@ -64,6 +65,11 @@
 //!   (no pre-trim, exactly-one replacement, never-empty raw fallback, fused
 //!   trailing `\s*`/`trimStart`, local `js_trim_start` mirroring
 //!   `suaegi-quickcmd`'s `js_trim_end`).
+//! - [`pi_overlay_ui_settings`] — Pi overlay UI settings merge (third private
+//!   `JsValue`/`JsRecord` copy, `[[Set]]` overwrite-in-place-else-append key
+//!   order pinned directly since the oracle's `toEqual` can't see it, array
+//!   top-level input guarded against index-key spreading, zero production
+//!   callers — ported for clone-completeness only, wired nowhere).
 
 pub mod agent_title_decoration;
 pub mod clipboard_text;
@@ -75,6 +81,7 @@ pub mod js_ws;
 pub mod markdown_toc_width;
 pub mod opencode_terminal_title;
 pub mod osc_title_scan;
+pub mod pi_overlay_ui_settings;
 pub mod powershell_argument;
 pub mod process_output_field_scanner;
 pub mod protocol_compat;
@@ -123,6 +130,9 @@ pub use opencode_terminal_title::{
     is_meaningful_opencode_terminal_title, is_opencode_native_title,
 };
 pub use osc_title_scan::extract_osc_title_scan_tail;
+pub use pi_overlay_ui_settings::{
+    merge_pi_overlay_ui_settings, PI_OVERLAY_CLEAR_ON_SHRINK, PI_OVERLAY_HIDE_THINKING_BLOCK,
+};
 pub use powershell_argument::{quote_powershell_literal, quote_powershell_native_argument};
 pub use process_output_field_scanner::{
     get_process_output_fields, iterate_process_output_lines, ProcessOutputLines,
