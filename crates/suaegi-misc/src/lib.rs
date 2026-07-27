@@ -1,4 +1,4 @@
-//! `suaegi-misc` — a batch of thirty-five small, self-contained pure helpers
+//! `suaegi-misc` — a batch of thirty-eight small, self-contained pure helpers
 //! ported verbatim from Orca's `src/shared/*`. Baselines differ per module:
 //! the original sixteen are @ v1.4.150-rc.0, and [`terminal_line_height`] /
 //! [`ui_language`] / [`opencode_terminal_title`] / [`agent_title_decoration`]
@@ -9,7 +9,8 @@
 //! [`gitlab_projects`] / [`updater_windows_signature_check`] /
 //! [`agent_notification_id`] / [`orchestration_task_summary`] /
 //! [`native_chat_agent_support`] / [`native_chat_stream_unsubscribe`] /
-//! [`emulator_touch_frame`]
+//! [`emulator_touch_frame`] / [`terminal_fonts`] /
+//! [`hook_command_source_policy`] / [`source_control_group_order`]
 //! are @ v1.4.146-rc.0.
 //! None import anything (no clock, no fs, no base64, no hashing); each has a
 //! Vitest oracle ported bit-for-bit, plus the oracle-silent "extra pins" that
@@ -152,6 +153,23 @@
 //!   order pinned as an explicit choice over the renderer path's `x, y,
 //!   type`, `edge: Option<f64>` omitting its key entirely on `None`,
 //!   encode-only with no decoder in this repo).
+//! - [`terminal_fonts`] — ⚠ P1 terminal font-weight clamp + bold-weight
+//!   derivation (`TERMINAL_FONT_WEIGHT_STEP` exported upstream but used by
+//!   nothing — no step snapping, round-then-clamp only; `is_finite` guard
+//!   falls back to `DEFAULT`, not `MIN`, unlike the structurally identical
+//!   [`terminal_line_height`]; bold-chain floor/delta masked at the
+//!   `resolve(500)` oracle fixture, separated by direct `resolve(600)` /
+//!   `resolve(100)` pins).
+//! - [`hook_command_source_policy`] — ⚠ P1 security: hook-command source
+//!   policy normalization (three-state `Option<Option<&str>>` distinguishing
+//!   `undefined` from `null`/non-string, since only strict `undefined` combines
+//!   with `hasLocalScript` to default to `'local-only'`; the `'local-only'`
+//!   membership arm is never exercised by a string fixture but dropping it
+//!   would silently run a repo's committed script against an explicit
+//!   opt-out).
+//! - [`source_control_group_order`] — source-control panel group order
+//!   (three-member closed set, exact-string membership, dead `'changes-first'`
+//!   ternary arm kept verbatim since it equals the fallback).
 
 pub mod agent_notification_id;
 pub mod agent_title_decoration;
@@ -165,6 +183,7 @@ pub mod github_project_ref_input;
 pub mod github_work_items_query_bounds;
 pub mod gitlab_projects;
 pub mod harness_injected_user_turns;
+pub mod hook_command_source_policy;
 pub mod hosted_review_refs;
 pub mod image_data_uri;
 pub mod js_ws;
@@ -180,8 +199,10 @@ pub mod process_output_field_scanner;
 pub mod protocol_compat;
 pub mod rate_limit_reset;
 pub mod remote_runtime_error;
+pub mod source_control_group_order;
 pub mod stable_pane_id;
 pub mod tailnet_address;
+pub mod terminal_fonts;
 pub mod terminal_line_height;
 pub mod ui_language;
 pub mod updater_windows_signature_check;
@@ -238,6 +259,10 @@ pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
     KNOWN_HARNESS_TAG_NAMES,
 };
+pub use hook_command_source_policy::{
+    normalize_hook_command_source_policy, resolve_hook_command_source_policy,
+    HookCommandSourcePolicy,
+};
 pub use hosted_review_refs::{normalize_hosted_review_base_ref, normalize_hosted_review_head_ref};
 pub use image_data_uri::build_image_data_uri;
 pub use js_ws::{is_js_whitespace, js_trim};
@@ -280,11 +305,20 @@ pub use rate_limit_reset::{
 pub use remote_runtime_error::{
     is_recoverable_remote_runtime_connection_error, RemoteRuntimeClientErrorLike,
 };
+pub use source_control_group_order::{
+    normalize_source_control_group_order, SourceControlGroupOrder,
+    DEFAULT_SOURCE_CONTROL_GROUP_ORDER,
+};
 pub use stable_pane_id::{
     is_stable_pane_id, is_terminal_leaf_id, make_pane_key, parse_legacy_numeric_pane_key,
     parse_pane_key, LegacyNumericPaneKey, MakePaneKeyError, ParsedPaneKey,
 };
 pub use tailnet_address::is_tailnet_ipv4_address;
+pub use terminal_fonts::{
+    normalize_terminal_font_weight, resolve_terminal_font_weights, TerminalFontWeights,
+    DEFAULT_TERMINAL_FONT_WEIGHT, TERMINAL_FONT_WEIGHT_MAX, TERMINAL_FONT_WEIGHT_MIN,
+    TERMINAL_FONT_WEIGHT_STEP,
+};
 pub use terminal_line_height::{
     normalize_terminal_line_height, MAX_TERMINAL_LINE_HEIGHT, MIN_TERMINAL_LINE_HEIGHT,
 };
