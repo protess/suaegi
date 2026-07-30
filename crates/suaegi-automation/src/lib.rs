@@ -17,8 +17,8 @@ mod rrule;
 pub use cron::{
     cron_date_matches, cron_has_possible_occurrence, cron_matches,
     get_automation_cron_expression_fields, is_valid_automation_cron_schedule,
-    parse_cron_expression, start_of_local_day, CronError, ParsedCron, AUTOMATION_CRON_EXPRESSION_MAX_BYTES,
-    CRON_SCAN_DAYS, DAY_CODES, DAY_MS, WEEKDAY_CODES,
+    parse_cron_expression, start_of_local_day, CronError, ParsedCron,
+    AUTOMATION_CRON_EXPRESSION_MAX_BYTES, CRON_SCAN_DAYS, DAY_CODES, DAY_MS, WEEKDAY_CODES,
 };
 
 // M2 — RRULE parse/build + `=`-dispatched schedule validation. See

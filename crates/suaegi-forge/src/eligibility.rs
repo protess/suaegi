@@ -47,9 +47,7 @@ pub async fn creation_eligibility<P: ForgeProvider + Sync>(
     // 1. gh 설치/버전/인증.
     match preflight(gh_runner).await {
         Preflight::NotInstalled => return CreationEligibility::Blocked(R::NotInstalled),
-        Preflight::NotAuthenticated => {
-            return CreationEligibility::Blocked(R::NotAuthenticated)
-        }
+        Preflight::NotAuthenticated => return CreationEligibility::Blocked(R::NotAuthenticated),
         Preflight::OutdatedVersion { found, min } => {
             return CreationEligibility::Blocked(R::OutdatedGh { found, min })
         }

@@ -163,9 +163,18 @@ mod tests {
         let pane_key = Some("tab-1:11111111-1111-4111-8111-111111111111");
         let worktree_id = Some("repo::/Users/me/orca/workspaces/feature");
 
-        assert_eq!(build_agent_notification_id(None, pane_key, Some(1_780_000_000_123.0)), None);
-        assert_eq!(build_agent_notification_id(worktree_id, None, Some(1_780_000_000_123.0)), None);
-        assert_eq!(build_agent_notification_id(worktree_id, pane_key, None), None);
+        assert_eq!(
+            build_agent_notification_id(None, pane_key, Some(1_780_000_000_123.0)),
+            None
+        );
+        assert_eq!(
+            build_agent_notification_id(worktree_id, None, Some(1_780_000_000_123.0)),
+            None
+        );
+        assert_eq!(
+            build_agent_notification_id(worktree_id, pane_key, None),
+            None
+        );
     }
 
     // Mandatory extra pins (oracle-silent — plan §5, N6/N7):
@@ -208,8 +217,14 @@ mod tests {
     /// truthiness, exactly like `None` — not merely a type/`Option` check.
     #[test]
     fn pin_empty_string_fields_are_rejected() {
-        assert_eq!(build_agent_notification_id(Some(""), Some("pane"), Some(1.0)), None);
-        assert_eq!(build_agent_notification_id(Some("repo"), Some(""), Some(1.0)), None);
+        assert_eq!(
+            build_agent_notification_id(Some(""), Some("pane"), Some(1.0)),
+            None
+        );
+        assert_eq!(
+            build_agent_notification_id(Some("repo"), Some(""), Some(1.0)),
+            None
+        );
     }
 
     /// N8 crux pin: a magnitude beyond `i64::MAX` distinguishes staying in

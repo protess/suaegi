@@ -369,9 +369,7 @@ mod tests {
             Some(923)
         );
         assert_eq!(
-            parse_github_issue_or_pr_number(
-                "https://github.my-company.net/MyOrg/my_repo/pull/395"
-            ),
+            parse_github_issue_or_pr_number("https://github.my-company.net/MyOrg/my_repo/pull/395"),
             Some(395)
         );
     }
@@ -399,9 +397,7 @@ mod tests {
     #[test]
     fn oracle_parses_trailing_segments_with_query_fragment_and_repeated_slashes() {
         assert_eq!(
-            parse_github_issue_or_pr_number(
-                "https://github.com/o/r/pull/1965/changes?diff=split"
-            ),
+            parse_github_issue_or_pr_number("https://github.com/o/r/pull/1965/changes?diff=split"),
             Some(1965)
         );
         assert_eq!(
@@ -458,9 +454,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_github_issue_or_pr_link(
-                "https://github.my-company.net/MyOrg/my_repo/pull/395"
-            ),
+            parse_github_issue_or_pr_link("https://github.my-company.net/MyOrg/my_repo/pull/395"),
             Some(GitHubIssueOrPRLink {
                 slug: slug("MyOrg", "my_repo"),
                 number: 395,
@@ -644,14 +638,8 @@ mod tests {
     /// the matcher directly on a raw path to pin the real semantics.
     #[test]
     fn p2_non_ascii_digits_rejected_at_path_matcher_level() {
-        assert_eq!(
-            match_github_item_path("/o/r/pull/\u{0664}\u{0662}"),
-            None
-        );
-        assert_eq!(
-            match_github_item_path("/o/r/pull/\u{FF14}\u{FF12}"),
-            None
-        );
+        assert_eq!(match_github_item_path("/o/r/pull/\u{0664}\u{0662}"), None);
+        assert_eq!(match_github_item_path("/o/r/pull/\u{FF14}\u{FF12}"), None);
         // Sanity: ASCII digits still match at this same level.
         assert_eq!(
             match_github_item_path("/o/r/pull/42"),
@@ -688,9 +676,7 @@ mod tests {
             Some(u64::MAX)
         );
         assert_eq!(
-            parse_github_issue_or_pr_link(&format!(
-                "https://github.com/o/r/pull/{twenty_nines}"
-            )),
+            parse_github_issue_or_pr_link(&format!("https://github.com/o/r/pull/{twenty_nines}")),
             Some(GitHubIssueOrPRLink {
                 slug: slug("o", "r"),
                 number: u64::MAX,
@@ -745,14 +731,8 @@ mod tests {
             parse_github_issue_or_pr_link("ftp://github.com/o/r/pull/1"),
             None
         );
-        assert_eq!(
-            parse_github_issue_or_pr_link("file:///o/r/pull/1"),
-            None
-        );
-        assert_eq!(
-            parse_github_issue_or_pr_link("javascript:alert(1)"),
-            None
-        );
+        assert_eq!(parse_github_issue_or_pr_link("file:///o/r/pull/1"), None);
+        assert_eq!(parse_github_issue_or_pr_link("javascript:alert(1)"), None);
         assert_eq!(
             parse_github_issue_or_pr_number("ftp://github.com/o/r/pull/1"),
             None
@@ -793,9 +773,7 @@ mod tests {
         // breaks the scheme -- both routes must reject it.
         assert_eq!(parse_github_issue_or_pr_number("\u{0085}42\u{0085}"), None);
         assert_eq!(
-            parse_github_issue_or_pr_link(
-                "\u{FEFF}https://github.com/o/r/pull/5\u{FEFF}"
-            ),
+            parse_github_issue_or_pr_link("\u{FEFF}https://github.com/o/r/pull/5\u{FEFF}"),
             Some(GitHubIssueOrPRLink {
                 slug: slug("o", "r"),
                 number: 5,
@@ -803,9 +781,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_github_issue_or_pr_link(
-                "\u{0085}https://github.com/o/r/pull/5\u{0085}"
-            ),
+            parse_github_issue_or_pr_link("\u{0085}https://github.com/o/r/pull/5\u{0085}"),
             None
         );
     }
@@ -846,4 +822,3 @@ mod tests {
         );
     }
 }
-

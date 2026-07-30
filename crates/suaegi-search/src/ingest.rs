@@ -26,8 +26,8 @@ use serde::Deserialize;
 
 use crate::clamp::{clamp_line_context, Clamped};
 use crate::match_count::normalize_search_result;
-use crate::path::{join_search_root, relative_to_search_root};
 use crate::path::normalize_relative_path;
+use crate::path::{join_search_root, relative_to_search_root};
 use crate::types::{SearchAccumulator, SearchFileResult, SearchMatch, SearchResult};
 
 /// The stream-parser verdict: keep feeding lines, or the cap was hit and the
@@ -184,7 +184,9 @@ pub fn ingest_rg_json_line(
         None => raw_path,
     };
     let rel_path = normalize_relative_path(&relative_to_search_root(root_path, &abs_path));
-    let line_content = strip_trailing_newline(data.lines.and_then(|l| l.text).as_deref().unwrap_or("")).to_string();
+    let line_content =
+        strip_trailing_newline(data.lines.and_then(|l| l.text).as_deref().unwrap_or(""))
+            .to_string();
     let line_number = data.line_number.map(|n| n as usize).unwrap_or(0);
 
     let mut submatches = data.submatches.unwrap_or_default();
@@ -207,7 +209,8 @@ pub fn ingest_rg_json_line(
         // Malformed `start > end` cannot underflow-panic.
         let match_length = end.saturating_sub(start);
         let clamped = clamp_line_context(&line_content, start, match_length);
-        if push_match(acc, &abs_path, &rel_path, clamped, line_number, max_results) == Ingest::Stop {
+        if push_match(acc, &abs_path, &rel_path, clamped, line_number, max_results) == Ingest::Stop
+        {
             return Ingest::Stop;
         }
     }
@@ -425,7 +428,13 @@ mod tests {
     #[test]
     fn rg_oracle_12_empty_submatch_fallback_empty_line() {
         let mut acc = create_accumulator();
-        ingest_rg_json_line(&rg_match("/root/a.ts", 5, &[], ""), "/root", &mut acc, 100, None);
+        ingest_rg_json_line(
+            &rg_match("/root/a.ts", 5, &[], ""),
+            "/root",
+            &mut acc,
+            100,
+            None,
+        );
         let f = only_file(&acc);
         assert_eq!(f.match_count, Some(1));
         assert_eq!(f.matches[0].line, 5);
@@ -469,7 +478,10 @@ mod tests {
             None,
         );
         assert_eq!(v, Ingest::Stop);
-        assert!(acc.truncated, "truncated invariant: cap reached ⇒ truncated");
+        assert!(
+            acc.truncated,
+            "truncated invariant: cap reached ⇒ truncated"
+        );
         assert_eq!(acc.total_matches, 2);
         assert_eq!(only_file(&acc).match_count, Some(2));
     }
@@ -623,7 +635,13 @@ mod tests {
     fn git_oracle_26_null_multi_position() {
         let mut acc = create_accumulator();
         let re = re_for("foo");
-        let v = ingest_git_grep_line("src/a.ts\u{0}5\u{0}foo and foo again\n", "/root", Some(&re), &mut acc, 100);
+        let v = ingest_git_grep_line(
+            "src/a.ts\u{0}5\u{0}foo and foo again\n",
+            "/root",
+            Some(&re),
+            &mut acc,
+            100,
+        );
         assert_eq!(v, Ingest::Continue);
         let f = only_file(&acc);
         assert_eq!(f.match_count, Some(2));
@@ -660,7 +678,11 @@ mod tests {
         assert_eq!(f.match_count, Some(1));
         assert_eq!(f.matches.len(), 1);
         assert_eq!(
-            (f.matches[0].line, f.matches[0].column, f.matches[0].match_length),
+            (
+                f.matches[0].line,
+                f.matches[0].column,
+                f.matches[0].match_length
+            ),
             (10, 1, 12)
         );
     }
@@ -671,7 +693,13 @@ mod tests {
     fn git_oracle_29_colon_in_filename() {
         let mut acc = create_accumulator();
         let re = re_for("x");
-        ingest_git_grep_line("weird:name.ts\u{0}1\u{0}x", "/root", Some(&re), &mut acc, 100);
+        ingest_git_grep_line(
+            "weird:name.ts\u{0}1\u{0}x",
+            "/root",
+            Some(&re),
+            &mut acc,
+            100,
+        );
         assert_eq!(only_file(&acc).relative_path, "weird:name.ts");
     }
 
@@ -721,7 +749,11 @@ mod tests {
         assert_eq!(f.match_count, Some(1));
         assert_eq!(f.matches.len(), 1);
         assert_eq!(
-            (f.matches[0].line, f.matches[0].column, f.matches[0].match_length),
+            (
+                f.matches[0].line,
+                f.matches[0].column,
+                f.matches[0].match_length
+            ),
             (3, 1, "hello world".len())
         );
         assert_eq!(f.matches[0].line_content, "hello world");
@@ -748,7 +780,11 @@ mod tests {
         assert_eq!(f.match_count, Some(1));
         assert_eq!(f.matches.len(), 1);
         assert_eq!(
-            (f.matches[0].line, f.matches[0].column, f.matches[0].match_length),
+            (
+                f.matches[0].line,
+                f.matches[0].column,
+                f.matches[0].match_length
+            ),
             (3, 1, "git reported this line".len())
         );
         assert_eq!(f.matches[0].line_content, "git reported this line");
@@ -818,7 +854,11 @@ mod tests {
         seed_file(&mut acc, "/r/b.ts", "b.ts", None, 1);
         acc.total_matches = 1;
         let result = finalize(&acc);
-        let rels: Vec<&str> = result.files.iter().map(|f| f.relative_path.as_str()).collect();
+        let rels: Vec<&str> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
         assert_eq!(rels, vec!["b.ts"]);
     }
 
@@ -858,9 +898,17 @@ mod tests {
     #[test]
     fn finalize_preserves_file_order_not_hashmap() {
         let mut acc = create_accumulator();
-        let order = ["zeta", "alpha", "mike", "bravo", "yankee", "charlie", "delta"];
+        let order = [
+            "zeta", "alpha", "mike", "bravo", "yankee", "charlie", "delta",
+        ];
         for name in order {
-            seed_file(&mut acc, &format!("/r/{name}.ts"), &format!("{name}.ts"), None, 1);
+            seed_file(
+                &mut acc,
+                &format!("/r/{name}.ts"),
+                &format!("{name}.ts"),
+                None,
+                1,
+            );
         }
         acc.total_matches = order.len();
         let got: Vec<String> = finalize(&acc)

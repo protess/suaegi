@@ -44,17 +44,26 @@ mod tests {
 
     #[test]
     fn normalizes_undefined_to_min() {
-        assert_eq!(normalize_terminal_line_height(None), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(None),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     #[test]
     fn normalizes_nan_to_min() {
-        assert_eq!(normalize_terminal_line_height(Some(f64::NAN)), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(Some(f64::NAN)),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     #[test]
     fn normalizes_below_min_to_min() {
-        assert_eq!(normalize_terminal_line_height(Some(0.85)), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(Some(0.85)),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     #[test]
@@ -74,7 +83,10 @@ mod tests {
 
     #[test]
     fn normalizes_above_max_to_max() {
-        assert_eq!(normalize_terminal_line_height(Some(4.0)), MAX_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(Some(4.0)),
+            MAX_TERMINAL_LINE_HEIGHT
+        );
     }
 
     // Mandatory extra pins (oracle-silent):
@@ -85,12 +97,18 @@ mod tests {
     /// one without it.
     #[test]
     fn pin_positive_infinity_falls_back_to_min() {
-        assert_eq!(normalize_terminal_line_height(Some(f64::INFINITY)), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(Some(f64::INFINITY)),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     #[test]
     fn pin_negative_infinity_falls_back_to_min() {
-        assert_eq!(normalize_terminal_line_height(Some(f64::NEG_INFINITY)), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(Some(f64::NEG_INFINITY)),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     /// MIN/MAX literals, pinned directly (the 7 oracle cases alone admit any
@@ -117,7 +135,10 @@ mod tests {
     /// always falls back to MIN rather than being parsed.
     #[test]
     fn pin_non_numeric_falls_back_to_min() {
-        assert_eq!(normalize_terminal_line_height(None), MIN_TERMINAL_LINE_HEIGHT);
+        assert_eq!(
+            normalize_terminal_line_height(None),
+            MIN_TERMINAL_LINE_HEIGHT
+        );
     }
 
     /// No rounding: a fractional value passes through bit-identical.

@@ -20,14 +20,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, Stream};
-use iced::widget::{button, container, pane_grid, text};
-use iced::{Element, Length, Subscription};
+use iced::font::{Family, Weight};
+use iced::widget::{button, column, container, pane_grid, row, scrollable, text_input, Space};
+use iced::{Color, Element, Font, Length, Subscription};
 
 use suaegi_term::session::TerminalSession;
 
+use crate::i18n::text;
 use crate::session_store::SessionId;
 use crate::state::{AppState, Message};
 use crate::terminal::Terminal;
+use crate::theme;
 
 /// 스트림을 이 간격으로 페이싱한다. `generation()`을 루프에서 그냥 읽으면
 /// executor 워커를 점유한 채 busy-spin 하고, `std::thread::sleep`은 async
@@ -39,6 +42,17 @@ use crate::terminal::Terminal;
 /// 두 경로(이 구독의 알림, 재요청 루프)가 같은 주기로 안정된다.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::from_rgb8(red, green, blue))
+}
+
 /// **렌더러에 대해 제네릭인 이유**는 테스트가 이 함수를 *그대로* 구동하기
 /// 위해서다. `()` 렌더러(`iced_core/src/renderer/null.rs`)로 같은 트리를 만들면
 /// 창도 GPU도 없이 pane_grid에 이벤트를 흘릴 수 있고, 그래야 아래의
@@ -49,11 +63,19 @@ where
     R: iced::advanced::text::Renderer<Font = iced::Font> + 'static,
 {
     let Some(panes) = state.panes() else {
-        return container(text("Select or create a worktree to start a session"))
+        let empty = column![
+            text("Start a workspace").size(22),
+            text("Select a worktree in the sidebar, or create a new one with +.").size(14),
+            text("Each workspace gets its own branch, files, and agent terminal.").size(13),
+        ]
+        .spacing(8)
+        .align_x(iced::Alignment::Center);
+        return container(empty)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(theme::editor_surface)
             .into();
     };
 
@@ -70,14 +92,52 @@ where
         let title = match state.last_input_loss() == Some(session_id) {
             // 입력 유실은 보이는 피드백이 있어야 한다(`WriteOutcome::Dropped` =
             // 사용자가 친 것이 사라졌다). `Suppressed`는 여기 오지 않는다.
-            true => format!("{} — input dropped", state.session_title(session_id)),
-            false => state.session_title(session_id).to_string(),
+            true => format!("{} — input dropped", state.session_tab_title(session_id)),
+            false => state.session_tab_title(session_id),
         };
-        let title_bar = pane_grid::TitleBar::new(text(title).size(13))
-            .controls(pane_grid::Controls::new(
-                button(text("x").size(12)).on_press(Message::PaneCloseRequested(pane)),
-            ))
-            .padding(6);
+        let mut tab_contents = row![text("▣").size(12).color(theme::MUTED), text(title).size(13),]
+            .spacing(5)
+            .align_y(iced::Alignment::Center);
+        if state.ui_settings().experimental_native_chat {
+            tab_contents = tab_contents.push(
+                button(
+                    text(if state.native_chat_open(session_id) {
+                        "Terminal"
+                    } else {
+                        "Chat"
+                    })
+                    .size(10),
+                )
+                .on_press(Message::NativeChatToggled(session_id))
+                .padding([1, 5])
+                .style(theme::ghost_button),
+            );
+        }
+        tab_contents = tab_contents.push(
+            button(text("×").size(12))
+                .on_press(Message::PaneCloseRequested(pane))
+                .padding([1, 3])
+                .style(theme::ghost_button),
+        );
+        let tab = container(tab_contents).padding([3, 6]).style(
+            if state.session_needs_attention(session_id) {
+                theme::attention_top_bar
+            } else {
+                theme::top_bar
+            },
+        );
+        let title_bar = pane_grid::TitleBar::new(
+            row![
+                tab,
+                button(text("+").size(14))
+                    .on_press(Message::BrowserOpenRequested)
+                    .padding([2, 6])
+                    .style(theme::ghost_button),
+                Space::new().width(Length::Fill),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(4);
 
         pane_grid::Content::new(session_body(state, session_id)).title_bar(title_bar)
     })
@@ -87,16 +147,30 @@ where
     // `leeway/2`다. `leeway = 0`이면 밴드가 거터와 정확히 일치해 침범이 0이 된다 —
     // 분할선 근처를 눌러도 터미널이 그 press를 선택 시작으로 오해하지 않는다.
     // `spacing`은 **잡기 좋은 폭**을 위해 올린다(4px면 충분하다).
-    .spacing(4)
+    .spacing(u32::from(state.ui_settings().terminal_divider_thickness_px))
     .on_click(Message::PaneClicked)
     .on_drag(Message::PaneDragged)
     .on_resize(0, Message::PaneResized)
     .width(Length::Fill)
     .height(Length::Fill);
 
+    let app_is_dark = crate::theme::mode_is_dark(&state.ui_settings().theme);
+    let divider = if app_is_dark {
+        &state.ui_settings().terminal_divider_color_dark
+    } else {
+        &state.ui_settings().terminal_divider_color_light
+    };
+    let divider_color = parse_hex_color(divider).unwrap_or_else(|| {
+        if app_is_dark {
+            Color::from_rgb8(0x3f, 0x3f, 0x46)
+        } else {
+            Color::from_rgb8(0xd4, 0xd4, 0xd8)
+        }
+    });
     container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
+        .style(move |_theme| iced::widget::container::Style::default().background(divider_color))
         .into()
 }
 
@@ -104,14 +178,153 @@ where
 /// 그동안 휠 이벤트를 자식에게 **전달하지 않는다**(`scrollable.rs:786-791`) —
 /// 터미널이 스크롤백과 마우스 리포팅을 직접 소유하므로 휠은 반드시 위젯까지
 /// 닿아야 한다. 터미널은 자기 스크롤백을 스스로 그린다.
-fn session_body<R>(state: &AppState, id: SessionId) -> Element<'_, Message, iced::Theme, R>
+pub(crate) fn session_body<R>(
+    state: &AppState,
+    id: SessionId,
+) -> Element<'_, Message, iced::Theme, R>
 where
     R: iced::advanced::text::Renderer<Font = iced::Font> + 'static,
 {
+    if let Some(worktree) = state.hibernated_worktree_for_session(id) {
+        let sleeping = column![
+            text("Agent sleeping").size(18),
+            text("This completed Claude session was paused to save resources.")
+                .size(12)
+                .color(theme::MUTED),
+            button(text("Wake and resume").size(12))
+                .on_press(Message::WorktreeSelected(worktree))
+                .padding([8, 12])
+                .style(theme::primary_dark_button),
+        ]
+        .spacing(9)
+        .align_x(iced::Alignment::Center);
+        return container(sleeping)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(theme::editor_surface)
+            .into();
+    }
+    if state.native_chat_open(id) {
+        return native_chat_body(state, id);
+    }
+    crate::terminal::palette::configure_color_overrides(
+        &state.ui_settings().terminal_color_overrides,
+    );
+    let app_is_dark = crate::theme::mode_is_dark(&state.ui_settings().theme);
+    let terminal_theme = if !app_is_dark && state.ui_settings().terminal_use_separate_light_theme {
+        state.ui_settings().terminal_theme_light.as_str()
+    } else {
+        state.ui_settings().terminal_theme_dark.as_str()
+    };
+    let family = match state.ui_settings().terminal_font_family.as_str() {
+        "SF Mono" => Family::Name("SF Mono"),
+        "Menlo" => Family::Name("Menlo"),
+        "JetBrains Mono" => Family::Name("JetBrains Mono"),
+        "Fira Code" => Family::Name("Fira Code"),
+        _ => Family::Monospace,
+    };
+    let weight = match state.ui_settings().terminal_font_weight {
+        0..=349 => Weight::Light,
+        350..=449 => Weight::Normal,
+        450..=549 => Weight::Medium,
+        550..=649 => Weight::Semibold,
+        _ => Weight::Bold,
+    };
+    let font = Font {
+        family,
+        weight,
+        ..Font::MONOSPACE
+    };
     // `Terminal::new`가 `widget_id_for(id)`로 위젯 id를 파생시킨다 — 앱의
     // `operation::focus`가 같은 함수를 불러 같은 id에 도달한다.
-    Element::from(Terminal::new(id, state.session_store().snapshot(id)))
-        .map(|(id, command)| Message::Terminal { id, command })
+    Element::from(
+        Terminal::new(id, state.session_store().snapshot(id))
+            .font(font)
+            .text_size(state.ui_settings().terminal_font_size as f32)
+            .line_height(iced::widget::text::LineHeight::Relative(
+                state.ui_settings().terminal_line_height_percent as f32 / 100.0,
+            ))
+            .ligatures_enabled(state.ui_settings().terminal_ligatures != "off")
+            .right_click_to_paste(state.ui_settings().terminal_right_click_to_paste)
+            .middle_click_to_paste(state.ui_settings().primary_selection_middle_click_paste)
+            .focus_follows_mouse(state.ui_settings().terminal_focus_follows_mouse)
+            .cursor_style(&state.ui_settings().terminal_cursor_style)
+            .cursor_blink_phase_visible(
+                !state.ui_settings().terminal_cursor_blink || state.terminal_cursor_phase_visible(),
+            )
+            .cursor_opacity(f32::from(state.ui_settings().terminal_cursor_opacity_percent) / 100.0)
+            .background_opacity(
+                f32::from(state.ui_settings().terminal_background_opacity_percent) / 100.0,
+            )
+            .pane_opacity(
+                f32::from(state.ui_settings().terminal_active_pane_opacity_percent) / 100.0,
+                f32::from(state.ui_settings().terminal_inactive_pane_opacity_percent) / 100.0,
+            )
+            .padding(
+                state.ui_settings().terminal_padding_x as f32,
+                state.ui_settings().terminal_padding_y as f32,
+            )
+            .scroll_sensitivity(
+                f32::from(state.ui_settings().terminal_scroll_sensitivity_percent) / 100.0,
+                f32::from(state.ui_settings().terminal_fast_scroll_sensitivity_percent) / 100.0,
+                state.ui_settings().terminal_tui_scroll_multiplier,
+            )
+            .mouse_hide_while_typing(state.ui_settings().terminal_mouse_hide_while_typing)
+            .mac_option_as_alt(&state.ui_settings().terminal_mac_option_as_alt)
+            .jis_yen_to_backslash(state.ui_settings().terminal_jis_yen_to_backslash)
+            .theme_name(terminal_theme),
+    )
+    .map(|(id, command)| Message::Terminal { id, command })
+}
+
+fn native_chat_body<R>(state: &AppState, id: SessionId) -> Element<'_, Message, iced::Theme, R>
+where
+    R: iced::advanced::text::Renderer<Font = iced::Font> + 'static,
+{
+    let snapshot = state.session_store().snapshot(id);
+    let transcript = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, _)| snapshot.row_text(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let composer = row![
+        text_input("Message the agent…", state.native_chat_draft(id))
+            .on_input(move |value| Message::NativeChatDraftChanged(id, value))
+            .on_submit(Message::NativeChatSubmitted(id))
+            .padding([8, 10])
+            .size(12),
+        button(text("Send").size(11))
+            .on_press(Message::NativeChatSubmitted(id))
+            .padding([8, 10])
+            .style(theme::primary_dark_button),
+    ]
+    .spacing(7)
+    .align_y(iced::Alignment::Center);
+    container(
+        column![
+            scrollable(
+                container(
+                    text(transcript)
+                        .font(Font::MONOSPACE)
+                        .size(state.ui_settings().terminal_font_size as f32)
+                )
+                .padding([12, 14])
+                .width(Length::Fill)
+            )
+            .height(Length::Fill),
+            composer,
+        ]
+        .spacing(8)
+        .padding([8, 10]),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(theme::editor_surface)
+    .into()
 }
 
 /// `Subscription::run_with`의 `data`. **`session`은 절대 해싱에 참여하지
@@ -494,6 +707,7 @@ mod tests {
                 args,
                 cwd: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 rows: 24,
                 cols: 80,
             },

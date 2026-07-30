@@ -60,7 +60,10 @@ enum Phase {
     WaitingForBracketedPaste,
     /// BRACKETED_PASTE는 봤다 — 이제 출력이 `QUIET_WINDOW` 동안 멎기를 기다린다.
     /// `since`는 마지막으로 출력을 본 시각, `last_generation`은 그때의 카운터.
-    Quieting { since: Instant, last_generation: u64 },
+    Quieting {
+        since: Instant,
+        last_generation: u64,
+    },
     /// 주입했거나 포기했다. 이후 poll은 항상 [`GateAction::Wait`].
     Finished,
 }
@@ -188,7 +191,10 @@ mod tests {
                 "no injection may happen before BRACKETED_PASTE at t={ms}ms"
             );
         }
-        assert!(!gate.is_finished(), "still waiting, not given up (within timeout)");
+        assert!(
+            !gate.is_finished(),
+            "still waiting, not given up (within timeout)"
+        );
     }
 
     /// BRACKETED_PASTE를 본 뒤 출력이 `QUIET_WINDOW` 동안 멎으면 **정확히 한 번**

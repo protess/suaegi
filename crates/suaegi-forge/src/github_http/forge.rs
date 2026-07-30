@@ -18,12 +18,7 @@
 //!   떨어뜨리고 빈 요약(모름)으로 둔다(gh `fetch_checks` 규율 미러).
 
 use super::classify::{classify_http_merge_failure, classify_http_unavailable};
-use super::parse::{
-    api_base, parse_github_remote, user_login, HttpComment, HttpPr, HttpReview,
-};
-use suaegi_http::{
-    HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportError,
-};
+use super::parse::{api_base, parse_github_remote, user_login, HttpComment, HttpPr, HttpReview};
 use crate::github::read_pr_template;
 use crate::pr_actions::{
     CommentLookup, MergeFailure, MergeMethod, MergeOptions, MergeOutcome, MergeabilityState,
@@ -37,6 +32,9 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use suaegi_http::{
+    HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportError,
+};
 use suaegi_secrets::Secret;
 
 /// 토큰 키체인 좌표. service는 앱 이름, account는 호스트(멀티-호스트 확장 여지). env
@@ -93,8 +91,14 @@ impl HttpGhForge {
         let token = self.token.as_ref()?;
         Some(vec![
             // expose()는 오직 여기서만. grep 감사점.
-            ("Authorization".to_string(), format!("Bearer {}", token.expose())),
-            ("Accept".to_string(), "application/vnd.github+json".to_string()),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", token.expose()),
+            ),
+            (
+                "Accept".to_string(),
+                "application/vnd.github+json".to_string(),
+            ),
             ("X-GitHub-Api-Version".to_string(), "2022-11-28".to_string()),
             ("User-Agent".to_string(), "suaegi".to_string()),
         ])
@@ -171,7 +175,11 @@ impl HttpGhForge {
     /// 브랜치/번호 공통 조회 실패 매핑: 전송 에러(u) → Unavailable(u).
     async fn review_by_branch_inner(&self, repo: &RepoCoords, branch: &str) -> ReviewLookup {
         // head=owner:branch 필터. 값은 percent-encode(브랜치명에 /·특수문자 가능).
-        let head = format!("{}:{}", encode_component(&repo.owner), encode_component(branch));
+        let head = format!(
+            "{}:{}",
+            encode_component(&repo.owner),
+            encode_component(branch)
+        );
         let url = self.repos_url(repo, &format!("/pulls?head={head}&state=all&per_page=1"));
         let resp = match self.send(HttpMethod::Get, url, None, READ_TIMEOUT).await {
             Ok(resp) => resp,
@@ -278,7 +286,13 @@ fn summarize_check_runs(runs: &[CheckRun]) -> ChecksSummary {
             s.pending += 1;
             continue;
         }
-        match r.conclusion.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+        match r
+            .conclusion
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "success" | "neutral" => s.passing += 1,
             "failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure" => {
                 s.failing += 1
@@ -416,7 +430,8 @@ impl ForgeProvider for HttpGhForge {
             // 422 = validation. "already exists"는 명시적 안내로, 그 밖은 정제된 일반 문구.
             422 => {
                 let lower = resp.body.to_ascii_lowercase();
-                if lower.contains("already exists") || lower.contains("pull request already exists") {
+                if lower.contains("already exists") || lower.contains("pull request already exists")
+                {
                     Err(ForgeError::Validation(
                         "A pull request already exists for this branch.".to_string(),
                     ))
@@ -580,8 +595,8 @@ async fn current_branch(worktree: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use suaegi_http::FakeTransport;
     use super::*;
+    use suaegi_http::FakeTransport;
 
     fn repo() -> RepoCoords {
         RepoCoords {
@@ -616,14 +631,20 @@ mod tests {
             lookup,
             ReviewLookup::Unavailable(ForgeUnavailable::NotAuthenticated)
         );
-        assert!(t.requests().is_empty(), "must not call transport without a token");
+        assert!(
+            t.requests().is_empty(),
+            "must not call transport without a token"
+        );
     }
 
     #[tokio::test]
     async fn branch_lookup_empty_array_is_none() {
         // 200 + [] = 진짜 PR 없음 = None.
         let (forge, _) = mk_forge(FakeTransport::ok_json(200, "[]"));
-        assert_eq!(forge.review_for_branch(&repo(), "feat").await, ReviewLookup::None);
+        assert_eq!(
+            forge.review_for_branch(&repo(), "feat").await,
+            ReviewLookup::None
+        );
     }
 
     #[tokio::test]
@@ -653,7 +674,11 @@ mod tests {
                 matches!(lookup, ReviewLookup::Unavailable(_)),
                 "status {status} must be Unavailable, got {lookup:?}"
             );
-            assert_ne!(lookup, ReviewLookup::None, "status {status} must not be None");
+            assert_ne!(
+                lookup,
+                ReviewLookup::None,
+                "status {status} must not be None"
+            );
         }
     }
 
@@ -740,20 +765,28 @@ mod tests {
         // 조회 실패를 유발.
         let lookup = forge.review_for_branch(&repo(), "feat").await;
         let rendered = format!("{lookup:?}");
-        assert!(!rendered.contains(TOKEN), "token leaked into lookup: {rendered}");
+        assert!(
+            !rendered.contains(TOKEN),
+            "token leaked into lookup: {rendered}"
+        );
 
         // merge 실패도 확인.
         let merr = forge
             .merge_pr(&repo(), 1, MergeMethod::Merge, MergeOptions::default())
             .await;
         let mrendered = format!("{merr:?}");
-        assert!(!mrendered.contains(TOKEN), "token leaked into merge error: {mrendered}");
+        assert!(
+            !mrendered.contains(TOKEN),
+            "token leaked into merge error: {mrendered}"
+        );
 
         // forge 자체의 Debug도 토큰을 안 찍는다.
         assert!(!format!("{forge:?}").contains(TOKEN));
 
         // 하지만 토큰은 Authorization 헤더로는 실제로 실렸다(엉뚱한 곳이 아님).
-        let auth = t.last_header("authorization").expect("authorization header sent");
+        let auth = t
+            .last_header("authorization")
+            .expect("authorization header sent");
         assert_eq!(auth, format!("Bearer {TOKEN}"));
     }
 
@@ -800,7 +833,8 @@ mod tests {
     async fn create_recovers_number_from_json_response() {
         let dir = tempfile::tempdir().unwrap();
         init_github_repo(dir.path()).await;
-        let body = r#"{"number":123,"html_url":"https://github.com/acme/widget/pull/123","state":"open"}"#;
+        let body =
+            r#"{"number":123,"html_url":"https://github.com/acme/widget/pull/123","state":"open"}"#;
         let t = Arc::new(FakeTransport::ok_json(201, body));
         let forge = HttpGhForge::with_transport(t.clone(), Some(Secret::new("ghp_X")));
         let input = CreateReviewInput {
@@ -818,7 +852,11 @@ mod tests {
         let reqs = t.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].method, HttpMethod::Post);
-        assert!(reqs[0].url.ends_with("/repos/acme/widget/pulls"), "url: {}", reqs[0].url);
+        assert!(
+            reqs[0].url.ends_with("/repos/acme/widget/pulls"),
+            "url: {}",
+            reqs[0].url
+        );
     }
 
     /// create 422 "already exists" → 명시적 Validation(원격은 진짜 repo 필요).
@@ -851,20 +889,46 @@ mod tests {
         use suaegi_git::runner::GitRunner;
         let git = GitRunner::new();
         git.run(dir, &["init", "-q"]).await.unwrap();
-        git.run(dir, &["remote", "add", "origin", "https://github.com/acme/widget.git"])
-            .await
-            .unwrap();
+        git.run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
     fn check_runs_summary_counts() {
         let runs = vec![
-            CheckRun { status: "completed".into(), conclusion: Some("success".into()) },
-            CheckRun { status: "completed".into(), conclusion: Some("neutral".into()) },
-            CheckRun { status: "completed".into(), conclusion: Some("failure".into()) },
-            CheckRun { status: "completed".into(), conclusion: Some("timed_out".into()) },
-            CheckRun { status: "in_progress".into(), conclusion: None },
-            CheckRun { status: "completed".into(), conclusion: Some("skipped".into()) },
+            CheckRun {
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+            },
+            CheckRun {
+                status: "completed".into(),
+                conclusion: Some("neutral".into()),
+            },
+            CheckRun {
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+            },
+            CheckRun {
+                status: "completed".into(),
+                conclusion: Some("timed_out".into()),
+            },
+            CheckRun {
+                status: "in_progress".into(),
+                conclusion: None,
+            },
+            CheckRun {
+                status: "completed".into(),
+                conclusion: Some("skipped".into()),
+            },
         ];
         let s = summarize_check_runs(&runs);
         assert_eq!(s.passing, 2);

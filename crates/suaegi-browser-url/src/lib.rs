@@ -238,7 +238,10 @@ pub fn classify_scheme_less_local_dev_address(raw_input: &str) -> Option<Url> {
 fn normalize_certificate_hostname(hostname: &str) -> String {
     let trimmed = js_trim(hostname);
     let lower = trimmed.to_lowercase();
-    let unbracketed: &str = match lower.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    let unbracketed: &str = match lower
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         Some(inner) => inner,
         None => lower.as_str(),
     };

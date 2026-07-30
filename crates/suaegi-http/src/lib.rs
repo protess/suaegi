@@ -16,7 +16,32 @@
 //! 오직 `Authorization` 헤더로만 실린다([`HttpRequest::headers`]).
 
 use async_trait::async_trait;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
+
+#[derive(Debug, Clone, Default)]
+struct NetworkConfig {
+    proxy_url: String,
+    bypass_rules: String,
+    http1_only: bool,
+}
+
+fn network_config() -> &'static RwLock<NetworkConfig> {
+    static CONFIG: OnceLock<RwLock<NetworkConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| RwLock::new(NetworkConfig::default()))
+}
+
+/// Updates the process-wide HTTP policy used by subsequently created
+/// transports. Existing in-flight requests are intentionally unaffected.
+pub fn configure(proxy_url: String, bypass_rules: String, http1_only: bool) {
+    if let Ok(mut config) = network_config().write() {
+        *config = NetworkConfig {
+            proxy_url,
+            bypass_rules,
+            http1_only,
+        };
+    }
+}
 
 /// 우리가 쓰는 HTTP 메서드(REST/GraphQL 표면에 필요한 것만).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +49,7 @@ pub enum HttpMethod {
     Get,
     Post,
     Put,
+    Patch,
 }
 
 /// 소비자가 전송에 넘기는 요청. `headers`에 `Authorization`이 들어간다(유일한 토큰 경로).
@@ -97,10 +123,24 @@ impl ReqwestTransport {
     pub fn new() -> Self {
         // user_agent는 GitHub REST가 요구한다(없으면 403). 토큰은 여기 안 넣는다 —
         // 요청별 Authorization 헤더로만 실린다.
-        let client = reqwest::Client::builder()
-            .user_agent("suaegi")
-            .build()
+        let config = network_config()
+            .read()
+            .map(|config| config.clone())
             .unwrap_or_default();
+        let mut builder = reqwest::Client::builder().user_agent("suaegi");
+        if !config.proxy_url.trim().is_empty() {
+            if let Ok(mut proxy) = reqwest::Proxy::all(config.proxy_url.trim()) {
+                if !config.bypass_rules.trim().is_empty() {
+                    proxy =
+                        proxy.no_proxy(reqwest::NoProxy::from_string(config.bypass_rules.trim()));
+                }
+                builder = builder.proxy(proxy);
+            }
+        }
+        if config.http1_only {
+            builder = builder.http1_only();
+        }
+        let client = builder.build().unwrap_or_default();
         Self { client }
     }
 }
@@ -122,6 +162,7 @@ impl HttpTransport for ReqwestTransport {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
             HttpMethod::Put => reqwest::Method::PUT,
+            HttpMethod::Patch => reqwest::Method::PATCH,
         };
         let mut rb = self.client.request(method, &req.url).timeout(req.timeout);
         for (k, v) in &req.headers {
@@ -225,13 +266,17 @@ pub mod fake {
     impl HttpTransport for FakeTransport {
         async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, TransportError> {
             self.requests.lock().unwrap().push(req);
-            self.responses.lock().unwrap().pop_front().unwrap_or_else(|| {
-                Ok(HttpResponse {
-                    status: 500,
-                    headers: Vec::new(),
-                    body: String::new(),
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(HttpResponse {
+                        status: 500,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    })
                 })
-            })
         }
     }
 }

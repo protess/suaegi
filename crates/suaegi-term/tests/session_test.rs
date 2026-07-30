@@ -1,8 +1,8 @@
 mod platform;
 
+use alacritty_terminal::index::Side;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use alacritty_terminal::index::Side;
 use suaegi_term::grid::TitleChange;
 use suaegi_term::input_types::{
     ClickKind, KeyInput, KeyLocation, Mods, MouseAction, MouseIntent, NamedKey, TermKey,
@@ -18,6 +18,7 @@ fn spec(cmd: (String, Vec<String>)) -> SessionSpec {
             args: cmd.1,
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             rows: 24,
             cols: 80,
         },
@@ -400,6 +401,7 @@ fn wheel(lines: i32) -> MouseIntent {
         mods: Mods::default(),
         click: ClickKind::Single,
         force_local: false,
+        tui_wheel_multiplier: 1,
     }
 }
 
@@ -465,7 +467,11 @@ fn send_mouse_bumps_the_generation_when_it_asks_for_a_redraw() {
     let before = session.generation();
     let result = session.send_mouse(&wheel(2)).expect("wheel routes");
     assert!(result.redraw, "a local scroll changes what is on screen");
-    assert_eq!(result.write, WriteOutcome::Suppressed, "nothing goes to the pty");
+    assert_eq!(
+        result.write,
+        WriteOutcome::Suppressed,
+        "nothing goes to the pty"
+    );
     assert!(
         session.generation() > before,
         "a redraw without a generation bump repaints the stale snapshot"

@@ -412,9 +412,8 @@ pub struct BuildNestedRepoScanTelemetryArgs {
 pub fn build_nested_repo_scan_telemetry(
     args: BuildNestedRepoScanTelemetryArgs,
 ) -> NestedRepoScanTelemetry {
-    let found_count = cap_nested_repo_telemetry_count(
-        args.scan.map(|scan| scan.repo_count).unwrap_or(0.0),
-    );
+    let found_count =
+        cap_nested_repo_telemetry_count(args.scan.map(|scan| scan.repo_count).unwrap_or(0.0));
 
     let result = match args.scan {
         None => NestedRepoScanTelemetryResult::ScanFailed,
@@ -551,7 +550,9 @@ pub fn build_nested_repo_import_result_telemetry(
     let selected_count = cap_nested_repo_telemetry_count(args.selected_count);
 
     let imported_count = cap_nested_repo_telemetry_count(
-        args.result.map(|result| result.imported_count).unwrap_or(0.0),
+        args.result
+            .map(|result| result.imported_count)
+            .unwrap_or(0.0),
     );
     let already_known_count = cap_nested_repo_telemetry_count(
         args.result
@@ -610,7 +611,9 @@ pub fn cap_nested_repo_telemetry_count(count: f64) -> u32 {
         return 0;
     }
     let floored = count.floor();
-    let clamped = floored.max(0.0).min(f64::from(NESTED_REPO_TELEMETRY_MAX_REPO_COUNT));
+    let clamped = floored
+        .max(0.0)
+        .min(f64::from(NESTED_REPO_TELEMETRY_MAX_REPO_COUNT));
     // Safety: `clamped` is finite and lies in `[0.0, MAX as f64]`, so the
     // cast is exact and in-range for `u32`.
     clamped as u32
@@ -781,14 +784,20 @@ mod tests {
 
         assert_eq!(telemetry.attempt_id, "2fbac1e3-5094-45b4-80a6-90281e6e9e09");
         assert_eq!(telemetry.surface, NestedRepoTelemetrySurface::Onboarding);
-        assert_eq!(telemetry.runtime_kind, NestedRepoTelemetryRuntimeKind::Local);
+        assert_eq!(
+            telemetry.runtime_kind,
+            NestedRepoTelemetryRuntimeKind::Local
+        );
         assert_eq!(telemetry.result, NestedRepoScanTelemetryResult::ReviewShown);
         assert_eq!(
             telemetry.selected_path_kind,
             Some(NestedRepoScanPathKind::NonGitFolder)
         );
         assert_eq!(telemetry.found_count, 3);
-        assert_eq!(telemetry.found_count_bucket, NestedRepoCountBucket::TwoToThree);
+        assert_eq!(
+            telemetry.found_count_bucket,
+            NestedRepoCountBucket::TwoToThree
+        );
         assert!(!telemetry.truncated);
         assert!(!telemetry.timed_out);
     }
@@ -812,11 +821,20 @@ mod tests {
         assert_eq!(telemetry.attempt_id, "2fbac1e3-5094-45b4-80a6-90281e6e9e09");
         assert_eq!(telemetry.surface, NestedRepoTelemetrySurface::Sidebar);
         assert_eq!(telemetry.runtime_kind, NestedRepoTelemetryRuntimeKind::Ssh);
-        assert_eq!(telemetry.action, NestedRepoImportTelemetryAction::ImportGroup);
+        assert_eq!(
+            telemetry.action,
+            NestedRepoImportTelemetryAction::ImportGroup
+        );
         assert_eq!(telemetry.found_count, 3);
-        assert_eq!(telemetry.found_count_bucket, NestedRepoCountBucket::TwoToThree);
+        assert_eq!(
+            telemetry.found_count_bucket,
+            NestedRepoCountBucket::TwoToThree
+        );
         assert_eq!(telemetry.selected_count, 2);
-        assert_eq!(telemetry.selected_count_bucket, NestedRepoCountBucket::TwoToThree);
+        assert_eq!(
+            telemetry.selected_count_bucket,
+            NestedRepoCountBucket::TwoToThree
+        );
         assert!(!telemetry.all_selected);
     }
 
@@ -881,7 +899,10 @@ mod tests {
         assert_eq!(result.surface, NestedRepoTelemetrySurface::Onboarding);
         assert_eq!(result.runtime_kind, NestedRepoTelemetryRuntimeKind::Runtime);
         assert_eq!(result.mode, ProjectGroupImportMode::Group);
-        assert_eq!(result.outcome, NestedRepoImportTelemetryOutcome::PartialFailure);
+        assert_eq!(
+            result.outcome,
+            NestedRepoImportTelemetryOutcome::PartialFailure
+        );
         assert_eq!(result.found_count, 4);
         assert_eq!(result.selected_count, 4);
         assert_eq!(result.imported_count, 2);
@@ -1144,11 +1165,26 @@ mod tests {
                 }),
             });
 
-        assert_eq!(result.found_count_bucket, NestedRepoCountBucket::SixteenPlus);
-        assert_eq!(result.selected_count_bucket, NestedRepoCountBucket::EightToFifteen);
-        assert_eq!(result.imported_count_bucket, NestedRepoCountBucket::FourToSeven);
-        assert_eq!(result.already_known_count_bucket, NestedRepoCountBucket::One);
-        assert_eq!(result.failed_count_bucket, NestedRepoCountBucket::TwoToThree);
+        assert_eq!(
+            result.found_count_bucket,
+            NestedRepoCountBucket::SixteenPlus
+        );
+        assert_eq!(
+            result.selected_count_bucket,
+            NestedRepoCountBucket::EightToFifteen
+        );
+        assert_eq!(
+            result.imported_count_bucket,
+            NestedRepoCountBucket::FourToSeven
+        );
+        assert_eq!(
+            result.already_known_count_bucket,
+            NestedRepoCountBucket::One
+        );
+        assert_eq!(
+            result.failed_count_bucket,
+            NestedRepoCountBucket::TwoToThree
+        );
     }
 
     // =========================================================================
@@ -1240,7 +1276,10 @@ mod tests {
 
         // Direct literal assertions — the oracle never asserts either string.
         assert_eq!(NestedRepoImportTelemetryOutcome::Failed.as_str(), "failed");
-        assert_eq!(NestedRepoImportTelemetryOutcome::Success.as_str(), "success");
+        assert_eq!(
+            NestedRepoImportTelemetryOutcome::Success.as_str(),
+            "success"
+        );
     }
 
     // =========================================================================
@@ -1299,7 +1338,10 @@ mod tests {
 
     #[test]
     fn m8_surface_literals() {
-        assert_eq!(NestedRepoTelemetrySurface::Onboarding.as_str(), "onboarding");
+        assert_eq!(
+            NestedRepoTelemetrySurface::Onboarding.as_str(),
+            "onboarding"
+        );
         assert_eq!(NestedRepoTelemetrySurface::Sidebar.as_str(), "sidebar");
     }
 
@@ -1312,18 +1354,27 @@ mod tests {
 
     #[test]
     fn m8_scan_result_literals() {
-        assert_eq!(NestedRepoScanTelemetryResult::ReviewShown.as_str(), "review_shown");
+        assert_eq!(
+            NestedRepoScanTelemetryResult::ReviewShown.as_str(),
+            "review_shown"
+        );
         assert_eq!(NestedRepoScanTelemetryResult::GitRepo.as_str(), "git_repo");
         assert_eq!(
             NestedRepoScanTelemetryResult::NoNestedRepos.as_str(),
             "no_nested_repos"
         );
-        assert_eq!(NestedRepoScanTelemetryResult::ScanFailed.as_str(), "scan_failed");
+        assert_eq!(
+            NestedRepoScanTelemetryResult::ScanFailed.as_str(),
+            "scan_failed"
+        );
     }
 
     #[test]
     fn m8_import_action_literals() {
-        assert_eq!(NestedRepoImportTelemetryAction::ImportGroup.as_str(), "import_group");
+        assert_eq!(
+            NestedRepoImportTelemetryAction::ImportGroup.as_str(),
+            "import_group"
+        );
         assert_eq!(
             NestedRepoImportTelemetryAction::ImportSeparate.as_str(),
             "import_separate"
@@ -1337,7 +1388,10 @@ mod tests {
 
     #[test]
     fn m8_import_outcome_literals() {
-        assert_eq!(NestedRepoImportTelemetryOutcome::Success.as_str(), "success");
+        assert_eq!(
+            NestedRepoImportTelemetryOutcome::Success.as_str(),
+            "success"
+        );
         assert_eq!(
             NestedRepoImportTelemetryOutcome::PartialFailure.as_str(),
             "partial_failure"
@@ -1348,7 +1402,10 @@ mod tests {
     #[test]
     fn m8_scan_path_kind_literals() {
         assert_eq!(NestedRepoScanPathKind::GitRepo.as_str(), "git_repo");
-        assert_eq!(NestedRepoScanPathKind::NonGitFolder.as_str(), "non_git_folder");
+        assert_eq!(
+            NestedRepoScanPathKind::NonGitFolder.as_str(),
+            "non_git_folder"
+        );
     }
 
     #[test]
@@ -1484,7 +1541,10 @@ mod tests {
 
         assert_eq!(chars.len(), 36);
         for &dash_index in &[8usize, 13, 18, 23] {
-            assert_eq!(chars[dash_index], '-', "expected dash at index {dash_index}");
+            assert_eq!(
+                chars[dash_index], '-',
+                "expected dash at index {dash_index}"
+            );
         }
         for (index, &ch) in chars.iter().enumerate() {
             if [8, 13, 18, 23].contains(&index) {
@@ -1540,7 +1600,10 @@ mod tests {
                 timed_out: false,
             }),
         });
-        assert_eq!(telemetry.result, NestedRepoScanTelemetryResult::NoNestedRepos);
+        assert_eq!(
+            telemetry.result,
+            NestedRepoScanTelemetryResult::NoNestedRepos
+        );
         assert_eq!(telemetry.found_count, 0);
     }
 
@@ -1555,7 +1618,10 @@ mod tests {
                 found_count: 1.0,
                 selected_count: 0.0,
             });
-        assert_eq!(open_as_folder.action, NestedRepoImportTelemetryAction::OpenAsFolder);
+        assert_eq!(
+            open_as_folder.action,
+            NestedRepoImportTelemetryAction::OpenAsFolder
+        );
 
         let back =
             build_nested_repo_import_action_telemetry(BuildNestedRepoImportActionTelemetryArgs {

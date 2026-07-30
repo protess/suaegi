@@ -70,6 +70,7 @@ fn press_at(row: usize, col: usize) -> MouseIntent {
         mods: Mods::default(),
         click: ClickKind::Single,
         force_local: false,
+        tui_wheel_multiplier: 1,
     }
 }
 
@@ -78,7 +79,13 @@ fn press_at(row: usize, col: usize) -> MouseIntent {
 #[test]
 #[ignore = "타이밍 측정 — 수동으로 --ignored --nocapture로 돌린다"]
 fn input_latency_while_the_reader_feeds_max_size_chunks() {
-    let grid = Arc::new(TerminalGrid::new(GridSize { rows: 50, cols: 200 }, 10_000));
+    let grid = Arc::new(TerminalGrid::new(
+        GridSize {
+            rows: 50,
+            cols: 200,
+        },
+        10_000,
+    ));
     let stop = Arc::new(AtomicBool::new(false));
 
     // 파서를 실제로 일하게 만드는 청크 — 개행과 SGR이 섞인 진짜 출력에 가깝다.
@@ -131,7 +138,13 @@ fn input_latency_while_the_reader_feeds_max_size_chunks() {
 #[test]
 #[ignore = "타이밍 측정 — 수동으로 --ignored --nocapture로 돌린다"]
 fn input_latency_with_an_idle_reader() {
-    let grid = TerminalGrid::new(GridSize { rows: 50, cols: 200 }, 10_000);
+    let grid = TerminalGrid::new(
+        GridSize {
+            rows: 50,
+            cols: 200,
+        },
+        10_000,
+    );
     let key = arrow_up();
     for _ in 0..50 {
         let _ = grid.encode_key_locked(&key);
@@ -191,6 +204,7 @@ fn extraction_latency_over_a_full_scrollback() {
         mods: Mods::default(),
         click: ClickKind::Single,
         force_local: false,
+        tui_wheel_multiplier: 1,
     })
     .expect("release routes");
 

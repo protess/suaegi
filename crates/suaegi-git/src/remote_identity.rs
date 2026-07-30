@@ -133,11 +133,14 @@ pub fn derive_git_remote_identity(stdout: &str) -> Option<GitRemoteIdentity> {
             .cmp(&primary_remote_sort_key(&b.0.name))
             .then_with(|| a.0.name.cmp(&b.0.name))
     });
-    entries.into_iter().next().map(|(e, key)| GitRemoteIdentity {
-        canonical_key: key,
-        remote_name: e.name,
-        remote_url: e.url,
-    })
+    entries
+        .into_iter()
+        .next()
+        .map(|(e, key)| GitRemoteIdentity {
+            canonical_key: key,
+            remote_name: e.name,
+            remote_url: e.url,
+        })
 }
 
 #[cfg(test)]
@@ -155,7 +158,10 @@ mod tests {
         let expected = Some("github.com/example/sample-app".to_string());
         assert_eq!(norm("https://github.com/example/sample-app.git"), expected);
         assert_eq!(norm("git@github.com:example/sample-app.git"), expected);
-        assert_eq!(norm("ssh://git@github.com/example/sample-app.git"), expected);
+        assert_eq!(
+            norm("ssh://git@github.com/example/sample-app.git"),
+            expected
+        );
         assert_eq!(norm("https://GitHub.com/example/sample-app.git"), expected);
     }
 
@@ -219,17 +225,15 @@ mod tests {
             })
         );
 
-        let origin = derive_git_remote_identity(
-            "origin\tgit@git.company.test:team/sample-app.git (fetch)",
-        )
-        .unwrap();
+        let origin =
+            derive_git_remote_identity("origin\tgit@git.company.test:team/sample-app.git (fetch)")
+                .unwrap();
         assert_eq!(origin.remote_name, "origin");
         assert_eq!(origin.canonical_key, "git.company.test/team/sample-app");
 
-        let mirror = derive_git_remote_identity(
-            "mirror\tgit@git.company.test:team/sample-app.git (fetch)",
-        )
-        .unwrap();
+        let mirror =
+            derive_git_remote_identity("mirror\tgit@git.company.test:team/sample-app.git (fetch)")
+                .unwrap();
         assert_eq!(mirror.remote_name, "mirror");
         assert_eq!(mirror.canonical_key, "git.company.test/team/sample-app");
     }

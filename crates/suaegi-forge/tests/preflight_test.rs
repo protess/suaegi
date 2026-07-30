@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! preflight: gh 미설치 / 미인증 / 구버전 / ready 구분(플랜 §3.2).
 
 mod fixture;

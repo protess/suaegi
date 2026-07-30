@@ -34,6 +34,7 @@ pub mod marine_creatures;
 pub mod text_scanner;
 
 pub mod display_name;
+pub mod suggestion;
 pub mod workspace_name;
 
 pub use branch_name::{
@@ -43,6 +44,9 @@ pub use branch_name::{
 };
 pub use display_name::derive_workspace_display_name;
 pub use marine_creatures::MARINE_CREATURES;
+pub use suggestion::{
+    get_suggested_creature_name, normalize_suggested_name, should_apply_suggested_name,
+};
 pub use text_scanner::{collect_compact_workspace_words, fold_workspace_name_whitespace_to_hyphen};
 pub use workspace_name::{
     get_linear_issue_workspace_name, get_linked_work_item_suggested_name,

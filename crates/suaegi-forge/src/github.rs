@@ -1,7 +1,5 @@
 use crate::classify::{classify_unavailable, is_no_pull_request};
-use crate::parse::{
-    parse_created_pr, summarize_checks, GhCheck, GhPrView, GhRepoView,
-};
+use crate::parse::{parse_created_pr, summarize_checks, GhCheck, GhPrView, GhRepoView};
 use crate::pr_actions::{
     classify_merge_failure, mergeability_from_fields, CommentLookup, GhCommentRaw, GhReviewRaw,
     MergeFailure, MergeMethod, MergeOptions, MergeOutcome, MergeabilityFields, MergeabilityState,
@@ -48,7 +46,10 @@ pub enum Preflight {
     /// gh 있지만 `gh auth status` 실패 → "gh auth login" 안내.
     NotAuthenticated,
     /// gh가 하한보다 낮음.
-    OutdatedVersion { found: String, min: String },
+    OutdatedVersion {
+        found: String,
+        min: String,
+    },
 }
 
 /// gh 설치·버전·인증을 검사한다. 실패를 불투명하게 던지지 않고 분류해 돌려준다.
@@ -182,8 +183,7 @@ impl GhForge {
             Err(_) => return ChecksSummary::default(),
         };
         // 체크가 하나도 없으면 gh는 "no checks reported"를 낸다 → 빈 요약.
-        if out.stdout.trim().is_empty()
-            || out.stderr.to_lowercase().contains("no checks reported")
+        if out.stdout.trim().is_empty() || out.stderr.to_lowercase().contains("no checks reported")
         {
             return ChecksSummary::default();
         }
@@ -196,10 +196,7 @@ impl GhForge {
 
 #[async_trait]
 impl ForgeProvider for GhForge {
-    async fn resolve_repository(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<RepoCoords>, ForgeError> {
+    async fn resolve_repository(&self, worktree: &Path) -> Result<Option<RepoCoords>, ForgeError> {
         let out = self
             .runner
             .run(worktree, &["repo", "view", "--json", "owner,name,url"])
@@ -328,9 +325,7 @@ impl ForgeProvider for GhForge {
             },
             Err(GhError::Failed { stderr, .. }) => {
                 let lower = stderr.to_lowercase();
-                if lower.contains("already exists")
-                    || lower.contains("a pull request for branch")
-                {
+                if lower.contains("already exists") || lower.contains("a pull request for branch") {
                     Err(ForgeError::Validation(
                         "A pull request already exists for this branch.".to_string(),
                     ))
@@ -466,7 +461,13 @@ impl PrActions for GhForge {
             .run(
                 Self::neutral_cwd(),
                 &[
-                    "pr", "view", &number_str, "--repo", &repo_arg, "--json", "reviews",
+                    "pr",
+                    "view",
+                    &number_str,
+                    "--repo",
+                    &repo_arg,
+                    "--json",
+                    "reviews",
                 ],
             )
             .await;
@@ -496,7 +497,13 @@ impl PrActions for GhForge {
             .run(
                 Self::neutral_cwd(),
                 &[
-                    "pr", "view", &number_str, "--repo", &repo_arg, "--json", "comments",
+                    "pr",
+                    "view",
+                    &number_str,
+                    "--repo",
+                    &repo_arg,
+                    "--json",
+                    "comments",
                 ],
             )
             .await;

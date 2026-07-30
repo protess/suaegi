@@ -640,6 +640,7 @@ mod tests {
             mods: Mods::default(),
             click: ClickKind::Single,
             force_local: false,
+            tui_wheel_multiplier: 1,
         }
     }
 
@@ -1061,7 +1062,10 @@ mod tests {
     /// 부르기 때문이다. `encode_paste`의 bracketed 가지와 byte-identical해야 한다.
     #[test]
     fn wrap_bracketed_paste_always_wraps_and_strips_terminator() {
-        assert_eq!(wrap_bracketed_paste("fix the bug"), b"\x1b[200~fix the bug\x1b[201~");
+        assert_eq!(
+            wrap_bracketed_paste("fix the bug"),
+            b"\x1b[200~fix the bug\x1b[201~"
+        );
         // 주입 텍스트에 든 종료자를 제거하지 않으면 그 뒤가 괄호 밖으로 새어
         // 셸이 실행한다 — 프롬프트도 신뢰할 수 없는 입력이다.
         assert_eq!(
@@ -1097,7 +1101,8 @@ mod tests {
             .filter(|w| *w == b"\x1b[201~".as_slice())
             .count();
         assert_eq!(
-            reconstructed, 0,
+            reconstructed,
+            0,
             "a reconstructed terminator survived in the payload — the bracket closes early \
              and the rest executes as keystrokes: {}",
             show(&out)
@@ -1107,7 +1112,12 @@ mod tests {
             .windows(6)
             .filter(|w| *w == b"\x1b[201~".as_slice())
             .count();
-        assert_eq!(total, 1, "exactly one terminator (ours) must remain: {}", show(&out));
+        assert_eq!(
+            total,
+            1,
+            "exactly one terminator (ours) must remain: {}",
+            show(&out)
+        );
     }
 
     #[test]

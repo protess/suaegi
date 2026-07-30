@@ -537,7 +537,12 @@ fn format_ecmascript_float(value: f64) -> String {
 mod tests {
     use super::*;
 
-    fn frame(opcode: TerminalStreamOpcode, stream_id: f64, seq: f64, payload: Vec<u8>) -> TerminalStreamFrame {
+    fn frame(
+        opcode: TerminalStreamOpcode,
+        stream_id: f64,
+        seq: f64,
+        payload: Vec<u8>,
+    ) -> TerminalStreamFrame {
         TerminalStreamFrame {
             opcode,
             stream_id,
@@ -572,12 +577,8 @@ mod tests {
     #[test]
     fn oracle_round_trips_fixed_width_binary_frame_headers_and_payloads() {
         let payload = encode_terminal_stream_text("hello terminal");
-        let encoded = encode_terminal_stream_frame(&frame(
-            TerminalStreamOpcode::Output,
-            42.0,
-            9.0,
-            payload,
-        ));
+        let encoded =
+            encode_terminal_stream_frame(&frame(TerminalStreamOpcode::Output, 42.0, 9.0, payload));
 
         let decoded = decode_terminal_stream_frame(&encoded).expect("valid frame");
 
@@ -708,7 +709,10 @@ mod tests {
         // fields it checks rather than the full (superset) object.
         assert_eq!(subscribe_json["streamId"], serde_json::json!(12));
         assert_eq!(subscribe_json["terminal"], serde_json::json!("terminal-1"));
-        assert_eq!(snapshot_request.opcode, TerminalStreamOpcode::SnapshotRequest);
+        assert_eq!(
+            snapshot_request.opcode,
+            TerminalStreamOpcode::SnapshotRequest
+        );
         assert_eq!(snapshot_request.stream_id, 12.0);
         assert_eq!(unsubscribe.opcode, TerminalStreamOpcode::Unsubscribe);
         assert_eq!(unsubscribe.stream_id, 12.0);
@@ -903,8 +907,7 @@ mod tests {
         for (i, opcode) in opcodes.into_iter().enumerate() {
             let byte = (i + 1) as u8;
             assert_eq!(opcode as u8, byte, "opcode discriminant must equal {byte}");
-            let encoded =
-                encode_terminal_stream_frame(&frame(opcode, 1.0, 1.0, Vec::new()));
+            let encoded = encode_terminal_stream_frame(&frame(opcode, 1.0, 1.0, Vec::new()));
             assert_eq!(encoded[2], byte);
             let decoded = decode_terminal_stream_frame(&encoded).expect("valid frame");
             assert_eq!(decoded.opcode, opcode);
@@ -1110,7 +1113,10 @@ mod tests {
     #[test]
     fn r10_integer_valued_float_encodes_without_a_trailing_point_zero() {
         let bytes = encode_terminal_stream_json(&num(120.0));
-        assert_eq!(bytes, b"120", "ryu would print \"120.0\"; JS prints \"120\"");
+        assert_eq!(
+            bytes, b"120",
+            "ryu would print \"120.0\"; JS prints \"120\""
+        );
     }
 
     #[test]

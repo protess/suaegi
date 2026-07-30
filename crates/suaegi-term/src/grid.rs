@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -15,6 +15,26 @@ use crate::input_types::{
     CopyRequest, CopyTargets, GridMouseResult, KeyInput, MouseAction, MouseEncodeError,
     MouseIntent, MouseRoute, PointerLatch, TermMouseButton,
 };
+
+fn semantic_escape_chars_setting() -> &'static RwLock<String> {
+    static SETTING: OnceLock<RwLock<String>> = OnceLock::new();
+    SETTING.get_or_init(|| RwLock::new(Config::default().semantic_escape_chars))
+}
+
+/// Configures semantic-selection word boundaries for subsequently created
+/// terminal grids.
+pub fn configure_semantic_escape_chars(value: impl Into<String>) {
+    if let Ok(mut setting) = semantic_escape_chars_setting().write() {
+        *setting = value.into();
+    }
+}
+
+fn configured_semantic_escape_chars() -> String {
+    semantic_escape_chars_setting()
+        .read()
+        .map(|setting| setting.clone())
+        .unwrap_or_else(|_| Config::default().semantic_escape_chars)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridSize {
@@ -391,6 +411,7 @@ impl TerminalGrid {
     pub fn new(size: GridSize, scrollback: usize) -> Self {
         let config = Config {
             scrolling_history: scrollback,
+            semantic_escape_chars: configured_semantic_escape_chars(),
             ..Config::default()
         };
         let proxy = GridEventProxy::default();
@@ -474,10 +495,7 @@ impl TerminalGrid {
     /// 선택 변경을 부르면, **두 번째 락에서 `display_offset`이 이미 달라져 있을
     /// 수 있다.** 그러면 사용자가 가리킨 셀이 아닌 곳이 선택된다. 이 레이스는
     /// 교차검증에서 두 번 재발했다.
-    pub fn handle_mouse(
-        &self,
-        intent: &MouseIntent,
-    ) -> Result<GridMouseResult, MouseEncodeError> {
+    pub fn handle_mouse(&self, intent: &MouseIntent) -> Result<GridMouseResult, MouseEncodeError> {
         let mut state = self.state.lock();
         let mode = *state.term.mode();
 
@@ -492,7 +510,16 @@ impl TerminalGrid {
         let mut bytes = None;
 
         match route {
-            MouseRoute::Report | MouseRoute::AltScreenArrows => {
+            MouseRoute::Report => {
+                let mut multiplied = *intent;
+                if let MouseAction::Wheel { lines } = intent.action {
+                    multiplied.action = MouseAction::Wheel {
+                        lines: lines.saturating_mul(i32::from(intent.tui_wheel_multiplier)),
+                    };
+                }
+                bytes = encode::encode_mouse(&route, &multiplied, mode);
+            }
+            MouseRoute::AltScreenArrows => {
                 bytes = encode::encode_mouse(&route, intent, mode);
             }
             MouseRoute::LocalScroll => {
@@ -670,8 +697,8 @@ impl TerminalGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::index::{Line, Side};
     use crate::input_types::{ClickKind, KeyLocation, Mods, NamedKey, TermKey, ViewportHit};
+    use alacritty_terminal::index::{Line, Side};
 
     fn range(start: (i32, usize), end: (i32, usize), is_block: bool) -> SelectionRange {
         SelectionRange {
@@ -711,6 +738,7 @@ mod tests {
             mods: Mods::default(),
             click: ClickKind::Single,
             force_local: false,
+            tui_wheel_multiplier: 1,
         }
     }
 
@@ -806,7 +834,10 @@ mod tests {
     #[test]
     fn a_selection_entirely_outside_the_viewport_clips_to_none() {
         // 끝이 뷰포트 위 — 남는 행이 없다
-        assert_eq!(clip_selection(range((-9, 1), (-5, 8), false), 0, 4, 10), None);
+        assert_eq!(
+            clip_selection(range((-9, 1), (-5, 8), false), 0, 4, 10),
+            None
+        );
         // 시작이 뷰포트 아래 — 역시 없다
         assert_eq!(clip_selection(range((7, 1), (9, 8), false), 0, 4, 10), None);
         // 대조군: 한 행이라도 걸치면 Some이어야 한다
@@ -958,7 +989,11 @@ mod tests {
             after_range, before_range,
             "the range must be unchanged for this test to mean anything"
         );
-        assert_eq!(grid.snapshot().row_text(0), "ZZZZZ", "output must have landed");
+        assert_eq!(
+            grid.snapshot().row_text(0),
+            "ZZZZZ",
+            "output must have landed"
+        );
         assert!(
             after_epoch > before_epoch,
             "output overwrote cells inside the selection, so the epoch must advance: \
@@ -980,7 +1015,11 @@ mod tests {
             after, before,
             "there is nothing to invalidate when no selection exists"
         );
-        assert_eq!(grid.snapshot().row_text(0), "ZZZZZ", "output must have landed");
+        assert_eq!(
+            grid.snapshot().row_text(0),
+            "ZZZZZ",
+            "output must have landed"
+        );
     }
 
     #[test]
@@ -1171,6 +1210,25 @@ mod tests {
     }
 
     #[test]
+    fn tui_wheel_multiplier_only_expands_mouse_reporting() {
+        let grid = grid_with_scrollback();
+        grid.feed(b"\x1b[?1000h\x1b[?1006h");
+        let mut wheel = intent(MouseAction::Wheel { lines: 1 }, (0, 0), Side::Left, None);
+        wheel.tui_wheel_multiplier = 3;
+        let result = grid.handle_mouse(&wheel).expect("wheel routes");
+        assert_eq!(
+            result.bytes.as_deref(),
+            Some(b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M".as_slice())
+        );
+
+        grid.feed(b"\x1b[?1000l");
+        let before = grid.snapshot().display_offset;
+        let local = grid.handle_mouse(&wheel).expect("local wheel routes");
+        assert!(local.redraw);
+        assert_eq!(grid.snapshot().display_offset, before + 1);
+    }
+
+    #[test]
     fn a_local_wheel_scrolls_the_display_and_asks_for_a_redraw() {
         let grid = grid_with_scrollback();
         assert_eq!(grid.snapshot().display_offset, 0);
@@ -1185,7 +1243,10 @@ mod tests {
             .expect("wheel routes");
 
         assert!(result.redraw, "scrolling changes what is on screen");
-        assert_eq!(result.bytes, None, "a local scroll writes nothing to the pty");
+        assert_eq!(
+            result.bytes, None,
+            "a local scroll writes nothing to the pty"
+        );
         assert_eq!(grid.snapshot().display_offset, 2);
     }
 
@@ -1288,7 +1349,10 @@ mod tests {
         let fresh = grid
             .request_copy(CopyTargets::EXPLICIT)
             .expect("the selection still exists");
-        assert_eq!(grid.extract_selection(fresh.epoch), Some("ZZZZ".to_string()));
+        assert_eq!(
+            grid.extract_selection(fresh.epoch),
+            Some("ZZZZ".to_string())
+        );
     }
 
     #[test]

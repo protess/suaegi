@@ -107,7 +107,8 @@ pub fn is_github_project_ref_input_too_large(input: &str, max_bytes: Option<f64>
 /// fidelity to the source and because it is not provably redundant in
 /// general — see [`pin_bounded_check_rejects_a_long_non_whitespace_input`].
 pub fn has_bounded_github_project_ref_input_text(input: &str) -> bool {
-    !is_github_project_ref_input_too_large(input, None) && input.chars().any(|c| !is_js_whitespace(c))
+    !is_github_project_ref_input_too_large(input, None)
+        && input.chars().any(|c| !is_js_whitespace(c))
 }
 
 #[cfg(test)]
@@ -182,7 +183,10 @@ mod tests {
     #[test]
     fn pin_max_bytes_option_covers_every_js_numeric_branch() {
         assert!(!is_github_project_ref_input_too_large("short", None));
-        assert!(is_github_project_ref_input_too_large(&"x".repeat(2049), None));
+        assert!(is_github_project_ref_input_too_large(
+            &"x".repeat(2049),
+            None
+        ));
 
         // NaN / +Infinity: cap disabled entirely.
         assert!(!is_github_project_ref_input_too_large(
@@ -224,7 +228,9 @@ mod tests {
     /// would make this pass when it must fail.
     #[test]
     fn pin_bounded_check_rejects_a_long_non_whitespace_input() {
-        assert!(!has_bounded_github_project_ref_input_text(&"x".repeat(2049)));
+        assert!(!has_bounded_github_project_ref_input_text(
+            &"x".repeat(2049)
+        ));
     }
 
     /// K7: a multibyte input pinned at the *exact* byte cap, not merely over

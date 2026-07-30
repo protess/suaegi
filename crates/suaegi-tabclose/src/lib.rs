@@ -463,8 +463,8 @@ pub fn close_terminal_tab_in_workspace_session(
                 .filter(|id| !closed_visible_ids.contains(*id))
                 .cloned()
                 .collect();
-            let active_tab_id_was_closing = closed_visible_ids
-                .contains(group.active_tab_id.as_deref().unwrap_or(""));
+            let active_tab_id_was_closing =
+                closed_visible_ids.contains(group.active_tab_id.as_deref().unwrap_or(""));
             let active_tab_id: Option<String> = if active_tab_id_was_closing {
                 pick_next_active_tab(&group, &closed_visible_ids)
             } else if group
@@ -476,9 +476,11 @@ pub fn close_terminal_tab_in_workspace_session(
             } else {
                 tab_order.first().cloned()
             };
-            let recent_tab_ids = group
-                .recent_tab_ids
-                .map(|ids| ids.into_iter().filter(|id| tab_order.contains(id)).collect());
+            let recent_tab_ids = group.recent_tab_ids.map(|ids| {
+                ids.into_iter()
+                    .filter(|id| tab_order.contains(id))
+                    .collect()
+            });
             TabGroup {
                 id: group.id,
                 active_tab_id,
@@ -489,7 +491,8 @@ pub fn close_terminal_tab_in_workspace_session(
         .filter(|group| !group.tab_order.is_empty())
         .collect();
 
-    let valid_group_ids: HashSet<String> = next_groups.iter().map(|group| group.id.clone()).collect();
+    let valid_group_ids: HashSet<String> =
+        next_groups.iter().map(|group| group.id.clone()).collect();
     // O:204-207
     let prior_active_group_id = session
         .active_group_id_by_worktree
@@ -519,7 +522,8 @@ pub fn close_terminal_tab_in_workspace_session(
         .cloned()
         .unwrap_or_default();
     worktree_tabs.retain(|tab| tab.id != tab_id);
-    next.tabs_by_worktree.insert(worktree_id.to_string(), worktree_tabs);
+    next.tabs_by_worktree
+        .insert(worktree_id.to_string(), worktree_tabs);
 
     next.terminal_layouts_by_tab_id = session.terminal_layouts_by_tab_id.clone();
     next.terminal_layouts_by_tab_id.remove(tab_id); // O:224
@@ -533,7 +537,10 @@ pub fn close_terminal_tab_in_workspace_session(
     groups_map.insert(worktree_id.to_string(), next_groups.clone());
     next.tab_groups = Some(groups_map);
 
-    let mut remote_map = session.remote_session_ids_by_tab_id.clone().unwrap_or_default();
+    let mut remote_map = session
+        .remote_session_ids_by_tab_id
+        .clone()
+        .unwrap_or_default();
     remote_map.remove(tab_id); // O:225
     next.remote_session_ids_by_tab_id = Some(remote_map);
 
@@ -570,9 +577,7 @@ pub fn close_terminal_tab_in_workspace_session(
         .clone()
         .unwrap_or_default();
     let prefix = format!("{tab_id}:");
-    sleeping.retain(|pane_key, record| {
-        !(pane_key.starts_with(&prefix) || record.tab_id == tab_id)
-    });
+    sleeping.retain(|pane_key, record| !(pane_key.starts_with(&prefix) || record.tab_id == tab_id));
     next.sleeping_agent_sessions_by_pane_key = Some(sleeping);
 
     // O:241: surface derived from `next` (post-mutation tabs/groups), NOT
@@ -586,7 +591,10 @@ pub fn close_terminal_tab_in_workspace_session(
     );
 
     // O:242-257
-    let mut active_tab_id_map = session.active_tab_id_by_worktree.clone().unwrap_or_default();
+    let mut active_tab_id_map = session
+        .active_tab_id_by_worktree
+        .clone()
+        .unwrap_or_default();
     active_tab_id_map.insert(worktree_id.to_string(), surface.terminal_tab_id.clone());
     next.active_tab_id_by_worktree = Some(active_tab_id_map);
 
@@ -597,11 +605,17 @@ pub fn close_terminal_tab_in_workspace_session(
     active_browser_map.insert(worktree_id.to_string(), surface.browser_tab_id.clone());
     next.active_browser_tab_id_by_worktree = Some(active_browser_map);
 
-    let mut active_file_map = session.active_file_id_by_worktree.clone().unwrap_or_default();
+    let mut active_file_map = session
+        .active_file_id_by_worktree
+        .clone()
+        .unwrap_or_default();
     active_file_map.insert(worktree_id.to_string(), surface.file_id.clone());
     next.active_file_id_by_worktree = Some(active_file_map);
 
-    let mut active_type_map = session.active_tab_type_by_worktree.clone().unwrap_or_default();
+    let mut active_type_map = session
+        .active_tab_type_by_worktree
+        .clone()
+        .unwrap_or_default();
     active_type_map.insert(worktree_id.to_string(), surface.kind);
     next.active_tab_type_by_worktree = Some(active_type_map);
 
@@ -698,7 +712,12 @@ mod tests {
         let mut unified_tabs = HashMap::new();
         unified_tabs.insert(
             WORKTREE_ID.to_string(),
-            vec![unified_tab("terminal-1", "terminal-1", TabContentType::Terminal, "group-1")],
+            vec![unified_tab(
+                "terminal-1",
+                "terminal-1",
+                TabContentType::Terminal,
+                "group-1",
+            )],
         );
 
         let mut tab_groups = HashMap::new();
@@ -865,7 +884,12 @@ mod tests {
         session.unified_tabs = Some(HashMap::from([(
             WORKTREE_ID.to_string(),
             vec![
-                unified_tab("terminal-1", "terminal-1", TabContentType::Terminal, "group-1"),
+                unified_tab(
+                    "terminal-1",
+                    "terminal-1",
+                    TabContentType::Terminal,
+                    "group-1",
+                ),
                 unified_tab("browser-1", "browser-1", TabContentType::Browser, "group-1"),
             ],
         )]));
@@ -905,7 +929,10 @@ mod tests {
                 .unwrap(),
             &Some("browser-1".to_string())
         );
-        assert_eq!(result.session.active_worktree_id, Some(WORKTREE_ID.to_string()));
+        assert_eq!(
+            result.session.active_worktree_id,
+            Some(WORKTREE_ID.to_string())
+        );
     }
 
     // =========================================================================
@@ -944,9 +971,10 @@ mod tests {
         let mut current = WorkspaceSessionState::default();
         for index in 0..40 {
             let id = format!("terminal-{index}");
-            current
-                .tabs_by_worktree
-                .insert(WORKTREE_ID.to_string(), vec![TerminalTab::new(id.clone(), None)]);
+            current.tabs_by_worktree.insert(
+                WORKTREE_ID.to_string(),
+                vec![TerminalTab::new(id.clone(), None)],
+            );
             current.terminal_layouts_by_tab_id.insert(
                 id.clone(),
                 TerminalLayoutSnapshot {
@@ -990,7 +1018,12 @@ mod tests {
         let mut session = base_session();
         session.unified_tabs = Some(HashMap::from([(
             WORKTREE_ID.to_string(),
-            vec![unified_tab("unified-x", "terminal-1", TabContentType::Terminal, "group-1")],
+            vec![unified_tab(
+                "unified-x",
+                "terminal-1",
+                TabContentType::Terminal,
+                "group-1",
+            )],
         )]));
 
         let result = close_terminal_tab_in_workspace_session(&session, WORKTREE_ID, "terminal-1");
@@ -1003,7 +1036,12 @@ mod tests {
         let mut session = base_session();
         session.unified_tabs = Some(HashMap::from([(
             WORKTREE_ID.to_string(),
-            vec![unified_tab("terminal-1", "some-other-entity", TabContentType::Terminal, "group-1")],
+            vec![unified_tab(
+                "terminal-1",
+                "some-other-entity",
+                TabContentType::Terminal,
+                "group-1",
+            )],
         )]));
 
         let result = close_terminal_tab_in_workspace_session(&session, WORKTREE_ID, "terminal-1");
@@ -1017,9 +1055,24 @@ mod tests {
         session.unified_tabs = Some(HashMap::from([(
             WORKTREE_ID.to_string(),
             vec![
-                unified_tab("unified-a", "terminal-1", TabContentType::Terminal, "group-1"),
-                unified_tab("terminal-1", "some-other-entity", TabContentType::Terminal, "group-1"),
-                unified_tab("unrelated", "unrelated-entity", TabContentType::Terminal, "group-1"),
+                unified_tab(
+                    "unified-a",
+                    "terminal-1",
+                    TabContentType::Terminal,
+                    "group-1",
+                ),
+                unified_tab(
+                    "terminal-1",
+                    "some-other-entity",
+                    TabContentType::Terminal,
+                    "group-1",
+                ),
+                unified_tab(
+                    "unrelated",
+                    "unrelated-entity",
+                    TabContentType::Terminal,
+                    "group-1",
+                ),
             ],
         )]));
         session.tab_groups = Some(HashMap::from([(
@@ -1077,7 +1130,10 @@ mod tests {
         // "terminal-1" is removed from tab_order purely via the raw-id
         // membership in closed_visible_ids, even though no unified tab
         // carried it.
-        assert_eq!(groups[WORKTREE_ID][0].tab_order, vec!["terminal-2".to_string()]);
+        assert_eq!(
+            groups[WORKTREE_ID][0].tab_order,
+            vec!["terminal-2".to_string()]
+        );
     }
 
     // =========================================================================
@@ -1111,7 +1167,8 @@ mod tests {
     #[test]
     fn n6_not_found_returns_unchanged_session_with_both_flags_false() {
         let session = base_session();
-        let result = close_terminal_tab_in_workspace_session(&session, WORKTREE_ID, "does-not-exist");
+        let result =
+            close_terminal_tab_in_workspace_session(&session, WORKTREE_ID, "does-not-exist");
         assert_eq!(
             result,
             WorkspaceSessionTerminalTabCloseResult {

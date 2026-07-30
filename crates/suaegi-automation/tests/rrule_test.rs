@@ -384,7 +384,11 @@ fn leading_bom_is_trimmed_like_js() {
         "leading U+FEFF must be trimmed (JS-faithful) so FREQ=DAILY is valid"
     );
     // And the cron path shares the same helper: a BOM-prefixed cron expr is valid too.
-    assert!(is_valid_automation_cron_schedule("\u{FEFF}0 9 * * *", anchor(), UTC));
+    assert!(is_valid_automation_cron_schedule(
+        "\u{FEFF}0 9 * * *",
+        anchor(),
+        UTC
+    ));
 }
 
 #[test]

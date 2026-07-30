@@ -82,12 +82,30 @@ mod tests {
 
     #[test]
     fn accepts_supported_language_settings() {
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_SYSTEM)), UiLanguage::System);
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_ENGLISH)), UiLanguage::En);
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_CHINESE)), UiLanguage::Zh);
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_KOREAN)), UiLanguage::Ko);
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_JAPANESE)), UiLanguage::Ja);
-        assert_eq!(normalize_ui_language(Some(UI_LANGUAGE_SPANISH)), UiLanguage::Es);
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_SYSTEM)),
+            UiLanguage::System
+        );
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_ENGLISH)),
+            UiLanguage::En
+        );
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_CHINESE)),
+            UiLanguage::Zh
+        );
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_KOREAN)),
+            UiLanguage::Ko
+        );
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_JAPANESE)),
+            UiLanguage::Ja
+        );
+        assert_eq!(
+            normalize_ui_language(Some(UI_LANGUAGE_SPANISH)),
+            UiLanguage::Es
+        );
     }
 
     #[test]

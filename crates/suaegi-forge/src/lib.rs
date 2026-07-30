@@ -17,6 +17,7 @@ pub mod pr_actions;
 pub mod provider;
 pub mod repo_icon;
 pub mod runner;
+pub mod token_forge;
 
 pub use any::AnyForge;
 pub use eligibility::{creation_eligibility, CreationBlockedReason, CreationEligibility};
@@ -68,3 +69,4 @@ pub use repo_icon::{
     MAX_REPO_ICON_UPLOAD_BYTES,
 };
 pub use runner::{GhError, GhOutput, GhRunner};
+pub use token_forge::{token_creation_eligibility, TokenForge, TokenForgeKind};

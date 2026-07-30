@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Tree, Widget};
-use iced::advanced::{Clipboard, Shell, mouse, renderer};
+use iced::advanced::{mouse, renderer, Clipboard, Shell};
 use iced::widget::{button, pane_grid, scrollable, text};
 use iced::{Element, Event, Length, Point, Rectangle, Size, Theme};
 
@@ -28,10 +28,10 @@ use harness::{Harness, Step};
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // 필드는 메시지 종류 구분에만 쓰고 값은 읽지 않는다
 enum Message {
-    PaneClicked(pane_grid::Pane),
-    PaneDragged(pane_grid::DragEvent),
-    PaneResized(pane_grid::ResizeEvent),
-    PaneCloseRequested(pane_grid::Pane),
+    Clicked(pane_grid::Pane),
+    Dragged(pane_grid::DragEvent),
+    Resized(pane_grid::ResizeEvent),
+    CloseRequested(pane_grid::Pane),
 }
 
 /// 본문 자리에 놓는 프로브. 받은 이벤트를 전부 공유 로그에 적는다.
@@ -162,7 +162,7 @@ fn run(body: Body, capture: bool, events: &[(Event, Point)]) -> (Vec<Message>, V
             let name: &'static str = if *index == 0 { "left" } else { "right" };
             let title_bar = pane_grid::TitleBar::new(text(name).size(13))
                 .controls(pane_grid::Controls::new(
-                    button(text("x").size(12)).on_press(Message::PaneCloseRequested(pane)),
+                    button(text("x").size(12)).on_press(Message::CloseRequested(pane)),
                 ))
                 .padding(6);
 
@@ -179,9 +179,9 @@ fn run(body: Body, capture: bool, events: &[(Event, Point)]) -> (Vec<Message>, V
             pane_grid::Content::new(content).title_bar(title_bar)
         })
         .spacing(2)
-        .on_click(Message::PaneClicked)
-        .on_drag(Message::PaneDragged)
-        .on_resize(8, Message::PaneResized)
+        .on_click(Message::Clicked)
+        .on_drag(Message::Dragged)
+        .on_resize(8, Message::Resized)
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
@@ -219,7 +219,7 @@ fn dragged(messages: &[Message]) -> Vec<&pane_grid::DragEvent> {
     messages
         .iter()
         .filter_map(|m| match m {
-            Message::PaneDragged(e) => Some(e),
+            Message::Dragged(e) => Some(e),
             _ => None,
         })
         .collect()
@@ -252,9 +252,7 @@ fn press_near_divider_reaches_the_body_and_still_starts_a_resize() {
          press over the grid); log = {log:?}"
     );
     assert!(
-        messages
-            .iter()
-            .any(|m| matches!(m, Message::PaneResized(_))),
+        messages.iter().any(|m| matches!(m, Message::Resized(_))),
         "pane_grid must still start a resize from the same press; messages = {messages:?}",
     );
 }
@@ -282,10 +280,10 @@ fn a_child_capturing_the_event_does_not_suppress_pane_grid() {
         let kinds: Vec<&'static str> = messages
             .iter()
             .map(|m| match m {
-                Message::PaneClicked(_) => "Clicked",
-                Message::PaneDragged(_) => "Dragged",
-                Message::PaneResized(_) => "Resized",
-                Message::PaneCloseRequested(_) => "Close",
+                Message::Clicked(_) => "Clicked",
+                Message::Dragged(_) => "Dragged",
+                Message::Resized(_) => "Resized",
+                Message::CloseRequested(_) => "Close",
             })
             .collect();
         (kinds, log)
@@ -324,9 +322,7 @@ fn drag_from_the_body_clicks_but_never_picks_the_pane() {
     );
 
     assert!(
-        messages
-            .iter()
-            .any(|m| matches!(m, Message::PaneClicked(_))),
+        messages.iter().any(|m| matches!(m, Message::Clicked(_))),
         "a press in the body must publish PaneClicked; messages = {messages:?}",
     );
     assert!(

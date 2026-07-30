@@ -93,7 +93,10 @@ fn matches_opencode_core(s: &str) -> bool {
         return false;
     };
     let after_ws2 = after_pipe.trim_start_matches(is_js_whitespace);
-    after_ws2.chars().next().is_some_and(|c| !is_js_whitespace(c))
+    after_ws2
+        .chars()
+        .next()
+        .is_some_and(|c| !is_js_whitespace(c))
 }
 
 #[cfg(test)]
@@ -107,7 +110,9 @@ mod tests {
         assert!(is_meaningful_opencode_terminal_title(Some(
             "OC | Native Stable Session"
         )));
-        assert!(is_meaningful_opencode_terminal_title(Some("  OC|Session  ")));
+        assert!(is_meaningful_opencode_terminal_title(Some(
+            "  OC|Session  "
+        )));
         assert!(is_opencode_native_title(Some(
             "OC | Understand about the plugin"
         )));
@@ -117,7 +122,9 @@ mod tests {
     #[test]
     fn rejects_generic_incomplete_embedded_and_lookalike_titles() {
         assert!(!is_meaningful_opencode_terminal_title(Some("OpenCode")));
-        assert!(!is_meaningful_opencode_terminal_title(Some("OpenCode ready")));
+        assert!(!is_meaningful_opencode_terminal_title(Some(
+            "OpenCode ready"
+        )));
         assert!(!is_meaningful_opencode_terminal_title(Some("OC |")));
         assert!(!is_meaningful_opencode_terminal_title(None));
         // Why: lowercase is not OpenCode's native marker; avoid "oc |" cwd/task noise.

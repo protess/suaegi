@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! GhForge를 스크립트 fake gh(PATH 앞에 얹음)로 실 단위 테스트한다. 출력 파싱·exit code
 //! 분류·None/Unavailable/Found 분기를 트레잇 추상화 없이 검증한다(플랜 §5).
 
@@ -17,8 +20,7 @@ fn coords() -> RepoCoords {
     }
 }
 
-const PR_VIEW_JSON: &str =
-    r#"{"number":57,"title":"Fix the bug","state":"OPEN","url":"https://github.com/acme/widget/pull/57","isDraft":false}"#;
+const PR_VIEW_JSON: &str = r#"{"number":57,"title":"Fix the bug","state":"OPEN","url":"https://github.com/acme/widget/pull/57","isDraft":false}"#;
 
 #[tokio::test]
 async fn resolve_repository_reads_owner_name_host() {
@@ -59,14 +61,12 @@ async fn resolve_repository_none_when_not_github() {
 #[tokio::test]
 async fn review_for_branch_found_with_checks() {
     let _g = env_lock();
-    let fake = FakeGh::new()
-        .rule("pr view", PR_VIEW_JSON, "", 0)
-        .rule(
-            "pr checks",
-            r#"[{"bucket":"pass"},{"bucket":"pass"},{"bucket":"fail"},{"bucket":"pending"}]"#,
-            "",
-            8,
-        );
+    let fake = FakeGh::new().rule("pr view", PR_VIEW_JSON, "", 0).rule(
+        "pr checks",
+        r#"[{"bucket":"pass"},{"bucket":"pass"},{"bucket":"fail"},{"bucket":"pending"}]"#,
+        "",
+        8,
+    );
     let _p = fake.activate();
     let lookup = GhForge::new().review_for_branch(&coords(), "feat").await;
     match lookup {

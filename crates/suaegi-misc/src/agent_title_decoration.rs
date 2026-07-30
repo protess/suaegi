@@ -73,8 +73,10 @@ fn js_trim_start(s: &str) -> &str {
 /// True for a status glyph: ✳, ✦, ⏲, ◇, ✋, or a braille spinner frame in
 /// U+2800..=U+28FF.
 fn is_agent_title_decoration_glyph(c: char) -> bool {
-    matches!(c, '\u{2733}' | '\u{2726}' | '\u{23F2}' | '\u{25C7}' | '\u{270B}')
-        || ('\u{2800}'..='\u{28FF}').contains(&c)
+    matches!(
+        c,
+        '\u{2733}' | '\u{2726}' | '\u{23F2}' | '\u{25C7}' | '\u{270B}'
+    ) || ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
 /// Attempts `(?:[✳✦⏲◇✋⠀-⣿]+|[.*]\s)` at the start of `title`: either a
@@ -108,13 +110,18 @@ fn match_leading_decoration_branch(title: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty};
+    use super::{
+        strip_leading_agent_title_decoration, strip_leading_agent_title_decoration_or_empty,
+    };
 
     // Oracle: agent-title-decoration.test.ts
 
     #[test]
     fn strips_claudes_idle_glyph() {
-        assert_eq!(strip_leading_agent_title_decoration("✳ Claude Code"), "Claude Code");
+        assert_eq!(
+            strip_leading_agent_title_decoration("✳ Claude Code"),
+            "Claude Code"
+        );
     }
 
     #[test]
@@ -123,7 +130,10 @@ mod tests {
             strip_leading_agent_title_decoration(". working on the fix"),
             "working on the fix"
         );
-        assert_eq!(strip_leading_agent_title_decoration("* Claude Code"), "Claude Code");
+        assert_eq!(
+            strip_leading_agent_title_decoration("* Claude Code"),
+            "Claude Code"
+        );
     }
 
     #[test]
@@ -133,8 +143,14 @@ mod tests {
 
     #[test]
     fn leaves_an_undecorated_title_untouched() {
-        assert_eq!(strip_leading_agent_title_decoration("Dolphin-2"), "Dolphin-2");
-        assert_eq!(strip_leading_agent_title_decoration("npm run dev"), "npm run dev");
+        assert_eq!(
+            strip_leading_agent_title_decoration("Dolphin-2"),
+            "Dolphin-2"
+        );
+        assert_eq!(
+            strip_leading_agent_title_decoration("npm run dev"),
+            "npm run dev"
+        );
     }
 
     #[test]
@@ -155,7 +171,10 @@ mod tests {
     #[test]
     fn indirect_oracle_mobile_terminal_tab_agent() {
         // :80 — strips leading agent decorations when an icon is shown.
-        assert_eq!(strip_leading_agent_title_decoration("✦ Gemini CLI"), "Gemini CLI");
+        assert_eq!(
+            strip_leading_agent_title_decoration("✦ Gemini CLI"),
+            "Gemini CLI"
+        );
         // :88 — strips decorations for launch-owned terminal tabs before hooks arrive.
         assert_eq!(strip_leading_agent_title_decoration("✳ working"), "working");
     }
@@ -168,7 +187,10 @@ mod tests {
     /// is NOT mutation-tested; see module docs and plan §2).
     #[test]
     fn pin_trim_start_is_load_bearing_when_nothing_matches() {
-        assert_eq!(strip_leading_agent_title_decoration("  npm run dev"), "npm run dev");
+        assert_eq!(
+            strip_leading_agent_title_decoration("  npm run dev"),
+            "npm run dev"
+        );
     }
 
     /// W10: there is no pre-trim — a leading space before the glyph blocks
@@ -226,8 +248,14 @@ mod tests {
     /// W12: the braille range's exact endpoints match...
     #[test]
     fn pin_braille_range_endpoints_match() {
-        assert_eq!(strip_leading_agent_title_decoration("\u{2800} Task"), "Task");
-        assert_eq!(strip_leading_agent_title_decoration("\u{28FF} Task"), "Task");
+        assert_eq!(
+            strip_leading_agent_title_decoration("\u{2800} Task"),
+            "Task"
+        );
+        assert_eq!(
+            strip_leading_agent_title_decoration("\u{28FF} Task"),
+            "Task"
+        );
     }
 
     /// ...and the characters immediately outside the range do not (an

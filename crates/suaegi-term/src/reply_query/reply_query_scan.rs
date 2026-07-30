@@ -33,8 +33,7 @@ fn anchored(pattern: &str) -> Regex {
 
 static DEVICE_ATTRIBUTES_QUERY_RE: LazyLock<Regex> =
     LazyLock::new(|| anchored(r"\A\x1b\[[?>=]?[0-9;]*c\z"));
-static MODE_QUERY_RE: LazyLock<Regex> =
-    LazyLock::new(|| anchored(r"\A\x1b\[\??[0-9;]+\$p\z"));
+static MODE_QUERY_RE: LazyLock<Regex> = LazyLock::new(|| anchored(r"\A\x1b\[\??[0-9;]+\$p\z"));
 
 /// A reply-eliciting query located in the stream, with absolute byte
 /// coordinates. `end_seq` is EXCLUSIVE.
@@ -194,7 +193,10 @@ fn find_byte(hay: &[u8], byte: u8, from: usize) -> Option<usize> {
     if from > hay.len() {
         return None;
     }
-    hay[from..].iter().position(|&b| b == byte).map(|p| from + p)
+    hay[from..]
+        .iter()
+        .position(|&b| b == byte)
+        .map(|p| from + p)
 }
 
 #[cfg(test)]
@@ -218,10 +220,7 @@ mod tests {
             scan_terminal_reply_query_sequences(data, 100, &EMPTY_TERMINAL_REPLY_QUERY_SCAN_STATE);
         assert_eq!(
             result.queries,
-            vec![
-                seq(b"\x1b[6n", 106, 110),
-                seq(b"\x1b[?2031h", 115, 123),
-            ]
+            vec![seq(b"\x1b[6n", 106, 110), seq(b"\x1b[?2031h", 115, 123),]
         );
         assert_eq!(result.state, EMPTY_TERMINAL_REPLY_QUERY_SCAN_STATE);
     }
@@ -284,11 +283,8 @@ mod tests {
     #[test]
     fn c2_device_attributes_and_mode_queries_match() {
         for q in [&b"\x1b[c"[..], b"\x1b[>0c", b"\x1b[?2026$p", b"\x1b[18t"] {
-            let r = scan_terminal_reply_query_sequences(
-                q,
-                0,
-                &EMPTY_TERMINAL_REPLY_QUERY_SCAN_STATE,
-            );
+            let r =
+                scan_terminal_reply_query_sequences(q, 0, &EMPTY_TERMINAL_REPLY_QUERY_SCAN_STATE);
             assert_eq!(r.queries.len(), 1, "expected match for {q:?}");
             assert_eq!(r.queries[0].data, q.to_vec());
         }

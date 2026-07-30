@@ -24,14 +24,18 @@ libc = "0.2"
 portable-pty = "0.9"
 alacritty_terminal = "0.25.1"
 crossbeam-channel = "0.5"
-iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "lazy"] }
+iced = { version = "0.14", features = ["tokio", "canvas", "advanced", "lazy", "svg", "image", "markdown"] }
 futures = "0.3"
 # hook 헤더의 pane 키 인코딩. 손으로 짜지 않는 이유는 **엄격 디코딩**이 요구사항이라서다
 # (URL_SAFE_NO_PAD). 관대한 디코더는 패딩 유무가 어긋나도 통과시켜 버린다.
 base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.10"
 # 7a-2b HTTP GitHub 백엔드용. rustls(ring)만 — native-tls/OpenSSL·cmake 의존을 피한다.
+# 공개 WebPKI 루트와 macOS 시스템 루트를 함께 읽어, 회사/로컬 신뢰 저장소를 쓰는
+# 공급자 API도 Electron(net.fetch) 기반 Orca와 동일하게 연결한다.
 # blocking이 아니라 async: forge 트레잇이 async_trait이고 앱이 tokio 위에서 돈다.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
 # suaegi-automation leaf crate. Orca의 스케줄 산술이 전부 로컬 wall-clock
 # (getHours/getDate/getDay/setHours)이라, ambient Local(F2 금지) 대신 명시 IANA TZ를
 # 주입해 결정론적으로 재현한다. clock 피처는 끈다 — Local/now 접근을 컴파일 단에서 차단.

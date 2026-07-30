@@ -11,19 +11,20 @@
 //! 상태로 표현한 것이 `confirm: Option<MergeConfirm>`이고, `confirm_merge`가 그
 //! 상태가 있을 때만 방식을 돌려준다(없으면 절대 머지를 발급하지 않는다).
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, text};
+use iced::widget::{button, checkbox, column, container, row, scrollable};
 use iced::{Color, Element, Length};
 
 use suaegi_core::domain::WorktreeId;
-use suaegi_forge::{MergeMethod, MergeabilityState, ReviewState};
+use suaegi_forge::{CommentLookup, MergeMethod, MergeabilityState, ReviewState};
 
 use crate::forge_ui::{
     self, CommentsLine, MergeButton, MergeResultDisplay, PrDetails, ReviewsLine,
 };
+use crate::i18n::text;
 use crate::state::{Message, OpId};
 
 /// 패널 고정 폭. 사이드바·diff 패널과 같은 이유로 `row!` 레벨에서 못 박는다.
-pub const WIDTH: f32 = 380.0;
+pub const WIDTH: f32 = 320.0;
 
 /// 확인 단계에서 미리 고른 기본 방식. **HUMAN-EYES / 제품 선택**: 사용자는 확인
 /// 단계에서 세 방식 중 하나를 명시적으로 고를 수 있고, 이건 그저 선택 커서의 시작
@@ -242,16 +243,21 @@ pub fn view(state: &PrPanelState) -> Option<Element<'_, Message>> {
     if !state.is_open() {
         return None;
     }
+    let worktree = state.worktree()?.clone();
     let number = state.number()?;
 
     let header = row![
-        text(format!("PR #{number}")).size(15).width(Length::Fill),
-        button(text("refresh").size(11)).on_press(Message::PrPanelRefreshRequested),
-        button(text("close").size(11)).on_press(Message::PrPanelClosed),
+        text(format!("PR #{number}")).size(17).width(Length::Fill),
+        button(text("refresh").size(13))
+            .on_press(Message::PrPanelRefreshRequested)
+            .style(crate::theme::ghost_button),
+        button(text("×").size(13))
+            .on_press(Message::PrPanelClosed)
+            .style(crate::theme::ghost_button),
     ]
     .spacing(6);
 
-    let mut body = column![header, text(state.header_line()).size(12)]
+    let mut body = column![header, text(state.header_line()).size(14)]
         .spacing(8)
         .padding(12);
 
@@ -259,11 +265,49 @@ pub fn view(state: &PrPanelState) -> Option<Element<'_, Message>> {
     // **Unavailable은 색으로도 구별**한다 — "없음"과 다른 값이다.
     match state.details() {
         None => {
-            body = body.push(text("Loading PR details…").size(12).color(MUTED));
+            body = body.push(text("Loading PR details…").size(14).color(MUTED));
         }
         Some(details) => {
             body = body.push(reviews_widget(&forge_ui::reviews_line(&details.reviews)));
             body = body.push(comments_widget(&forge_ui::comments_line(&details.comments)));
+            if details.mergeability == MergeabilityState::Blocked {
+                body = body.push(
+                    button(text("Fix checks with agent").size(12))
+                        .on_press(Message::HostedReviewAiActionRequested {
+                            worktree: worktree.clone(),
+                            action: "fixChecks".to_string(),
+                            detail: format!(
+                                "Hosted review #{number} is blocked by checks or required approvals."
+                            ),
+                        })
+                        .style(crate::theme::selected_button),
+                );
+            } else if details.mergeability == MergeabilityState::Conflicting {
+                body = body.push(
+                    button(text("Resolve conflicts with agent").size(12))
+                        .on_press(Message::HostedReviewAiActionRequested {
+                            worktree: worktree.clone(),
+                            action: "resolveConflicts".to_string(),
+                            detail: format!(
+                                "Hosted review #{number} conflicts with its base branch."
+                            ),
+                        })
+                        .style(crate::theme::selected_button),
+                );
+            }
+            if matches!(&details.comments, CommentLookup::Found(comments) if !comments.is_empty()) {
+                body = body.push(
+                    button(text("Resolve review comments with agent").size(12))
+                        .on_press(Message::HostedReviewAiActionRequested {
+                            worktree,
+                            action: "resolveComments".to_string(),
+                            detail: format!(
+                                "Hosted review #{number} has unresolved review comments."
+                            ),
+                        })
+                        .style(crate::theme::selected_button),
+                );
+            }
         }
     }
 
@@ -279,22 +323,23 @@ pub fn view(state: &PrPanelState) -> Option<Element<'_, Message>> {
         container(scrollable(body))
             .width(Length::Fixed(WIDTH))
             .height(Length::Fill)
+            .style(crate::theme::context_panel)
             .into(),
     )
 }
 
 fn reviews_widget(line: &ReviewsLine) -> Element<'static, Message> {
     match line {
-        ReviewsLine::Summary(s) => text(format!("Reviews: {s}")).size(12).into(),
+        ReviewsLine::Summary(s) => text(format!("Reviews: {s}")).size(14).into(),
         // 일시 실패 → 경고색. 절대 "없음"으로 보이지 않는다.
-        ReviewsLine::Unavailable(s) => text(format!("Reviews: {s}")).size(12).color(WARN).into(),
+        ReviewsLine::Unavailable(s) => text(format!("Reviews: {s}")).size(14).color(WARN).into(),
     }
 }
 
 fn comments_widget(line: &CommentsLine) -> Element<'static, Message> {
     match line {
-        CommentsLine::Summary(s) => text(format!("Comments: {s}")).size(12).into(),
-        CommentsLine::Unavailable(s) => text(format!("Comments: {s}")).size(12).color(WARN).into(),
+        CommentsLine::Summary(s) => text(format!("Comments: {s}")).size(14).into(),
+        CommentsLine::Unavailable(s) => text(format!("Comments: {s}")).size(14).color(WARN).into(),
     }
 }
 
@@ -306,12 +351,12 @@ fn outcome_widget(outcome: &MergeResultDisplay) -> Element<'static, Message> {
         // 일시 실패 — "거부됨"이 아니라 재시도.
         MergeResultDisplay::Unavailable(reason) => (format!("Merge failed: {reason}"), WARN),
     };
-    text(label).size(12).color(color).into()
+    text(label).size(14).color(color).into()
 }
 
 fn merge_area(state: &PrPanelState) -> Element<'_, Message> {
     if state.is_merging() {
-        return text("Merging…").size(12).color(MUTED).into();
+        return text("Merging…").size(14).color(MUTED).into();
     }
     match state.confirm() {
         Some(confirm) => confirm_widget(state, confirm),
@@ -323,15 +368,15 @@ fn merge_area(state: &PrPanelState) -> Element<'_, Message> {
 /// on_press 없는(=비활성) 버튼 + 이유(죽은 버튼이 아니다).
 fn merge_button_widget(state: &PrPanelState) -> Element<'_, Message> {
     match state.mergeability() {
-        None => text("Checking mergeability…").size(12).color(MUTED).into(),
+        None => text("Checking mergeability…").size(14).color(MUTED).into(),
         Some(m) => match forge_ui::merge_button(m) {
-            MergeButton::Enabled => button(text("Merge…").size(12))
+            MergeButton::Enabled => button(text("Merge…").size(14))
                 .on_press(Message::MergeRequested)
                 .into(),
             // on_press 없는 버튼은 iced가 비활성으로 렌더한다 + 이유를 붙인다.
             MergeButton::Disabled(reason) => column![
-                button(text("Merge").size(12)),
-                text(reason).size(10).color(MUTED),
+                button(text("Merge").size(14)),
+                text(reason).size(12).color(MUTED),
             ]
             .spacing(4)
             .into(),
@@ -345,7 +390,7 @@ fn confirm_widget<'a>(state: &'a PrPanelState, confirm: &MergeConfirm) -> Elemen
     let warning = text(format!(
         "Merge PR #{number} now? This writes to the base branch and cannot be easily undone."
     ))
-    .size(12)
+    .size(14)
     .color(WARN);
 
     let methods = row![
@@ -361,14 +406,14 @@ fn confirm_widget<'a>(state: &'a PrPanelState, confirm: &MergeConfirm) -> Elemen
         .text_size(12);
 
     let actions = row![
-        button(text("Confirm merge").size(12)).on_press(Message::MergeConfirmed),
-        button(text("Cancel").size(12)).on_press(Message::MergeCancelled),
+        button(text("Confirm merge").size(14)).on_press(Message::MergeConfirmed),
+        button(text("Cancel").size(14)).on_press(Message::MergeCancelled),
     ]
     .spacing(6);
 
     column![
         warning,
-        text("Method:").size(11).color(MUTED),
+        text("Method:").size(13).color(MUTED),
         methods,
         delete,
         actions,
@@ -388,7 +433,7 @@ fn method_button(
     } else {
         label.to_string()
     };
-    button(text(text_label).size(11))
+    button(text(text_label).size(13))
         .on_press(Message::MergeMethodSelected(method))
         .into()
 }
@@ -549,7 +594,10 @@ mod tests {
             !p.accept_details(&WorktreeId("/wt/other".into()), OpId(2)),
             "a result for another worktree is dropped"
         );
-        assert!(p.accept_details(&wt(), OpId(2)), "control: the latest is accepted");
+        assert!(
+            p.accept_details(&wt(), OpId(2)),
+            "control: the latest is accepted"
+        );
     }
 
     /// 패널을 닫은 뒤(또는 다른 worktree로 옮긴 뒤) 도착하는 머지 결과는 버린다 —

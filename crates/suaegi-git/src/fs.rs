@@ -4,7 +4,7 @@
 //! 레벨을 읽고(M2) 파일 하나를 안전하게 읽고(M4) 원자적으로 쓴다(M5).
 
 use crate::compare::{resolve_for_read, resolve_for_write, Resolved, BINARY_SNIFF_BYTES};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 use std::time::SystemTime;
 
@@ -41,6 +41,24 @@ pub enum FileRead {
         size: u64,
     },
     /// stat 크기가 `limit`를 넘겨 버퍼링하지 않았다.
+    TooLarge {
+        limit: u64,
+    },
+}
+
+/// A text file opened for editing, together with the exact on-disk signature
+/// that the save path must compare before replacing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditableFileRead {
+    Ready {
+        text: String,
+        size: u64,
+        signature: FileSignature,
+    },
+    Binary {
+        bytes: Vec<u8>,
+        size: u64,
+    },
     TooLarge {
         limit: u64,
     },
@@ -158,6 +176,74 @@ pub fn read_file(worktree: &Path, rel_path: &str) -> io::Result<FileRead> {
     read_file_with_cap(worktree, rel_path, MAX_TEXT_FILE_SIZE)
 }
 
+/// Reads a regular UTF-8 file for the embedded editor.
+///
+/// Unlike [`read_file`], symlinks are rejected: the editor's save path also
+/// rejects a symlink leaf, so showing the link target text as if it were an
+/// editable document would offer a save action that can never succeed.
+///
+/// Metadata is sampled before and after the read. If it changes while bytes are
+/// being read, the load is rejected instead of pairing one version's contents
+/// with another version's signature (which could make the next save clobber an
+/// external edit).
+pub fn read_editable_file(worktree: &Path, rel_path: &str) -> io::Result<EditableFileRead> {
+    let file_path = match resolve_for_read(worktree, rel_path)? {
+        Resolved::Regular(path) => path,
+        Resolved::Symlink(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to edit a symlink: {rel_path:?}"),
+            ));
+        }
+    };
+
+    let mut file = std::fs::File::open(&file_path)?;
+    let before = FileSignature::from_metadata(&file.metadata()?)?;
+    if before.size > MAX_TEXT_FILE_SIZE {
+        return Ok(EditableFileRead::TooLarge {
+            limit: MAX_TEXT_FILE_SIZE,
+        });
+    }
+
+    // The file can grow after the first metadata call. `take(cap + 1)` keeps
+    // that race bounded and lets us classify it as TooLarge without buffering
+    // the rest.
+    let mut bytes = Vec::with_capacity(before.size as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_TEXT_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TEXT_FILE_SIZE {
+        return Ok(EditableFileRead::TooLarge {
+            limit: MAX_TEXT_FILE_SIZE,
+        });
+    }
+
+    let after = FileSignature::from_metadata(&std::fs::metadata(&file_path)?)?;
+    if before != after || after.size != bytes.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file changed while it was being opened",
+        ));
+    }
+
+    let size = after.size;
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    let binary = bytes[..sniff_len].contains(&0) || std::str::from_utf8(&bytes).is_err();
+    if binary {
+        Ok(EditableFileRead::Binary { bytes, size })
+    } else {
+        // SAFETY is not used: the UTF-8 check above pins this conversion.
+        let text = String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "file content changed encoding")
+        })?;
+        Ok(EditableFileRead::Ready {
+            text,
+            size,
+            signature: after,
+        })
+    }
+}
+
 /// 파일이 우리가 마지막으로 본 이후 **밖에서 바뀌었는지**만 감지하기 위한 최소 지문.
 /// `size`(`metadata.len()`) + `mtime`(`metadata.modified()`). 콘텐츠 해시가 아니라
 /// stat 기반이라 값싸고, 편집기가 저장 후 재베이스라인하는 데 충분하다
@@ -179,6 +265,16 @@ impl FileSignature {
             size: meta.len(),
             mtime: meta.modified()?,
         })
+    }
+}
+
+pub fn file_signature(worktree: &Path, rel_path: &str) -> io::Result<FileSignature> {
+    match resolve_for_read(worktree, rel_path)? {
+        Resolved::Regular(path) => FileSignature::from_metadata(&std::fs::metadata(path)?),
+        Resolved::Symlink(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to inspect a symlink as an editable file: {rel_path:?}"),
+        )),
     }
 }
 
@@ -325,8 +421,8 @@ mod tests {
     //! 실제 파일/디렉터리/심링크를 `tempdir`에 만들어 검증한다(모킹 금지). 각 crux
     //! 테스트는 하나의 mutant를 죽이도록 설계됐다.
     use super::{
-        list_dir, read_file, read_file_with_cap, write_file, FileContent, FileRead, FileSignature,
-        WriteOutcome,
+        list_dir, read_editable_file, read_file, read_file_with_cap, write_file, EditableFileRead,
+        FileContent, FileRead, FileSignature, WriteOutcome,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -724,6 +820,37 @@ mod tests {
             } => assert_eq!(s, "héllo 안녕"),
             other => panic!("write 후 read가 Text가 아니다: {other:?}"),
         }
+    }
+
+    #[test]
+    fn editable_read_returns_text_with_the_signature_required_by_save() {
+        let wt = worktree();
+        fs::write(wt.path().join("note.txt"), "hello").unwrap();
+
+        let (text, signature) = match read_editable_file(wt.path(), "note.txt").unwrap() {
+            EditableFileRead::Ready {
+                text, signature, ..
+            } => (text, signature),
+            other => panic!("expected editable text, got {other:?}"),
+        };
+        assert_eq!(text, "hello");
+
+        let outcome = write_file(wt.path(), "note.txt", b"updated", Some(&signature)).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Written { .. }));
+        assert_eq!(fs::read(wt.path().join("note.txt")).unwrap(), b"updated");
+    }
+
+    #[test]
+    fn editable_read_refuses_binary_and_symlink_inputs_without_lossy_text() {
+        let wt = worktree();
+        fs::write(wt.path().join("raw.bin"), [0xff, 0x00, 0x61]).unwrap();
+        assert!(matches!(
+            read_editable_file(wt.path(), "raw.bin").unwrap(),
+            EditableFileRead::Binary { size: 3, .. }
+        ));
+
+        symlink("raw.bin", wt.path().join("link")).unwrap();
+        assert!(read_editable_file(wt.path(), "link").is_err());
     }
 
     // --- M5: 임의 바이트(비-UTF8)도 그대로 쓴다 — 편집기가 바이너리 저장 가능 ---

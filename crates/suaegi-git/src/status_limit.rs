@@ -72,9 +72,18 @@ mod tests {
     fn resolves_integer_ge_zero_else_default() {
         assert_eq!(resolve_git_status_limit(Some(0.0)), 0);
         assert_eq!(resolve_git_status_limit(Some(25.0)), 25);
-        assert_eq!(resolve_git_status_limit(Some(1.5)), DEFAULT_GIT_STATUS_LIMIT); // non-integer
-        assert_eq!(resolve_git_status_limit(Some(f64::NAN)), DEFAULT_GIT_STATUS_LIMIT);
-        assert_eq!(resolve_git_status_limit(Some(-1.0)), DEFAULT_GIT_STATUS_LIMIT);
+        assert_eq!(
+            resolve_git_status_limit(Some(1.5)),
+            DEFAULT_GIT_STATUS_LIMIT
+        ); // non-integer
+        assert_eq!(
+            resolve_git_status_limit(Some(f64::NAN)),
+            DEFAULT_GIT_STATUS_LIMIT
+        );
+        assert_eq!(
+            resolve_git_status_limit(Some(-1.0)),
+            DEFAULT_GIT_STATUS_LIMIT
+        );
         assert_eq!(resolve_git_status_limit(None), DEFAULT_GIT_STATUS_LIMIT); // non-number
     }
 

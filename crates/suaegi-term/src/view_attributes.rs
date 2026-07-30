@@ -449,10 +449,7 @@ mod tests {
         // (0xaaaa >> 8 == 0xaa == 0xaaaa & 0xff). Distinct nibbles per channel
         // break the tie: 0x1234 >> 8 = 0x12 = 18, but 0x1234 as u8
         // (truncation) = 0x34 = 52.
-        assert_eq!(
-            parse_x_color_spec("#123456789abc"),
-            Some([18, 86, 154])
-        );
+        assert_eq!(parse_x_color_spec("#123456789abc"), Some([18, 86, 154]));
     }
 
     #[test]

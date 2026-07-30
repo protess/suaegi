@@ -19,7 +19,8 @@ fn is_ecmascript_whitespace(code: u32) -> bool {
         | 0x0020 // Space
         | 0x00A0 // No-Break Space
         | 0x1680 // Ogham Space Mark
-        | 0x2000..=0x200A // En Quad .. Hair Space
+        | 0x2000
+            ..=0x200A // En Quad .. Hair Space
         | 0x2028 | 0x2029 // Line/Paragraph Separator
         | 0x202F // Narrow No-Break Space
         | 0x205F // Medium Mathematical Space

@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! creation-eligibility 게이팅(플랜 §3.4). **실제 git**으로 `@{u}` 체크를, **fake gh**로
 //! preflight/resolve/PR 조회를 검증한다.
 
@@ -12,8 +15,7 @@ use suaegi_git::runner::GitRunner;
 
 const REPO_VIEW_JSON: &str =
     r#"{"name":"widget","owner":{"login":"acme"},"url":"https://github.com/acme/widget"}"#;
-const PR_VIEW_JSON: &str =
-    r#"{"number":57,"title":"Fix","state":"OPEN","url":"https://github.com/acme/widget/pull/57","isDraft":false}"#;
+const PR_VIEW_JSON: &str = r#"{"number":57,"title":"Fix","state":"OPEN","url":"https://github.com/acme/widget/pull/57","isDraft":false}"#;
 
 fn ready_github(pr_stdout: &str, pr_stderr: &str, pr_exit: i32) -> FakeGh {
     FakeGh::new()
@@ -40,7 +42,10 @@ async fn eligible_when_pushed_github_branch_has_no_pr() {
     let _g = env_lock();
     let fake = ready_github("", "no pull requests found for branch \"feat\"\n", 1);
     let _p = fake.activate();
-    assert_eq!(eligibility(dir.path(), "feat").await, CreationEligibility::Eligible);
+    assert_eq!(
+        eligibility(dir.path(), "feat").await,
+        CreationEligibility::Eligible
+    );
 }
 
 /// **회귀 방어 (c) — upstream 게이트.** push 안 된 브랜치는 자격이 없다. `@{u}` 체크를
@@ -109,14 +114,12 @@ async fn blocked_not_github_repo() {
     let dir = tempfile::tempdir().unwrap();
     init_repo_with_branch(dir.path(), "feat", true);
     let _g = env_lock();
-    let fake = FakeGh::new()
-        .with_ready_preflight()
-        .rule(
-            "repo view",
-            "",
-            "none of the git remotes point to a known GitHub host\n",
-            1,
-        );
+    let fake = FakeGh::new().with_ready_preflight().rule(
+        "repo view",
+        "",
+        "none of the git remotes point to a known GitHub host\n",
+        1,
+    );
     let _p = fake.activate();
     assert_eq!(
         eligibility(dir.path(), "feat").await,

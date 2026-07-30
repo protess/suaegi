@@ -23,7 +23,7 @@ use suaegi_term::grid::{SnapshotCell, TerminalSnapshot, ViewportSelection};
 
 use crate::terminal::palette::{self, Palette};
 use crate::terminal::state::{CellMetrics, State};
-use crate::terminal::Terminal;
+use crate::terminal::{terminal_content_bounds, Terminal};
 
 // ---------------------------------------------------------------------------
 // 셀 스타일 결정 — 순수
@@ -101,11 +101,27 @@ pub fn resolve_cell(
         fg = palette::attenuate(fg, palette::DIM_FACTOR);
     }
 
-    // 3~5. 교환 셋. 홀수 번이면 반전, 짝수 번이면 상쇄된다.
-    let swaps =
-        u32::from(flags.contains(Flags::INVERSE)) + u32::from(selected) + u32::from(under_cursor);
-    if swaps % 2 == 1 {
+    // 3. INVERSE is always a swap.
+    if flags.contains(Flags::INVERSE) {
         std::mem::swap(&mut fg, &mut bg);
+    }
+    // 4. A configured selection color wins; without one, preserve xterm's
+    // inversion behavior.
+    if selected {
+        if p.selection_background().is_some() || p.selection_foreground().is_some() {
+            bg = p.selection_background().unwrap_or(bg);
+            fg = p.selection_foreground().unwrap_or(fg);
+        } else {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+    }
+    // 5. The cursor quad uses `cursor`; its optional accent controls the glyph
+    // on top of a covering block cursor.
+    if under_cursor {
+        std::mem::swap(&mut fg, &mut bg);
+        if let Some(accent) = p.cursor_accent() {
+            fg = accent;
+        }
     }
 
     // 6. 글리프를 그릴 것인가. **배경과는 무관하다.**
@@ -234,6 +250,7 @@ pub(crate) fn draw<Renderer>(
     Renderer: text::Renderer<Font = Font>,
 {
     let bounds = layout.bounds();
+    let grid_bounds = terminal_content_bounds(bounds, terminal.padding_x, terminal.padding_y);
 
     // 클리핑 API가 따로 없다 — `with_layer`가 클리핑이다
     // (`iced_core/src/renderer.rs:22-28`). 화면 밖이면 아예 하지 않는다.
@@ -241,12 +258,19 @@ pub(crate) fn draw<Renderer>(
         return;
     };
 
-    let p = palette::shared();
+    let p = palette::shared_for(terminal.theme_name);
+    let pane_opacity = if state.focused {
+        terminal.active_pane_opacity
+    } else {
+        terminal.inactive_pane_opacity
+    };
 
     renderer.with_layer(clip, |renderer| {
         // 메트릭이 없으면(측정 실패) 셀을 어디에 놓을지 모른다. 그래도 배경은
         // 칠한다 — 부모의 색이 비치는 것보다 낫다.
-        renderer.fill_quad(quad(bounds), p.background());
+        let mut background = p.background();
+        background.a *= terminal.background_opacity * pane_opacity;
+        renderer.fill_quad(quad(bounds), background);
 
         let Some(metrics) = state.metrics else {
             return;
@@ -260,11 +284,16 @@ pub(crate) fn draw<Renderer>(
             state,
             renderer,
             p,
-            bounds,
+            grid_bounds,
             clip,
             metrics,
             terminal.font,
             terminal.text_size,
+            terminal.ligatures_enabled,
+            terminal.cursor_style,
+            terminal.cursor_blink_phase_visible,
+            terminal.cursor_opacity,
+            pane_opacity,
         );
     });
 }
@@ -280,6 +309,11 @@ fn draw_grid<Renderer>(
     metrics: CellMetrics,
     font: Font,
     text_size: Pixels,
+    ligatures_enabled: bool,
+    cursor_override: Option<CursorShape>,
+    cursor_blink_phase_visible: bool,
+    cursor_opacity: f32,
+    pane_opacity: f32,
 ) where
     Renderer: text::Renderer<Font = Font>,
 {
@@ -293,7 +327,12 @@ fn draw_grid<Renderer>(
     // APP_CURSOR는 커서 **키** 모드(화살표가 `ESC O A`냐 `ESC [ A`냐)이고
     // 커서 렌더링과 아무 관계가 없다. 그래서 일반 모드에서 커서 아래 글자가
     // 사라진다.
-    let shape = cursor_shape(snapshot, state.focused);
+    let shape =
+        if snapshot.cursor.is_some_and(|cursor| cursor.blinking) && !cursor_blink_phase_visible {
+            None
+        } else {
+            cursor_shape_with_override(snapshot, state.focused, cursor_override)
+        };
     let covering_cursor = match shape {
         Some(CursorShape::Block) => snapshot.cursor.map(|c| (c.row, c.col)),
         _ => None,
@@ -326,7 +365,10 @@ fn draw_grid<Renderer>(
                 .as_ref()
                 .is_some_and(|sel| cell_selected(sel, row, col));
             let under_cursor = covering_cursor == Some((row, col));
-            resolved.push(resolve_cell(cell, p, selected, under_cursor));
+            let mut resolved_cell = resolve_cell(cell, p, selected, under_cursor);
+            resolved_cell.fg.a *= pane_opacity;
+            resolved_cell.bg.a *= pane_opacity;
+            resolved.push(resolved_cell);
         }
     }
 
@@ -386,7 +428,9 @@ fn draw_grid<Renderer>(
             width: span as f32 * cw,
             height: ch,
         };
-        draw_cursor(renderer, shape, cell, p.cursor(), stroke(ch));
+        let mut cursor_color = p.cursor();
+        cursor_color.a *= cursor_opacity * pane_opacity;
+        draw_cursor(renderer, shape, cell, cursor_color, stroke(ch));
     }
 
     // --- 패스 3: 텍스트 -----------------------------------------------------
@@ -460,7 +504,11 @@ fn draw_grid<Renderer>(
                     // CJK·이모지·결합 문자가 `Basic`에서 깨진다. 셀 내용은
                     // 글자 하나라 `Advanced`여도 셰이핑 캐시가 거의 항상
                     // 맞는다(`iced_graphics/src/text/cache.rs:29-42`).
-                    shaping: text::Shaping::Advanced,
+                    shaping: if ligatures_enabled {
+                        text::Shaping::Advanced
+                    } else {
+                        text::Shaping::Basic
+                    },
                     wrapping: text::Wrapping::None,
                 },
                 Point::new(x, origin.y),
@@ -480,12 +528,21 @@ fn draw_grid<Renderer>(
 /// `CursorShape::Hidden`은 `!SHOW_CURSOR`가 우리에게 도달하는 경로다
 /// (`alacritty_terminal/src/term/mod.rs:2380`). 언포커스보다 **먼저** 본다 —
 /// 숨긴 커서는 포커스를 잃어도 숨긴 것이다.
+#[cfg_attr(not(test), allow(dead_code))]
 fn cursor_shape(snapshot: &TerminalSnapshot, focused: bool) -> Option<CursorShape> {
+    cursor_shape_with_override(snapshot, focused, None)
+}
+
+fn cursor_shape_with_override(
+    snapshot: &TerminalSnapshot,
+    focused: bool,
+    override_shape: Option<CursorShape>,
+) -> Option<CursorShape> {
     let shape = snapshot.cursor?.shape;
     match shape {
         CursorShape::Hidden => None,
         _ if !focused => Some(CursorShape::HollowBlock),
-        other => Some(other),
+        other => Some(override_shape.unwrap_or(other)),
     }
 }
 

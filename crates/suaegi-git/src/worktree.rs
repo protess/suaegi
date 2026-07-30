@@ -69,6 +69,52 @@ pub async fn add_worktree(
     base_ref: &str,
     workspace_root: &Path,
 ) -> Result<CreatedWorktree, WorktreeError> {
+    add_worktree_with_layout(
+        runner,
+        repo_path,
+        requested_name,
+        base_ref,
+        workspace_root,
+        true,
+    )
+    .await
+}
+
+/// Creates a worktree using Orca's configurable workspace layout. Existing
+/// callers keep the historical nested layout through [`add_worktree`], while
+/// the desktop settings surface can opt out of the repo-named subdirectory.
+pub async fn add_worktree_with_layout(
+    runner: &GitRunner,
+    repo_path: &Path,
+    requested_name: &str,
+    base_ref: &str,
+    workspace_root: &Path,
+    nest_workspaces: bool,
+) -> Result<CreatedWorktree, WorktreeError> {
+    add_worktree_with_layout_and_prefix(
+        runner,
+        repo_path,
+        requested_name,
+        base_ref,
+        workspace_root,
+        nest_workspaces,
+        None,
+    )
+    .await
+}
+
+/// Creates a worktree while allowing the branch to live below an Orca-style
+/// prefix (`username/name` or `custom/name`). The filesystem directory keeps
+/// the concise workspace name.
+pub async fn add_worktree_with_layout_and_prefix(
+    runner: &GitRunner,
+    repo_path: &Path,
+    requested_name: &str,
+    base_ref: &str,
+    workspace_root: &Path,
+    nest_workspaces: bool,
+    branch_prefix: Option<&str>,
+) -> Result<CreatedWorktree, WorktreeError> {
     validate_user_ref(base_ref).map_err(|_| WorktreeError::InvalidBaseRef(base_ref.to_string()))?;
 
     let sanitized = sanitize_worktree_name(requested_name);
@@ -76,23 +122,33 @@ pub async fn add_worktree(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".to_string());
-    let parent = workspace_root.join(&repo_dir_name);
+    let parent = if nest_workspaces {
+        workspace_root.join(&repo_dir_name)
+    } else {
+        workspace_root.to_path_buf()
+    };
     tokio::fs::create_dir_all(&parent).await?;
     // WorktreeId의 근간이 되는 경로이므로 항상 canonical 절대 경로로
     let parent = tokio::fs::canonicalize(&parent).await?;
 
+    let prefix = branch_prefix
+        .map(sanitize_worktree_name)
+        .filter(|prefix| !prefix.is_empty());
     let mut chosen: Option<(String, PathBuf)> = None;
     for name in candidate_names(&sanitized) {
         let path = parent.join(&name);
+        let branch = prefix
+            .as_ref()
+            .map_or_else(|| name.clone(), |prefix| format!("{prefix}/{name}"));
         // Path::exists()와 동일하게 권한 에러 등은 "존재하지 않음"으로 취급
         // (unwrap_or(false)) — try_exists()의 Err를 그대로 전파하면 기존
         // exists() 동작(모든 에러를 false로 뭉갬)과 달라진다.
         if tokio::fs::try_exists(&path).await.unwrap_or(false)
-            || branch_exists(runner, repo_path, &name).await?
+            || branch_exists(runner, repo_path, &branch).await?
         {
             continue;
         }
-        chosen = Some((name, path));
+        chosen = Some((branch, path));
         break;
     }
     let (branch, path) = chosen.ok_or(WorktreeError::NoAvailableName)?;

@@ -15,6 +15,8 @@ suaegi-core = { path = "../suaegi-core" }
 suaegi-misc = { path = "../suaegi-misc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
 # Jira Basic 인증 헤더 `base64(email:token)` 조립(§2, Orca `client.ts:338`). 엄격 표준 알파벳.
 base64 = { workspace = true }
 
