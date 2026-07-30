@@ -31,6 +31,7 @@ fn start_throwaway_session(command: (String, Vec<String>)) -> TerminalSession {
             args: command.1,
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             rows: 24,
             cols: 80,
         },

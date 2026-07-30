@@ -216,6 +216,7 @@ pub fn classify_shortcut(input: &KeyInput, platform: Platform) -> Option<Shortcu
 /// 타이핑을 받아야 한다 — 키에 bounds 게이팅을 걸면 마우스를 옆 pane으로 옮기는
 /// 순간 입력이 죽는다. bounds 필터링은 커서 좌표가 의미를 갖는 **마우스 경로**
 /// (Task 6)의 몫이다.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update(
     state: &mut State,
     id: SessionId,
@@ -223,6 +224,8 @@ pub(crate) fn update(
     clipboard: &mut dyn Clipboard,
     shell: &mut Shell<'_, Published>,
     platform: Platform,
+    mac_option_as_alt: &str,
+    jis_yen_to_backslash: bool,
 ) {
     // **수식자는 언포커스여도 따라간다.** `iced_term`은 언포커스 상태의 키보드
     // 이벤트를 통째로 버려서 수식자 캐시가 상한다(`view.rs:334` vs `:348`) —
@@ -292,7 +295,7 @@ pub(crate) fn update(
         return;
     };
 
-    let input = to_key_input(
+    let mut input = to_key_input(
         key,
         *physical_key,
         *location,
@@ -300,6 +303,20 @@ pub(crate) fn update(
         text.as_deref(),
         *repeat,
     );
+    if jis_yen_to_backslash && matches!(input.key, TermKey::Char('¥' | '￥')) {
+        input.key = TermKey::Char('\\');
+        input.physical_latin = Some('\\');
+        input.text = Some("\\".to_string());
+    }
+    if platform == Platform::Mac
+        && input.mods.alt
+        && matches!(mac_option_as_alt, "true" | "left" | "right")
+    {
+        if let Some(latin) = input.physical_latin {
+            input.key = TermKey::Char(latin);
+            input.text = None;
+        }
+    }
 
     // 우선순위 1번: 앱 단축키. 모드와 무관하므로 여기서 끝내고 `Key`를 내지 않는다.
     if let Some(shortcut) = classify_shortcut(&input, platform) {
@@ -322,6 +339,13 @@ pub(crate) fn update(
                 }
             }
         }
+        shell.capture_event();
+        return;
+    }
+
+    if !*repeat
+        && crate::keybindings::should_capture_in_terminal(key, physical_key, modifiers, platform)
+    {
         shell.capture_event();
         return;
     }

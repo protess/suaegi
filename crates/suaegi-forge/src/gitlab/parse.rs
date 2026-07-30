@@ -174,7 +174,11 @@ impl GlabMrView {
         match status.as_str() {
             "success" => s.passing = 1,
             "failed" | "canceled" | "cancelled" => s.failing = 1,
-            "running" | "pending" | "created" | "preparing" | "waiting_for_resource"
+            "running"
+            | "pending"
+            | "created"
+            | "preparing"
+            | "waiting_for_resource"
             | "scheduled" => s.pending = 1,
             // "manual"/"skipped"/""/미지 값은 세지 않는다(보수적).
             _ => {}
@@ -410,7 +414,10 @@ mod tests {
 
     #[test]
     fn non_mr_output_yields_none() {
-        assert_eq!(parse_created_mr("https://gitlab.com/acme/widget/-/issues/9"), None);
+        assert_eq!(
+            parse_created_mr("https://gitlab.com/acme/widget/-/issues/9"),
+            None
+        );
         assert_eq!(parse_created_mr("some warning without a url"), None);
         assert_eq!(
             parse_created_mr("https://gitlab.com/acme/widget/-/merge_requests/0"),
@@ -457,8 +464,14 @@ mod tests {
 
     #[test]
     fn non_gitlab_remote_is_none() {
-        assert_eq!(parse_gitlab_remote("https://github.com/acme/widget.git"), None);
-        assert_eq!(parse_gitlab_remote("git@bitbucket.org:acme/widget.git"), None);
+        assert_eq!(
+            parse_gitlab_remote("https://github.com/acme/widget.git"),
+            None
+        );
+        assert_eq!(
+            parse_gitlab_remote("git@bitbucket.org:acme/widget.git"),
+            None
+        );
     }
 
     #[test]
@@ -537,12 +550,35 @@ mod tests {
 
     #[test]
     fn checks_summary_from_pipeline() {
-        assert_eq!(mr_with("", "", false, Some("success")).checks_summary().passing, 1);
-        assert_eq!(mr_with("", "", false, Some("failed")).checks_summary().failing, 1);
-        assert_eq!(mr_with("", "", false, Some("canceled")).checks_summary().failing, 1);
-        assert_eq!(mr_with("", "", false, Some("running")).checks_summary().pending, 1);
+        assert_eq!(
+            mr_with("", "", false, Some("success"))
+                .checks_summary()
+                .passing,
+            1
+        );
+        assert_eq!(
+            mr_with("", "", false, Some("failed"))
+                .checks_summary()
+                .failing,
+            1
+        );
+        assert_eq!(
+            mr_with("", "", false, Some("canceled"))
+                .checks_summary()
+                .failing,
+            1
+        );
+        assert_eq!(
+            mr_with("", "", false, Some("running"))
+                .checks_summary()
+                .pending,
+            1
+        );
         // 파이프라인 없음/skipped → 빈 요약.
-        assert_eq!(mr_with("", "", false, None).checks_summary(), ChecksSummary::default());
+        assert_eq!(
+            mr_with("", "", false, None).checks_summary(),
+            ChecksSummary::default()
+        );
         assert_eq!(
             mr_with("", "", false, Some("skipped")).checks_summary(),
             ChecksSummary::default()

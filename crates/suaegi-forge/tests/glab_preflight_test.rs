@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! glab preflight: 미설치 / 미인증 / 구버전 / ready 구분(gh preflight 미러).
 
 mod glab_fixture;
@@ -12,7 +15,10 @@ async fn preflight_ready_when_installed_and_authed() {
         .rule("--version", "glab version 1.36.0 (2024-05-01)\n", "", 0)
         .rule("auth status", "", "gitlab.com\n  Logged in as octocat\n", 0);
     let _p = fake.activate();
-    assert_eq!(glab_preflight(&GlabRunner::new()).await, GlabPreflight::Ready);
+    assert_eq!(
+        glab_preflight(&GlabRunner::new()).await,
+        GlabPreflight::Ready
+    );
 }
 
 #[tokio::test]

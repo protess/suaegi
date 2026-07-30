@@ -102,9 +102,8 @@ mod tests {
 
     #[test]
     fn is_idempotent_for_already_branded_ids() {
-        let branded = brand_ephemeral_setup_terminal_worktree_id(
-            "settings-orchestration-skill-terminal",
-        );
+        let branded =
+            brand_ephemeral_setup_terminal_worktree_id("settings-orchestration-skill-terminal");
         assert_eq!(
             brand_ephemeral_setup_terminal_worktree_id(&branded),
             branded
@@ -126,8 +125,10 @@ mod tests {
 
     #[test]
     fn does_not_introduce_the_worktree_id_separator() {
-        assert!(!brand_ephemeral_setup_terminal_worktree_id("onboarding-inline-terminal")
-            .contains("::"));
+        assert!(
+            !brand_ephemeral_setup_terminal_worktree_id("onboarding-inline-terminal")
+                .contains("::")
+        );
     }
 
     // Mandatory extra pins (oracle-silent):
@@ -176,9 +177,7 @@ mod tests {
     fn pin_brand_is_not_injective() {
         assert_eq!(
             brand_ephemeral_setup_terminal_worktree_id(""),
-            brand_ephemeral_setup_terminal_worktree_id(
-                EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX
-            )
+            brand_ephemeral_setup_terminal_worktree_id(EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX)
         );
     }
 
@@ -213,7 +212,8 @@ mod tests {
     /// the ported-unchanged upstream collision hazard.
     #[test]
     fn pin_panel_id_colliding_with_prefix_is_not_re_branded() {
-        let colliding = format!("{EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX}not-actually-branded");
+        let colliding =
+            format!("{EPHEMERAL_SETUP_TERMINAL_WORKTREE_ID_PREFIX}not-actually-branded");
         assert_eq!(
             brand_ephemeral_setup_terminal_worktree_id(&colliding),
             colliding

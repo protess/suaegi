@@ -43,4 +43,6 @@ pub enum TermCommand {
     CopySelection {
         to: CopyTargets,
     },
+    /// Focus-follows-mouse asks the application to focus this session's pane.
+    FocusRequested,
 }

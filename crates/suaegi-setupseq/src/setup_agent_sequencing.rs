@@ -219,7 +219,9 @@ pub fn create_sequenced_setup_agent_commands(
     // Why: overlapping gated launches of the same setup runner must not race
     // on a shared completion marker.
     let marker_path = format!("{}.{}.done", resolution.runner_script_path_for_shell, nonce);
-    let wait_timeout_seconds = args.wait_timeout_seconds.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECONDS);
+    let wait_timeout_seconds = args
+        .wait_timeout_seconds
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECONDS);
 
     let mut startup_env = HashMap::new();
     startup_env.insert(
@@ -438,8 +440,7 @@ fn build_windows_startup_command(
         "      Remove-Item -LiteralPath $marker, $tmp -Force -ErrorAction SilentlyContinue"
             .to_string(),
         "      if ($setupStatus -ne 0) {".to_string(),
-        "        [Console]::Error.WriteLine(\"Setup failed; skipping agent startup.\")"
-            .to_string(),
+        "        [Console]::Error.WriteLine(\"Setup failed; skipping agent startup.\")".to_string(),
         "        exit $setupStatus".to_string(),
         "      }".to_string(),
         format!("      $startup = $env:{SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV}"),
@@ -604,13 +605,11 @@ mod tests {
             .contains("bash /repo/.git/orca/setup-runner.sh"));
         assert!(result.setup_command.contains("printf"));
         assert!(result.setup_command.contains("nonce-123 \"$status\""));
-        assert!(result.setup_command.contains(
-            "mv -f /repo/.git/orca/setup-runner.sh.nonce-123.done.tmp"
-        ));
-        assert!(result.startup_command.starts_with("bash -lc "));
         assert!(result
-            .startup_command
-            .contains("deadline=$((SECONDS + 9))"));
+            .setup_command
+            .contains("mv -f /repo/.git/orca/setup-runner.sh.nonce-123.done.tmp"));
+        assert!(result.startup_command.starts_with("bash -lc "));
+        assert!(result.startup_command.contains("deadline=$((SECONDS + 9))"));
         assert!(!result.startup_command.contains("date +%s"));
         assert!(result
             .startup_command
@@ -622,7 +621,10 @@ mod tests {
         assert!(result.startup_command.contains("exec codex"));
         assert!(result.startup_command.contains("fix bug"));
         assert_eq!(
-            result.startup_env.unwrap().get(SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV),
+            result
+                .startup_env
+                .unwrap()
+                .get(SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV),
             Some(&"codex 'fix bug'".to_string())
         );
     }
@@ -665,8 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn oracle_keeps_simple_posix_startup_commands_eligible_for_exec_when_quoted_text_has_separators()
-    {
+    fn oracle_keeps_simple_posix_startup_commands_eligible_for_exec_when_quoted_text_has_separators(
+    ) {
         let result = create_sequenced_setup_agent_commands(args(
             "/repo/.git/orca/setup-runner.sh",
             "codex 'fix this; then test'",
@@ -716,9 +718,9 @@ mod tests {
         assert!(result
             .setup_command
             .contains("bash /home/jin/repo/.git/worktrees/feature/orca/setup-runner.sh"));
-        assert!(result.setup_command.contains(
-            "/home/jin/repo/.git/worktrees/feature/orca/setup-runner.sh.nonce-wsl.done"
-        ));
+        assert!(result
+            .setup_command
+            .contains("/home/jin/repo/.git/worktrees/feature/orca/setup-runner.sh.nonce-wsl.done"));
         assert!(!result.setup_command.contains("wsl.localhost"));
     }
 
@@ -757,10 +759,7 @@ mod tests {
         assert!(result
             .setup_command
             .contains("echo !ORCA_SETUP_NONCE!:!ORCA_SETUP_STATUS!"));
-        assert_eq!(
-            result.startup_command.matches("powershell.exe").count(),
-            1
-        );
+        assert_eq!(result.startup_command.matches("powershell.exe").count(), 1);
         assert!(result
             .startup_command
             .contains("powershell.exe -NoProfile -ExecutionPolicy Bypass"));
@@ -901,7 +900,10 @@ mod tests {
 
             let commands = create_sequenced_setup_agent_commands(args(
                 &runner_script_path.display().to_string(),
-                &format!("bash {}", quote_sh(&startup_script_path.display().to_string())),
+                &format!(
+                    "bash {}",
+                    quote_sh(&startup_script_path.display().to_string())
+                ),
                 SetupRunnerCommandPlatform::Posix,
                 "fresh-sequence",
                 Some(5),
@@ -1040,8 +1042,7 @@ mod tests {
         }
 
         #[test]
-        fn oracle_times_out_instead_of_hanging_forever_when_setup_never_writes_a_matching_marker()
-        {
+        fn oracle_times_out_instead_of_hanging_forever_when_setup_never_writes_a_matching_marker() {
             let dir = make_temp_dir();
             let runner_script_path = dir.join("setup-runner.sh");
             write_executable(&runner_script_path, "#!/bin/sh\nexit 0\n");
@@ -1103,7 +1104,10 @@ mod tests {
 
     #[test]
     fn k3_quote_windows_arg_doubles_embedded_quotes_breaking_cmd_parity() {
-        assert_eq!(quote_windows_arg("C:\\a\"&calc&\".cmd"), "\"C:\\a\"\"&calc&\"\".cmd\"");
+        assert_eq!(
+            quote_windows_arg("C:\\a\"&calc&\".cmd"),
+            "\"C:\\a\"\"&calc&\"\".cmd\""
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1144,8 +1148,11 @@ mod tests {
         // `wrap_cmd`'s outer re-quoting: the `&calc&` here ends up in an
         // UNQUOTED region of the final cmd.exe command line, executable.
         let marker_path = "C:\\a\"&calc&\".done";
-        let command =
-            build_windows_setup_command("cmd.exe /c \"C:\\repo\\setup-runner.cmd\"", marker_path, "nonce-1");
+        let command = build_windows_setup_command(
+            "cmd.exe /c \"C:\\repo\\setup-runner.cmd\"",
+            marker_path,
+            "nonce-1",
+        );
         assert_eq!(
             command,
             "cmd.exe /d /s /v:on /c \"set \"\"ORCA_SETUP_MARKER=C:\\a\"\"\"\"&calc&\"\"\"\".done\"\" & set \"\"ORCA_SETUP_NONCE=nonce-1\"\" & del /f /q \"\"!ORCA_SETUP_MARKER!\"\" \"\"!ORCA_SETUP_MARKER!.tmp\"\" 2>nul & call cmd.exe /c \"\"C:\\repo\\setup-runner.cmd\"\" & set \"\"ORCA_SETUP_STATUS=!ERRORLEVEL!\"\" & > \"\"!ORCA_SETUP_MARKER!.tmp\"\" echo !ORCA_SETUP_NONCE!:!ORCA_SETUP_STATUS! & move /y \"\"!ORCA_SETUP_MARKER!.tmp\"\" \"\"!ORCA_SETUP_MARKER!\"\" >nul & exit /b !ORCA_SETUP_STATUS!\""
@@ -1268,7 +1275,9 @@ mod tests {
             resolve_setup_agent_sequence_launch_command(&env, Some("fallback")),
             Some("fallback".to_string())
         );
-        assert_eq!(resolve_setup_agent_sequence_launch_command(&env, None), None);
+        assert_eq!(
+            resolve_setup_agent_sequence_launch_command(&env, None),
+            None
+        );
     }
 }
-

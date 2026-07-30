@@ -45,9 +45,18 @@ mod tests {
 
     #[test]
     fn keeps_supported_source_control_group_orders() {
-        assert_eq!(normalize_source_control_group_order(Some("changes-first")), ChangesFirst);
-        assert_eq!(normalize_source_control_group_order(Some("staged-first")), StagedFirst);
-        assert_eq!(normalize_source_control_group_order(Some("untracked-first")), UntrackedFirst);
+        assert_eq!(
+            normalize_source_control_group_order(Some("changes-first")),
+            ChangesFirst
+        );
+        assert_eq!(
+            normalize_source_control_group_order(Some("staged-first")),
+            StagedFirst
+        );
+        assert_eq!(
+            normalize_source_control_group_order(Some("untracked-first")),
+            UntrackedFirst
+        );
     }
 
     #[test]
@@ -56,7 +65,10 @@ mod tests {
             normalize_source_control_group_order(Some("tracked-first")),
             DEFAULT_SOURCE_CONTROL_GROUP_ORDER
         );
-        assert_eq!(normalize_source_control_group_order(None), DEFAULT_SOURCE_CONTROL_GROUP_ORDER);
+        assert_eq!(
+            normalize_source_control_group_order(None),
+            DEFAULT_SOURCE_CONTROL_GROUP_ORDER
+        );
     }
 
     // Mandatory extra pins (oracle-silent):
@@ -64,9 +76,18 @@ mod tests {
     /// F15 — each member pinned directly, plus the `DEFAULT` literal.
     #[test]
     fn pin_each_member_and_default_literal() {
-        assert_eq!(normalize_source_control_group_order(Some("changes-first")), ChangesFirst);
-        assert_eq!(normalize_source_control_group_order(Some("staged-first")), StagedFirst);
-        assert_eq!(normalize_source_control_group_order(Some("untracked-first")), UntrackedFirst);
+        assert_eq!(
+            normalize_source_control_group_order(Some("changes-first")),
+            ChangesFirst
+        );
+        assert_eq!(
+            normalize_source_control_group_order(Some("staged-first")),
+            StagedFirst
+        );
+        assert_eq!(
+            normalize_source_control_group_order(Some("untracked-first")),
+            UntrackedFirst
+        );
         assert_eq!(DEFAULT_SOURCE_CONTROL_GROUP_ORDER, ChangesFirst);
     }
 

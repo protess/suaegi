@@ -411,7 +411,10 @@ fn is_native_file_drop_target(value: Option<&JsValue>) -> bool {
 /// key explicitly present with an `undefined` value both satisfy `===
 /// undefined` in JS, so both map to this returning `true` here.
 fn is_optional_native_file_drop_string(value: Option<&JsValue>) -> bool {
-    matches!(value, None | Some(JsValue::Undefined) | Some(JsValue::Str(_)))
+    matches!(
+        value,
+        None | Some(JsValue::Undefined) | Some(JsValue::Str(_))
+    )
 }
 
 /// `isNativeFileDropPathList` (`O:78-80`): `Array.isArray(value) &&
@@ -553,7 +556,9 @@ pub fn validate_native_file_drop_paths(
     options: NativeFileDropValidationOptions,
 ) -> NativeFileDropPathValidation {
     let path_count = paths.len() as u64;
-    let max_paths = options.max_paths.unwrap_or(NATIVE_FILE_DROP_MAX_PATHS as f64);
+    let max_paths = options
+        .max_paths
+        .unwrap_or(NATIVE_FILE_DROP_MAX_PATHS as f64);
     // `pathCount > maxPaths` (`O:155`): a plain JS `>`, no separate
     // `Number.isFinite` guard needed here — Rust's `f64` comparison already
     // returns `false` against `NaN` exactly like JS, so `NaN` accepts any
@@ -672,8 +677,11 @@ pub fn create_native_file_drop_payload(
             paths: paths.to_vec(),
         }),
         // Unreachable: both handled by early returns above.
-        Some(NativeDropResolution::FileExplorer { .. }) | Some(NativeDropResolution::Terminal { .. }) => {
-            unreachable!("FileExplorer and Terminal resolutions are handled by earlier early-returns")
+        Some(NativeDropResolution::FileExplorer { .. })
+        | Some(NativeDropResolution::Terminal { .. }) => {
+            unreachable!(
+                "FileExplorer and Terminal resolutions are handled by earlier early-returns"
+            )
         }
         Some(NativeDropResolution::Rejected) => {
             unreachable!("Rejected resolutions are handled by the earlier early-return")
@@ -952,11 +960,13 @@ mod tests {
         let payload = create_native_file_drop_payload(None, &paths);
         assert_eq!(
             payload,
-            Some(NativeFileDropPayload::Rejected(NativeFileDropRejectedPayload {
-                byte_length: NATIVE_FILE_DROP_MAX_PATH_BYTES + 1,
-                path_count: 2,
-                reason: NativeFileDropRejectedReason::PathsTooLarge,
-            }))
+            Some(NativeFileDropPayload::Rejected(
+                NativeFileDropRejectedPayload {
+                    byte_length: NATIVE_FILE_DROP_MAX_PATH_BYTES + 1,
+                    path_count: 2,
+                    reason: NativeFileDropRejectedReason::PathsTooLarge,
+                }
+            ))
         );
         assert!(!format!("{payload:?}").contains("alice"));
     }
@@ -970,7 +980,10 @@ mod tests {
         assert!(is_native_file_drop_payload(&JsValue::object([
             ("destinationDir", JsValue::str("/repo/src")),
             ("paths", JsValue::array([JsValue::str("/tmp/a")])),
-            ("target", JsValue::str(NATIVE_FILE_DROP_TARGET_FILE_EXPLORER)),
+            (
+                "target",
+                JsValue::str(NATIVE_FILE_DROP_TARGET_FILE_EXPLORER)
+            ),
         ])));
         assert!(is_native_file_drop_payload(&JsValue::object([
             ("paneLeafId", JsValue::str("leaf-1")),
@@ -998,7 +1011,10 @@ mod tests {
         ])));
         assert!(!is_native_file_drop_payload(&JsValue::object([
             ("paths", JsValue::array([JsValue::str("/tmp/a")])),
-            ("target", JsValue::str(NATIVE_FILE_DROP_TARGET_FILE_EXPLORER)),
+            (
+                "target",
+                JsValue::str(NATIVE_FILE_DROP_TARGET_FILE_EXPLORER)
+            ),
         ])));
         assert!(!is_native_file_drop_payload(&JsValue::object([
             ("paths", JsValue::array([JsValue::str("/tmp/a")])),
@@ -1008,9 +1024,7 @@ mod tests {
         assert!(!is_native_file_drop_payload(&JsValue::object([
             (
                 "paths",
-                JsValue::array(
-                    (0..=NATIVE_FILE_DROP_MAX_PATHS).map(|_| JsValue::str("/tmp/a"))
-                )
+                JsValue::array((0..=NATIVE_FILE_DROP_MAX_PATHS).map(|_| JsValue::str("/tmp/a")))
             ),
             ("target", JsValue::str(NATIVE_FILE_DROP_TARGET_EDITOR)),
         ])));
@@ -1090,7 +1104,13 @@ mod tests {
         assert_eq!(NATIVE_FILE_DROP_TARGET_REJECTED, "rejected");
         assert_eq!(
             NATIVE_FILE_DROP_TARGET_VALUES,
-            ["editor", "terminal", "composer", "file-explorer", "project-sidebar"]
+            [
+                "editor",
+                "terminal",
+                "composer",
+                "file-explorer",
+                "project-sidebar"
+            ]
         );
     }
 
@@ -1128,7 +1148,7 @@ mod tests {
     #[test]
     fn l2_size_rejection_reports_the_truncated_overshoot_inclusive_total() {
         let paths = vec![
-            s("C:\\Users\\alice\\"), // 15 ASCII bytes
+            s("C:\\Users\\alice\\"),                              // 15 ASCII bytes
             "a".repeat(NATIVE_FILE_DROP_MAX_PATH_BYTES as usize), // 262144 bytes
         ];
         let validation =
@@ -1505,11 +1525,13 @@ mod tests {
         let payload = create_native_file_drop_payload(None, &paths);
         assert_eq!(
             payload,
-            Some(NativeFileDropPayload::Rejected(NativeFileDropRejectedPayload {
-                byte_length: 0,
-                path_count: NATIVE_FILE_DROP_MAX_PATHS + 1,
-                reason: NativeFileDropRejectedReason::TooManyPaths,
-            }))
+            Some(NativeFileDropPayload::Rejected(
+                NativeFileDropRejectedPayload {
+                    byte_length: 0,
+                    path_count: NATIVE_FILE_DROP_MAX_PATHS + 1,
+                    reason: NativeFileDropRejectedReason::TooManyPaths,
+                }
+            ))
         );
     }
 
@@ -1521,15 +1543,16 @@ mod tests {
         let paths: Vec<String> = (0..=NATIVE_FILE_DROP_MAX_PATHS)
             .map(|i| format!("/tmp/{i}"))
             .collect();
-        let payload =
-            create_native_file_drop_payload(Some(NativeDropResolution::Rejected), &paths);
+        let payload = create_native_file_drop_payload(Some(NativeDropResolution::Rejected), &paths);
         assert_eq!(
             payload,
-            Some(NativeFileDropPayload::Rejected(NativeFileDropRejectedPayload {
-                byte_length: 0,
-                path_count: NATIVE_FILE_DROP_MAX_PATHS + 1,
-                reason: NativeFileDropRejectedReason::TooManyPaths,
-            }))
+            Some(NativeFileDropPayload::Rejected(
+                NativeFileDropRejectedPayload {
+                    byte_length: 0,
+                    path_count: NATIVE_FILE_DROP_MAX_PATHS + 1,
+                    reason: NativeFileDropRejectedReason::TooManyPaths,
+                }
+            ))
         );
     }
 
@@ -1542,9 +1565,6 @@ mod tests {
             13
         );
         assert_eq!(measure_native_file_drop_path_bytes(&[]), 0);
-        assert_eq!(
-            measure_native_file_drop_path_bytes(&[s("\u{1F600}")]),
-            4
-        );
+        assert_eq!(measure_native_file_drop_path_bytes(&[s("\u{1F600}")]), 4);
     }
 }

@@ -190,7 +190,11 @@ fn render_list_item(node: &Value, prefix: &str) -> String {
     for (block_index, block) in blocks.iter().enumerate() {
         let block_lines: Vec<&str> = block.text.split('\n').collect();
         if block_index == 0 {
-            lines.push(format!("{prefix}{}", block_lines.first().copied().unwrap_or("")).trim_end().to_string());
+            lines.push(
+                format!("{prefix}{}", block_lines.first().copied().unwrap_or(""))
+                    .trim_end()
+                    .to_string(),
+            );
             for line in &block_lines[1..] {
                 lines.push(format!("{continuation}{line}").trim_end().to_string());
             }
@@ -268,7 +272,11 @@ fn render_block(node: &Value) -> MarkdownBlock {
         "paragraph" => block(render_inline(&node["content"])),
         "heading" => {
             let prefix = "#".repeat(heading_level(&node["attrs"]["level"]));
-            block(format!("{prefix} {}", render_inline(&node["content"]).trim()).trim().to_string())
+            block(
+                format!("{prefix} {}", render_inline(&node["content"]).trim())
+                    .trim()
+                    .to_string(),
+            )
         }
         "bulletList" => MarkdownBlock {
             kind: BlockKind::List,

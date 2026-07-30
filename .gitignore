@@ -12,6 +12,7 @@ reference/
 # 세션/에이전트 스크래치 (로컬 전용)
 .superpowers/
 .context/
+.omc/
 .claude/settings.local.json
 
 # 시크릿 — 절대 커밋 금지

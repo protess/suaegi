@@ -244,7 +244,10 @@ mod tests {
     #[test]
     fn advance_abandons_tracking_past_the_cap() {
         let mut huge = b"\x1b]0;".to_vec();
-        huge.extend(std::iter::repeat_n(b'x', MAX_PARTIAL_ESCAPE_TAIL_LENGTH + 10));
+        huge.extend(std::iter::repeat_n(
+            b'x',
+            MAX_PARTIAL_ESCAPE_TAIL_LENGTH + 10,
+        ));
         assert_eq!(advance_partial_escape_tail(b"", &huge), Vec::<u8>::new());
     }
 

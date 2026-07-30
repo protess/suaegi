@@ -40,7 +40,11 @@ impl BellDetector {
     /// Whether `data` contains a real terminal bell (BEL not consumed as an OSC
     /// terminator). `contains_osc_introducer` lets a caller that already scanned
     /// for `ESC ]` share the result instead of paying a second pass.
-    pub fn chunk_contains_bell(&mut self, data: &[u8], contains_osc_introducer: Option<bool>) -> bool {
+    pub fn chunk_contains_bell(
+        &mut self,
+        data: &[u8],
+        contains_osc_introducer: Option<bool>,
+    ) -> bool {
         if !self.in_osc && !self.pending_escape && !data.contains(&BEL) {
             // Why: CSI/plain chunks with no BEL and no OSC start cannot affect
             // bell state; avoid walking every byte of normal terminal output.

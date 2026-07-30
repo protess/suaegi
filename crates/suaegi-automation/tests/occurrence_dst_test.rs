@@ -53,13 +53,9 @@ fn la_civil(ms: i64) -> (u32, u32) {
 #[test]
 fn spring_forward_next_daily_gap_rolls_forward() {
     let rrule = build_automation_rrule(AutomationSchedulePreset::Daily, 2, 30, None);
-    let next = next_automation_occurrence_after(
-        &rrule,
-        la(2026, 3, 1, 0, 0),
-        la(2026, 3, 7, 12, 0),
-        LA,
-    )
-    .unwrap();
+    let next =
+        next_automation_occurrence_after(&rrule, la(2026, 3, 1, 0, 0), la(2026, 3, 7, 12, 0), LA)
+            .unwrap();
     // 03:30 PDT — the gap rolled the 02:30 candidate forward one hour.
     assert_eq!(next, utc_ms(2026, 3, 8, 10, 30));
     assert_eq!(la_civil(next), (3, 30), "02:30 rolled forward to 03:30");
@@ -99,7 +95,11 @@ fn fall_back_next_daily_fold_picks_earliest() {
     .unwrap();
     // 01:30 PDT (earlier), NOT 01:30 PST (which would be 09:30Z).
     assert_eq!(next, utc_ms(2026, 11, 1, 8, 30));
-    assert_ne!(next, utc_ms(2026, 11, 1, 9, 30), "must be the EARLIER fold instant");
+    assert_ne!(
+        next,
+        utc_ms(2026, 11, 1, 9, 30),
+        "must be the EARLIER fold instant"
+    );
     assert_eq!(la_civil(next), (1, 30));
 }
 
@@ -139,24 +139,34 @@ fn spring_forward_backward_fixed_day_ms_skips_march_8() {
     let rrule = build_automation_rrule(AutomationSchedulePreset::Weekly, 12, 0, Some(0)); // SU
     let latest = latest_automation_occurrence_at_or_before(
         &rrule,
-        la(2026, 2, 1, 0, 0),        // dtstart well before, so a Some result is guaranteed
-        la(2026, 3, 9, 12, 0),       // now = Monday after spring-forward
+        la(2026, 2, 1, 0, 0), // dtstart well before, so a Some result is guaranteed
+        la(2026, 3, 9, 12, 0), // now = Monday after spring-forward
         LA,
     )
     .unwrap();
 
     // Sanity: both candidate days really are Sundays.
     assert_eq!(
-        LA.timestamp_millis_opt(la(2026, 3, 8, 0, 0)).single().unwrap().weekday(),
+        LA.timestamp_millis_opt(la(2026, 3, 8, 0, 0))
+            .single()
+            .unwrap()
+            .weekday(),
         chrono::Weekday::Sun
     );
     assert_eq!(
-        LA.timestamp_millis_opt(la(2026, 3, 1, 0, 0)).single().unwrap().weekday(),
+        LA.timestamp_millis_opt(la(2026, 3, 1, 0, 0))
+            .single()
+            .unwrap()
+            .weekday(),
         chrono::Weekday::Sun
     );
 
     // Fixed DAY_MS skipped 03-08 → the answer is 03-01, NOT 03-08.
-    assert_eq!(latest, Some(utc_ms(2026, 3, 1, 20, 0)), "2026-03-01T12:00 PST");
+    assert_eq!(
+        latest,
+        Some(utc_ms(2026, 3, 1, 20, 0)),
+        "2026-03-01T12:00 PST"
+    );
     assert_ne!(
         latest,
         Some(la(2026, 3, 8, 12, 0)),

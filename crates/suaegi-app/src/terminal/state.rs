@@ -242,6 +242,7 @@ pub struct State {
     /// 픽셀 스크롤(트랙패드)의 나머지 누산기. 셀 높이로 나눈 나머지를 보존해야
     /// 작은 델타가 여러 번 와도 정확히 한 줄이 된다.
     pub scroll_acc: f32,
+    pub mouse_hidden_after_typing: bool,
     pub mods: Mods,
     /// 진행 중인 IME 조합 문자열(preedit). 조합이 끝나면 `Commit`으로 확정되고
     /// 여기서 지워진다. **내용만 든다** — 선택 구간과 텍스트 크기는 최소 구현에서

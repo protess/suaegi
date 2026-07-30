@@ -14,9 +14,7 @@
 
 use chrono_tz::Tz;
 
-use crate::cron::{
-    cron_has_possible_occurrence, js_trim, parse_cron_expression, ParsedCron,
-};
+use crate::cron::{cron_has_possible_occurrence, js_trim, parse_cron_expression, ParsedCron};
 use crate::rrule::{
     parse_automation_rrule, parse_schedule, AutomationRruleParts, AutomationSchedulePreset,
     ParsedSchedule,
@@ -193,7 +191,10 @@ fn format_parsed_rrule_schedule(schedule: &AutomationRruleParts) -> String {
             format!("Daily at {}", format_time(schedule.hour, schedule.minute))
         }
         AutomationSchedulePreset::Weekdays => {
-            format!("Weekdays at {}", format_time(schedule.hour, schedule.minute))
+            format!(
+                "Weekdays at {}",
+                format_time(schedule.hour, schedule.minute)
+            )
         }
         // `weekly` (and the `custom` union arm, unreachable from parse_automation_rrule).
         AutomationSchedulePreset::Weekly | AutomationSchedulePreset::Custom => {

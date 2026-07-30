@@ -167,9 +167,15 @@ mod tests {
 
     #[test]
     fn non_pr_output_yields_none() {
-        assert_eq!(parse_created_pr("https://github.com/acme/widget/issues/9"), None);
+        assert_eq!(
+            parse_created_pr("https://github.com/acme/widget/issues/9"),
+            None
+        );
         assert_eq!(parse_created_pr("some warning without a url"), None);
-        assert_eq!(parse_created_pr("https://github.com/acme/widget/pull/0"), None);
+        assert_eq!(
+            parse_created_pr("https://github.com/acme/widget/pull/0"),
+            None
+        );
     }
 
     #[test]
@@ -204,12 +210,24 @@ mod tests {
     #[test]
     fn checks_summary_buckets() {
         let checks = vec![
-            GhCheck { bucket: "pass".into() },
-            GhCheck { bucket: "PASS".into() },
-            GhCheck { bucket: "fail".into() },
-            GhCheck { bucket: "cancel".into() },
-            GhCheck { bucket: "pending".into() },
-            GhCheck { bucket: "skipping".into() },
+            GhCheck {
+                bucket: "pass".into(),
+            },
+            GhCheck {
+                bucket: "PASS".into(),
+            },
+            GhCheck {
+                bucket: "fail".into(),
+            },
+            GhCheck {
+                bucket: "cancel".into(),
+            },
+            GhCheck {
+                bucket: "pending".into(),
+            },
+            GhCheck {
+                bucket: "skipping".into(),
+            },
         ];
         let s = summarize_checks(&checks);
         assert_eq!(s.passing, 2);

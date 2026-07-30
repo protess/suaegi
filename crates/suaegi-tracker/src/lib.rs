@@ -9,24 +9,25 @@
 
 pub mod common;
 pub mod jira;
-pub mod link;
 pub mod linear;
+pub mod link;
 
 pub use common::{Classified, Lookup, TrackerUnavailable};
 pub use jira::{
     JiraAuthType, JiraClient, JiraComment, JiraConnection, JiraIssue, JiraIssueFilter, JiraPage,
     JiraProject, JiraViewer,
 };
-pub use link::{
-    resolve_current_issue, resolve_current_jira_issue, LinkedJiraIssue, LinkedLinearIssue,
-};
 pub use linear::{
     canonicalize_linear_issue_attribute_filter, is_empty_linear_issue_attribute_filter,
     linear_issue_attribute_filter_signature, optional_parsed_linear_issue_attribute_filter,
     parse_linear_issue_attribute_filter, Comment, CreatedAttachment, CreatedComment,
     InvalidWriteId, Issue, IssuePage, IssueUpdate, LinearClient, LinearIssueAttributeAssignee,
-    LinearIssueAttributeFilter, LinearIssueAttributeFilterError, LinearWorkspace, NewIssue,
-    WriteId, WriteOutcome, LINEAR_ISSUE_ATTRIBUTE_FILTER_ID_MAX_LENGTH,
-    LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_LABEL_IDS, LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_PRIORITIES,
-    LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_STATE_IDS,
+    LinearIssueAttributeFilter, LinearIssueAttributeFilterError, LinearIssueContextOptions,
+    LinearLabel, LinearMember, LinearProject, LinearRelation, LinearRelationPage, LinearState,
+    LinearTeam, LinearWorkspace, NewIssue, WriteId, WriteOutcome,
+    LINEAR_ISSUE_ATTRIBUTE_FILTER_ID_MAX_LENGTH, LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_LABEL_IDS,
+    LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_PRIORITIES, LINEAR_ISSUE_ATTRIBUTE_FILTER_MAX_STATE_IDS,
+};
+pub use link::{
+    resolve_current_issue, resolve_current_jira_issue, LinkedJiraIssue, LinkedLinearIssue,
 };

@@ -99,10 +99,7 @@ mod tests {
 
         let git_idx = args.iter().position(|a| a == "!.git").unwrap();
         let first_glob = args.iter().position(|a| a == "--glob").unwrap();
-        assert!(
-            git_idx > first_glob,
-            "!.git must follow a --glob: {args:?}"
-        );
+        assert!(git_idx > first_glob, "!.git must follow a --glob: {args:?}");
 
         assert_eq!(&args[args.len() - 3..], &["--", "needle", "/root"]);
     }

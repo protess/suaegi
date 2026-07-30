@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use iced::Task;
 use suaegi_core::domain::{Worktree, WorktreeId};
-use suaegi_term::agent::{build_spawn_by_id, status_source_for_id, StatusSource};
+use suaegi_term::agent::{
+    build_spawn_by_id, build_spawn_by_id_with_profile, status_source_for_id, StatusSource,
+};
 use suaegi_term::grid::TerminalSnapshot;
 use suaegi_term::input_types::CopyRequest;
 use suaegi_term::presence::{AgentPresence, PresenceMonitor, ProcessProbe, PsProbe};
@@ -170,12 +172,14 @@ pub struct SessionSlot {
     pub worktree_id: WorktreeId,
     /// 이 세션을 어느 에이전트로 띄웠나(레지스트리 id, `None`=로그인 셸). 상태
     /// 배선이 훅(Claude)과 OSC-title(그 외) 세션을 가르는 데 쓴다
-    /// ([`status_source_for_id`]). 33행 전체를 표의 id로 다루므로 좁은 `AgentKind`가
+    /// ([`status_source_for_id`]). 전체 행을 표의 id로 다루므로 좁은 `AgentKind`가
     /// 아니라 `&'static str`이다.
     pub agent: Option<&'static str>,
     pub session: Arc<TerminalSession>,
     pub snapshot: TerminalSnapshot,
     pub snapshot_generation: u64,
+    /// Last bell counter delivered to the application layer.
+    pub observed_bell_count: u64,
     /// 진행 중인 스냅샷 요청이 **어느 generation을 뜨는 중인지**. bool로는
     /// 엉뚱한 결과가 남의 가드를 풀어 동시 스냅샷이 생긴다.
     pub snapshot_in_flight: Option<u64>,
@@ -203,6 +207,7 @@ impl SessionSlot {
         agent: Option<&'static str>,
         session: TerminalSession,
     ) -> Self {
+        let observed_bell_count = session.bell_count();
         Self {
             id,
             worktree_id,
@@ -210,6 +215,7 @@ impl SessionSlot {
             session: Arc::new(session),
             snapshot: blank_snapshot(),
             snapshot_generation: 0,
+            observed_bell_count,
             snapshot_in_flight: None,
             presence: AgentPresence::Unknown,
             presence_in_flight: false,
@@ -322,6 +328,18 @@ impl SessionStore {
         prompt: Option<String>,
         env: Vec<(String, String)>,
     ) -> Task<Message> {
+        self.start_configured(id, worktree, agent_id, prompt, env, SCROLLBACK_LINES)
+    }
+
+    pub fn start_configured(
+        &mut self,
+        id: SessionId,
+        worktree: &Worktree,
+        agent_id: Option<&'static str>,
+        prompt: Option<String>,
+        env: Vec<(String, String)>,
+        scrollback_lines: usize,
+    ) -> Task<Message> {
         let worktree_id = worktree.id.clone();
         let cwd = worktree.path.clone();
         // 슬롯이 생기는 `accept_started`까지 어느 에이전트였는지 기억해 둔다.
@@ -329,6 +347,120 @@ impl SessionStore {
         let mut spawn =
             build_spawn_by_id(agent_id, prompt.as_deref(), cwd, DEFAULT_ROWS, DEFAULT_COLS);
         spawn.env.extend(env);
+        self.start_spawn(id, worktree_id, spawn, scrollback_lines, None)
+    }
+
+    pub(crate) fn start_raw(
+        &mut self,
+        id: SessionId,
+        worktree_id: WorktreeId,
+        agent_id: Option<&'static str>,
+        spawn: PtySpawn,
+        scrollback_lines: usize,
+    ) -> Task<Message> {
+        self.pending_agents.insert(id, agent_id);
+        self.start_spawn(id, worktree_id, spawn, scrollback_lines, None)
+    }
+
+    pub(crate) fn start_raw_named(
+        &mut self,
+        id: SessionId,
+        worktree_id: WorktreeId,
+        agent_id: Option<&'static str>,
+        spawn: PtySpawn,
+        scrollback_lines: usize,
+        daemon_id: String,
+    ) -> Task<Message> {
+        self.pending_agents.insert(id, agent_id);
+        self.start_spawn(id, worktree_id, spawn, scrollback_lines, Some(daemon_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_profiled(
+        &mut self,
+        id: SessionId,
+        worktree: &Worktree,
+        agent_id: Option<&'static str>,
+        prompt: Option<String>,
+        env: Vec<(String, String)>,
+        scrollback_lines: usize,
+        command_override: Option<&str>,
+        configured_args: Option<&str>,
+    ) -> Task<Message> {
+        let worktree_id = worktree.id.clone();
+        let parse = |label: &str, value: &str| {
+            suaegi_gen_prompt::tokenize_custom_command_template(value)
+                .map_err(|error| format!("{label} are invalid: {error}"))
+        };
+        let command = command_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| parse("Agent command", value))
+            .transpose();
+        let args = configured_args
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| parse("Agent arguments", value))
+            .transpose();
+        let parsed =
+            command.and_then(|command| args.map(|args| (command, args.unwrap_or_default())));
+        let (command, args) = match parsed {
+            Ok(values) => values,
+            Err(error) => {
+                self.pending_agents.insert(id, agent_id);
+                return Task::done(Message::SessionStarted {
+                    id,
+                    worktree_id,
+                    result: Err(error),
+                });
+            }
+        };
+        let mut spawn = build_spawn_by_id_with_profile(
+            agent_id,
+            prompt.as_deref(),
+            worktree.path.clone(),
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            command.as_deref(),
+            &args,
+        );
+        spawn.env.extend(env);
+        self.pending_agents.insert(id, agent_id);
+        self.start_spawn(id, worktree_id, spawn, scrollback_lines, None)
+    }
+
+    /// Resume a hibernated Claude session using the provider-owned session id.
+    /// The id is validated before it reaches this boundary.
+    pub fn start_resumed_claude(
+        &mut self,
+        id: SessionId,
+        worktree: &Worktree,
+        provider_session_id: String,
+        env: Vec<(String, String)>,
+        scrollback_lines: usize,
+    ) -> Task<Message> {
+        let worktree_id = worktree.id.clone();
+        let mut spawn = build_spawn_by_id(
+            Some("claude"),
+            None,
+            worktree.path.clone(),
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+        );
+        spawn.args = vec!["--resume".to_string(), provider_session_id];
+        spawn.env.extend(env);
+        self.pending_agents.insert(id, Some("claude"));
+        self.start_spawn(id, worktree_id, spawn, scrollback_lines, None)
+    }
+
+    fn start_spawn(
+        &mut self,
+        id: SessionId,
+        worktree_id: WorktreeId,
+        spawn: PtySpawn,
+        scrollback_lines: usize,
+        daemon_id: Option<String>,
+    ) -> Task<Message> {
         // **프로덕션 경로에서 실제로 심긴 env를 관측할 수 있게 한다.**
         // `spawn_env()`를 따로 테스트하는 것만으로는 그 값이 정말 PTY까지
         // 갔는지 알 수 없다 — 그 공백이 복원된 세션에 훅 env가 하나도 심기지
@@ -340,11 +472,18 @@ impl SessionStore {
         background::blocking(move |mut sender| {
             let spec = SessionSpec {
                 pty: spawn,
-                scrollback: SCROLLBACK_LINES,
+                scrollback: scrollback_lines.clamp(1_000, 100_000),
             };
-            let result = TerminalSession::start(spec)
-                .map(StartedSession::new)
-                .map_err(|e| e.to_string());
+            let result = if suaegi_term::daemon::configured() {
+                TerminalSession::start_persistent(
+                    spec,
+                    daemon_id.unwrap_or_else(|| format!("worktree:{}", worktree_id.0.clone())),
+                )
+            } else {
+                TerminalSession::start(spec)
+            }
+            .map(StartedSession::new)
+            .map_err(|e| e.to_string());
             let _ = sender.try_send(Message::SessionStarted {
                 id,
                 worktree_id: worktree_id.clone(),
@@ -366,7 +505,16 @@ impl SessionStore {
     ) -> Result<(), StartRejected> {
         // 거절되든 받아들여지든 pending 엔트리는 여기서 소비한다(안 그러면 샌다).
         // 복원·테스트처럼 `start`를 안 거친 경로는 `None`(로그인 셸/OSC-title)으로 둔다.
-        let agent = self.pending_agents.remove(&id).unwrap_or(None);
+        let requested_agent = self.pending_agents.remove(&id).unwrap_or(None);
+        // 기존 데몬 PTY 안의 프로세스는 이전 앱의 임시 hook 포트/token을
+        // 환경으로 들고 있어 새 hook 서버에 이벤트를 보낼 수 없다. 그 세션을
+        // Hook 전용(Claude)으로 남기면 배지가 영원히 낡으므로, 재부착 세션은
+        // OSC-title + foreground probe 경로로 폴백한다.
+        let agent = if session.was_reattached() {
+            None
+        } else {
+            requested_agent
+        };
         if !worktree_still_exists {
             self.retire(Arc::new(session), Some(id));
             return Err(StartRejected::WorktreeGone);
@@ -380,6 +528,11 @@ impl SessionStore {
     /// 훅(Claude) 세션과 OSC-title 세션을 가른다.
     pub fn status_source(&self, id: SessionId) -> Option<StatusSource> {
         self.slots.get(&id).map(|s| status_source_for_id(s.agent))
+    }
+
+    /// Agent registry id used to launch this live session.
+    pub fn agent(&self, id: SessionId) -> Option<&'static str> {
+        self.slots.get(&id).and_then(|slot| slot.agent)
     }
 
     /// 스냅샷은 UI 스레드에서 뜨지 않는다. 이미 진행 중이면 `false`를 반환하고
@@ -564,6 +717,22 @@ impl SessionStore {
     }
 
     fn retire(&self, session: Arc<TerminalSession>, id: Option<SessionId>) {
+        // 명시적 pane close는 데몬 세션까지 kill해야 하지만 control RPC가
+        // 블로킹 I/O라 UI 스레드에서 부를 수 없다. kill 전용 스레드가 Arc를
+        // 들고 있는 동안 Reaper는 strong_count > 1을 보고 기다리고, kill이
+        // 끝나 Arc가 떨어진 뒤에만 실제 TerminalSession 소멸자를 실행한다.
+        let killer = Arc::clone(&session);
+        if std::thread::Builder::new()
+            .name("suaegi-session-killer".to_string())
+            .spawn(move || {
+                let _ = killer.kill();
+            })
+            .is_err()
+        {
+            // 스레드 생성 자체가 실패한 드문 경로에서는 명시적 close 의미를
+            // 잃고 데몬 세션을 고아로 남기는 것보다 이 호출이 잠깐 막히는 편이 낫다.
+            let _ = session.kill();
+        }
         let retired_count = Arc::clone(&self.retired_count);
         let reaped_at = Arc::clone(&self.reaped_at);
         let track_reaped_at = self.track_reaped_at;
@@ -624,6 +793,28 @@ impl SessionStore {
             Some(slot) => &slot.snapshot,
             None => EMPTY.get_or_init(blank_snapshot),
         }
+    }
+
+    /// Returns true once for each observed increase in a session's real BEL
+    /// counter. Multiple bells between UI frames intentionally coalesce into
+    /// one desktop notification.
+    pub fn take_bell(&mut self, id: SessionId) -> bool {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return false;
+        };
+        let current = slot.session.bell_count();
+        if current <= slot.observed_bell_count {
+            return false;
+        }
+        slot.observed_bell_count = current;
+        true
+    }
+
+    pub fn take_osc52_writes(&mut self, id: SessionId) -> Vec<String> {
+        self.slots
+            .get_mut(&id)
+            .map(|slot| slot.session.take_osc52_writes())
+            .unwrap_or_default()
     }
 
     // ---- 리사이즈: 워커 + 세션당 최신 seq만 (Task 0.8 스레딩 정책 표) ----
@@ -783,6 +974,7 @@ impl SessionStore {
                 args: command.1,
                 cwd: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 rows: DEFAULT_ROWS,
                 cols: DEFAULT_COLS,
             },
@@ -890,6 +1082,7 @@ impl SessionStore {
                 args,
                 cwd: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 rows: DEFAULT_ROWS,
                 cols: DEFAULT_COLS,
             },

@@ -272,12 +272,14 @@ mod tests {
         assert_eq!(result.len(), 4);
 
         // 0: slice(0, 0) => empty.
-        let result = compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(0.0));
+        let result =
+            compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(0.0));
         assert_eq!(result.len(), 0);
 
         // -1: drops only the last element (len 4 -> 3), NOT truncate's
         // saturating-to-0 behavior.
-        let result = compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(-1.0));
+        let result =
+            compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(-1.0));
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].path, "new");
         assert_eq!(result[1].path, "a");
@@ -349,7 +351,8 @@ mod tests {
             entry("gitlab.com", "b", "2"),
             entry("gitlab.com", "c", "3"),
         ];
-        let result = compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(1.0));
+        let result =
+            compute_next_gitlab_recents(&existing, "gitlab.com", "new", FIXED_NOW, Some(1.0));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "new");
     }

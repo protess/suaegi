@@ -133,7 +133,8 @@ pub fn resolve_native_chat_transcript_agent(
 mod tests {
     use super::{
         is_native_chat_supported_agent, resolve_native_chat_transcript_agent,
-        should_step_native_chat_ask_answer, NativeChatTranscriptAgent, NATIVE_CHAT_SUPPORTED_AGENTS,
+        should_step_native_chat_ask_answer, NativeChatTranscriptAgent,
+        NATIVE_CHAT_SUPPORTED_AGENTS,
     };
 
     // Oracle: native-chat-agent-support.test.ts
@@ -266,10 +267,7 @@ mod tests {
         assert!(!is_native_chat_supported_agent(Some(" claude ")));
         assert!(!is_native_chat_supported_agent(Some("")));
         assert_eq!(resolve_native_chat_transcript_agent(Some("Claude")), None);
-        assert_eq!(
-            resolve_native_chat_transcript_agent(Some(" claude ")),
-            None
-        );
+        assert_eq!(resolve_native_chat_transcript_agent(Some(" claude ")), None);
         assert_eq!(resolve_native_chat_transcript_agent(Some("")), None);
         assert!(!should_step_native_chat_ask_answer(Some("Claude")));
         assert!(!should_step_native_chat_ask_answer(Some(" claude ")));
@@ -291,6 +289,9 @@ mod tests {
                 .map(NativeChatTranscriptAgent::as_str),
             Some("claude")
         );
-        assert_eq!(resolve_native_chat_transcript_agent(Some("unknown-agent")), None);
+        assert_eq!(
+            resolve_native_chat_transcript_agent(Some("unknown-agent")),
+            None
+        );
     }
 }

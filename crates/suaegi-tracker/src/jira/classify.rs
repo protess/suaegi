@@ -117,7 +117,11 @@ mod tests {
         );
         // 어느 것도 NotFound(None)로 새지 않는다.
         for s in [429, 500, 502, 503] {
-            assert_ne!(classify_jira_status(s, None), JiraStatus::NotFound, "status={s}");
+            assert_ne!(
+                classify_jira_status(s, None),
+                JiraStatus::NotFound,
+                "status={s}"
+            );
         }
     }
 

@@ -82,7 +82,10 @@ fn oversized_expression_is_rejected_before_tokenizing() {
 fn byte_guard_boundary_is_utf8_len() {
     // F4: `s.len() > 2048` rejects; `== 2048` accepts. Pad a valid cron with spaces.
     let base = "0 0 * * *"; // 9 bytes → 5 fields
-    let at_limit = format!("{base}{}", " ".repeat(AUTOMATION_CRON_EXPRESSION_MAX_BYTES - base.len()));
+    let at_limit = format!(
+        "{base}{}",
+        " ".repeat(AUTOMATION_CRON_EXPRESSION_MAX_BYTES - base.len())
+    );
     assert_eq!(at_limit.len(), AUTOMATION_CRON_EXPRESSION_MAX_BYTES);
     assert_eq!(
         get_automation_cron_expression_fields(&at_limit, 5),
@@ -106,10 +109,18 @@ fn byte_guard_boundary_is_utf8_len() {
 fn malformed_separators_are_invalid() {
     // Two steps in one field (`*/15/2`) → stepParts.length > 2.
     assert!(parse_cron_expression("*/15/2 9 * * *").is_err());
-    assert!(!is_valid_automation_cron_schedule("*/15/2 9 * * *", anchor(), UTC));
+    assert!(!is_valid_automation_cron_schedule(
+        "*/15/2 9 * * *",
+        anchor(),
+        UTC
+    ));
     // Empty range end (`1--5`).
     assert!(parse_cron_expression("0 9 1--5 * *").is_err());
-    assert!(!is_valid_automation_cron_schedule("0 9 1--5 * *", anchor(), UTC));
+    assert!(!is_valid_automation_cron_schedule(
+        "0 9 1--5 * *",
+        anchor(),
+        UTC
+    ));
 }
 
 // -------------------------------------------------------------------------------------
@@ -120,7 +131,11 @@ fn malformed_separators_are_invalid() {
 fn dom31_in_february_never_runs() {
     // Parses fine, but the 3294-day scan finds no match.
     assert!(parse_cron_expression("0 0 31 2 *").is_ok());
-    assert!(!is_valid_automation_cron_schedule("0 0 31 2 *", anchor(), UTC));
+    assert!(!is_valid_automation_cron_schedule(
+        "0 0 31 2 *",
+        anchor(),
+        UTC
+    ));
 }
 
 // -------------------------------------------------------------------------------------
@@ -161,8 +176,14 @@ fn full_dow_ranges_are_unrestricted_and_valid() {
     // `0 9 * * 0-7` and `0 9 * * 1-7` both fold to the full 7-element DOW set.
     for expr in ["0 9 * * 0-7", "0 9 * * 1-7"] {
         let rule = parse_cron_expression(expr).unwrap();
-        assert!(!rule.day_of_week_restricted, "{expr} should be unrestricted");
-        assert!(is_valid_automation_cron_schedule(expr, anchor(), UTC), "{expr} should be valid");
+        assert!(
+            !rule.day_of_week_restricted,
+            "{expr} should be unrestricted"
+        );
+        assert!(
+            is_valid_automation_cron_schedule(expr, anchor(), UTC),
+            "{expr} should be valid"
+        );
     }
 }
 
@@ -172,7 +193,10 @@ fn full_dow_ranges_are_unrestricted_and_valid() {
 
 #[test]
 fn f1_dom_syntaxes_that_collapse_to_unrestricted() {
-    let full_dom_list = (1..=31).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let full_dom_list = (1..=31)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let full_dom_expr = format!("0 9 {full_dom_list} * MON");
     for expr in [
         "0 9 */1 * MON".to_string(),
@@ -180,20 +204,39 @@ fn f1_dom_syntaxes_that_collapse_to_unrestricted() {
         full_dom_expr,
     ] {
         let rule = parse_cron_expression(&expr).unwrap();
-        assert!(!rule.day_of_month_restricted, "{expr}: DOM must be unrestricted");
-        assert!(rule.day_of_week_restricted, "{expr}: DOW MON must be restricted");
+        assert!(
+            !rule.day_of_month_restricted,
+            "{expr}: DOM must be unrestricted"
+        );
+        assert!(
+            rule.day_of_week_restricted,
+            "{expr}: DOW MON must be restricted"
+        );
         // Unrestricted DOM → AND → Monday only.
-        assert!(cron_date_matches(&rule, ms(2026, 5, 18, 9, 0), UTC), "{expr}: Monday matches");
-        assert!(!cron_date_matches(&rule, ms(2026, 5, 1, 9, 0), UTC), "{expr}: Friday-1st excluded");
+        assert!(
+            cron_date_matches(&rule, ms(2026, 5, 18, 9, 0), UTC),
+            "{expr}: Monday matches"
+        );
+        assert!(
+            !cron_date_matches(&rule, ms(2026, 5, 1, 9, 0), UTC),
+            "{expr}: Friday-1st excluded"
+        );
     }
 }
 
 #[test]
 fn f1_dow_syntaxes_that_collapse_to_unrestricted() {
     let full_dow_list = "0,1,2,3,4,5,6";
-    for expr in ["0 9 * * 0-7", "0 9 * * 1-7", &format!("0 9 * * {full_dow_list}")] {
+    for expr in [
+        "0 9 * * 0-7",
+        "0 9 * * 1-7",
+        &format!("0 9 * * {full_dow_list}"),
+    ] {
         let rule = parse_cron_expression(expr).unwrap();
-        assert!(!rule.day_of_week_restricted, "{expr}: DOW must be unrestricted");
+        assert!(
+            !rule.day_of_week_restricted,
+            "{expr}: DOW must be unrestricted"
+        );
     }
 }
 
@@ -212,7 +255,10 @@ fn f1_sunday_seven_normalizes_before_cardinality() {
 
 #[test]
 fn f1_requires_exactly_five_fields() {
-    assert_eq!(parse_cron_expression("0 9 * *"), Err(suaegi_automation::CronError::WrongFieldCount));
+    assert_eq!(
+        parse_cron_expression("0 9 * *"),
+        Err(suaegi_automation::CronError::WrongFieldCount)
+    );
     assert_eq!(
         parse_cron_expression("0 9 * * * *"),
         Err(suaegi_automation::CronError::WrongFieldCount)
@@ -228,7 +274,11 @@ fn f1_requires_exactly_five_fields() {
 fn leap_day_schedule_is_valid() {
     // `0 0 29 2 *`: DOM {29} restricted, DOW unrestricted → AND → Feb 29. There IS a
     // Feb 29 within the 9-year scan window (2028), so it is valid.
-    assert!(is_valid_automation_cron_schedule("0 0 29 2 *", anchor(), UTC));
+    assert!(is_valid_automation_cron_schedule(
+        "0 0 29 2 *",
+        anchor(),
+        UTC
+    ));
 }
 
 #[test]
@@ -264,9 +314,18 @@ fn name_tables_parse_correctly() {
     assert_eq!(march.months, set(&[3]));
 
     // Both 2-letter and 3-letter day codes resolve (SU/SUN = 0, SA/SAT = 6).
-    assert_eq!(parse_cron_expression("0 0 * * SU").unwrap().days_of_week, set(&[0]));
-    assert_eq!(parse_cron_expression("0 0 * * SUN").unwrap().days_of_week, set(&[0]));
-    assert_eq!(parse_cron_expression("0 0 * * SAT").unwrap().days_of_week, set(&[6]));
+    assert_eq!(
+        parse_cron_expression("0 0 * * SU").unwrap().days_of_week,
+        set(&[0])
+    );
+    assert_eq!(
+        parse_cron_expression("0 0 * * SUN").unwrap().days_of_week,
+        set(&[0])
+    );
+    assert_eq!(
+        parse_cron_expression("0 0 * * SAT").unwrap().days_of_week,
+        set(&[6])
+    );
 }
 
 // -------------------------------------------------------------------------------------
@@ -290,16 +349,37 @@ fn cron_matches_checks_hour_and_minute() {
 #[test]
 fn field_parser_rejects_bad_steps_and_ranges() {
     // Step must be a positive integer.
-    assert!(parse_cron_expression("*/0 9 * * *").is_err(), "step 0 rejected");
-    assert!(parse_cron_expression("5/ 9 * * *").is_err(), "empty step rejected");
+    assert!(
+        parse_cron_expression("*/0 9 * * *").is_err(),
+        "step 0 rejected"
+    );
+    assert!(
+        parse_cron_expression("5/ 9 * * *").is_err(),
+        "empty step rejected"
+    );
     // Out-of-range single value.
-    assert!(parse_cron_expression("60 9 * * *").is_err(), "minute 60 out of range");
-    assert!(parse_cron_expression("0 24 * * *").is_err(), "hour 24 out of range");
-    assert!(parse_cron_expression("0 9 0 * *").is_err(), "day-of-month 0 out of range");
+    assert!(
+        parse_cron_expression("60 9 * * *").is_err(),
+        "minute 60 out of range"
+    );
+    assert!(
+        parse_cron_expression("0 24 * * *").is_err(),
+        "hour 24 out of range"
+    );
+    assert!(
+        parse_cron_expression("0 9 0 * *").is_err(),
+        "day-of-month 0 out of range"
+    );
     // start > end.
-    assert!(parse_cron_expression("0 9 * * 5-1").is_err(), "reversed range rejected");
+    assert!(
+        parse_cron_expression("0 9 * * 5-1").is_err(),
+        "reversed range rejected"
+    );
     // Empty list part.
-    assert!(parse_cron_expression("0 9 1,,3 * *").is_err(), "empty list part rejected");
+    assert!(
+        parse_cron_expression("0 9 1,,3 * *").is_err(),
+        "empty list part rejected"
+    );
 }
 
 #[test]

@@ -8,16 +8,18 @@
 //! 없는 diff 알고리즘을 새로 쓰는 셈이라 **더 비싸다.** `file_diff`가 이미
 //! 완성된 patch를 준다.
 
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::text::Wrapping;
+use iced::widget::{button, column, container, row, scrollable};
 use iced::{Color, Element, Font, Length};
 
 use suaegi_core::domain::WorktreeId;
 use suaegi_git::compare::{ChangeStatus, ChangedFile, CompareHandle, CompareOutcome, FileDiff};
 
+use crate::i18n::text;
 use crate::state::{DiffFailure, Message, OpId};
 
 /// 패널 고정 폭. 사이드바와 같은 이유로 `row!` 레벨에서 못 박는다.
-pub const WIDTH: f32 = 420.0;
+pub const WIDTH: f32 = 320.0;
 
 /// 목록 영역의 상태. **`Cancelled`에 대응하는 변형이 없는 것이 의도다** —
 /// 취소는 상태 전이가 아니라 "아무 일도 일어나지 않음"이다([`panel_state_for`]).
@@ -67,6 +69,7 @@ pub struct DiffState {
     /// 하나가 나중에 도착해 새 결과를 덮으면 사용자는 옛 목록을 본다.
     latest_compare_op: Option<OpId>,
     latest_patch_op: Option<OpId>,
+    file_tree_visible: bool,
     /// 진행 중인 비교의 취소 손잡이. 패널을 닫으면 당긴다.
     cancel: Option<CompareHandle>,
 }
@@ -203,15 +206,33 @@ impl DiffState {
         self.selected_file.as_deref()
     }
 
+    pub fn file_tree_visible(&self) -> bool {
+        self.file_tree_visible
+    }
+
+    pub fn toggle_file_tree(&mut self) {
+        self.file_tree_visible = !self.file_tree_visible;
+    }
+
     /// 비교를 시작한다. 이전 비교가 진행 중이면 **먼저 취소한다** — 안 그러면
     /// 옛 비교가 끝까지 돌며 최대 210초 동안 git을 붙든다.
     pub fn begin_compare(&mut self, worktree: WorktreeId, op: OpId) -> CompareHandle {
+        self.begin_compare_with_file_tree(worktree, op, true)
+    }
+
+    pub fn begin_compare_with_file_tree(
+        &mut self,
+        worktree: WorktreeId,
+        op: OpId,
+        file_tree_visible: bool,
+    ) -> CompareHandle {
         self.cancel_in_flight();
         self.panel = PanelState::Loading;
         self.worktree = Some(worktree);
         self.selected_file = None;
         self.patch = PatchState::Idle;
         self.latest_compare_op = Some(op);
+        self.file_tree_visible = file_tree_visible;
         let handle = CompareHandle::new();
         self.cancel = Some(handle.clone());
         handle
@@ -293,32 +314,58 @@ impl DiffState {
 
 // ---- view ----
 
-pub fn view(state: &DiffState) -> Option<Element<'_, Message>> {
+pub fn view(
+    state: &DiffState,
+    side_by_side: bool,
+    word_wrap: bool,
+    font: Font,
+) -> Option<Element<'_, Message>> {
     if !state.is_open() {
         return None;
     }
     let worktree = state.worktree()?.clone();
 
     let header = row![
-        text("Changes").size(15).width(Length::Fill),
-        button(text("close").size(12)).on_press(Message::DiffCancelled { worktree }),
+        text("Changes").size(17).width(Length::Fill),
+        button(
+            text(if state.file_tree_visible() {
+                "Hide files"
+            } else {
+                "Show files"
+            })
+            .size(11)
+        )
+        .on_press(Message::DiffFileTreeToggled)
+        .style(crate::theme::ghost_button),
+        button(text("×").size(14))
+            .on_press(Message::DiffCancelled { worktree })
+            .style(crate::theme::ghost_button),
     ]
     .spacing(6);
 
     let mut body = column![header].spacing(8).padding(12);
 
     if let Some(message) = status_message(state.panel()) {
-        body = body.push(text(message).size(12));
+        body = body.push(text(message).size(14));
     }
-    if let PanelState::Ready(files) = state.panel() {
-        body = body.push(file_list(state, files));
+    if state.file_tree_visible() {
+        if let PanelState::Ready(files) = state.panel() {
+            body = body.push(file_list(state, files));
+        }
+    } else if matches!(state.patch(), PatchState::Idle) {
+        body = body.push(
+            text("The changed-file tree is hidden by your default diff setting.")
+                .size(11)
+                .color(crate::theme::MUTED),
+        );
     }
-    body = body.push(patch_view(state.patch()));
+    body = body.push(patch_view(state.patch(), side_by_side, word_wrap, font));
 
     Some(
         container(body)
             .width(Length::Fixed(WIDTH))
             .height(Length::Fill)
+            .style(crate::theme::context_panel)
             .into(),
     )
 }
@@ -344,9 +391,14 @@ fn file_list<'a>(state: &'a DiffState, files: &'a [ChangedFile]) -> Element<'a, 
             path: file.path.clone(),
         });
         list = list.push(
-            button(text(label).size(12))
+            button(text(label).size(14))
                 .on_press_maybe(press)
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .style(if selected {
+                    crate::theme::selected_button
+                } else {
+                    crate::theme::ghost_button
+                }),
         );
     }
     scrollable(list).height(Length::FillPortion(2)).into()
@@ -360,40 +412,79 @@ fn counts_suffix(file: &ChangedFile) -> String {
     }
 }
 
-fn patch_view(state: &PatchState) -> Element<'_, Message> {
+fn patch_view(
+    state: &PatchState,
+    side_by_side: bool,
+    word_wrap: bool,
+    font: Font,
+) -> Element<'_, Message> {
     let body: Element<'_, Message> = match state {
-        PatchState::Idle => text("Select a file to see its patch.").size(12).into(),
-        PatchState::Loading => text("Loading patch…").size(12).into(),
+        PatchState::Idle => text("Select a file to see its patch.").size(14).into(),
+        PatchState::Loading => text("Loading patch…").size(14).into(),
         PatchState::Failed(message) => text(format!("Could not load patch: {message}"))
-            .size(12)
+            .size(14)
             .into(),
-        PatchState::Loaded(FileDiff::Binary) => text("Binary file — no text diff.").size(12).into(),
+        PatchState::Loaded(FileDiff::Binary) => text("Binary file — no text diff.").size(14).into(),
         PatchState::Loaded(FileDiff::TooLarge { limit }) => text(format!(
             "Patch is too large to display (over {} MB).",
             limit / (1024 * 1024)
         ))
-        .size(12)
+        .size(14)
         .into(),
         // **추측하지 않는다** — 타입 변경·미병합 등은 무엇을 보여줘야 하는지 모른다.
         PatchState::Loaded(FileDiff::NonRenderable(code)) => {
             text(format!("No preview for change type '{code}'."))
-                .size(12)
+                .size(14)
                 .into()
         }
-        PatchState::Loaded(FileDiff::Patch(patch)) => patch_lines(patch),
+        PatchState::Loaded(FileDiff::Patch(patch)) if side_by_side => {
+            side_by_side_patch_lines(patch, word_wrap, font)
+        }
+        PatchState::Loaded(FileDiff::Patch(patch)) => patch_lines(patch, word_wrap, font),
     };
     scrollable(body).height(Length::FillPortion(3)).into()
 }
 
-fn patch_lines(patch: &str) -> Element<'_, Message> {
+fn patch_lines(patch: &str, word_wrap: bool, font: Font) -> Element<'_, Message> {
     let mut lines = column![].spacing(0);
     for line in patch.lines() {
         lines = lines.push(
             text(line.to_string())
-                .size(11)
-                .font(Font::MONOSPACE)
+                .size(13)
+                .font(font)
+                .wrapping(if word_wrap {
+                    Wrapping::WordOrGlyph
+                } else {
+                    Wrapping::None
+                })
                 .color(line_color(line_kind(line))),
         );
+    }
+    lines.into()
+}
+
+fn side_by_side_patch_lines(patch: &str, word_wrap: bool, font: Font) -> Element<'_, Message> {
+    let mut lines = column![].spacing(1);
+    for line in patch.lines() {
+        let kind = line_kind(line);
+        let (left, right) = match kind {
+            LineKind::Removed => (line, ""),
+            LineKind::Added => ("", line),
+            _ => (line, line),
+        };
+        let make = |value: &str| {
+            text(value.to_string())
+                .size(12)
+                .font(font)
+                .wrapping(if word_wrap {
+                    Wrapping::WordOrGlyph
+                } else {
+                    Wrapping::None
+                })
+                .color(line_color(kind))
+                .width(Length::FillPortion(1))
+        };
+        lines = lines.push(row![make(left), make(right)].spacing(8));
     }
     lines.into()
 }

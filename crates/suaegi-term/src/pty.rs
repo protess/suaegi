@@ -21,6 +21,7 @@ pub struct PtySpawn {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
     pub rows: u16,
     pub cols: u16,
 }
@@ -46,6 +47,8 @@ pub struct PtySession {
     /// `kill()`에서 멈추면 "Drop은 블로킹하지 않는다"는 보장이 깨진다.
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Immutable direct child PID captured before the child can be reaped.
+    pid: u32,
     /// 스폰 시점에 고정한 프로세스 그룹 ID (= 직속 자식의 PID). 나중에 자식을
     /// 조회하지 않고 이 값을 쓴다 — 락 회피 + 값 불변.
     #[cfg(unix)]
@@ -177,6 +180,9 @@ impl PtySession {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        for key in &spec.env_remove {
+            cmd.env_remove(key);
+        }
 
         let mut child = pair
             .slave
@@ -217,8 +223,9 @@ impl PtySession {
         let killer = child.clone_killer();
         // 그룹 ID를 지금 고정한다 — portable-pty는 자식을 자체 세션/그룹으로 띄우므로
         // pgid == 직속 자식의 PID다
+        let pid = child.process_id().unwrap_or(0);
         #[cfg(unix)]
-        let pgid = child.process_id().unwrap_or(0) as i32;
+        let pgid = pid as i32;
 
         // slave를 붙들고 있으면 자식이 죽어도 리더가 EOF를 보지 못한다
         drop(pair.slave);
@@ -229,6 +236,7 @@ impl PtySession {
                 writer: Mutex::new(writer),
                 child: Mutex::new(child),
                 killer: Mutex::new(killer),
+                pid,
                 #[cfg(unix)]
                 pgid,
                 lifecycle: Mutex::new(Lifecycle::default()),
@@ -243,6 +251,10 @@ impl PtySession {
         writer.write_all(bytes)?;
         writer.flush()?;
         Ok(())
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.pid
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), TermError> {

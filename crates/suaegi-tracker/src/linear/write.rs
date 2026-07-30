@@ -26,8 +26,8 @@
 //! message-substring으로 폴백한다(human-eyes로 실측). raw message는 **탐지에만** 쓰고 결과엔 담지 않는다.
 
 use super::classify::{classify_graphql, GraphqlOutcome};
-use super::client::{parse_issue, ISSUE_FIELDS};
-use super::model::{Classified, Issue, TrackerUnavailable};
+use super::client::{parse_issue, parse_relation, ISSUE_FIELDS};
+use super::model::{Classified, Issue, LinearRelation, TrackerUnavailable};
 use super::LinearClient;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -204,16 +204,49 @@ impl LinearClient {
     /// 이슈 생성(`createIssueForAgent`). write-id를 `input.id`로 실어 멱등하게. 성공이면 write-id로
     /// readback해 확인된 [`Issue`]를 [`WriteOutcome::Written`]으로.
     pub async fn create_issue(&self, write_id: &WriteId, input: NewIssue) -> WriteOutcome<Issue> {
-        const CREATE: &str = "mutation IssueCreate($input: IssueCreateInput!) { \
-             issueCreate(input: $input) { success issue { id } } }";
         let mut fields = json!({
-            "id": write_id.as_str(),
             "teamId": input.team_id,
             "title": input.title,
         });
         if let Some(desc) = &input.description {
             fields["description"] = json!(desc);
         }
+        self.create_issue_fields(write_id, fields).await
+    }
+
+    /// Create an issue with the complete Linear `IssueCreateInput` surface used by the
+    /// agent CLI. The caller supplies provider field names; this boundary restricts
+    /// them to Orca's supported issue fields and owns the idempotency id.
+    pub async fn create_issue_fields(
+        &self,
+        write_id: &WriteId,
+        mut fields: Value,
+    ) -> WriteOutcome<Issue> {
+        const CREATE: &str = "mutation IssueCreate($input: IssueCreateInput!) { \
+             issueCreate(input: $input) { success issue { id } } }";
+        let Some(object) = fields.as_object_mut() else {
+            return WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput));
+        };
+        if !object.contains_key("teamId") || !object.contains_key("title") {
+            return WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput));
+        }
+        const ALLOWED: &[&str] = &[
+            "teamId",
+            "title",
+            "description",
+            "stateId",
+            "assigneeId",
+            "priority",
+            "estimate",
+            "dueDate",
+            "labelIds",
+            "projectId",
+            "parentId",
+        ];
+        if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput));
+        }
+        object.insert("id".into(), json!(write_id.as_str()));
         let vars = json!({ "input": fields });
         if let Err(halt) = self
             .post_mutation(CREATE, vars, "issueCreate", write_id.as_str())
@@ -231,8 +264,6 @@ impl LinearClient {
     /// 이슈 갱신(`updateIssueForAgent`) — **`state_id`가 상태 전이(워크플로우 이동)**. 갱신 후
     /// 대상 이슈 id로 readback해 확인. update는 create가 아니라 duplicate가 없다(자연 멱등).
     pub async fn update_issue(&self, issue_id: &str, update: IssueUpdate) -> WriteOutcome<Issue> {
-        const UPDATE: &str = "mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { \
-             issueUpdate(id: $id, input: $input) { success issue { id } } }";
         let mut fields = json!({});
         if let Some(v) = &update.state_id {
             fields["stateId"] = json!(v);
@@ -245,6 +276,32 @@ impl LinearClient {
         }
         if let Some(v) = &update.assignee_id {
             fields["assigneeId"] = json!(v);
+        }
+        self.update_issue_fields(issue_id, fields).await
+    }
+
+    /// Update the complete Orca-supported `IssueUpdateInput` field set. `null`
+    /// intentionally clears nullable fields; absent fields remain unchanged.
+    pub async fn update_issue_fields(&self, issue_id: &str, fields: Value) -> WriteOutcome<Issue> {
+        const UPDATE: &str = "mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { \
+             issueUpdate(id: $id, input: $input) { success issue { id } } }";
+        let Some(object) = fields.as_object() else {
+            return WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput));
+        };
+        const ALLOWED: &[&str] = &[
+            "stateId",
+            "title",
+            "description",
+            "assigneeId",
+            "priority",
+            "estimate",
+            "dueDate",
+            "labelIds",
+            "projectId",
+            "parentId",
+        ];
+        if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput));
         }
         let vars = json!({ "id": issue_id, "input": fields });
         // update엔 write-id가 input.id로 실리지 않는다(대상은 기존 이슈, 자연 멱등) → duplicate
@@ -266,13 +323,28 @@ impl LinearClient {
         issue_id: &str,
         body: &str,
     ) -> WriteOutcome<CreatedComment> {
+        self.add_comment_with_parent(write_id, issue_id, body, None)
+            .await
+    }
+
+    pub async fn add_comment_with_parent(
+        &self,
+        write_id: &WriteId,
+        issue_id: &str,
+        body: &str,
+        parent_id: Option<&str>,
+    ) -> WriteOutcome<CreatedComment> {
         const CREATE: &str = "mutation CommentCreate($input: CommentCreateInput!) { \
              commentCreate(input: $input) { success comment { id } } }";
-        let vars = json!({ "input": {
+        let mut input = json!({
             "id": write_id.as_str(),
             "issueId": issue_id,
             "body": body,
-        }});
+        });
+        if let Some(parent_id) = parent_id {
+            input["parentId"] = json!(parent_id);
+        }
+        let vars = json!({ "input": input });
         if let Err(halt) = self
             .post_mutation(CREATE, vars, "commentCreate", write_id.as_str())
             .await
@@ -311,6 +383,90 @@ impl LinearClient {
         match self.readback_attachment(write_id.as_str()).await {
             Ok(attachment) => WriteOutcome::Written(attachment),
             Err(halt) => halt.into_outcome(),
+        }
+    }
+
+    pub async fn create_issue_relation(
+        &self,
+        issue_id: &str,
+        related_issue_id: &str,
+        relation_type: &str,
+    ) -> WriteOutcome<LinearRelation> {
+        const CREATE: &str = "mutation IssueRelationCreate($input: IssueRelationCreateInput!) { \
+            issueRelationCreate(input: $input) { success issueRelation { \
+                id type issue { id identifier title url } relatedIssue { id identifier title url } \
+            } } }";
+        let variables = json!({"input": {
+            "issueId": issue_id,
+            "relatedIssueId": related_issue_id,
+            "type": relation_type,
+        }});
+        let response = match self.post_graphql(CREATE, variables, WRITE_TIMEOUT).await {
+            None => {
+                return WriteOutcome::Unavailable(Classified::new(
+                    TrackerUnavailable::NotAuthenticated,
+                ))
+            }
+            Some(Err(TransportError::Timeout)) => return WriteOutcome::Unconfirmed,
+            Some(Err(TransportError::Connect(_))) => {
+                return WriteOutcome::Unavailable(Classified::new(TrackerUnavailable::Network))
+            }
+            Some(Ok(response)) => response,
+        };
+        match classify_graphql(response.status, &response.body) {
+            GraphqlOutcome::Success(data) => {
+                let result = &data["issueRelationCreate"];
+                if result["success"].as_bool() == Some(true) && !result["issueRelation"].is_null() {
+                    WriteOutcome::Written(parse_relation(&result["issueRelation"], true))
+                } else {
+                    WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput))
+                }
+            }
+            GraphqlOutcome::Failure(classified) => {
+                if is_duplicate_write_error(&response.body) {
+                    WriteOutcome::Unconfirmed
+                } else if classified.kind == TrackerUnavailable::InvalidInput {
+                    WriteOutcome::Rejected(classified)
+                } else {
+                    WriteOutcome::Unavailable(classified)
+                }
+            }
+        }
+    }
+
+    pub async fn delete_issue_relation(&self, relation_id: &str) -> WriteOutcome<()> {
+        const DELETE: &str = "mutation IssueRelationDelete($id: String!) { \
+            issueRelationDelete(id: $id) { success } }";
+        let response = match self
+            .post_graphql(DELETE, json!({"id": relation_id}), WRITE_TIMEOUT)
+            .await
+        {
+            None => {
+                return WriteOutcome::Unavailable(Classified::new(
+                    TrackerUnavailable::NotAuthenticated,
+                ))
+            }
+            Some(Err(TransportError::Timeout)) => return WriteOutcome::Unconfirmed,
+            Some(Err(TransportError::Connect(_))) => {
+                return WriteOutcome::Unavailable(Classified::new(TrackerUnavailable::Network))
+            }
+            Some(Ok(response)) => response,
+        };
+        match classify_graphql(response.status, &response.body) {
+            GraphqlOutcome::Success(data)
+                if data["issueRelationDelete"]["success"].as_bool() == Some(true) =>
+            {
+                WriteOutcome::Written(())
+            }
+            GraphqlOutcome::Success(_) => {
+                WriteOutcome::Rejected(Classified::new(TrackerUnavailable::InvalidInput))
+            }
+            GraphqlOutcome::Failure(classified)
+                if classified.kind == TrackerUnavailable::InvalidInput =>
+            {
+                WriteOutcome::Rejected(classified)
+            }
+            GraphqlOutcome::Failure(classified) => WriteOutcome::Unavailable(classified),
         }
     }
 
@@ -378,7 +534,8 @@ impl LinearClient {
     /// write 후 이슈 readback. **모든 실패(전송/GraphQL/null) → Unconfirmed** — write가 랜딩했는지
     /// 확인 못함. 성공+비-null만 확인된 [`Issue`](Orca `confirmLinearWrite`+`getCreatedIssueRecord`).
     async fn readback_issue(&self, id: &str) -> Result<Issue, WriteHalt> {
-        let query = format!("query IssueByUuid($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
+        let query =
+            format!("query IssueByUuid($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
         let node = self.readback_node(&query, id, "issue").await?;
         Ok(parse_issue(&node))
     }
@@ -411,7 +568,10 @@ impl LinearClient {
     /// readback 공통: POST → 성공이면 `root` 노드(비-null)를 준다. **모든 실패는 Unconfirmed**(전송
     /// 실패, GraphQL 에러, 성공+null 모두). write가 랜딩했는지 확인 못함 — 성공/실패 주장 안 함.
     async fn readback_node(&self, query: &str, id: &str, root: &str) -> Result<Value, WriteHalt> {
-        match self.post_graphql(query, json!({ "id": id }), WRITE_TIMEOUT).await {
+        match self
+            .post_graphql(query, json!({ "id": id }), WRITE_TIMEOUT)
+            .await
+        {
             // 미인증 또는 전송 실패 → 확인 불가(랜딩했을 수 있으니 절대 실패 단정 아님).
             None | Some(Err(_)) => Err(WriteHalt::Unconfirmed),
             Some(Ok(resp)) => match classify_graphql(resp.status, &resp.body) {
@@ -467,8 +627,7 @@ mod tests {
     // ---- 실제 Linear GraphQL write-response 모양 픽스처 ----
 
     /// mutation 성공(success:true + issue id). readback와 짝.
-    const CREATE_OK: &str =
-        r#"{"data":{"issueCreate":{"success":true,"issue":{"id":"3b241101-e2bb-4255-8caf-4136c566a962"}}}}"#;
+    const CREATE_OK: &str = r#"{"data":{"issueCreate":{"success":true,"issue":{"id":"3b241101-e2bb-4255-8caf-4136c566a962"}}}}"#;
 
     /// create readback 성공 — 확인된 이슈.
     const ISSUE_READBACK_OK: &str = r#"{"data":{"issue":{
@@ -494,17 +653,26 @@ mod tests {
     #[test]
     fn write_id_accepts_uuid_rejects_non_uuid() {
         assert!(WriteId::parse(WRITE_ID).is_ok());
-        assert!(WriteId::parse("3B241101-E2BB-4255-8CAF-4136C566A962").is_ok(), "대소문자 무관");
+        assert!(
+            WriteId::parse("3B241101-E2BB-4255-8CAF-4136C566A962").is_ok(),
+            "대소문자 무관"
+        );
         assert_eq!(WriteId::parse("not-a-uuid"), Err(InvalidWriteId));
         assert_eq!(WriteId::parse(""), Err(InvalidWriteId));
         // 길이/그룹 어긋남 거부.
-        assert_eq!(WriteId::parse("3b241101-e2bb-4255-8caf-4136c566a9"), Err(InvalidWriteId));
+        assert_eq!(
+            WriteId::parse("3b241101-e2bb-4255-8caf-4136c566a9"),
+            Err(InvalidWriteId)
+        );
         assert_eq!(
             WriteId::parse("3b241101-e2bb-4255-8caf-4136c566a962-extra"),
             Err(InvalidWriteId)
         );
         // 비-hex 문자 거부.
-        assert_eq!(WriteId::parse("zb241101-e2bb-4255-8caf-4136c566a962"), Err(InvalidWriteId));
+        assert_eq!(
+            WriteId::parse("zb241101-e2bb-4255-8caf-4136c566a962"),
+            Err(InvalidWriteId)
+        );
     }
 
     // ---- create: 성공 경로 ----
@@ -525,7 +693,10 @@ mod tests {
         let reqs = t.requests();
         assert_eq!(reqs.len(), 2);
         let body: Value = serde_json::from_str(reqs[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["variables"]["input"]["id"], WRITE_ID, "write-id는 input.id로 실린다");
+        assert_eq!(
+            body["variables"]["input"]["id"], WRITE_ID,
+            "write-id는 input.id로 실린다"
+        );
         assert_eq!(body["variables"]["input"]["teamId"], "team_1");
         // readback은 같은 write-id로 조회.
         let rb: Value = serde_json::from_str(reqs[1].body.as_deref().unwrap()).unwrap();
@@ -680,7 +851,10 @@ mod tests {
     #[tokio::test]
     async fn create_success_false_is_rejected() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"data":{"issueCreate":{"success":false,"issue":null}}}"#));
+        t.push_response(ok(
+            200,
+            r#"{"data":{"issueCreate":{"success":false,"issue":null}}}"#,
+        ));
         match client(t).create_issue(&wid(), new_issue()).await {
             WriteOutcome::Rejected(c) => assert_eq!(c.kind, TrackerUnavailable::InvalidInput),
             other => panic!("expected Rejected, got {other:?}"),
@@ -762,6 +936,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn complete_update_fields_keep_null_clears_and_reject_unknown_keys() {
+        let t = Arc::new(FakeTransport::default());
+        t.push_response(ok(
+            200,
+            r#"{"data":{"issueUpdate":{"success":true,"issue":{"id":"iss_1"}}}}"#,
+        ));
+        t.push_response(ok(200, ISSUE_READBACK_OK));
+        let fields = json!({
+            "assigneeId": null,
+            "priority": 2,
+            "estimate": null,
+            "dueDate": "2026-07-30",
+            "labelIds": ["label_1"],
+            "projectId": null,
+            "parentId": "iss_parent"
+        });
+        match client(t.clone()).update_issue_fields("iss_1", fields).await {
+            WriteOutcome::Written(_) => {}
+            other => panic!("expected Written, got {other:?}"),
+        }
+        let body: Value = serde_json::from_str(t.requests()[0].body.as_deref().unwrap()).unwrap();
+        assert!(body["variables"]["input"]["assigneeId"].is_null());
+        assert_eq!(body["variables"]["input"]["labelIds"][0], "label_1");
+        assert_eq!(body["variables"]["input"]["priority"], 2);
+
+        let t2 = Arc::new(FakeTransport::default());
+        match client(t2.clone())
+            .update_issue_fields("iss_1", json!({"secretUnsupportedField": true}))
+            .await
+        {
+            WriteOutcome::Rejected(classified) => {
+                assert_eq!(classified.kind, TrackerUnavailable::InvalidInput)
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(
+            t2.requests().is_empty(),
+            "invalid fields never reach Linear"
+        );
+    }
+
     // ---- comment / attach ----
 
     #[tokio::test]
@@ -801,6 +1017,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn comment_reply_sends_parent_id() {
+        let t = Arc::new(FakeTransport::default());
+        t.push_response(ok(
+            200,
+            r#"{"data":{"commentCreate":{"success":true,"comment":{"id":"3b241101-e2bb-4255-8caf-4136c566a962"}}}}"#,
+        ));
+        t.push_response(ok(
+            200,
+            r#"{"data":{"comment":{"id":"3b241101-e2bb-4255-8caf-4136c566a962",
+                "url":null,"body":"reply","issue":{"identifier":"ENG-9"}}}}"#,
+        ));
+        match client(t.clone())
+            .add_comment_with_parent(&wid(), "iss_1", "reply", Some("comment_parent"))
+            .await
+        {
+            WriteOutcome::Written(_) => {}
+            other => panic!("expected Written, got {other:?}"),
+        }
+        let body: Value = serde_json::from_str(t.requests()[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["variables"]["input"]["parentId"], "comment_parent");
+    }
+
+    #[tokio::test]
     async fn attach_link_confirms_written() {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(
@@ -813,7 +1052,15 @@ mod tests {
                 "title":"PR #42","url":"https://github.com/acme/repo/pull/42",
                 "issue":{"id":"iss_1","identifier":"ENG-9","url":"https://linear.app/acme/issue/ENG-9"}}}}"#,
         ));
-        match client(t).attach_link(&wid(), "iss_1", "PR #42", "https://github.com/acme/repo/pull/42").await {
+        match client(t)
+            .attach_link(
+                &wid(),
+                "iss_1",
+                "PR #42",
+                "https://github.com/acme/repo/pull/42",
+            )
+            .await
+        {
             WriteOutcome::Written(a) => {
                 assert_eq!(a.title, "PR #42");
                 assert_eq!(a.issue_identifier.as_deref(), Some("ENG-9"));
@@ -826,10 +1073,44 @@ mod tests {
     async fn attach_link_duplicate_is_duplicate() {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(200, DUPLICATE_200));
-        match client(t).attach_link(&wid(), "iss_1", "PR #42", "https://x").await {
+        match client(t)
+            .attach_link(&wid(), "iss_1", "PR #42", "https://x")
+            .await
+        {
             WriteOutcome::Duplicate(id) => assert_eq!(id, WRITE_ID),
             other => panic!("expected Duplicate, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relation_create_and_delete_use_linear_mutations() {
+        let t = Arc::new(FakeTransport::default());
+        t.push_response(ok(
+            200,
+            r#"{"data":{"issueRelationCreate":{"success":true,"issueRelation":{
+                "id":"rel_1","type":"blocks","issue":{"id":"iss_1","identifier":"ENG-1","title":"A"},
+                "relatedIssue":{"id":"iss_2","identifier":"ENG-2","title":"B"}}}}}"#,
+        ));
+        t.push_response(ok(
+            200,
+            r#"{"data":{"issueRelationDelete":{"success":true}}}"#,
+        ));
+        let c = client(t.clone());
+        match c.create_issue_relation("iss_1", "iss_2", "blocks").await {
+            WriteOutcome::Written(relation) => {
+                assert_eq!(relation.relationship, "blocks");
+                assert_eq!(relation.related_identifier, "ENG-2");
+            }
+            other => panic!("expected Written relation, got {other:?}"),
+        }
+        match c.delete_issue_relation("rel_1").await {
+            WriteOutcome::Written(()) => {}
+            other => panic!("expected deleted relation, got {other:?}"),
+        }
+        let create: Value = serde_json::from_str(t.requests()[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(create["variables"]["input"]["relatedIssueId"], "iss_2");
+        let delete: Value = serde_json::from_str(t.requests()[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(delete["variables"]["id"], "rel_1");
     }
 
     /// 미인증(토큰 없음) write → Unavailable(NotAuthenticated), 전송조차 안 함.

@@ -152,12 +152,18 @@ pub fn abbreviate_orchestration_task_spec(spec: &str) -> AbbreviatedSpec {
     let trimmed = js_trim(&collapsed);
     let truncated = utf16_len(trimmed) > TASK_SPEC_BRIEF_LENGTH;
     if !truncated {
-        return AbbreviatedSpec { spec: trimmed.to_string(), spec_truncated: false };
+        return AbbreviatedSpec {
+            spec: trimmed.to_string(),
+            spec_truncated: false,
+        };
     }
 
     let sliced = utf16_slice_prefix(trimmed, TASK_SPEC_BRIEF_LENGTH - 1);
     let sliced = js_trim_end(sliced);
-    AbbreviatedSpec { spec: format!("{sliced}\u{2026}"), spec_truncated: true }
+    AbbreviatedSpec {
+        spec: format!("{sliced}\u{2026}"),
+        spec_truncated: true,
+    }
 }
 
 /// Port of `abbreviateOrchestrationTasks` (`:3-17`), reshaped per N15: `T` is
@@ -169,7 +175,10 @@ pub fn abbreviate_orchestration_tasks<T>(
     tasks: &[T],
     get_spec: impl Fn(&T) -> &str,
 ) -> Vec<AbbreviatedSpec> {
-    tasks.iter().map(|task| abbreviate_orchestration_task_spec(get_spec(task))).collect()
+    tasks
+        .iter()
+        .map(|task| abbreviate_orchestration_task_spec(get_spec(task)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -188,8 +197,10 @@ mod tests {
 
     #[test]
     fn collapses_whitespace_and_caps_long_task_specs() {
-        let tasks =
-            [Task { id: "task_1", spec: format!("First line\n\n{}", "detail ".repeat(40)) }];
+        let tasks = [Task {
+            id: "task_1",
+            spec: format!("First line\n\n{}", "detail ".repeat(40)),
+        }];
         let results = abbreviate_orchestration_tasks(&tasks, |t| t.spec.as_str());
         let task = &results[0];
 
@@ -202,23 +213,35 @@ mod tests {
 
     #[test]
     fn preserves_a_short_one_line_spec() {
-        let tasks = [Task { id: "x", spec: "Short task".to_string() }];
+        let tasks = [Task {
+            id: "x",
+            spec: "Short task".to_string(),
+        }];
         let results = abbreviate_orchestration_tasks(&tasks, |t| t.spec.as_str());
 
         assert_eq!(
             results[0],
-            AbbreviatedSpec { spec: "Short task".to_string(), spec_truncated: false }
+            AbbreviatedSpec {
+                spec: "Short task".to_string(),
+                spec_truncated: false
+            }
         );
     }
 
     #[test]
     fn does_not_report_whitespace_normalization_as_truncation() {
-        let tasks = [Task { id: "x", spec: "Short\n\n  task".to_string() }];
+        let tasks = [Task {
+            id: "x",
+            spec: "Short\n\n  task".to_string(),
+        }];
         let results = abbreviate_orchestration_tasks(&tasks, |t| t.spec.as_str());
 
         assert_eq!(
             results[0],
-            AbbreviatedSpec { spec: "Short task".to_string(), spec_truncated: false }
+            AbbreviatedSpec {
+                spec: "Short task".to_string(),
+                spec_truncated: false
+            }
         );
     }
 
@@ -249,7 +272,13 @@ mod tests {
     fn pin_boundary_159_units_not_truncated() {
         let spec = "a".repeat(159);
         let result = abbreviate_orchestration_task_spec(&spec);
-        assert_eq!(result, AbbreviatedSpec { spec: spec.clone(), spec_truncated: false });
+        assert_eq!(
+            result,
+            AbbreviatedSpec {
+                spec: spec.clone(),
+                spec_truncated: false
+            }
+        );
     }
 
     /// N16 boundary pin: exactly 160 units is NOT truncated (strict `>`).
@@ -257,7 +286,13 @@ mod tests {
     fn pin_boundary_160_units_not_truncated() {
         let spec = "a".repeat(160);
         let result = abbreviate_orchestration_task_spec(&spec);
-        assert_eq!(result, AbbreviatedSpec { spec: spec.clone(), spec_truncated: false });
+        assert_eq!(
+            result,
+            AbbreviatedSpec {
+                spec: spec.clone(),
+                spec_truncated: false
+            }
+        );
     }
 
     /// N16 boundary pin: exactly 161 units IS truncated, and the truncated
@@ -317,7 +352,13 @@ mod tests {
     #[test]
     fn pin_untruncated_task_is_still_whitespace_normalized() {
         let result = abbreviate_orchestration_task_spec("a\n\n\tb   c");
-        assert_eq!(result, AbbreviatedSpec { spec: "a b c".to_string(), spec_truncated: false });
+        assert_eq!(
+            result,
+            AbbreviatedSpec {
+                spec: "a b c".to_string(),
+                spec_truncated: false
+            }
+        );
     }
 
     /// N14: U+FEFF (BOM/ZWNBSP) is ECMAScript whitespace, so `\s+` collapses
@@ -326,7 +367,13 @@ mod tests {
     #[test]
     fn pin_feff_collapses_as_whitespace() {
         let result = abbreviate_orchestration_task_spec("a\u{FEFF}b");
-        assert_eq!(result, AbbreviatedSpec { spec: "a b".to_string(), spec_truncated: false });
+        assert_eq!(
+            result,
+            AbbreviatedSpec {
+                spec: "a b".to_string(),
+                spec_truncated: false
+            }
+        );
     }
 
     /// N14: U+0085 (NEL) is NOT ECMAScript whitespace, so it must survive
@@ -338,7 +385,10 @@ mod tests {
         let result = abbreviate_orchestration_task_spec("a\u{0085}b");
         assert_eq!(
             result,
-            AbbreviatedSpec { spec: "a\u{0085}b".to_string(), spec_truncated: false }
+            AbbreviatedSpec {
+                spec: "a\u{0085}b".to_string(),
+                spec_truncated: false
+            }
         );
     }
 
@@ -372,7 +422,10 @@ mod tests {
         let result = abbreviate_orchestration_task_spec("\u{0085}task");
         assert_eq!(
             result,
-            AbbreviatedSpec { spec: "\u{0085}task".to_string(), spec_truncated: false }
+            AbbreviatedSpec {
+                spec: "\u{0085}task".to_string(),
+                spec_truncated: false
+            }
         );
     }
 }

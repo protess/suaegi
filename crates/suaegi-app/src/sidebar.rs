@@ -1,11 +1,10 @@
-use std::path::PathBuf;
-
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    button, checkbox, column, container, pick_list, row, scrollable, text_input, Space,
 };
 use iced::{Alignment, Color, Element, Length};
 
 use suaegi_core::domain::{Repo, RepoId};
+#[cfg(test)]
 use suaegi_forge::{ChecksSummary, ReviewState};
 use suaegi_git::worktree::WorktreeEntry;
 
@@ -22,17 +21,23 @@ pub fn prompt_input_id(repo_id: &RepoId) -> iced::advanced::widget::Id {
 use suaegi_term::presence::AgentPresence;
 
 use crate::agent_status::contract::BadgeState;
-use crate::forge_ui::{self, CreatePrAffordance, PrIndicator};
+#[cfg(test)]
+use crate::forge_ui::{self, PrIndicator};
+use crate::i18n::text;
+use crate::icons::{self, Icon};
 use crate::persistence_thread::{LoadOrigin, SaveStatus};
 use crate::state::{worktree_id_for, AppState, CreatePrDraft, JiraState, LinearState, Message};
+use crate::theme;
 use crate::tracker_ui::{self, IssueListView, JiraIssueListView};
 use suaegi_core::domain::WorktreeId;
 
 // PR 표시자 색. 배지와 같은 팔레트 계열이되(사이드바 톤 통일) 상태를 색으로 구별한다.
 const PR_NEUTRAL: Color = Color::from_rgb(0.53, 0.53, 0.53);
 const PR_OPEN: Color = Color::from_rgb(0.18, 0.63, 0.26);
+#[cfg(test)]
 const PR_MERGED: Color = Color::from_rgb(0.52, 0.34, 0.72);
 const PR_CLOSED: Color = Color::from_rgb(0.75, 0.22, 0.17);
+#[cfg(test)]
 const PR_UNKNOWN: Color = Color::from_rgb(0.85, 0.55, 0.0);
 // Linear 링크/이슈 색. PR 팔레트와 구별되는 보라 계열(트래커 vs forge).
 const LINEAR_LINK: Color = Color::from_rgb(0.42, 0.45, 0.85);
@@ -46,41 +51,262 @@ const JIRA_UNAVAILABLE: Color = Color::from_rgb(0.85, 0.55, 0.0);
 /// 사이드바 고정 폭. `pane_grid`는 고정 폭 pane이 없고(비율 분할만) 사이드바가
 /// 터미널 격자 한가운데로 드래그될 수 있으므로, 사이드바는 pane이 아니라 상위
 /// `row!` 레이아웃에서 이 폭으로 못박은 별도 위젯이다.
-pub const WIDTH: f32 = 260.0;
+pub const WIDTH: f32 = 207.0;
+const CONTEXT_WIDTH: f32 = 300.0;
 
 pub fn view(state: &AppState) -> Element<'_, Message> {
-    let mut list = column![add_repo_row(state)].spacing(16).padding(12);
+    let automation_active = state.automation_ui().open;
+    let activity_active = state.activity_open();
+    let tasks_active = !automation_active && !activity_active && state.tasks_open();
+    let mut nav = column![button(
+        row![
+            icons::view(Icon::ListChecks, 13.0, theme::MUTED),
+            text("Onboarding checklist").size(14)
+        ]
+        .spacing(7)
+    )
+    .on_press(Message::OnboardingOpened)
+    .width(Length::Fill)
+    .padding([5, 6])
+    .style(theme::ghost_button),]
+    .spacing(1);
+    if state.ui_settings().show_tasks_button {
+        nav = nav.push(
+            button(
+                row![
+                    icons::view(Icon::ClipboardList, 13.0, theme::MUTED),
+                    text("Tasks").size(14)
+                ]
+                .spacing(7),
+            )
+            .on_press(Message::TasksOpened)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(if tasks_active {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        );
+    }
+    if state.ui_settings().show_automations_button {
+        nav = nav.push(
+            button(
+                row![
+                    icons::view(Icon::CalendarClock, 13.0, theme::MUTED),
+                    text("Automations").size(14)
+                ]
+                .spacing(7),
+            )
+            .on_press(Message::AutomationOpened)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(if automation_active {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        );
+    }
+    if state.ui_settings().experimental_activity {
+        nav = nav.push(
+            button(
+                row![
+                    icons::view(Icon::ListChecks, 13.0, theme::MUTED),
+                    text("Activity").size(14)
+                ]
+                .spacing(7),
+            )
+            .on_press(Message::ActivityOpened)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(if activity_active {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        );
+    }
+    nav = nav.push(
+        button(
+            row![
+                icons::view(Icon::Search, 13.0, theme::MUTED),
+                text("Search").size(14).width(Length::Fill)
+            ]
+            .spacing(7),
+        )
+        .on_press(Message::WorkspaceSearchRequested)
+        .width(Length::Fill)
+        .padding([5, 6])
+        .style(theme::search_button),
+    );
 
-    // Create-PR 다이얼로그(열려 있을 때만). 픽셀·상호작용은 사람 눈으로 본다 —
-    // 로직(자격 게이팅, 상태 매핑)은 `forge_ui`가 검사한다.
-    if let Some(dialog) = state.create_pr_dialog() {
-        list = list.push(create_pr_form(dialog));
+    let workspace_header = row![
+        text("Projects")
+            .size(13)
+            .color(theme::MUTED)
+            .width(Length::Fill),
+        button(text("☷").size(13))
+            .on_press(Message::WorkspaceOptionsToggled)
+            .padding([3, 5])
+            .style(if state.workspace_options_open() {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        button(if state.is_adding_repo() { "×" } else { "▣" })
+            .on_press(Message::RepoAddToggled)
+            .padding([3, 5])
+            .style(theme::ghost_button),
+        button(text("+").size(17))
+            .on_press_maybe(
+                state
+                    .repos()
+                    .first()
+                    .map(|repo| Message::WorktreeCreateToggled(repo.id.clone())),
+            )
+            .padding([1, 5])
+            .style(theme::ghost_button),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
+    let mut workspace_tools = column![workspace_header].spacing(8);
+    if state.is_adding_repo() {
+        workspace_tools = workspace_tools.push(
+            container(add_repo_row(state))
+                .padding(6)
+                .width(Length::Fill)
+                .style(theme::active_card),
+        );
     }
 
-    // N1: Linear 연결 + 이슈 목록. 픽셀·상호작용은 사람 눈으로 본다 — 로직(연결 결과 매핑,
-    // Unavailable≠no issues)은 `tracker_ui`가 검사한다. 링크 타깃은 **선택된** worktree다.
-    list = list.push(linear_panel(state));
-
-    // N2: Jira 연결 + 이슈 목록. Linear와 같은 규율 — 픽셀은 사람 눈, 로직은 `tracker_ui`.
-    list = list.push(jira_panel(state));
-
+    let mut workspaces = column![].spacing(2);
+    let pinned = state
+        .repos()
+        .iter()
+        .flat_map(|repo| state.worktrees_for(&repo.id).iter())
+        .filter(|entry| {
+            state.worktree_is_visible(entry)
+                && state.worktree_is_pinned(&worktree_id_for(&entry.path))
+        })
+        .collect::<Vec<_>>();
+    if !pinned.is_empty() {
+        let mut pinned_rows = column![text("Pinned").size(11).color(theme::MUTED)].spacing(2);
+        for entry in pinned {
+            pinned_rows = pinned_rows.push(worktree_entry(state, entry));
+        }
+        workspaces = workspaces.push(
+            container(pinned_rows)
+                .width(Length::Fill)
+                .padding([5, 2])
+                .style(theme::configured_sidebar(state.ui_settings())),
+        );
+    }
     for group in grouped_worktrees(state) {
-        list = list.push(repo_group(state, &group));
+        workspaces = workspaces.push(repo_group(state, &group));
     }
 
+    let integrations = button(icons::view(Icon::Settings, 13.0, theme::MUTED))
+        .on_press(Message::IntegrationsToggled)
+        .padding([3, 6])
+        .style(if state.integrations_open() {
+            theme::selected_button
+        } else {
+            theme::ghost_button
+        });
+
+    let mut footer = column![row![
+        integrations,
+        button(icons::view(Icon::CircleHelp, 13.0, theme::MUTED))
+            .on_press(Message::HelpToggled)
+            .padding([3, 6])
+            .style(if state.help_open() {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        Space::new().width(Length::Fill),
+        button(text("⌖").size(14).color(theme::MUTED))
+            .on_press(Message::RevealActiveWorkspace)
+            .padding([3, 5])
+            .style(theme::ghost_button),
+        button(text("▦").size(14).color(theme::MUTED))
+            .on_press(Message::WorkspaceBoardToggled)
+            .padding([3, 5])
+            .style(if state.workspace_board_open() {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+    ]
+    .spacing(3)
+    .align_y(Alignment::Center)]
+    .spacing(4);
     if let Some(error) = state.last_error() {
-        list = list.push(text(format!("! {error}")).size(12));
+        footer = footer.push(text(format!("! {error}")).size(14));
+    }
+    if let Some(status) = status_line(state) {
+        footer = footer.push(text(status).size(14));
     }
 
-    let mut layout = column![scrollable(list).height(Length::Fill)].height(Length::Fill);
-    if let Some(status) = status_line(state) {
-        layout = layout.push(container(text(status).size(12)).padding(8));
-    }
+    let layout = column![
+        container(nav).padding([4, 7]),
+        container(workspace_tools).padding([7, 8]),
+        scrollable(container(workspaces).padding([0, 5])).height(Length::Fill),
+        container(footer)
+            .padding([5, 7])
+            .style(theme::configured_sidebar_top_bar(state.ui_settings())),
+    ]
+    .height(Length::Fill);
 
     container(layout)
         .width(Length::Fixed(WIDTH))
         .height(Length::Fill)
+        .style(theme::configured_sidebar(state.ui_settings()))
         .into()
+}
+
+/// 연결 설정은 좁은 탐색 메뉴가 아니라 하나의 문맥 패널을 사용한다. 긴 Jira URL,
+/// 이메일, 토큰 입력이 작업공간 이름을 밀어내거나 사이드바를 가로로 넘치지 않는다.
+pub fn integrations_view(state: &AppState) -> Option<Element<'_, Message>> {
+    if !state.integrations_open() {
+        return None;
+    }
+
+    let header = row![
+        text("Integrations").size(17).width(Length::Fill),
+        button("×")
+            .on_press(Message::IntegrationsToggled)
+            .style(theme::ghost_button),
+    ]
+    .align_y(Alignment::Center);
+    let providers = column![linear_panel(state), jira_panel(state)].spacing(10);
+    let body = column![header, scrollable(providers).height(Length::Fill)]
+        .spacing(10)
+        .padding(12);
+
+    Some(
+        container(body)
+            .width(Length::Fixed(CONTEXT_WIDTH))
+            .height(Length::Fill)
+            .style(theme::context_panel)
+            .into(),
+    )
+}
+
+/// PR 생성 역시 우측 문맥 슬롯을 사용한다. 폼이 worktree 목록 사이에 끼어들지
+/// 않으므로 사용자가 무엇을 대상으로 작업 중인지 계속 볼 수 있다.
+pub fn create_pr_view(state: &AppState) -> Option<Element<'_, Message>> {
+    let dialog = state.create_pr_dialog()?;
+    Some(
+        container(create_pr_form(state, dialog))
+            .width(Length::Fixed(CONTEXT_WIDTH))
+            .height(Length::Fill)
+            .padding(4)
+            .style(theme::context_panel)
+            .into(),
+    )
 }
 
 fn add_repo_row(state: &AppState) -> Element<'_, Message> {
@@ -90,6 +316,10 @@ fn add_repo_row(state: &AppState) -> Element<'_, Message> {
             .on_input(Message::RepoPathInputChanged)
             .on_submit(Message::AddRepoSubmitted)
             .width(Length::Fill),
+        button("Browse")
+            .on_press(Message::RepoBrowseRequested)
+            .padding([5, 7])
+            .style(theme::ghost_button),
         button("Add")
             .on_press_maybe((!value.trim().is_empty()).then_some(Message::AddRepoSubmitted)),
     ]
@@ -113,7 +343,15 @@ fn grouped_worktrees(state: &AppState) -> Vec<RepoGroup<'_>> {
         .iter()
         .map(|repo| RepoGroup {
             repo,
-            worktrees: state.worktrees_for(&repo.id).iter().collect(),
+            worktrees: state
+                .worktrees_for(&repo.id)
+                .iter()
+                .filter(|entry| {
+                    state.worktree_is_visible(entry)
+                        && (state.ui_settings().show_pinned_worktrees_in_groups
+                            || !state.worktree_is_pinned(&worktree_id_for(&entry.path)))
+                })
+                .collect(),
         })
         .collect()
 }
@@ -122,13 +360,50 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
     let repo_id = group.repo.id.clone();
     let draft = state.worktree_name_draft(&repo_id);
 
-    let header = text(group.repo.display_name.clone()).size(15);
+    let create_toggle_id = repo_id.clone();
+    let create_is_open = state.is_creating_worktree_for(&repo_id);
+    let actions_id = repo_id.clone();
+    let badge_color = state
+        .ui_settings()
+        .repo_badge_colors
+        .get(&repo_id.0)
+        .and_then(|value| theme::parse_hex(value))
+        .unwrap_or(theme::MUTED);
+    let project_icon: Element<'_, Message> = state
+        .ui_settings()
+        .repo_icons
+        .get(&repo_id.0)
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(
+            || icons::view(Icon::GitBranch, 11.0, badge_color).into(),
+            |value| text(value.clone()).size(13).color(badge_color).into(),
+        );
+    let header = row![
+        project_icon,
+        text(group.repo.display_name.clone())
+            .size(14)
+            .width(Length::Fill),
+        button(icons::view(Icon::Ellipsis, 12.0, theme::MUTED))
+            .on_press(Message::ProjectActionsToggled(actions_id))
+            .padding([2, 4])
+            .style(if state.project_actions_open() == Some(&repo_id) {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        button(if create_is_open { "×" } else { "+" })
+            .on_press(Message::WorktreeCreateToggled(create_toggle_id))
+            .padding([2, 5])
+            .style(theme::ghost_button),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
 
     let repo_id_for_input = repo_id.clone();
     let repo_id_for_submit = repo_id.clone();
     let repo_id_for_button = repo_id.clone();
     let name_row = row![
-        text_input("new-worktree-name", draft)
+        text_input("workspace name (optional)", draft)
             .id(name_input_id(&repo_id))
             .on_input(move |value| Message::WorktreeNameInputChanged {
                 repo_id: repo_id_for_input.clone(),
@@ -138,11 +413,9 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
                 repo_id: repo_id_for_submit.clone()
             })
             .width(Length::Fill),
-        button("+ worktree").on_press_maybe((!draft.trim().is_empty()).then(|| {
-            Message::CreateWorktreeSubmitted {
-                repo_id: repo_id_for_button.clone(),
-            }
-        })),
+        button("+ worktree").on_press(Message::CreateWorktreeSubmitted {
+            repo_id: repo_id_for_button.clone(),
+        }),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
@@ -180,42 +453,235 @@ fn repo_group<'a>(state: &'a AppState, group: &RepoGroup<'a>) -> Element<'a, Mes
         repo_id: repo_id_for_prompt_submit.clone(),
     })
     .width(Length::Fill)
-    .size(12);
-    let create_row = column![agent_picker, prompt_input, name_row].spacing(6);
+    .size(14);
+    let name_hint = text(format!(
+        "Blank name uses the prompt or “{}”.",
+        state.worktree_suggested_name(&repo_id)
+    ))
+    .size(11)
+    .color(theme::MUTED);
+    let setup_choice: Element<'_, Message> = if state.repo_has_setup_script(&repo_id) {
+        let run = state.worktree_setup_run_selection(&repo_id);
+        let setup_repo = repo_id.clone();
+        row![
+            column![
+                text("Workspace setup script").size(11),
+                text(if run {
+                    "Runs after this worktree is created."
+                } else {
+                    "Skipped for this worktree."
+                })
+                .size(10)
+                .color(theme::MUTED),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            button(text(if run { "✓ Run setup" } else { "Skip setup" }).size(10))
+                .on_press(Message::WorktreeSetupRunToggled(setup_repo))
+                .padding([4, 7])
+                .style(if run {
+                    theme::selected_button
+                } else {
+                    theme::ghost_button
+                }),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
+    let sparse_choices = state.sparse_preset_choices(&repo_id);
+    let sparse_choice: Element<'_, Message> = if sparse_choices.len() > 1 {
+        let selected = state.selected_sparse_preset_choice(&repo_id);
+        let sparse_repo = repo_id.clone();
+        row![
+            column![
+                text("Sparse checkout").size(11),
+                text("Limit this workspace to a saved directory set.")
+                    .size(10)
+                    .color(theme::MUTED),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            pick_list(sparse_choices, Some(selected), move |choice| {
+                Message::WorktreeSparsePresetSelected(sparse_repo.clone(), choice.id)
+            })
+            .width(Length::Fixed(150.0))
+            .text_size(10),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
+    let vm_recipe_choices = state.vm_recipe_choices(&repo_id);
+    let vm_recipe_choice: Element<'_, Message> =
+        if state.ui_settings().experimental_ephemeral_vms && vm_recipe_choices.len() > 1 {
+            let selected = state.selected_vm_recipe_choice(&repo_id);
+            let recipe_repo = repo_id.clone();
+            row![
+                column![
+                    text("Run workspace on").size(11),
+                    text("Choose local or a per-workspace environment recipe.")
+                        .size(10)
+                        .color(theme::MUTED),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+                pick_list(vm_recipe_choices, Some(selected), move |choice| {
+                    Message::WorktreeVmRecipeSelected(recipe_repo.clone(), choice.id)
+                })
+                .width(Length::Fixed(190.0))
+                .text_size(10),
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+    let create_row = column![
+        agent_picker,
+        prompt_input,
+        setup_choice,
+        sparse_choice,
+        vm_recipe_choice,
+        name_row,
+        name_hint
+    ]
+    .spacing(6);
 
-    let mut rows = column![header, create_row].spacing(6);
-    for entry in &group.worktrees {
-        let worktree_id = worktree_id_for(&entry.path);
-        let is_selected = state.selected_worktree() == Some(&worktree_id);
-        let presence = state.worktree_presence(&worktree_id);
-        let badge = state.worktree_badge(&worktree_id);
-        rows = rows.push(worktree_row(repo_id.clone(), entry, is_selected, badge, presence));
-        // N1: 링크된 Linear 이슈가 있으면 worktree 행 아래에 보여준다(식별자만 — 딥링크
-        // 좌표는 메타에 있고 N3 write-back이 쓴다).
-        if let Some(issue) = state.linked_linear_issue(&worktree_id) {
-            rows = rows.push(
-                text(format!("  ⌁ {issue}"))
-                    .size(11)
-                    .color(LINEAR_LINK),
-            );
-        }
-        // N2: 링크된 Jira 이슈가 있으면 같은 자리에 보여준다(키만 — 사이트는 메타에 있다).
-        if let Some(issue) = state.linked_jira_issue(&worktree_id) {
-            rows = rows.push(text(format!("  ◈ {issue}")).size(11).color(JIRA_LINK));
-        }
-        // Plan 7a-1: PR 상태 표시자 + 새로고침 + Create-PR 어포던스. 캐시에서
-        // 파생하되 매핑은 `forge_ui`가 검사한다(Unavailable≠NoPr, Offer는 자격 있을 때만).
-        let status = state.github_status_for(&worktree_id);
-        if let Some(pr_row) = pr_status_row(
-            worktree_id,
-            forge_ui::indicator_for(status),
-            forge_ui::create_pr_affordance(status),
-        ) {
-            rows = rows.push(pr_row);
-        }
+    let mut rows = column![container(header).padding([2, 5])].spacing(2);
+    if create_is_open {
+        rows = rows.push(
+            container(create_row)
+                .padding(6)
+                .width(Length::Fill)
+                .style(theme::active_card),
+        );
+    }
+    if let Some(inbox) = external_worktree_inbox(state, group.repo) {
+        rows = rows.push(inbox);
     }
 
-    container(rows).width(Length::Fill).into()
+    for entry in &group.worktrees {
+        rows = rows.push(worktree_entry(state, entry));
+    }
+
+    container(rows)
+        .width(Length::Fill)
+        .padding([6, 2])
+        .style(theme::configured_sidebar(state.ui_settings()))
+        .into()
+}
+
+fn external_worktree_inbox<'a>(
+    state: &'a AppState,
+    repo: &'a Repo,
+) -> Option<Element<'a, Message>> {
+    let candidates = state.external_worktree_inbox(&repo.id);
+    if candidates.is_empty() {
+        return None;
+    }
+    let count = candidates.len();
+    let mut entries = column![text("These worktrees were created outside of Suaegi.")
+        .size(10)
+        .color(theme::MUTED)]
+    .spacing(3);
+    for entry in candidates {
+        let import_repo = repo.id.clone();
+        let worktree = worktree_id_for(&entry.path);
+        let name = entry
+            .branch
+            .clone()
+            .unwrap_or_else(|| entry.path.to_string_lossy().into_owned());
+        entries = entries.push(
+            row![
+                column![
+                    text(name).size(11),
+                    text(entry.path.to_string_lossy().into_owned())
+                        .size(9)
+                        .color(theme::MUTED),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+                button(text("Import").size(9))
+                    .on_press(Message::RepoExternalWorktreeImported(import_repo, worktree,))
+                    .padding([3, 6])
+                    .style(theme::ghost_button),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        );
+    }
+    let import_all_repo = repo.id.clone();
+    let keep_hidden_repo = repo.id.clone();
+    let suppress_repo = repo.id.clone();
+    entries = entries.push(
+        row![
+            button(text("Keep hidden").size(9))
+                .on_press(Message::RepoExternalWorktreesKeptHidden(keep_hidden_repo))
+                .padding([3, 6])
+                .style(theme::ghost_button),
+            button(text("Import all").size(9))
+                .on_press(Message::RepoExternalWorktreesImportedAll(import_all_repo))
+                .padding([3, 6])
+                .style(theme::ghost_button),
+            button(text("Don't show again").size(9))
+                .on_press(Message::RepoExternalWorktreeDiscoverySuppressed(
+                    suppress_repo
+                ))
+                .padding([3, 6])
+                .style(theme::ghost_button),
+        ]
+        .spacing(4),
+    );
+    Some(
+        container(
+            column![
+                text(format!("New externally-created worktrees  {count}"))
+                    .size(11)
+                    .color(theme::MUTED),
+                entries,
+            ]
+            .spacing(4),
+        )
+        .padding([5, 8])
+        .style(theme::active_card)
+        .into(),
+    )
+}
+
+fn worktree_entry<'a>(state: &'a AppState, entry: &'a WorktreeEntry) -> Element<'a, Message> {
+    let worktree_id = worktree_id_for(&entry.path);
+    let is_selected = state.selected_worktree() == Some(&worktree_id);
+    let mut rows = column![worktree_row(
+        entry,
+        WorktreeRowState {
+            is_selected,
+            actions_open: state.worktree_actions_open() == Some(&worktree_id),
+            is_pinned: state.worktree_is_pinned(&worktree_id),
+            is_unread: state.worktree_is_unread(&worktree_id),
+            is_sleeping: state.worktree_is_sleeping(&worktree_id),
+            badge: state.worktree_badge(&worktree_id),
+            presence: state.worktree_presence(&worktree_id),
+            prompt_cache_seconds: state.prompt_cache_remaining_seconds(&worktree_id),
+            compact: state.ui_settings().compact_worktree_cards,
+            display_name: state.worktree_display_name(&worktree_id, entry),
+        },
+    )]
+    .spacing(1);
+    if is_selected {
+        if let Some(comment) = state.worktree_comment(&worktree_id) {
+            rows = rows.push(text(format!("  {comment}")).size(11).color(theme::MUTED));
+        }
+        if let Some(issue) = state.linked_linear_issue(&worktree_id) {
+            rows = rows.push(text(format!("  ⌁ {issue}")).size(13).color(LINEAR_LINK));
+        }
+        if let Some(issue) = state.linked_jira_issue(&worktree_id) {
+            rows = rows.push(text(format!("  ◈ {issue}")).size(13).color(JIRA_LINK));
+        }
+    }
+    rows.into()
 }
 
 /// 에이전트 상태 배지. **`Unknown`은 `Working`과 시각적으로 구별한다** — "모른다"와
@@ -246,7 +712,7 @@ fn badge_glyph(badge: BadgeState, presence: AgentPresence) -> (&'static str, Col
 
 fn presence_badge(badge: BadgeState, presence: AgentPresence) -> Element<'static, Message> {
     let (label, color) = badge_glyph(badge, presence);
-    container(text(label).size(10).color(color))
+    container(text(label).size(12).color(color))
         .width(Length::Fixed(10.0))
         .height(Length::Fixed(10.0))
         .into()
@@ -255,116 +721,140 @@ fn presence_badge(badge: BadgeState, presence: AgentPresence) -> Element<'static
 /// git이 non-forced `worktree remove`로 main 체크아웃을 항상 거부하므로
 /// 지우는 버튼을 눌러도 안전은 하지만, 애초에 버튼을 안 보여주는 게 낫다 —
 /// 눌러도 아무 일도 안 일어나는 죽은 버튼보다 명확하다.
+#[cfg(test)]
 fn worktree_is_removable(entry: &WorktreeEntry) -> bool {
     !entry.is_main
 }
 
-fn worktree_row(
-    repo_id: RepoId,
-    entry: &WorktreeEntry,
+struct WorktreeRowState {
     is_selected: bool,
+    actions_open: bool,
+    is_pinned: bool,
+    is_unread: bool,
+    is_sleeping: bool,
     badge: BadgeState,
     presence: AgentPresence,
-) -> Element<'static, Message> {
-    let worktree_id = worktree_id_for(&entry.path);
-    let label = entry
-        .branch
-        .clone()
-        .unwrap_or_else(|| "(detached)".to_string());
-    let marker = if is_selected { "> " } else { "  " };
-
-    let remove_id = worktree_id.clone();
-    let remove_path: PathBuf = entry.path.clone();
-    let remove_branch = entry.branch.clone();
-
-    let diff_id = worktree_id.clone();
-    let mut cells: Vec<Element<'static, Message>> = vec![
-        presence_badge(badge, presence),
-        button(text(format!("{marker}{label}")))
-            .on_press(Message::WorktreeSelected(worktree_id))
-            .width(Length::Fill)
-            .into(),
-        // diff 패널 토글. 같은 worktree를 다시 누르면 닫힌다.
-        button(text("diff").size(11))
-            .on_press(Message::DiffRequested { worktree: diff_id })
-            .into(),
-    ];
-    if worktree_is_removable(entry) {
-        cells.push(
-            button("remove")
-                .on_press(Message::RemoveWorktreeRequested {
-                    repo_id,
-                    worktree_id: remove_id,
-                    worktree_path: remove_path,
-                    branch: remove_branch,
-                })
-                .into(),
-        );
-    }
-
-    row(cells).spacing(6).align_y(Alignment::Center).into()
+    prompt_cache_seconds: Option<u64>,
+    compact: bool,
+    display_name: String,
 }
 
-/// PR 상태 한 줄: 표시자 + 새로고침(↻) + Create-PR 어포던스. 그릴 게 하나도 없으면
-/// (조회 전이거나 GitHub 리포가 아니면) `None`을 돌려 행 자체를 넣지 않는다.
-///
-/// **표시자 텍스트/색은 사람 눈으로 보는 픽셀이다.** 검사되는 결정은 `forge_ui`의
-/// `indicator_for`/`create_pr_affordance`(순수)이고, 여기 `pr_indicator_label`은 그
-/// 결과가 시각적으로 구별되는지만 얕게 테스트한다(배지의 `badge_glyph`와 같은 규율).
-fn pr_status_row(
-    worktree_id: suaegi_core::domain::WorktreeId,
-    indicator: PrIndicator,
-    affordance: CreatePrAffordance,
-) -> Option<Element<'static, Message>> {
-    let label = pr_indicator_label(&indicator);
-    // 조회 전(라벨 없음) + 어포던스 숨김 = 이 worktree엔 보여줄 GitHub 정보가 없다.
-    if label.is_none() && matches!(affordance, CreatePrAffordance::Hidden) {
-        return None;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorktreeRowMetrics {
+    label_size: u32,
+    detail_size: u32,
+    content_padding: [u16; 2],
+    show_detail: bool,
+}
 
-    let mut cells: Vec<Element<'static, Message>> = Vec::new();
-    if let Some((txt, color)) = label {
-        cells.push(text(txt).size(11).color(color).into());
+fn worktree_row_metrics(compact: bool) -> WorktreeRowMetrics {
+    if compact {
+        WorktreeRowMetrics {
+            label_size: 13,
+            detail_size: 11,
+            content_padding: [1, 3],
+            show_detail: false,
+        }
+    } else {
+        WorktreeRowMetrics {
+            label_size: 14,
+            detail_size: 12,
+            content_padding: [3, 4],
+            show_detail: true,
+        }
     }
-    // 명시적 수동 새로고침(배경 폴링 없음 — §3.7).
-    let refresh_id = worktree_id.clone();
-    cells.push(
-        button(text("↻").size(11))
-            .on_press(Message::GithubRefreshRequested {
-                worktree: refresh_id,
-            })
-            .into(),
-    );
-    // Plan 7b: PR이 있을 때만 패널 열기 버튼(머지가능성·리뷰·코멘트 + 확인 게이트 머지).
-    if matches!(indicator, PrIndicator::Present { .. }) {
-        cells.push(
-            button(text("PR").size(11))
-                .on_press(Message::PrPanelOpened {
-                    worktree: worktree_id.clone(),
-                })
-                .into(),
+}
+
+fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'static, Message> {
+    let worktree_id = worktree_id_for(&entry.path);
+    let label = state.display_name;
+    let metrics = worktree_row_metrics(state.compact);
+
+    // Selection already has a row background. Replacing the badge with a green selection
+    // dot hid Claude's Waiting/Done state on the pane the user was actually looking at.
+    // Orca keeps the status glyph authoritative even for the selected worktree.
+    let status: Element<'static, Message> = presence_badge(state.badge, state.presence);
+    let mut identity = row![
+        status,
+        text(label.clone()).size(metrics.label_size),
+        Space::new().width(Length::Fill),
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center);
+    if state.is_unread {
+        identity = identity.push(text("●").size(9).color(Color::from_rgb8(0x4f, 0x7f, 0xff)));
+    }
+    if state.is_pinned {
+        identity = identity.push(text("⚑").size(10).color(theme::MUTED));
+    }
+    if state.is_sleeping {
+        identity = identity.push(text("z").size(10).color(theme::MUTED));
+    }
+    if let Some(seconds) = state.prompt_cache_seconds {
+        identity = identity.push(
+            container(
+                text(format!("◷ {}:{:02}", seconds / 60, seconds % 60))
+                    .size(10)
+                    .color(theme::MUTED),
+            )
+            .padding([1, 4])
+            .style(theme::chip),
         );
     }
-    match affordance {
-        CreatePrAffordance::Offer => cells.push(
-            button(text("Create PR").size(11))
-                .on_press(Message::CreatePrOpened {
-                    worktree: worktree_id,
-                })
-                .into(),
-        ),
-        // 죽은 버튼 대신 이유. 예: NoUpstream → "push the branch first".
-        CreatePrAffordance::Blocked(reason) => {
-            cells.push(text(reason).size(10).color(PR_NEUTRAL).into())
-        }
-        CreatePrAffordance::Hidden => {}
-    }
+    let identity = if entry.is_main {
+        identity.push(
+            container(text("primary").size(11).color(theme::MUTED))
+                .padding([2, 5])
+                .style(theme::chip),
+        )
+    } else {
+        identity
+    };
+    let content: Element<'static, Message> = if metrics.show_detail {
+        column![
+            identity,
+            text(label).size(metrics.detail_size).color(theme::MUTED),
+        ]
+        .spacing(1)
+        .into()
+    } else {
+        identity.into()
+    };
 
-    Some(row(cells).spacing(6).align_y(Alignment::Center).into())
+    let select_id = worktree_id.clone();
+    let actions: Element<'static, Message> = if state.is_selected || state.actions_open {
+        button(icons::view(Icon::Ellipsis, 11.0, theme::MUTED))
+            .on_press(Message::WorktreeActionsToggled(worktree_id))
+            .padding([8, 4])
+            .style(theme::selected_button)
+            .into()
+    } else {
+        Space::new()
+            .width(Length::Fixed(19.0))
+            .height(Length::Fixed(27.0))
+            .into()
+    };
+
+    row![
+        button(container(content).padding(metrics.content_padding))
+            .on_press(Message::WorktreeSelected(select_id))
+            .padding(0)
+            .width(Length::Fill)
+            .style(if state.is_selected {
+                theme::selected_button
+            } else {
+                theme::ghost_button
+            }),
+        actions,
+    ]
+    .spacing(1)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// PR 표시자 → (문구, 색). `None` = 아무것도 안 그린다(Hidden). **`Unknown`은
 /// `NoPr`와 문구·색이 모두 다르다** — "상태 모름"이 "PR 없음"으로 보이면 안 된다.
+#[cfg(test)]
 fn pr_indicator_label(indicator: &PrIndicator) -> Option<(String, Color)> {
     match indicator {
         PrIndicator::Hidden => None,
@@ -390,6 +880,7 @@ fn pr_indicator_label(indicator: &PrIndicator) -> Option<(String, Color)> {
     }
 }
 
+#[cfg(test)]
 fn pr_state_text(state: ReviewState) -> &'static str {
     match state {
         ReviewState::Open => "open",
@@ -399,6 +890,7 @@ fn pr_state_text(state: ReviewState) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn pr_state_color(state: ReviewState) -> Color {
     match state {
         ReviewState::Open => PR_OPEN,
@@ -409,6 +901,7 @@ fn pr_state_color(state: ReviewState) -> Color {
 }
 
 /// CI 체크 요약 "✓passing ✗failing •pending". 체크가 하나도 없으면 `None`(조용).
+#[cfg(test)]
 fn checks_text(checks: ChecksSummary) -> Option<String> {
     if checks.passing == 0 && checks.failing == 0 && checks.pending == 0 {
         return None;
@@ -421,27 +914,31 @@ fn checks_text(checks: ChecksSummary) -> Option<String> {
 
 /// Create-PR 다이얼로그 폼. **픽셀·상호작용은 사람 눈**이다 — 자격 게이팅과 성공 시
 /// 링크 영속화는 `state`/`forge_ui`에서 검사한다.
-fn create_pr_form(dialog: &CreatePrDraft) -> Element<'_, Message> {
+fn create_pr_form<'a>(state: &'a AppState, dialog: &'a CreatePrDraft) -> Element<'a, Message> {
     let mut form = column![
-        text("Create pull request").size(14),
+        text("Create hosted review").size(16),
         text_input("title", &dialog.title)
             .on_input(Message::CreatePrTitleChanged)
-            .size(12),
+            .size(14),
         text_input("base branch", &dialog.base)
             .on_input(Message::CreatePrBaseChanged)
-            .size(12),
-        text_input("body (blank = repo PR template)", &dialog.body)
+            .size(14),
+        text_input("description", &dialog.body)
             .on_input(Message::CreatePrBodyChanged)
-            .size(12),
+            .size(14),
         checkbox(dialog.draft)
             .label("Draft")
             .on_toggle(Message::CreatePrDraftToggled)
+            .text_size(12),
+        checkbox(dialog.use_template)
+            .label("Use repository PR/MR template")
+            .on_toggle(Message::CreatePrUseTemplateToggled)
             .text_size(12),
     ]
     .spacing(6);
 
     if let Some(err) = &dialog.error {
-        form = form.push(text(format!("! {err}")).size(11).color(PR_CLOSED));
+        form = form.push(text(format!("! {err}")).size(13).color(PR_CLOSED));
     }
 
     // 제출 중이면 버튼을 잠근다(중복 제출 방지).
@@ -450,12 +947,29 @@ fn create_pr_form(dialog: &CreatePrDraft) -> Element<'_, Message> {
     } else {
         "Create"
     };
-    let submit = button(text(submit_label).size(12))
-        .on_press_maybe((!dialog.submitting).then_some(Message::CreatePrSubmitted));
-    let cancel = button(text("Cancel").size(12)).on_press(Message::CreatePrCancelled);
-    form = form.push(row![submit, cancel].spacing(6));
+    let submit = button(text(submit_label).size(14)).on_press_maybe(
+        (!dialog.submitting && !dialog.generating).then_some(Message::CreatePrSubmitted),
+    );
+    let generate = button(
+        text(if dialog.generating {
+            "Generating…"
+        } else {
+            "Generate details"
+        })
+        .size(14),
+    )
+    .on_press_maybe(
+        (state.ui_settings().source_control_ai.enabled && !dialog.submitting && !dialog.generating)
+            .then_some(Message::CreatePrGenerateDetailsRequested),
+    );
+    let cancel = button(text("Cancel").size(14)).on_press(Message::CreatePrCancelled);
+    form = form.push(row![submit, generate, cancel].spacing(6));
 
-    container(form).padding(8).into()
+    container(form)
+        .padding(8)
+        .width(Length::Fill)
+        .style(theme::context_panel)
+        .into()
 }
 
 /// N1: Linear 패널. 미연결이면 **마스킹된** 키 입력 + Connect, 연결 중이면 진행 표시,
@@ -463,19 +977,19 @@ fn create_pr_form(dialog: &CreatePrDraft) -> Element<'_, Message> {
 ///
 /// **픽셀·상호작용은 사람 눈으로 본다.** 검사되는 결정은 `tracker_ui`가 값으로 뽑는다:
 /// 연결 결과 매핑(성공/실패), 그리고 crux인 **Unavailable≠no issues**(이슈 목록 매핑).
-fn linear_panel(state: &AppState) -> Element<'_, Message> {
+pub(crate) fn linear_panel(state: &AppState) -> Element<'_, Message> {
     let linear: &LinearState = state.linear();
     let selected = state.selected_worktree().cloned();
 
-    let mut panel = column![text("Linear").size(14)].spacing(6);
+    let mut panel = column![text("Linear").size(16)].spacing(6);
 
     match &linear.workspace {
         // 연결됨: org 이름 + 이슈 새로고침 + 이슈 목록.
         Some(ws) => {
             panel = panel.push(
                 row![
-                    text(format!("● {}", ws.name)).size(12).color(PR_OPEN),
-                    button(text("↻ issues").size(11))
+                    text(format!("● {}", ws.name)).size(14).color(PR_OPEN),
+                    button(text("↻ issues").size(13))
                         .on_press(Message::LinearIssuesRefreshRequested),
                 ]
                 .spacing(6)
@@ -489,26 +1003,30 @@ fn linear_panel(state: &AppState) -> Element<'_, Message> {
             panel = panel.push(
                 text_input("Linear API key", &linear.api_key_input)
                     .secure(true)
-                    .on_input(Message::LinearApiKeyChanged)
+                    .on_input(|value| Message::LinearApiKeyChanged(crate::SecretDraft::new(value)))
                     .on_submit(Message::LinearConnectSubmitted)
-                    .size(12),
+                    .size(14),
             );
             let connect_label = if linear.connecting {
                 "Connecting…"
             } else {
                 "Connect"
             };
-            panel = panel.push(
-                button(text(connect_label).size(12))
-                    .on_press_maybe((!linear.connecting).then_some(Message::LinearConnectSubmitted)),
-            );
+            panel =
+                panel.push(button(text(connect_label).size(14)).on_press_maybe(
+                    (!linear.connecting).then_some(Message::LinearConnectSubmitted),
+                ));
             if let Some(err) = &linear.connect_error {
-                panel = panel.push(text(format!("! {err}")).size(11).color(PR_CLOSED));
+                panel = panel.push(text(format!("! {err}")).size(13).color(PR_CLOSED));
             }
         }
     }
 
-    container(panel).padding(8).into()
+    container(panel)
+        .padding(10)
+        .width(Length::Fill)
+        .style(theme::card)
+        .into()
 }
 
 /// 이슈 목록 렌더. **`tracker_ui::issue_list`가 Unavailable≠no issues를 정하고**, 여기선
@@ -518,23 +1036,26 @@ fn linear_issue_list(
     selected: Option<&WorktreeId>,
 ) -> Element<'static, Message> {
     if linear.issues_loading && linear.issues.is_none() {
-        return text("loading issues…").size(11).color(PR_NEUTRAL).into();
+        return text("loading issues…").size(13).color(PR_NEUTRAL).into();
     }
     let Some(lookup) = &linear.issues else {
-        return text("no issues loaded yet").size(11).color(PR_NEUTRAL).into();
+        return text("no issues loaded yet")
+            .size(13)
+            .color(PR_NEUTRAL)
+            .into();
     };
 
     match tracker_ui::issue_list(lookup) {
         IssueListView::Unavailable(msg) => {
             // **절대 "no issues"가 아니다** — 조회 실패는 구별된 색·문구로.
             text(format!("issues unavailable — {msg}"))
-                .size(11)
+                .size(13)
                 .color(LINEAR_UNAVAILABLE)
                 .into()
         }
         IssueListView::Issues { issues, has_more } => {
             if issues.is_empty() {
-                return text("no issues").size(11).color(PR_NEUTRAL).into();
+                return text("no issues").size(13).color(PR_NEUTRAL).into();
             }
             let mut list = column![].spacing(4);
             for issue in &issues {
@@ -542,7 +1063,11 @@ fn linear_issue_list(
             }
             if has_more {
                 // 무성 절단 금지 — bounded traversal이 끊었음을 표면화한다.
-                list = list.push(text("…more (showing a bounded page)").size(10).color(PR_NEUTRAL));
+                list = list.push(
+                    text("…more (showing a bounded page)")
+                        .size(12)
+                        .color(PR_NEUTRAL),
+                );
             }
             list.into()
         }
@@ -560,13 +1085,17 @@ fn issue_row(
         .as_deref()
         .map(|s| format!(" · {s}"))
         .unwrap_or_default();
-    let label = text(format!("{} {}{}", issue.identifier, issue.title, state_suffix)).size(11);
+    let label = text(format!(
+        "{} {}{}",
+        issue.identifier, issue.title, state_suffix
+    ))
+    .size(13);
 
     let link_msg = selected.map(|wt| Message::LinearIssueLinked {
         worktree: wt.clone(),
         issue: issue.clone(),
     });
-    let link_btn = button(text("link").size(10)).on_press_maybe(link_msg);
+    let link_btn = button(text("link").size(12)).on_press_maybe(link_msg);
 
     row![label, link_btn]
         .spacing(6)
@@ -579,11 +1108,11 @@ fn issue_row(
 ///
 /// **픽셀·상호작용은 사람 눈으로 본다.** 검사되는 결정은 `tracker_ui`가 값으로 뽑는다:
 /// 연결 결과 매핑(성공/실패), 그리고 crux인 **Unavailable≠no issues**(이슈 목록 매핑).
-fn jira_panel(state: &AppState) -> Element<'_, Message> {
+pub(crate) fn jira_panel(state: &AppState) -> Element<'_, Message> {
     let jira: &JiraState = state.jira();
     let selected = state.selected_worktree().cloned();
 
-    let mut panel = column![text("Jira").size(14)].spacing(6);
+    let mut panel = column![text("Jira").size(16)].spacing(6);
 
     match &jira.viewer {
         // 연결됨: 계정 이름 + 이슈 새로고침 + 이슈 목록.
@@ -591,10 +1120,9 @@ fn jira_panel(state: &AppState) -> Element<'_, Message> {
             panel = panel.push(
                 row![
                     text(format!("● {}", viewer.display_name))
-                        .size(12)
+                        .size(14)
                         .color(PR_OPEN),
-                    button(text("↻ issues").size(11))
-                        .on_press(Message::JiraIssuesRefreshRequested),
+                    button(text("↻ issues").size(13)).on_press(Message::JiraIssuesRefreshRequested),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -604,29 +1132,32 @@ fn jira_panel(state: &AppState) -> Element<'_, Message> {
         // 미연결(또는 연결 실패): 연결 폼. 연결 중이면 버튼을 잠근다.
         None => {
             panel = panel.push(
-                text_input("Jira site URL (https://acme.atlassian.net)", &jira.site_url_input)
-                    .on_input(Message::JiraSiteUrlChanged)
-                    .size(12),
+                text_input(
+                    "Jira site URL (https://acme.atlassian.net)",
+                    &jira.site_url_input,
+                )
+                .on_input(Message::JiraSiteUrlChanged)
+                .size(14),
             );
             panel = panel.push(
                 text_input("email (Cloud / Server-Basic)", &jira.email_input)
                     .on_input(Message::JiraEmailChanged)
-                    .size(12),
+                    .size(14),
             );
             // **마스킹된 secure 입력** — 토큰이 화면에 평문으로 안 뜬다(로그/Debug에도 안 샌다).
             panel = panel.push(
                 text_input("API token / PAT", &jira.token_input)
                     .secure(true)
-                    .on_input(Message::JiraTokenChanged)
+                    .on_input(|value| Message::JiraTokenChanged(crate::SecretDraft::new(value)))
                     .on_submit(Message::JiraConnectSubmitted)
-                    .size(12),
+                    .size(14),
             );
             // Cloud/Server 토글: 체크 = Cloud(v3/ADF), 해제 = Server/DC(v2/plain).
             panel = panel.push(
                 checkbox(jira.is_cloud)
                     .label("Cloud (uncheck for Server/DC)")
                     .on_toggle(Message::JiraCloudToggled)
-                    .size(14)
+                    .size(16)
                     .text_size(11),
             );
             let connect_label = if jira.connecting {
@@ -635,42 +1166,46 @@ fn jira_panel(state: &AppState) -> Element<'_, Message> {
                 "Connect"
             };
             panel = panel.push(
-                button(text(connect_label).size(12))
+                button(text(connect_label).size(14))
                     .on_press_maybe((!jira.connecting).then_some(Message::JiraConnectSubmitted)),
             );
             if let Some(err) = &jira.connect_error {
-                panel = panel.push(text(format!("! {err}")).size(11).color(PR_CLOSED));
+                panel = panel.push(text(format!("! {err}")).size(13).color(PR_CLOSED));
             }
         }
     }
 
-    container(panel).padding(8).into()
+    container(panel)
+        .padding(10)
+        .width(Length::Fill)
+        .style(theme::card)
+        .into()
 }
 
 /// Jira 이슈 목록 렌더. **`tracker_ui::jira_issue_list`가 Unavailable≠no issues를 정하고**,
 /// 여기선 그 값을 픽셀로 옮길 뿐이다(사람 눈). 링크 버튼은 **선택된** worktree를 이 이슈에 링크한다.
-fn jira_issue_list(
-    jira: &JiraState,
-    selected: Option<&WorktreeId>,
-) -> Element<'static, Message> {
+fn jira_issue_list(jira: &JiraState, selected: Option<&WorktreeId>) -> Element<'static, Message> {
     if jira.issues_loading && jira.issues.is_none() {
-        return text("loading issues…").size(11).color(PR_NEUTRAL).into();
+        return text("loading issues…").size(13).color(PR_NEUTRAL).into();
     }
     let Some(lookup) = &jira.issues else {
-        return text("no issues loaded yet").size(11).color(PR_NEUTRAL).into();
+        return text("no issues loaded yet")
+            .size(13)
+            .color(PR_NEUTRAL)
+            .into();
     };
 
     match tracker_ui::jira_issue_list(lookup) {
         JiraIssueListView::Unavailable(msg) => {
             // **절대 "no issues"가 아니다** — 조회 실패는 구별된 색·문구로.
             text(format!("issues unavailable — {msg}"))
-                .size(11)
+                .size(13)
                 .color(JIRA_UNAVAILABLE)
                 .into()
         }
         JiraIssueListView::Issues { issues, has_more } => {
             if issues.is_empty() {
-                return text("no issues").size(11).color(PR_NEUTRAL).into();
+                return text("no issues").size(13).color(PR_NEUTRAL).into();
             }
             let mut list = column![].spacing(4);
             for issue in &issues {
@@ -678,7 +1213,11 @@ fn jira_issue_list(
             }
             if has_more {
                 // 무성 절단 금지 — bounded 검색이 끊었음을 표면화한다.
-                list = list.push(text("…more (showing a bounded page)").size(10).color(PR_NEUTRAL));
+                list = list.push(
+                    text("…more (showing a bounded page)")
+                        .size(12)
+                        .color(PR_NEUTRAL),
+                );
             }
             list.into()
         }
@@ -696,13 +1235,13 @@ fn jira_issue_row(
         .as_deref()
         .map(|s| format!(" · {s}"))
         .unwrap_or_default();
-    let label = text(format!("{} {}{}", issue.key, issue.title, status_suffix)).size(11);
+    let label = text(format!("{} {}{}", issue.key, issue.title, status_suffix)).size(13);
 
     let link_msg = selected.map(|wt| Message::JiraIssueLinked {
         worktree: wt.clone(),
         issue: issue.clone(),
     });
-    let link_btn = button(text("link").size(10)).on_press_maybe(link_msg);
+    let link_btn = button(text("link").size(12)).on_press_maybe(link_msg);
 
     row![label, link_btn]
         .spacing(6)
@@ -732,6 +1271,8 @@ fn status_line(state: &AppState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::persistence_thread::{LoadDiagnostics, SaveReport};
     use crate::state::OpId;
@@ -932,7 +1473,10 @@ mod tests {
             ok_glyph, "×",
             "exit code 0 is a normal finish, not a failure"
         );
-        assert_eq!(ok_glyph, badge_glyph(BadgeState::Done, AgentPresence::NoAgent).0);
+        assert_eq!(
+            ok_glyph,
+            badge_glyph(BadgeState::Done, AgentPresence::NoAgent).0
+        );
     }
 
     /// 최종 리뷰 항목 3: `list_worktrees`가 첫 엔트리에 `is_main: true`를
@@ -974,7 +1518,10 @@ mod tests {
         let no_pr = pr_indicator_label(&PrIndicator::NoPr).expect("no PR has a label");
         let unknown = pr_indicator_label(&PrIndicator::Unknown(ForgeUnavailable::NotAuthenticated))
             .expect("unknown has a label");
-        assert_ne!(no_pr.0, unknown.0, "'no PR' and 'status unknown' must read differently");
+        assert_ne!(
+            no_pr.0, unknown.0,
+            "'no PR' and 'status unknown' must read differently"
+        );
         assert_ne!(
             (no_pr.1.r, no_pr.1.g, no_pr.1.b),
             (unknown.1.r, unknown.1.g, unknown.1.b),
@@ -1012,5 +1559,15 @@ mod tests {
     #[test]
     fn checks_summary_is_silent_when_there_are_no_checks() {
         assert!(checks_text(ChecksSummary::default()).is_none());
+    }
+
+    #[test]
+    fn compact_worktree_cards_remove_the_duplicate_detail_line_and_tighten_spacing() {
+        let regular = worktree_row_metrics(false);
+        let compact = worktree_row_metrics(true);
+        assert!(regular.show_detail);
+        assert!(!compact.show_detail);
+        assert!(compact.label_size < regular.label_size);
+        assert!(compact.content_padding[0] < regular.content_padding[0]);
     }
 }

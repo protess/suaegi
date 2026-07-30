@@ -381,7 +381,9 @@ impl KittyKeyboardModeTracker {
         if input.len() < 2 {
             return None;
         }
-        (0..=input.len() - 2).rev().find(|&i| input[i] == 0xc2 && input[i + 1] == 0x9b)
+        (0..=input.len() - 2)
+            .rev()
+            .find(|&i| input[i] == 0xc2 && input[i + 1] == 0x9b)
     }
 
     fn is_incomplete_sequence_body(body: &[u8]) -> bool {

@@ -115,7 +115,10 @@ mod tests {
     /// pair of an astral char isn't split by the escape logic.
     #[test]
     fn escaped_non_bmp_char_preserved() {
-        assert_eq!(split_search_glob_patterns("\\\u{1F600}"), vec!["\\\u{1F600}"]);
+        assert_eq!(
+            split_search_glob_patterns("\\\u{1F600}"),
+            vec!["\\\u{1F600}"]
+        );
     }
 
     /// Fragment trimming must use the JS whitespace set, not Rust's. JS `.trim()`
@@ -126,10 +129,7 @@ mod tests {
     #[test]
     fn fragment_trim_matches_js_whitespace_set() {
         // U+FEFF-only fragment: JS trims to empty → dropped (Rust str::trim keeps it).
-        assert_eq!(
-            split_search_glob_patterns("a,\u{FEFF},b"),
-            vec!["a", "b"]
-        );
+        assert_eq!(split_search_glob_patterns("a,\u{FEFF},b"), vec!["a", "b"]);
         // U+0085/NEL is NOT JS-whitespace → the fragment survives with NEL intact
         // (Rust str::trim would strip it, dropping the fragment).
         assert_eq!(

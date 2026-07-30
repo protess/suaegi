@@ -2,8 +2,8 @@ use super::classify::{
     classify_glab_merge_failure, classify_glab_unavailable, is_no_merge_request,
 };
 use super::parse::{
-    encoded_project, glab_repo_arg, hostname_flag, parse_created_mr, parse_glab_version,
-    parse_gitlab_remote, GlabApprovals, GlabMrView, GlabNote,
+    encoded_project, glab_repo_arg, hostname_flag, parse_created_mr, parse_gitlab_remote,
+    parse_glab_version, GlabApprovals, GlabMrView, GlabNote,
 };
 use super::runner::{GlabError, GlabRunner, CREATE_TIMEOUT};
 use crate::pr_actions::{
@@ -54,7 +54,10 @@ pub enum GlabPreflight {
     /// glab 있지만 `glab auth status` 실패 → "glab auth login" 안내.
     NotAuthenticated,
     /// glab이 하한보다 낮음.
-    OutdatedVersion { found: String, min: String },
+    OutdatedVersion {
+        found: String,
+        min: String,
+    },
 }
 
 /// glab 설치·버전·인증을 검사한다. 실패를 불투명하게 던지지 않고 분류해 돌려준다(gh
@@ -149,17 +152,11 @@ impl ForgeProvider for GlabForge {
     /// 쓰지만, GitLab의 project path는 nested group을 담을 수 있고 이 파싱이 provider
     /// 라우팅(이 remote가 GitLab인가)의 근거이므로 Orca `parseGitLabProjectRef`처럼 원격을
     /// 직접 파싱한다. GitLab 원격이 아니면 None.
-    async fn resolve_repository(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<RepoCoords>, ForgeError> {
+    async fn resolve_repository(&self, worktree: &Path) -> Result<Option<RepoCoords>, ForgeError> {
         let git = GitRunner::new();
         // "no origin" / "not a git repository"는 exit 128 → Failed. 이를 "GitLab 아님"(None)
         // 으로 접는다. git 실행 자체가 안 되는(timeout 등) 경우만 Unavailable.
-        match git
-            .run(worktree, &["remote", "get-url", "origin"])
-            .await
-        {
+        match git.run(worktree, &["remote", "get-url", "origin"]).await {
             Ok(out) => Ok(parse_gitlab_remote(out.stdout.trim())),
             Err(suaegi_git::runner::GitError::Failed { .. }) => Ok(None),
             Err(_) => Err(ForgeError::Unavailable(ForgeUnavailable::Other(
@@ -363,7 +360,14 @@ impl PrActions for GlabForge {
         // **파괴적**. 이 백엔드는 auto-confirm을 하지 않는다 — UI가 먼저 확인한 뒤 부른다.
         // `--yes`는 glab의 비대화형 확인일 뿐(자동 승인 아님, gh와 동일 규율).
         let (repo_arg, host) = Self::repo_args(repo);
-        let owned = build_merge_args(&repo_arg, host, number, method, false, options.delete_branch);
+        let owned = build_merge_args(
+            &repo_arg,
+            host,
+            number,
+            method,
+            false,
+            options.delete_branch,
+        );
         let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
         let res = self
@@ -536,8 +540,14 @@ mod tests {
     #[test]
     fn merge_method_maps_to_the_right_flag() {
         assert_eq!(glab_merge_method_flag(MergeMethod::Merge), None);
-        assert_eq!(glab_merge_method_flag(MergeMethod::Squash), Some("--squash"));
-        assert_eq!(glab_merge_method_flag(MergeMethod::Rebase), Some("--rebase"));
+        assert_eq!(
+            glab_merge_method_flag(MergeMethod::Squash),
+            Some("--squash")
+        );
+        assert_eq!(
+            glab_merge_method_flag(MergeMethod::Rebase),
+            Some("--rebase")
+        );
     }
 
     /// **회귀 방어 — 파괴적 `--remove-source-branch`는 기본 off.** fake-glab의 prefix 매칭은

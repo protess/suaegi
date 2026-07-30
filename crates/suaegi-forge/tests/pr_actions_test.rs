@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! 7b PR 상호작용을 스크립트 fake gh(PATH 앞)로 실 단위 테스트한다. 커맨드 모양·exit
 //! 분류·확정거부/일시실패 분기를 트레잇 추상화 없이 검증한다(플랜 §5, 7a와 같은 하네스).
 //!
@@ -114,7 +117,10 @@ async fn merge_permission_denied_is_rejected() {
         .merge_pr(&coords(), 57, MergeMethod::Squash, MergeOptions::default())
         .await
         .unwrap();
-    assert_eq!(out, MergeOutcome::Rejected(MergeRejection::PermissionDenied));
+    assert_eq!(
+        out,
+        MergeOutcome::Rejected(MergeRejection::PermissionDenied)
+    );
 }
 
 /// **회귀 방어 (a) — 일시 실패가 확정 거부로 오독되면 안 된다.** 레이트리밋 merge 실패는
@@ -135,7 +141,9 @@ async fn transient_merge_failure_is_unavailable_not_rejected() {
         .await;
     match res {
         Err(ForgeError::Unavailable(ForgeUnavailable::RateLimited)) => {}
-        other => panic!("a transient merge failure must be Err(Unavailable::RateLimited), got {other:?}"),
+        other => {
+            panic!("a transient merge failure must be Err(Unavailable::RateLimited), got {other:?}")
+        }
     }
 }
 
@@ -172,19 +180,17 @@ async fn set_auto_merge_clean_status_is_validation() {
 #[tokio::test]
 async fn set_auto_merge_transient_is_unavailable() {
     let _g = env_lock();
-    let fake = FakeGh::new().rule(
-        "pr merge",
-        "",
-        "HTTP 401: Bad credentials\n",
-        1,
-    );
+    let fake = FakeGh::new().rule("pr merge", "", "HTTP 401: Bad credentials\n", 1);
     let _p = fake.activate();
     let err = GhForge::new()
         .set_auto_merge(&coords(), 57, MergeMethod::Squash)
         .await
         .unwrap_err();
     assert!(
-        matches!(err, ForgeError::Unavailable(ForgeUnavailable::NotAuthenticated)),
+        matches!(
+            err,
+            ForgeError::Unavailable(ForgeUnavailable::NotAuthenticated)
+        ),
         "got {err:?}"
     );
 }
@@ -200,7 +206,12 @@ const REVIEWS_JSON: &str = r#"{"reviews":[
 #[tokio::test]
 async fn pr_reviews_parses_summaries() {
     let _g = env_lock();
-    let fake = FakeGh::new().rule("pr view 57 --repo acme/widget --json reviews", REVIEWS_JSON, "", 0);
+    let fake = FakeGh::new().rule(
+        "pr view 57 --repo acme/widget --json reviews",
+        REVIEWS_JSON,
+        "",
+        0,
+    );
     let _p = fake.activate();
     let lookup = GhForge::new().pr_reviews(&coords(), 57).await;
     match lookup {
@@ -266,7 +277,12 @@ const COMMENTS_JSON: &str = r#"{"comments":[
 #[tokio::test]
 async fn pr_comments_parses_list() {
     let _g = env_lock();
-    let fake = FakeGh::new().rule("pr view 57 --repo acme/widget --json comments", COMMENTS_JSON, "", 0);
+    let fake = FakeGh::new().rule(
+        "pr view 57 --repo acme/widget --json comments",
+        COMMENTS_JSON,
+        "",
+        0,
+    );
     let _p = fake.activate();
     let lookup = GhForge::new().pr_comments(&coords(), 57).await;
     match lookup {

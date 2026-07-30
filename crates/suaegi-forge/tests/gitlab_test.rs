@@ -1,3 +1,6 @@
+// The process-wide PATH fixture must remain locked while its async child runs.
+#![allow(clippy::await_holding_lock)]
+
 //! GlabForge를 스크립트 fake glab(PATH 앞에 얹음)으로 실 단위 테스트한다. github_test.rs와
 //! pr_actions_test.rs를 미러하되 glab 커맨드 모양·GitLab 신호로. 출력 파싱·exit code 분류·
 //! None/Unavailable/Found 분기를 트레잇 추상화 없이 검증한다.
@@ -29,7 +32,10 @@ const MR_VIEW_JSON: &str = r#"{"iid":57,"title":"Fix the bug","state":"opened","
 #[tokio::test]
 async fn resolve_repository_reads_owner_name_host_from_origin() {
     let dir = tempfile::tempdir().unwrap();
-    init_gitlab_repo(dir.path(), "https://gitlab.example.com/group/sub/widget.git");
+    init_gitlab_repo(
+        dir.path(),
+        "https://gitlab.example.com/group/sub/widget.git",
+    );
     let repo = GlabForge::new()
         .resolve_repository(dir.path())
         .await
@@ -44,7 +50,10 @@ async fn resolve_repository_reads_owner_name_host_from_origin() {
 async fn resolve_repository_none_when_not_gitlab() {
     let dir = tempfile::tempdir().unwrap();
     init_gitlab_repo(dir.path(), "https://github.com/acme/widget.git");
-    let out = GlabForge::new().resolve_repository(dir.path()).await.unwrap();
+    let out = GlabForge::new()
+        .resolve_repository(dir.path())
+        .await
+        .unwrap();
     assert_eq!(out, None);
 }
 
@@ -53,7 +62,12 @@ async fn resolve_repository_none_when_not_gitlab() {
 #[tokio::test]
 async fn review_for_branch_found_with_pipeline_checks() {
     let _g = env_lock();
-    let fake = FakeGlab::new().rule("mr view feat -R acme/widget --output json", MR_VIEW_JSON, "", 0);
+    let fake = FakeGlab::new().rule(
+        "mr view feat -R acme/widget --output json",
+        MR_VIEW_JSON,
+        "",
+        0,
+    );
     let _p = fake.activate();
     let lookup = GlabForge::new().review_for_branch(&coords(), "feat").await;
     match lookup {
@@ -98,14 +112,22 @@ async fn transient_glab_error_is_unavailable_not_none() {
         ReviewLookup::None,
         "a transient glab error must NOT read as 'no MR' — it would erase known MR state"
     );
-    assert_eq!(lookup, ReviewLookup::Unavailable(ForgeUnavailable::RateLimited));
+    assert_eq!(
+        lookup,
+        ReviewLookup::Unavailable(ForgeUnavailable::RateLimited)
+    );
 }
 
 /// project 404(repo 사라짐)는 "MR 없음"이 아니라 Unavailable이어야 한다(같은 붕괴 방어의 갈래).
 #[tokio::test]
 async fn project_404_is_unavailable_not_none() {
     let _g = env_lock();
-    let fake = FakeGlab::new().rule("mr view", "", "GET .../projects/x: 404 Project Not Found\n", 1);
+    let fake = FakeGlab::new().rule(
+        "mr view",
+        "",
+        "GET .../projects/x: 404 Project Not Found\n",
+        1,
+    );
     let _p = fake.activate();
     let lookup = GlabForge::new().review_for_branch(&coords(), "feat").await;
     assert_ne!(lookup, ReviewLookup::None);
@@ -163,7 +185,10 @@ async fn create_review_parses_mr_number_from_url() {
         .await
         .expect("created");
     assert_eq!(review.number, 99);
-    assert_eq!(review.url, "https://gitlab.com/acme/widget/-/merge_requests/99");
+    assert_eq!(
+        review.url,
+        "https://gitlab.com/acme/widget/-/merge_requests/99"
+    );
     assert_eq!(review.state, ReviewState::Open);
 }
 
@@ -311,7 +336,10 @@ async fn merge_permission_denied_is_rejected() {
         .merge_pr(&coords(), 57, MergeMethod::Squash, MergeOptions::default())
         .await
         .unwrap();
-    assert_eq!(out, MergeOutcome::Rejected(MergeRejection::PermissionDenied));
+    assert_eq!(
+        out,
+        MergeOutcome::Rejected(MergeRejection::PermissionDenied)
+    );
 }
 
 /// **회귀 방어 (a) — 일시 실패가 확정 거부로 오독되면 안 된다.**
@@ -325,7 +353,9 @@ async fn transient_merge_failure_is_unavailable_not_rejected() {
         .await;
     match res {
         Err(ForgeError::Unavailable(ForgeUnavailable::RateLimited)) => {}
-        other => panic!("a transient merge failure must be Err(Unavailable::RateLimited), got {other:?}"),
+        other => {
+            panic!("a transient merge failure must be Err(Unavailable::RateLimited), got {other:?}")
+        }
     }
 }
 
@@ -357,7 +387,10 @@ async fn set_auto_merge_transient_is_unavailable() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, ForgeError::Unavailable(ForgeUnavailable::NotAuthenticated)),
+        matches!(
+            err,
+            ForgeError::Unavailable(ForgeUnavailable::NotAuthenticated)
+        ),
         "got {err:?}"
     );
 }
@@ -448,7 +481,10 @@ async fn pr_comments_transient_failure_is_unavailable_not_empty() {
     let _p = fake.activate();
     let lookup = GlabForge::new().pr_comments(&coords(), 57).await;
     assert_ne!(lookup, CommentLookup::Found(vec![]));
-    assert_eq!(lookup, CommentLookup::Unavailable(ForgeUnavailable::Network));
+    assert_eq!(
+        lookup,
+        CommentLookup::Unavailable(ForgeUnavailable::Network)
+    );
 }
 
 // ---- mergeability ----------------------------------------------------------

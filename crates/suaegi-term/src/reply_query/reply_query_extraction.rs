@@ -187,7 +187,10 @@ fn find_byte(hay: &[u8], byte: u8, from: usize) -> Option<usize> {
     if from > hay.len() {
         return None;
     }
-    hay[from..].iter().position(|&b| b == byte).map(|p| from + p)
+    hay[from..]
+        .iter()
+        .position(|&b| b == byte)
+        .map(|p| from + p)
 }
 
 #[cfg(test)]
@@ -255,7 +258,9 @@ mod tests {
     fn c4_contains_csi_incomplete_first_csi_is_immediate_false() {
         // Incomplete first CSI (no final byte) → false even though a later
         // complete query exists after it (Orca returns on the first -1).
-        assert!(!contains_csi_renderer_query(b"\x1b[123456789012345678901234567890"));
+        assert!(!contains_csi_renderer_query(
+            b"\x1b[123456789012345678901234567890"
+        ));
     }
 
     #[test]

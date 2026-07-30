@@ -19,7 +19,9 @@ pub use attribute_filter::{
 pub use classify::{classify_graphql, GraphqlOutcome};
 pub use client::{LinearClient, KEYCHAIN_SERVICE, LINEAR_ENDPOINT};
 pub use model::{
-    Classified, Comment, Issue, IssuePage, LinearWorkspace, Lookup, TrackerUnavailable,
+    Classified, Comment, Issue, IssuePage, LinearIssueContextOptions, LinearLabel, LinearMember,
+    LinearProject, LinearRelation, LinearRelationPage, LinearState, LinearTeam, LinearWorkspace,
+    Lookup, TrackerUnavailable,
 };
 pub use write::{
     CreatedAttachment, CreatedComment, InvalidWriteId, IssueUpdate, NewIssue, WriteId, WriteOutcome,

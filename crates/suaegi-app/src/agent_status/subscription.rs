@@ -170,6 +170,7 @@ mod tests {
             event: HookEventName::Stop,
             tool_name: None,
             agent_id: None,
+            prompt: None,
             background_tasks_empty: Some(true),
         }
     }

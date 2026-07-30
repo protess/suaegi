@@ -253,6 +253,13 @@ pub fn parse_hook(pane: &str, nonce: &str, body: &[u8]) -> Result<HookEvent, Par
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        prompt: obj
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .and_then(|prompt| {
+                let bounded: String = prompt.chars().take(512).collect();
+                (!bounded.trim().is_empty()).then_some(bounded)
+            }),
         background_tasks_empty,
     })
 }
@@ -447,6 +454,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sub.agent_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn prompt_is_bounded_and_redacted_from_debug_output() {
+        let pane = encode_pane_key(&PaneKey(WorktreeId("/w".into())));
+        let secret = format!("PR #1094 {}", "do not log this ".repeat(100));
+        let body = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": secret,
+        })
+        .to_string();
+        let event = parse_hook(&pane, "1", body.as_bytes()).expect("valid prompt hook");
+
+        assert_eq!(
+            event
+                .prompt
+                .as_deref()
+                .expect("nonblank prompt")
+                .chars()
+                .count(),
+            512,
+            "large prompts must be bounded before entering app state"
+        );
+        let debug = format!("{event:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(
+            !debug.contains("do not log this"),
+            "prompt contents must not leak through diagnostic formatting"
+        );
     }
 
     // ---- HTTP 한 겹 ----

@@ -64,7 +64,7 @@ impl SpawnNonce {
 
 /// 정규화된 훅 이벤트. 서버가 `parse_hook(pane, nonce, body)`로 만들고, 이 타입은
 /// **`iced`도 소켓도 모른다** — 그래서 표 테스트가 가능하다.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HookEvent {
     pub pane_key: PaneKey,
     /// 세대 판별. **우리가 발급한 값**이다.
@@ -76,6 +76,9 @@ pub struct HookEvent {
     /// `Some` = 서브에이전트, `None` = 리드. 실측: 리드 이벤트는 `agent_id`를
     /// 아예 갖지 않고 서브에이전트만 `agent_id`/`agent_type`을 둘 다 갖는다.
     pub agent_id: Option<String>,
+    /// First known agent prompt, bounded during parsing and never persisted.
+    /// It is used only to derive an optional stable tab title.
+    pub prompt: Option<String>,
     /// **`Stop`에서만 `None`을 "비지 않음"으로 취급한다**(보수적). 백그라운드
     /// 서브에이전트가 도는 중에 `Done`을 찍으면 배지가 done↔working으로 깜빡인다
     /// (실측 §1.6.6: 한 턴에 `Stop`이 두 번 오고, 첫 번째 뒤에 도구 호출이 8개 더 왔다).
@@ -92,6 +95,22 @@ pub struct HookEvent {
     // 처리하는 중이니 working이 맞다) 프롬프트 텍스트를 표시하지도 않는다.
     // 파싱만 하고 안 쓰는 필드는 썩고, 있으면 "쓰라고 만든 것"으로 오해된다.
     // 툴팁이 생겨서 필요해지면 §1.6.5의 접두사로 bool 하나를 다시 넣으면 된다.
+}
+
+impl std::fmt::Debug for HookEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HookEvent")
+            .field("pane_key", &self.pane_key)
+            .field("spawn_nonce", &self.spawn_nonce)
+            .field("claude_session_id", &self.claude_session_id)
+            .field("event", &self.event)
+            .field("tool_name", &self.tool_name)
+            .field("agent_id", &self.agent_id)
+            .field("prompt", &self.prompt.as_ref().map(|_| "<redacted>"))
+            .field("background_tasks_empty", &self.background_tasks_empty)
+            .finish()
+    }
 }
 
 /// 등록하는 훅 이벤트. **`Notification`은 없다** — `PermissionRequest`보다 6초
@@ -145,12 +164,9 @@ pub enum HookState {
 /// **`Waiting`에는 적용하지 않는다** — 답 없는 `AskUserQuestion`은 몇 시간이고
 /// 정당하게 `Waiting`이다. 오래돼서 의심스러운 것은 `Working`뿐이다.
 ///
-/// **측정된 API 재시도 창(~210초)보다 길게 잡는다.** 오류 시 Claude는 빨리 실패하지
-/// 않고 백오프로 재시도하며(실측: 화면에 "attempt 7/10", 그동안 훅이 하나도 오지
-/// 않는다), `StopFailure`가 t+210s에야 도착한다. 90초로 두면 **정상 재시도 중에**
-/// 배지가 `Unknown`으로 튀는데 그때 에이전트는 실제로 일하는 중이다 — 긴 침묵의
-/// 흔한 원인이 재시도라는 것이 이 값의 근거다.
-pub const HOOK_STALE_AFTER: Duration = Duration::from_secs(240);
+/// Orca와 같은 30분이다. 측정된 API 재시도 창(~210초)보다 길어 정상 재시도 중
+/// `Unknown`으로 튀지 않고, 긴 Claude 도구 작업도 Orca보다 먼저 회색으로 변하지 않는다.
+pub const HOOK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// `NoAgent`를 몇 번 연속으로 봐야 `Done`으로 확정하는가. `presence.rs`가 셸이
 /// exec하는 동안 포그라운드를 잠깐 쥐는 전이를 이미 문서화해뒀다 — 한 틱에
@@ -257,8 +273,9 @@ pub enum HookOutcome {
 /// |---|---|---|
 /// | `SessionStart` | `Reset` | 바인딩만. 아직 아무 일도 안 일어났다 |
 /// | `UserPromptSubmit` | `Set(Working)` | `<task-notification>` 필터는 넣지 않는다(아래) |
-/// | `PreToolUse`/`PostToolUse`/`PostToolUseFailure` | `Set(Working)` | |
-/// | `PermissionRequest` | `Set(Waiting)` | `AskUserQuestion` 특수 처리 없음 — 자동 허용이 아니다 |
+/// | 일반 `PreToolUse`/`PostToolUse`/`PostToolUseFailure` | `Set(Working)` | |
+/// | `PreToolUse(AskUserQuestion)` | `Set(Waiting)` | 자동 허용 뒤 사람의 답을 기다린다 |
+/// | `PermissionRequest` | `Set(Waiting)` | 사용자 승인 대기 |
 /// | `Stop` + background 빔 | `Set(Done)` | |
 /// | `Stop` + background 안 빔 | `Set(Working)` | 서브에이전트가 도는 중이다 |
 /// | `StopFailure` | `Set(Done)` **무조건** | 이 이벤트엔 `background_tasks`가 **구조적으로 없다** |
@@ -282,9 +299,23 @@ pub fn hook_outcome(event: &HookEvent) -> HookOutcome {
     match event.event {
         HookEventName::SessionStart => HookOutcome::Reset,
         HookEventName::UserPromptSubmit
-        | HookEventName::PreToolUse
         | HookEventName::PostToolUse
         | HookEventName::PostToolUseFailure => HookOutcome::Set(HookState::Working),
+        HookEventName::PreToolUse
+            if event.tool_name.as_deref().is_some_and(|tool| {
+                let normalized = tool
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                normalized == "askuserquestion"
+            }) =>
+        {
+            // Claude auto-allows AskUserQuestion, so it emits PreToolUse while actually
+            // blocked on the user's answer. Orca maps this exact case to waiting.
+            HookOutcome::Set(HookState::Waiting)
+        }
+        HookEventName::PreToolUse => HookOutcome::Set(HookState::Working),
         HookEventName::PermissionRequest => HookOutcome::Set(HookState::Waiting),
         HookEventName::Stop => match event.background_tasks_empty {
             Some(true) => HookOutcome::Set(HookState::Done),
@@ -535,8 +566,13 @@ mod tests {
                 BadgeState::Waiting,
                 0,
             ));
-            let with_unknown =
-                reduce(&input(AgentPresence::Unknown, hook, age, BadgeState::Waiting, 0));
+            let with_unknown = reduce(&input(
+                AgentPresence::Unknown,
+                hook,
+                age,
+                BadgeState::Waiting,
+                0,
+            ));
             assert_eq!(
                 with_unknown, with_agent,
                 "Unknown presence must resolve like Agent(_) for {label}"
@@ -545,7 +581,13 @@ mod tests {
         // 대조군: 훅이 없을 때 `Done`을 합성하지 않는다는 것을 직접 고정한다.
         // 위의 동치 단언만으로는 둘 다 틀린 값이어도 통과한다.
         assert_eq!(
-            reduce(&input(AgentPresence::Unknown, None, FRESH, BadgeState::Done, 0)),
+            reduce(&input(
+                AgentPresence::Unknown,
+                None,
+                FRESH,
+                BadgeState::Done,
+                0
+            )),
             BadgeState::Unknown,
             "with no hook and no presence we know nothing — synthesizing Done here would \
              mark a session finished that may be waiting on the trust dialog"
@@ -618,7 +660,11 @@ mod tests {
             BadgeState::Unknown,
             0,
         ));
-        assert_eq!(just_outside, BadgeState::Unknown, "one millisecond over decays");
+        assert_eq!(
+            just_outside,
+            BadgeState::Unknown,
+            "one millisecond over decays"
+        );
 
         assert!(
             HOOK_STALE_AFTER > Duration::from_secs(210),
@@ -644,7 +690,13 @@ mod tests {
         ] {
             for streak in [0, 1, 2] {
                 assert_eq!(
-                    reduce(&input(AgentPresence::NoAgent, None, FRESH, previous, streak)),
+                    reduce(&input(
+                        AgentPresence::NoAgent,
+                        None,
+                        FRESH,
+                        previous,
+                        streak
+                    )),
                     previous,
                     "streak {streak} is below the threshold, so the badge must hold at \
                      {previous:?} rather than flicker"
@@ -653,7 +705,13 @@ mod tests {
             // 대조군: 경계에 닿으면 확정된다.
             for streak in [3, 4, u8::MAX] {
                 assert_eq!(
-                    reduce(&input(AgentPresence::NoAgent, None, FRESH, previous, streak)),
+                    reduce(&input(
+                        AgentPresence::NoAgent,
+                        None,
+                        FRESH,
+                        previous,
+                        streak
+                    )),
                     BadgeState::Done,
                     "control: streak {streak} has confirmed the agent is gone"
                 );
@@ -691,6 +749,7 @@ mod tests {
             event: name,
             tool_name: None,
             agent_id: None,
+            prompt: None,
             background_tasks_empty,
         }
     }
@@ -700,7 +759,11 @@ mod tests {
         use HookEventName as E;
         let table = [
             (E::SessionStart, None, HookOutcome::Reset),
-            (E::UserPromptSubmit, None, HookOutcome::Set(HookState::Working)),
+            (
+                E::UserPromptSubmit,
+                None,
+                HookOutcome::Set(HookState::Working),
+            ),
             (E::PreToolUse, None, HookOutcome::Set(HookState::Working)),
             (E::PostToolUse, None, HookOutcome::Set(HookState::Working)),
             (
@@ -723,6 +786,25 @@ mod tests {
                 "{name:?} must map to {want:?}"
             );
         }
+    }
+
+    #[test]
+    fn claude_ask_user_question_pre_tool_is_waiting_like_orca() {
+        for tool_name in ["AskUserQuestion", "ask_user_question", "ask-user-question"] {
+            let mut event = event(HookEventName::PreToolUse, None);
+            event.tool_name = Some(tool_name.to_string());
+            assert_eq!(
+                hook_outcome(&event),
+                HookOutcome::Set(HookState::Waiting),
+                "{tool_name} blocks on a human answer even though Claude reports PreToolUse"
+            );
+        }
+        let mut ordinary = event(HookEventName::PreToolUse, None);
+        ordinary.tool_name = Some("Bash".to_string());
+        assert_eq!(
+            hook_outcome(&ordinary),
+            HookOutcome::Set(HookState::Working)
+        );
     }
 
     /// **`Stop`은 "끝났다"가 아니다.** Agent 도구는 기본이 백그라운드 실행이라

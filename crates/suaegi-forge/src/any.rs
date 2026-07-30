@@ -20,7 +20,7 @@ use crate::provider::{
     CreateReviewInput, ForgeError, ForgeProvider, RepoCoords, Review, ReviewLookup,
 };
 use crate::runner::GhRunner;
-use crate::{preflight, GhForge, Preflight};
+use crate::{preflight, GhForge, Preflight, TokenForge, TokenForgeKind};
 use async_trait::async_trait;
 use std::path::Path;
 use suaegi_git::runner::GitRunner;
@@ -35,6 +35,8 @@ pub enum AnyForge {
     GithubHttp(HttpGhForge),
     /// glab CLI GitLab 백엔드.
     Gitlab(GlabForge),
+    /// Token-authenticated Gitea/Forgejo, Azure DevOps, or Bitbucket backend.
+    Token(TokenForge),
 }
 
 impl AnyForge {
@@ -43,7 +45,19 @@ impl AnyForge {
     pub async fn select(worktree: &Path) -> AnyForge {
         let git = GitRunner::new();
         if let Ok(out) = git.run(worktree, &["remote", "get-url", "origin"]).await {
-            if parse_gitlab_remote(out.stdout.trim()).is_some() {
+            let remote = out.stdout.trim();
+            for kind in [
+                TokenForgeKind::AzureDevOps,
+                TokenForgeKind::Bitbucket,
+                TokenForgeKind::Gitea,
+            ] {
+                if let Some(provider) = TokenForge::from_environment(kind) {
+                    if provider.matches_remote(remote) {
+                        return AnyForge::Token(provider);
+                    }
+                }
+            }
+            if parse_gitlab_remote(remote).is_some() {
                 return AnyForge::Gitlab(GlabForge::new());
             }
         }
@@ -74,14 +88,12 @@ impl AnyForge {
 
 #[async_trait]
 impl ForgeProvider for AnyForge {
-    async fn resolve_repository(
-        &self,
-        worktree: &Path,
-    ) -> Result<Option<RepoCoords>, ForgeError> {
+    async fn resolve_repository(&self, worktree: &Path) -> Result<Option<RepoCoords>, ForgeError> {
         match self {
             AnyForge::Github(f) => f.resolve_repository(worktree).await,
             AnyForge::GithubHttp(f) => f.resolve_repository(worktree).await,
             AnyForge::Gitlab(f) => f.resolve_repository(worktree).await,
+            AnyForge::Token(f) => f.resolve_repository(worktree).await,
         }
     }
 
@@ -90,6 +102,7 @@ impl ForgeProvider for AnyForge {
             AnyForge::Github(f) => f.review_for_branch(repo, branch).await,
             AnyForge::GithubHttp(f) => f.review_for_branch(repo, branch).await,
             AnyForge::Gitlab(f) => f.review_for_branch(repo, branch).await,
+            AnyForge::Token(f) => f.review_for_branch(repo, branch).await,
         }
     }
 
@@ -98,6 +111,7 @@ impl ForgeProvider for AnyForge {
             AnyForge::Github(f) => f.review_by_number(repo, number).await,
             AnyForge::GithubHttp(f) => f.review_by_number(repo, number).await,
             AnyForge::Gitlab(f) => f.review_by_number(repo, number).await,
+            AnyForge::Token(f) => f.review_by_number(repo, number).await,
         }
     }
 
@@ -106,6 +120,7 @@ impl ForgeProvider for AnyForge {
             AnyForge::Github(f) => f.supports_review_creation(),
             AnyForge::GithubHttp(f) => f.supports_review_creation(),
             AnyForge::Gitlab(f) => f.supports_review_creation(),
+            AnyForge::Token(f) => f.supports_review_creation(),
         }
     }
 
@@ -114,6 +129,7 @@ impl ForgeProvider for AnyForge {
             AnyForge::Github(f) => f.create_review(input).await,
             AnyForge::GithubHttp(f) => f.create_review(input).await,
             AnyForge::Gitlab(f) => f.create_review(input).await,
+            AnyForge::Token(f) => f.create_review(input).await,
         }
     }
 }
@@ -131,6 +147,7 @@ impl PrActions for AnyForge {
             AnyForge::Github(f) => f.merge_pr(repo, number, method, options).await,
             AnyForge::GithubHttp(f) => f.merge_pr(repo, number, method, options).await,
             AnyForge::Gitlab(f) => f.merge_pr(repo, number, method, options).await,
+            AnyForge::Token(f) => f.merge_pr(repo, number, method, options).await,
         }
     }
 
@@ -144,6 +161,7 @@ impl PrActions for AnyForge {
             AnyForge::Github(f) => f.set_auto_merge(repo, number, method).await,
             AnyForge::GithubHttp(f) => f.set_auto_merge(repo, number, method).await,
             AnyForge::Gitlab(f) => f.set_auto_merge(repo, number, method).await,
+            AnyForge::Token(f) => f.set_auto_merge(repo, number, method).await,
         }
     }
 
@@ -152,6 +170,7 @@ impl PrActions for AnyForge {
             AnyForge::Github(f) => f.pr_reviews(repo, number).await,
             AnyForge::GithubHttp(f) => f.pr_reviews(repo, number).await,
             AnyForge::Gitlab(f) => f.pr_reviews(repo, number).await,
+            AnyForge::Token(f) => f.pr_reviews(repo, number).await,
         }
     }
 
@@ -160,6 +179,7 @@ impl PrActions for AnyForge {
             AnyForge::Github(f) => f.pr_comments(repo, number).await,
             AnyForge::GithubHttp(f) => f.pr_comments(repo, number).await,
             AnyForge::Gitlab(f) => f.pr_comments(repo, number).await,
+            AnyForge::Token(f) => f.pr_comments(repo, number).await,
         }
     }
 
@@ -168,6 +188,7 @@ impl PrActions for AnyForge {
             AnyForge::Github(f) => f.mergeability_state(repo, number).await,
             AnyForge::GithubHttp(f) => f.mergeability_state(repo, number).await,
             AnyForge::Gitlab(f) => f.mergeability_state(repo, number).await,
+            AnyForge::Token(f) => f.mergeability_state(repo, number).await,
         }
     }
 }

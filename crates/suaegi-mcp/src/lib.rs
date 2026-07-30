@@ -29,7 +29,7 @@ pub use inspection::{
     inspect_mcp_config_content, McpConfigInspection, McpConfigStatus, McpServerStatus,
     McpServerSummary, McpServerTransport,
 };
-pub use json::{parse_json, js_string_of, JsonNumber, JsonValue};
+pub use json::{js_string_of, parse_json, JsonNumber, JsonValue};
 
 // ---------------------------------------------------------------------------
 // O:1 McpConfigFormat

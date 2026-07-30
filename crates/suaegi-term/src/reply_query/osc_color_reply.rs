@@ -484,7 +484,10 @@ mod tests {
 
     #[test]
     fn keeps_a_split_st_terminator_pending() {
-        assert_eq!(q(b"\x1b]10;?\x1b"), TerminalOscColorQueryParseResult::Partial);
+        assert_eq!(
+            q(b"\x1b]10;?\x1b"),
+            TerminalOscColorQueryParseResult::Partial
+        );
         assert_eq!(
             q(b"\x1b]10;?;?\x1b"),
             TerminalOscColorQueryParseResult::Partial
@@ -506,7 +509,10 @@ mod tests {
             q(b"\x1b]10;?;?;?\x1b\\"),
             TerminalOscColorQueryParseResult::None
         );
-        assert_eq!(q(b"\x1b]11;?;?\x1b\\"), TerminalOscColorQueryParseResult::None);
+        assert_eq!(
+            q(b"\x1b]11;?;?\x1b\\"),
+            TerminalOscColorQueryParseResult::None
+        );
     }
 
     #[test]
@@ -658,14 +664,23 @@ mod tests {
 
     #[test]
     fn slots_for_body_maps_bodies() {
-        assert_eq!(terminal_osc_color_query_slots_for_body(Ten, b"?"), Some(SLOTS_10));
+        assert_eq!(
+            terminal_osc_color_query_slots_for_body(Ten, b"?"),
+            Some(SLOTS_10)
+        );
         assert_eq!(
             terminal_osc_color_query_slots_for_body(Ten, b"?;?"),
             Some(SLOTS_10_11)
         );
-        assert_eq!(terminal_osc_color_query_slots_for_body(Eleven, b"?"), Some(SLOTS_11));
+        assert_eq!(
+            terminal_osc_color_query_slots_for_body(Eleven, b"?"),
+            Some(SLOTS_11)
+        );
         // Combined body invalid for slot 11.
-        assert_eq!(terminal_osc_color_query_slots_for_body(Eleven, b"?;?"), None);
+        assert_eq!(
+            terminal_osc_color_query_slots_for_body(Eleven, b"?;?"),
+            None
+        );
     }
 
     // --- C8: send helper drives the injected sink ---

@@ -108,10 +108,10 @@ impl FakeKeychain {
 
     /// 저장된 자격을 미리 심는다(빌더).
     pub fn with(mut self, service: &str, account: &str, secret: &str) -> Self {
-        self.entries
-            .get_mut()
-            .unwrap()
-            .insert((service.to_string(), account.to_string()), Secret::new(secret));
+        self.entries.get_mut().unwrap().insert(
+            (service.to_string(), account.to_string()),
+            Secret::new(secret),
+        );
         self
     }
 

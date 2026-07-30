@@ -532,7 +532,7 @@ mod tests {
     /// `(0.0/0.0).clamp(0.0,1.0)`을 만들고 `f32::clamp`는 NaN을 통과시킨다.
     #[test]
     fn a_non_finite_ratio_never_reaches_the_serializer() {
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0 / 0.0] {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let q = quantize_ratio(bad);
             assert!(
                 q.is_finite(),
@@ -550,7 +550,7 @@ mod tests {
     fn a_tree_built_from_a_nan_resize_still_round_trips_through_json() {
         let tree = PersistedPane::Split {
             axis: PersistedAxis::Vertical,
-            ratio: quantize_ratio(0.0 / 0.0),
+            ratio: quantize_ratio(f32::NAN),
             a: Box::new(leaf("a")),
             b: Box::new(leaf("b")),
         };

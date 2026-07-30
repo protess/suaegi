@@ -143,10 +143,19 @@ pub fn hit_for(
 /// iced의 `y`도 양수가 위다(`iced_widget`의 `scrollable`이 `-y`를 아래 방향
 /// 오프셋에 더한다 — `scrollable.rs:873, 1799`), 그래서 부호를 뒤집지 않는다.
 pub fn accumulate_scroll(acc: &mut f32, delta: iced_mouse::ScrollDelta, cell_height: f32) -> i32 {
+    accumulate_scroll_scaled(acc, delta, cell_height, 1.0)
+}
+
+pub fn accumulate_scroll_scaled(
+    acc: &mut f32,
+    delta: iced_mouse::ScrollDelta,
+    cell_height: f32,
+    sensitivity: f32,
+) -> i32 {
     let lines = match delta {
         iced_mouse::ScrollDelta::Lines { y, .. } => y,
         iced_mouse::ScrollDelta::Pixels { y, .. } => y / cell_height,
-    };
+    } * sensitivity.clamp(0.1, 200.0);
     // OS가 NaN을 주면 누산기가 영구히 오염돼 **스크롤이 다시는 동작하지 않는다.**
     // 이 한 줄이 그 영구 고장을 막는다.
     if !lines.is_finite() {
@@ -207,6 +216,7 @@ pub fn press_intent(
         mods: state.mods,
         click,
         force_local: force_local(state.mods),
+        tui_wheel_multiplier: 1,
     })
 }
 
@@ -231,6 +241,7 @@ pub fn release_intent(
         mods: state.mods,
         click,
         force_local: force_local(state.mods),
+        tui_wheel_multiplier: 1,
     };
     state.held = None;
     Some(intent)
@@ -245,6 +256,7 @@ pub fn motion_intent(state: &State, hit: ViewportHit, click: ClickKind) -> Mouse
         mods: state.mods,
         click,
         force_local: force_local(state.mods),
+        tui_wheel_multiplier: 1,
     }
 }
 
@@ -254,6 +266,16 @@ pub fn motion_intent(state: &State, hit: ViewportHit, click: ClickKind) -> Mouse
 /// 모드로 독립 판정된다. 그 판단은 그리드가 하지만, 위젯도 여기서 `held`를
 /// 건드리지 않는 것으로 같은 규칙을 지킨다.
 pub fn wheel_intent(state: &State, hit: ViewportHit, lines: i32, click: ClickKind) -> MouseIntent {
+    wheel_intent_with_multiplier(state, hit, lines, click, 1)
+}
+
+pub fn wheel_intent_with_multiplier(
+    state: &State,
+    hit: ViewportHit,
+    lines: i32,
+    click: ClickKind,
+    tui_wheel_multiplier: u8,
+) -> MouseIntent {
     MouseIntent {
         action: MouseAction::Wheel { lines },
         hit,
@@ -261,6 +283,7 @@ pub fn wheel_intent(state: &State, hit: ViewportHit, lines: i32, click: ClickKin
         mods: state.mods,
         click,
         force_local: force_local(state.mods),
+        tui_wheel_multiplier: tui_wheel_multiplier.clamp(1, 10),
     }
 }
 
@@ -281,6 +304,7 @@ pub fn wheel_intent(state: &State, hit: ViewportHit, lines: i32, click: ClickKin
 /// 그리드 크기는 **스냅샷의 것**을 받는다. 사용자가 보고 클릭하는 것이 스냅샷이라
 /// 히트테스트도 같은 좌표계여야 한다 — 방금 리사이즈했는데 PTY가 아직 못 따라온
 /// 순간에 새 크기로 판정하면 화면에 없는 셀을 집는다.
+#[cfg(test)]
 pub(crate) fn update(
     state: &mut State,
     id: SessionId,
@@ -288,6 +312,22 @@ pub(crate) fn update(
     bounds: Rectangle,
     cursor: iced_mouse::Cursor,
     size: GridSize,
+    shell: &mut Shell<'_, Published>,
+) {
+    update_configured(state, id, event, bounds, cursor, size, 1.0, 5.0, 1, shell);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_configured(
+    state: &mut State,
+    id: SessionId,
+    event: &Event,
+    bounds: Rectangle,
+    cursor: iced_mouse::Cursor,
+    size: GridSize,
+    scroll_sensitivity: f32,
+    fast_scroll_sensitivity: f32,
+    tui_scroll_multiplier: u8,
     shell: &mut Shell<'_, Published>,
 ) {
     // **창 포커스를 잃으면 제스처를 닫는다.** `held`를 푸는 경로 중 유일하게
@@ -412,7 +452,18 @@ pub(crate) fn update(
             let Some(hit) = hit else {
                 return;
             };
-            let lines = accumulate_scroll(&mut state.scroll_acc, delta, metrics.height());
+            let sensitivity = scroll_sensitivity
+                * if state.mods.alt {
+                    fast_scroll_sensitivity
+                } else {
+                    1.0
+                };
+            let lines = accumulate_scroll_scaled(
+                &mut state.scroll_acc,
+                delta,
+                metrics.height(),
+                sensitivity,
+            );
             // 누산 결과가 0줄이면 발행하지 않는다 — 나머지는 누산기에 남아 있다.
             if lines == 0 {
                 return;
@@ -420,7 +471,13 @@ pub(crate) fn update(
             publish(
                 shell,
                 id,
-                wheel_intent(state, hit, lines, ClickKind::Single),
+                wheel_intent_with_multiplier(
+                    state,
+                    hit,
+                    lines,
+                    ClickKind::Single,
+                    tui_scroll_multiplier,
+                ),
             );
         }
         // 커서가 창을 드나드는 것 자체로는 터미널이 할 일이 없다. 버튼이
@@ -714,6 +771,31 @@ mod tests {
         );
         assert_eq!(lines, 3);
         assert_eq!(acc, 0.0);
+    }
+
+    #[test]
+    fn configured_scroll_sensitivity_scales_and_accumulates_fractional_lines() {
+        let mut acc = 0.0;
+        assert_eq!(
+            accumulate_scroll_scaled(
+                &mut acc,
+                iced_mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                16.0,
+                1.15,
+            ),
+            1
+        );
+        assert!((acc - 0.15).abs() < 0.001);
+        assert_eq!(
+            accumulate_scroll_scaled(
+                &mut acc,
+                iced_mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                16.0,
+                5.0,
+            ),
+            5
+        );
+        assert!((acc - 0.15).abs() < 0.001);
     }
 
     /// **위로 굴리면 양수다.** iced의 `y`도 양수가 위이고
@@ -1017,7 +1099,11 @@ mod tests {
     fn a_left_press_inside_bounds_keeps_focus() {
         let mut state = wired_state();
         state.focused = true;
-        run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        );
         assert!(state.focused, "위젯 안쪽 좌클릭은 포커스를 유지해야 한다");
     }
 
@@ -1189,10 +1275,26 @@ mod tests {
     fn chording_a_second_button_never_swallows_the_first_buttons_release() {
         let mut state = wired_state();
         let mut all = Vec::new();
-        all.extend(run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
-        all.extend(run(&mut state, &press(iced_mouse::Button::Right), cursor_at(1.0, 1.0)));
-        all.extend(run(&mut state, &release(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
-        all.extend(run(&mut state, &release(iced_mouse::Button::Right), cursor_at(1.0, 1.0)));
+        all.extend(run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        ));
+        all.extend(run(
+            &mut state,
+            &press(iced_mouse::Button::Right),
+            cursor_at(1.0, 1.0),
+        ));
+        all.extend(run(
+            &mut state,
+            &release(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        ));
+        all.extend(run(
+            &mut state,
+            &release(iced_mouse::Button::Right),
+            cursor_at(1.0, 1.0),
+        ));
 
         let actions: Vec<MouseAction> = intents(&all).iter().map(|i| i.action).collect();
         assert_eq!(
@@ -1218,7 +1320,11 @@ mod tests {
     #[test]
     fn a_lost_release_is_recovered_by_pressing_the_same_button_again() {
         let mut state = wired_state();
-        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        let _ = run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        );
         // 릴리스가 오지 않는다.
 
         let got = intents(&run(
@@ -1240,15 +1346,26 @@ mod tests {
         assert_eq!(state.held, Some(TermMouseButton::Left));
 
         // 그리고 계속 동작해야 한다 — 한 번 복구되고 다시 막히면 의미가 없다.
-        let _ = run(&mut state, &release(iced_mouse::Button::Left), cursor_at(2.0, 2.0));
+        let _ = run(
+            &mut state,
+            &release(iced_mouse::Button::Left),
+            cursor_at(2.0, 2.0),
+        );
         for i in 0..3 {
             let again = intents(&run(
                 &mut state,
                 &press(iced_mouse::Button::Left),
                 cursor_at(1.0, 1.0),
             ));
-            assert!(!again.is_empty(), "press #{i} after recovery produced nothing");
-            let _ = run(&mut state, &release(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+            assert!(
+                !again.is_empty(),
+                "press #{i} after recovery produced nothing"
+            );
+            let _ = run(
+                &mut state,
+                &release(iced_mouse::Button::Left),
+                cursor_at(1.0, 1.0),
+            );
         }
     }
 
@@ -1257,7 +1374,11 @@ mod tests {
     #[test]
     fn a_captured_release_still_resolves_our_own_gesture() {
         let mut state = wired_state();
-        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        let _ = run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        );
 
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
@@ -1339,7 +1460,11 @@ mod tests {
         );
 
         // 대조군: 그래서 다음 press가 정상적으로 나간다.
-        let after = intents(&run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0)));
+        let after = intents(&run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        ));
         assert_eq!(after.len(), 1);
     }
 
@@ -1348,7 +1473,11 @@ mod tests {
     #[test]
     fn losing_window_focus_resolves_a_held_gesture() {
         let mut state = wired_state();
-        let _ = run(&mut state, &press(iced_mouse::Button::Left), cursor_at(1.0, 1.0));
+        let _ = run(
+            &mut state,
+            &press(iced_mouse::Button::Left),
+            cursor_at(1.0, 1.0),
+        );
 
         let unfocused = Event::Window(window::Event::Unfocused);
         let got = intents(&run(&mut state, &unfocused, cursor_at(1.0, 1.0)));

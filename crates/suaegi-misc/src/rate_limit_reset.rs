@@ -64,7 +64,11 @@ pub fn get_reset_countdown_next_tick_delay(now: f64, reset_times: &[f64]) -> Opt
             continue;
         }
         let remaining_ms = reset_at - now;
-        let tick_unit_ms = if remaining_ms >= DAY_MS { HOUR_MS } else { MINUTE_MS };
+        let tick_unit_ms = if remaining_ms >= DAY_MS {
+            HOUR_MS
+        } else {
+            MINUTE_MS
+        };
         let delay_ms = (remaining_ms % tick_unit_ms) + 1.0;
         next_delay = Some(match next_delay {
             None => delay_ms,
@@ -102,8 +106,14 @@ mod tests {
     #[test]
     fn countdown_prefixes_the_duration_or_reports_resets_now() {
         assert_eq!(format_reset_countdown(0.0), "Resets now");
-        assert_eq!(format_reset_countdown(3.0 * HOUR + 54.0 * MIN), "Resets in 3h 54m");
-        assert_eq!(format_reset_countdown(6.0 * DAY + 7.0 * HOUR), "Resets in 6d 7h");
+        assert_eq!(
+            format_reset_countdown(3.0 * HOUR + 54.0 * MIN),
+            "Resets in 3h 54m"
+        );
+        assert_eq!(
+            format_reset_countdown(6.0 * DAY + 7.0 * HOUR),
+            "Resets in 6d 7h"
+        );
     }
 
     const NOW: f64 = 1_000_000_000.0;
@@ -111,7 +121,10 @@ mod tests {
     #[test]
     fn next_tick_returns_none_when_nothing_to_count_down() {
         assert_eq!(get_reset_countdown_next_tick_delay(NOW, &[]), None);
-        assert_eq!(get_reset_countdown_next_tick_delay(NOW, &[NOW - MIN, NOW]), None);
+        assert_eq!(
+            get_reset_countdown_next_tick_delay(NOW, &[NOW - MIN, NOW]),
+            None
+        );
         assert_eq!(
             get_reset_countdown_next_tick_delay(NOW, &[f64::NAN, f64::INFINITY]),
             None

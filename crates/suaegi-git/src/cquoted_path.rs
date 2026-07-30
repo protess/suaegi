@@ -57,8 +57,7 @@ pub fn decode_git_cquoted_path(value: &str) -> String {
                         count += 1;
                     }
                     // b[octal_start..=octal_end] are ASCII octal digits.
-                    let octal_str =
-                        std::str::from_utf8(&b[octal_start..=octal_end]).unwrap_or("0");
+                    let octal_str = std::str::from_utf8(&b[octal_start..=octal_end]).unwrap_or("0");
                     // E1: Orca accepts \000-\777 (up to 511) and narrows mod 256
                     // via Uint8Array. `u8::from_str_radix` would fail on \400-\777.
                     let parsed = u16::from_str_radix(octal_str, 8).unwrap_or(0);
@@ -90,7 +89,10 @@ mod tests {
     #[test]
     fn decodes_a_leading_utf8_bom_octal_run() {
         // \357\273\277 = EF BB BF = UTF-8 BOM (preserved, not stripped).
-        assert_eq!(decode_git_cquoted_path(r#""\357\273\277name""#), "\u{feff}name");
+        assert_eq!(
+            decode_git_cquoted_path(r#""\357\273\277name""#),
+            "\u{feff}name"
+        );
     }
 
     #[test]
@@ -114,8 +116,14 @@ mod tests {
     #[test]
     fn decodes_single_char_c_escapes() {
         assert_eq!(decode_git_cquoted_path(r#""a\tb\nc""#), "a\tb\nc");
-        assert_eq!(decode_git_cquoted_path(r#""quote\"back\\slash""#), "quote\"back\\slash");
-        assert_eq!(decode_git_cquoted_path(r#""\a\b\f\r\v""#), "\u{7}\u{8}\u{c}\r\u{b}");
+        assert_eq!(
+            decode_git_cquoted_path(r#""quote\"back\\slash""#),
+            "quote\"back\\slash"
+        );
+        assert_eq!(
+            decode_git_cquoted_path(r#""\a\b\f\r\v""#),
+            "\u{7}\u{8}\u{c}\r\u{b}"
+        );
     }
 
     #[test]

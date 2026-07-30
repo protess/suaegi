@@ -8,8 +8,8 @@ use suaegi_git::compare::{
 use suaegi_git::repo_probe::probe_repo;
 use suaegi_git::runner::{GitError, GitRunner};
 use suaegi_git::worktree::{
-    add_worktree, list_worktrees as git_list_worktrees, remove_worktree as git_remove_worktree,
-    CreatedWorktree, RemoveOutcome, WorktreeEntry,
+    add_worktree, add_worktree_with_layout_and_prefix, list_worktrees as git_list_worktrees,
+    remove_worktree as git_remove_worktree, CreatedWorktree, RemoveOutcome, WorktreeEntry,
 };
 
 use crate::background;
@@ -60,13 +60,86 @@ pub async fn create_worktree_now(
     .map_err(|e| e.to_string())
 }
 
+pub async fn create_worktree_with_layout_now(
+    repo: Repo,
+    requested_name: String,
+    base_ref: String,
+    workspace_root: PathBuf,
+    nest_workspaces: bool,
+    branch_prefix: Option<String>,
+    refresh_local_base_ref: bool,
+) -> Result<CreatedWorktree, String> {
+    let runner = GitRunner::new();
+    if refresh_local_base_ref {
+        let refspec = format!("{base_ref}:{base_ref}");
+        runner
+            .run(&repo.path, &["fetch", "origin", &refspec])
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    add_worktree_with_layout_and_prefix(
+        &runner,
+        &repo.path,
+        &requested_name,
+        &base_ref,
+        &workspace_root,
+        nest_workspaces,
+        branch_prefix.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 pub async fn remove_worktree_now(
     repo: Repo,
     worktree_path: PathBuf,
     force: bool,
     delete_branch: Option<String>,
+    mut linked_paths: Vec<String>,
 ) -> Result<RemoveOutcome, String> {
+    if let Ok(shared) = crate::repo_hooks::load_shared_directories(&repo.path) {
+        for path in shared {
+            if !linked_paths.contains(&path) {
+                linked_paths.push(path);
+            }
+        }
+    }
     let runner = GitRunner::new();
+    let existing_links = crate::worktree_linked_paths::existing_symlinks(
+        worktree_path.clone(),
+        linked_paths.clone(),
+    )
+    .await;
+    if !force && !existing_links.is_empty() {
+        let mut args = vec![
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "--untracked-files=all".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ];
+        args.extend(
+            existing_links
+                .iter()
+                .map(|path| format!(":(top,exclude,literal){path}")),
+        );
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let status = runner
+            .run(&worktree_path, &refs)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !status.stdout.trim().is_empty() {
+            return Err(format!(
+                "Worktree has uncommitted or untracked changes:\n{}",
+                status.stdout.trim()
+            ));
+        }
+    }
+    for warning in
+        crate::worktree_linked_paths::remove_symlinks(worktree_path.clone(), linked_paths).await
+    {
+        eprintln!("worktree shared path cleanup: {warning}");
+    }
     git_remove_worktree(
         &runner,
         &repo.path,
@@ -178,12 +251,16 @@ pub fn listing_from(result: Result<Vec<WorktreeEntry>, String>) -> WorktreeListi
     listing
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_worktree(
     request: OpId,
     repo: Repo,
     requested_name: String,
     base_ref: String,
     workspace_root: PathBuf,
+    nest_workspaces: bool,
+    branch_prefix: Option<String>,
+    refresh_local_base_ref: bool,
     // 이 create를 시작할 때 사이드바 피커가 고른 에이전트 id(`None`=로그인 셸).
     // create op와 함께 실어 보내야 응답을 기다리는 사이 사용자가 피커를 바꿔도
     // 이 worktree가 엉뚱한 에이전트로 굳지 않는다(이름 드래프트와 같은 원칙).
@@ -192,15 +269,70 @@ pub fn create_worktree(
     // 선택과 같은 이유로 op와 함께 실어 보낸다 — 성공 응답에 그대로 실려 돌아와
     // `pending_prompts`(비영속)에 담긴다.
     initial_prompt: Option<String>,
+    // Setup policy decision captured alongside the other creation drafts.
+    run_setup: bool,
+    // Paths copied with APFS clone semantics (or symlinked as a fallback) from the
+    // primary checkout after the worktree has been created.
+    linked_paths: Vec<String>,
+    sparse_directories: Vec<String>,
 ) -> Task<Message> {
     let repo_id = repo.id.clone();
+    let primary_path = repo.path.clone();
     Task::perform(
-        create_worktree_now(repo, requested_name, base_ref, workspace_root),
+        async move {
+            let created = create_worktree_with_layout_now(
+                repo,
+                requested_name,
+                base_ref,
+                workspace_root,
+                nest_workspaces,
+                branch_prefix,
+                refresh_local_base_ref,
+            )
+            .await?;
+            if let Err(error) = crate::sparse_checkout::apply(&created, &sparse_directories).await {
+                // The checkout is brand new and no agent/setup process has started yet.
+                // Best-effort rollback avoids leaving a registered half-created workspace.
+                let runner = GitRunner::new();
+                let _ = git_remove_worktree(
+                    &runner,
+                    &primary_path,
+                    &created.path,
+                    true,
+                    Some(&created.branch),
+                )
+                .await;
+                return Err(error);
+            }
+            for warning in crate::worktree_linked_paths::materialize(
+                primary_path.clone(),
+                created.path.clone(),
+                linked_paths,
+            )
+            .await
+            {
+                eprintln!("worktree shared path: {warning}");
+            }
+            let shared =
+                crate::worktree_linked_paths::resolve_shared_directories(primary_path.clone())
+                    .await;
+            for warning in crate::worktree_linked_paths::materialize_shared(
+                primary_path,
+                created.path.clone(),
+                shared,
+            )
+            .await
+            {
+                eprintln!("worktree shared directory: {warning}");
+            }
+            Ok(created)
+        },
         move |result| Message::WorktreeCreated {
             request,
             repo_id,
             created_with_agent: selected_agent.clone(),
             initial_prompt: initial_prompt.clone(),
+            run_setup,
             result,
         },
     )
@@ -249,10 +381,11 @@ pub fn remove_worktree(
     worktree_path: PathBuf,
     force: bool,
     delete_branch: Option<String>,
+    linked_paths: Vec<String>,
 ) -> Task<Message> {
     let repo_id = repo.id.clone();
     Task::perform(
-        remove_worktree_now(repo, worktree_path, force, delete_branch),
+        remove_worktree_now(repo, worktree_path, force, delete_branch, linked_paths),
         move |result| Message::WorktreeRemoved {
             request,
             repo_id,

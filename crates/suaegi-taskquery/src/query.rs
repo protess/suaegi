@@ -158,12 +158,20 @@ pub fn parse_task_query(raw_query: &str) -> ParsedTaskQuery {
         let normalized = token.to_ascii_lowercase();
         if normalized == "is:issue" {
             saw_issue_scope = true;
-            query.scope = if saw_pr_scope { Scope::All } else { Scope::Issue };
+            query.scope = if saw_pr_scope {
+                Scope::All
+            } else {
+                Scope::Issue
+            };
             continue;
         }
         if normalized == "is:pr" || normalized == "is:pull-request" {
             saw_pr_scope = true;
-            query.scope = if saw_issue_scope { Scope::All } else { Scope::Pr };
+            query.scope = if saw_issue_scope {
+                Scope::All
+            } else {
+                Scope::Pr
+            };
             continue;
         }
         if normalized == "is:open" {
@@ -222,7 +230,10 @@ pub fn parse_task_query(raw_query: &str) -> ParsedTaskQuery {
         // `:134` — state value normalized with to_ascii_lowercase (C2).
         let normalized_value = value.to_ascii_lowercase();
         if key == "state"
-            && matches!(normalized_value.as_str(), "open" | "closed" | "merged" | "all")
+            && matches!(
+                normalized_value.as_str(),
+                "open" | "closed" | "merged" | "all"
+            )
         {
             query.state = Some(match normalized_value.as_str() {
                 "open" => State::Open,
@@ -323,11 +334,7 @@ pub fn serialize_task_query(q: &ParsedTaskQuery) -> String {
 /// clears the field. For `labels`, pass the full next list. Mirrors the source's
 /// JS-truthiness on `if (parsed.reviewRequested)` etc. (empty string does not
 /// force PR scope).
-pub fn with_qualifier(
-    raw_query: &str,
-    key: TaskQueryFilterKey,
-    value: QualifierValue,
-) -> String {
+pub fn with_qualifier(raw_query: &str, key: TaskQueryFilterKey, value: QualifierValue) -> String {
     let mut parsed = parse_task_query(raw_query);
     match key {
         TaskQueryFilterKey::Author => {
@@ -338,7 +345,11 @@ pub fn with_qualifier(
         }
         TaskQueryFilterKey::ReviewRequested => {
             parsed.review_requested = as_string(value);
-            if parsed.review_requested.as_deref().is_some_and(|s| !s.is_empty()) {
+            if parsed
+                .review_requested
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            {
                 parsed.scope = Scope::Pr;
             }
         }
@@ -530,9 +541,8 @@ mod tests {
 
     #[test]
     fn parse_extracts_assignee_author_label_review() {
-        let parsed = parse_task_query(
-            "assignee:@me author:alice review-requested:@me label:bug free text",
-        );
+        let parsed =
+            parse_task_query("assignee:@me author:alice review-requested:@me label:bug free text");
         assert_eq!(parsed.assignee.as_deref(), Some("@me"));
         assert_eq!(parsed.author.as_deref(), Some("alice"));
         assert_eq!(parsed.review_requested.as_deref(), Some("@me"));
@@ -629,7 +639,11 @@ mod tests {
 
     #[test]
     fn with_qualifier_sets_and_clears_author() {
-        let set = with_qualifier("hello", TaskQueryFilterKey::Author, QualifierValue::Str("alice".into()));
+        let set = with_qualifier(
+            "hello",
+            TaskQueryFilterKey::Author,
+            QualifierValue::Str("alice".into()),
+        );
         assert_eq!(parse_task_query(&set).author.as_deref(), Some("alice"));
         assert_eq!(parse_task_query(&set).free_text, "hello");
         let cleared = with_qualifier(&set, TaskQueryFilterKey::Author, QualifierValue::Null);
@@ -684,15 +698,30 @@ mod tests {
     #[test]
     fn with_qualifier_keeps_pr_only_filters_scoped_to_pr() {
         assert_eq!(
-            parse_task_query(&with_qualifier("", TaskQueryFilterKey::Draft, QualifierValue::Str("true".into()))).scope,
+            parse_task_query(&with_qualifier(
+                "",
+                TaskQueryFilterKey::Draft,
+                QualifierValue::Str("true".into())
+            ))
+            .scope,
             Scope::Pr
         );
         assert_eq!(
-            parse_task_query(&with_qualifier("", TaskQueryFilterKey::State, QualifierValue::Str("merged".into()))).scope,
+            parse_task_query(&with_qualifier(
+                "",
+                TaskQueryFilterKey::State,
+                QualifierValue::Str("merged".into())
+            ))
+            .scope,
             Scope::Pr
         );
         assert_eq!(
-            parse_task_query(&with_qualifier("", TaskQueryFilterKey::ReviewRequested, QualifierValue::Str("@me".into()))).scope,
+            parse_task_query(&with_qualifier(
+                "",
+                TaskQueryFilterKey::ReviewRequested,
+                QualifierValue::Str("@me".into())
+            ))
+            .scope,
             Scope::Pr
         );
     }
@@ -734,7 +763,10 @@ mod tests {
     #[test]
     fn c2_ascii_case_fold() {
         assert_eq!(parse_task_query("IS:PR").scope, Scope::Pr);
-        assert_eq!(parse_task_query("Author:alice").author.as_deref(), Some("alice"));
+        assert_eq!(
+            parse_task_query("Author:alice").author.as_deref(),
+            Some("alice")
+        );
         assert_eq!(parse_task_query("STATE:OPEN").state, Some(State::Open));
         // Fullwidth "IS" (U+FF29 U+FF33) is not folded to ASCII "is" by either
         // to_ascii_lowercase or to_lowercase, so it stays free text (no fold surprise).

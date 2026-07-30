@@ -12,12 +12,12 @@ mod harness;
 use iced::advanced::widget::Tree;
 use iced::{Element, Size, Theme};
 
-use suaegi_app::session_store::{SessionId, blank_snapshot};
+use suaegi_app::session_store::{blank_snapshot, SessionId};
 use suaegi_app::terminal::contract::TermCommand;
 use suaegi_app::terminal::state::{CellMetrics, State};
 use suaegi_app::terminal::{Published, Terminal};
 
-use harness::{Harness, RecordingClipboard, Step, redraw};
+use harness::{redraw, Harness, RecordingClipboard, Step};
 
 const ID: SessionId = SessionId(7);
 
@@ -84,7 +84,7 @@ fn metrics_are_what_makes_a_resize_happen() {
     let with = run(bounds, &steps, true);
     assert_eq!(
         resizes(&with),
-        vec![(25, 100, resizes(&with)[0].2)],
+        vec![(24, 99, resizes(&with)[0].2)],
         "control: the identical run WITH metrics must emit exactly one resize"
     );
 }
@@ -99,8 +99,9 @@ fn a_size_change_emits_exactly_one_resize() {
     assert_eq!(resizes.len(), 1, "expected one resize, got {resizes:?}");
     assert_eq!(
         (resizes[0].0, resizes[0].1),
-        (25, 100),
-        "800x400 with 8x16 cells is 100 columns by 25 rows"
+        (24, 99),
+        "800x400 minus the default 4px padding per edge with 8x16 cells is \
+         99 columns by 24 rows"
     );
     assert!(
         resizes[0].2 > 0,
@@ -146,8 +147,8 @@ fn a_different_size_emits_a_new_resize() {
 
     let resizes = resizes(&emitted);
     assert_eq!(resizes.len(), 2, "expected two resizes, got {resizes:?}");
-    assert_eq!((resizes[0].0, resizes[0].1), (25, 100));
-    assert_eq!((resizes[1].0, resizes[1].1), (25, 50));
+    assert_eq!((resizes[0].0, resizes[0].1), (24, 99));
+    assert_eq!((resizes[1].0, resizes[1].1), (24, 49));
     assert!(
         resizes[1].2 > resizes[0].2,
         "seq must increase so the app's \"latest seq wins\" guard keeps the \
@@ -187,10 +188,10 @@ fn collapsing_to_zero_and_restoring_re_emits_the_resize() {
         "the collapse itself must emit nothing, but the restore must emit \
          again; got {resizes:?}"
     );
-    assert_eq!((resizes[0].0, resizes[0].1), (25, 100), "the first layout");
+    assert_eq!((resizes[0].0, resizes[0].1), (24, 99), "the first layout");
     assert_eq!(
         (resizes[1].0, resizes[1].1),
-        (25, 100),
+        (24, 99),
         "the restore emits the SAME grid size — that is precisely why a single \
          cache cannot detect it"
     );

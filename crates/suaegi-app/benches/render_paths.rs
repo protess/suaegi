@@ -45,9 +45,24 @@ const CELL_H: f32 = 16.0;
 fn row_content(row: usize, cols: usize) -> Vec<(char, Color)> {
     const PALETTE: [Color; 4] = [
         Color::WHITE,
-        Color { r: 0.4, g: 0.8, b: 0.4, a: 1.0 },
-        Color { r: 0.9, g: 0.7, b: 0.2, a: 1.0 },
-        Color { r: 0.4, g: 0.6, b: 1.0, a: 1.0 },
+        Color {
+            r: 0.4,
+            g: 0.8,
+            b: 0.4,
+            a: 1.0,
+        },
+        Color {
+            r: 0.9,
+            g: 0.7,
+            b: 0.2,
+            a: 1.0,
+        },
+        Color {
+            r: 0.4,
+            g: 0.6,
+            b: 1.0,
+            a: 1.0,
+        },
     ];
     // 행마다 다른 글자로 채운다 — 같은 행을 반복하면 캐시가 비현실적으로 잘 맞는다.
     (0..cols)
@@ -195,20 +210,28 @@ fn main() {
     for (rows, cols) in [(24usize, 80usize), (50, 200)] {
         println!("\n--- {rows}x{cols} = {} cells ---", rows * cols);
 
-        time(&format!("A. with_spans (per row, rebuilt)  {rows}x{cols}"), 20, || {
-            path_with_spans(rows, cols)
-        });
+        time(
+            &format!("A. with_spans (per row, rebuilt)  {rows}x{cols}"),
+            20,
+            || path_with_spans(rows, cols),
+        );
 
         let mut cache = Cache::new();
-        time(&format!("B. fill_text  (per cell, cached)  {rows}x{cols}"), 20, || {
-            let n = path_fill_text(&mut cache, rows, cols);
-            cache.trim();
-            n
-        });
+        time(
+            &format!("B. fill_text  (per cell, cached)  {rows}x{cols}"),
+            20,
+            || {
+                let n = path_fill_text(&mut cache, rows, cols);
+                cache.trim();
+                n
+            },
+        );
 
-        time(&format!("C. resolve_cell over the grid     {rows}x{cols}"), 200, || {
-            path_resolve(rows, cols)
-        });
+        time(
+            &format!("C. resolve_cell over the grid     {rows}x{cols}"),
+            200,
+            || path_resolve(rows, cols),
+        );
 
         let grid = suaegi_term::grid::TerminalGrid::new(
             suaegi_term::grid::GridSize { rows, cols },
@@ -221,8 +244,10 @@ fn main() {
             grid.feed(b"\r\n");
         }
         let snapshot = grid.snapshot();
-        time(&format!("D. TerminalSnapshot::clone        {rows}x{cols}"), 200, || {
-            path_snapshot_clone(&snapshot)
-        });
+        time(
+            &format!("D. TerminalSnapshot::clone        {rows}x{cols}"),
+            200,
+            || path_snapshot_clone(&snapshot),
+        );
     }
 }

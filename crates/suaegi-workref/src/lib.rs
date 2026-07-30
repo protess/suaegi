@@ -353,8 +353,10 @@ mod tests {
         );
         // Personal (fork) repos live under /users instead of /projects.
         assert_eq!(
-            label("see https://bitbucket.example.com/users/jane/repos/orca/pull-requests/9/overview")
-                .as_deref(),
+            label(
+                "see https://bitbucket.example.com/users/jane/repos/orca/pull-requests/9/overview"
+            )
+            .as_deref(),
             Some("PR 9")
         );
     }
@@ -521,7 +523,10 @@ mod tests {
     #[test]
     fn e_digit_non_ascii_numerals_do_not_match() {
         // Arabic-Indic digits after a ticket-shaped prefix.
-        assert_eq!(extract_work_identifier("JIRA-\u{0661}\u{0662}\u{0663}"), None);
+        assert_eq!(
+            extract_work_identifier("JIRA-\u{0661}\u{0662}\u{0663}"),
+            None
+        );
         // Arabic-Indic digits after a bare `#`.
         assert_eq!(extract_work_identifier("#\u{0664}\u{0665}"), None);
         // Full-width digits likewise stay out of `issue` matches.

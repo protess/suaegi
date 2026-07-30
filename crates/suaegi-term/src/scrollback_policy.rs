@@ -121,7 +121,10 @@ mod tests {
     fn normalizes_snapshot_rows_preserving_visible_screen_only_zero() {
         assert_eq!(normalize_desktop_terminal_snapshot_rows(None), None); // undefined & string
         assert_eq!(normalize_desktop_terminal_snapshot_rows(Some(0.0)), Some(0));
-        assert_eq!(normalize_desktop_terminal_snapshot_rows(Some(-1.0)), Some(0));
+        assert_eq!(
+            normalize_desktop_terminal_snapshot_rows(Some(-1.0)),
+            Some(0)
+        );
         assert_eq!(
             normalize_desktop_terminal_snapshot_rows(Some(25_000.9)),
             Some(25_000)

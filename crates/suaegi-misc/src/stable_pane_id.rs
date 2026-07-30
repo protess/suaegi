@@ -197,7 +197,10 @@ mod tests {
     #[test]
     fn rejects_legacy_numeric_ids_and_malformed_uuids() {
         for value in ["1", "pane:1", "11111111-1111-6111-8111-111111111111", ""] {
-            assert!(!is_stable_pane_id(value), "expected {value:?} to be rejected");
+            assert!(
+                !is_stable_pane_id(value),
+                "expected {value:?} to be rejected"
+            );
             assert!(!is_terminal_leaf_id(value));
         }
     }
@@ -219,7 +222,10 @@ mod tests {
     #[test]
     fn rejects_ambiguous_tab_ids_and_non_uuid_leaf_ids_when_building() {
         assert_eq!(make_pane_key("", LEAF_ID), Err(MakePaneKeyError::TabId));
-        assert_eq!(make_pane_key("tab:1", LEAF_ID), Err(MakePaneKeyError::TabId));
+        assert_eq!(
+            make_pane_key("tab:1", LEAF_ID),
+            Err(MakePaneKeyError::TabId)
+        );
         assert_eq!(make_pane_key("tab-1", "1"), Err(MakePaneKeyError::LeafId));
         // Message strings preserved verbatim.
         assert!(MakePaneKeyError::TabId.to_string().contains("tabId"));
@@ -271,7 +277,10 @@ mod tests {
     /// NOT digits (Rust Unicode `\d`/`is_numeric` would wrongly accept them).
     #[test]
     fn pin_arabic_indic_digits_rejected() {
-        assert_eq!(parse_legacy_numeric_pane_key("tab-1:\u{0661}\u{0662}"), None);
+        assert_eq!(
+            parse_legacy_numeric_pane_key("tab-1:\u{0661}\u{0662}"),
+            None
+        );
     }
 
     /// `.trim()` strips U+FEFF (JS whitespace) from a legacy key.

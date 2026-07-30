@@ -21,7 +21,10 @@
 
 use std::collections::HashSet;
 
-use crate::{PersistedOpenFile, Tab, TabContentType, TabGroup, WorkspaceSessionState, WorkspaceVisibleTabType};
+use crate::{
+    PersistedOpenFile, Tab, TabContentType, TabGroup, WorkspaceSessionState,
+    WorkspaceVisibleTabType,
+};
 
 /// `pickNextActiveTab` (`O:16-28`).
 pub fn pick_next_active_tab(group: &TabGroup, closing_ids: &HashSet<String>) -> Option<String> {
@@ -256,8 +259,7 @@ mod tests {
             id: id.to_string(),
             active_tab_id: active_tab_id.map(|s| s.to_string()),
             tab_order: tab_order.iter().map(|s| s.to_string()).collect(),
-            recent_tab_ids: recent_tab_ids
-                .map(|ids| ids.iter().map(|s| s.to_string()).collect()),
+            recent_tab_ids: recent_tab_ids.map(|ids| ids.iter().map(|s| s.to_string()).collect()),
         }
     }
 
@@ -273,13 +275,11 @@ mod tests {
         // tabOrder). Walking from the tail: b (survivor) wins immediately,
         // even though "c" and "a" are also survivors and appear earlier in
         // tabOrder.
-        let g = group(
-            "g1",
-            Some("x"),
-            &["a", "b", "c"],
-            Some(&["a", "c", "b"]),
+        let g = group("g1", Some("x"), &["a", "b", "c"], Some(&["a", "c", "b"]));
+        assert_eq!(
+            pick_next_active_tab(&g, &closing(&["x"])),
+            Some("b".to_string())
         );
-        assert_eq!(pick_next_active_tab(&g, &closing(&["x"])), Some("b".to_string()));
     }
 
     #[test]
@@ -375,9 +375,10 @@ mod tests {
     #[test]
     fn n9_branch1_terminal_active_unified() {
         let mut session = base_session();
-        session
-            .tabs_by_worktree
-            .insert("wt".to_string(), vec![TerminalTab::new("t1", Some("pty-1"))]);
+        session.tabs_by_worktree.insert(
+            "wt".to_string(),
+            vec![TerminalTab::new("t1", Some("pty-1"))],
+        );
         let tabs = vec![unified_tab("t1", "t1", "g1", TabContentType::Terminal)];
         let groups = vec![group("g1", Some("t1"), &["t1"], None)];
         let surface = derive_active_surface(&session, "wt", &tabs, &groups, Some("g1"));
@@ -388,7 +389,12 @@ mod tests {
     #[test]
     fn n9_branch2_browser_active_unified() {
         let session = base_session();
-        let tabs = vec![unified_tab("b1", "browser-1", "g1", TabContentType::Browser)];
+        let tabs = vec![unified_tab(
+            "b1",
+            "browser-1",
+            "g1",
+            TabContentType::Browser,
+        )];
         let groups = vec![group("g1", Some("b1"), &["b1"], None)];
         let surface = derive_active_surface(&session, "wt", &tabs, &groups, Some("g1"));
         assert_eq!(surface.kind, WorkspaceVisibleTabType::Browser);
@@ -408,7 +414,12 @@ mod tests {
     #[test]
     fn n9_branch3_diff_content_type_collapses_to_editor() {
         let session = base_session();
-        let tabs = vec![unified_tab("d1", "/diff-target.ts", "g1", TabContentType::Diff)];
+        let tabs = vec![unified_tab(
+            "d1",
+            "/diff-target.ts",
+            "g1",
+            TabContentType::Diff,
+        )];
         let groups = vec![group("g1", Some("d1"), &["d1"], None)];
         let surface = derive_active_surface(&session, "wt", &tabs, &groups, Some("g1"));
         assert_eq!(surface.kind, WorkspaceVisibleTabType::Editor);
@@ -504,7 +515,12 @@ mod tests {
         // active -> not a match, falls through to the no-active-unified
         // path (branch 6 here, since there is no file/browser fallback).
         let session = base_session();
-        let tabs = vec![unified_tab("t1", "t1", "some-other-group", TabContentType::Terminal)];
+        let tabs = vec![unified_tab(
+            "t1",
+            "t1",
+            "some-other-group",
+            TabContentType::Terminal,
+        )];
         let groups = vec![group("g1", Some("t1"), &["t1"], None)];
         let surface = derive_active_surface(&session, "wt", &tabs, &groups, Some("g1"));
         assert_eq!(surface.kind, WorkspaceVisibleTabType::Terminal);

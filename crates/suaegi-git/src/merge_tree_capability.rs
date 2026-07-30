@@ -52,8 +52,10 @@ fn git_error_text(error: &GitCommandError) -> String {
 // `/i`, Unicode `\s`; `.test()` is unanchored (== `is_match`). Both backtick and
 // apostrophe are accepted independently on each side.
 static WRITE_TREE_OPTION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:unknown|invalid|unrecognized) option(?::|\s+)[`']?(?:--?)?write-tree[`']?(?:\s|$)")
-        .unwrap()
+    Regex::new(
+        r"(?i)(?:unknown|invalid|unrecognized) option(?::|\s+)[`']?(?:--?)?write-tree[`']?(?:\s|$)",
+    )
+    .unwrap()
 });
 static WRITE_TREE_UNKNOWN_REV_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)unknown rev [`']?--write-tree[`']?(?:\s|$)").unwrap());
@@ -61,8 +63,10 @@ static WRITE_TREE_USAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)usage:\s*git merge-tree\s+<base-tree>\s+<branch1>\s+<branch2>").unwrap()
 });
 static MERGE_BASE_OPTION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:unknown|invalid|unrecognized) option(?::|\s+)[`']?(?:--?)?merge-base[`']?(?:\s|$)")
-        .unwrap()
+    Regex::new(
+        r"(?i)(?:unknown|invalid|unrecognized) option(?::|\s+)[`']?(?:--?)?merge-base[`']?(?:\s|$)",
+    )
+    .unwrap()
 });
 
 /// True when the error indicates `git merge-tree --write-tree` is unsupported.
@@ -91,9 +95,9 @@ mod tests {
             &GitCommandError::stderr("fatal: unknown rev --write-tree")
         ));
         // usage form (stdout).
-        assert!(is_unsupported_merge_tree_write_tree_error(&GitCommandError::stdout(
-            "usage: git merge-tree <base-tree> <branch1> <branch2>"
-        )));
+        assert!(is_unsupported_merge_tree_write_tree_error(
+            &GitCommandError::stdout("usage: git merge-tree <base-tree> <branch1> <branch2>")
+        ));
         // unknown option form (message, apostrophe-quoted).
         assert!(is_unsupported_merge_tree_write_tree_error(
             &GitCommandError::message("error: unknown option 'write-tree'")

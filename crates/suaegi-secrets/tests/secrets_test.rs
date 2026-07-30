@@ -36,7 +36,10 @@ fn resolved_debug_does_not_leak_token() {
         !dbg.contains(TOKEN),
         "Resolved Debug leaked the token: {dbg}"
     );
-    assert!(dbg.contains("Secret(***)"), "expected redacted marker: {dbg}");
+    assert!(
+        dbg.contains("Secret(***)"),
+        "expected redacted marker: {dbg}"
+    );
 }
 
 #[test]
@@ -51,7 +54,10 @@ fn secret_error_does_not_leak_token() {
 
     let dbg = format!("{err:?}");
     let disp = format!("{err}");
-    assert!(!dbg.contains(TOKEN), "SecretError Debug leaked token: {dbg}");
+    assert!(
+        !dbg.contains(TOKEN),
+        "SecretError Debug leaked token: {dbg}"
+    );
     assert!(
         !disp.contains(TOKEN),
         "SecretError Display leaked token: {disp}"
@@ -72,7 +78,10 @@ fn keychain_hit_wins_over_env() {
 
     let resolved = resolve(&backend, &env, &req);
 
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("from_keychain"));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("from_keychain")
+    );
     assert_eq!(resolved.source, Some(Source::Keychain));
     assert_eq!(resolved.keychain_error, None);
 }
@@ -90,7 +99,10 @@ fn keychain_miss_falls_back_to_env() {
 
     let resolved = resolve(&backend, &env, &req);
 
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("from_env"));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("from_env")
+    );
     assert_eq!(resolved.source, Some(Source::Env("GH_TOKEN".to_string())));
     assert_eq!(resolved.keychain_error, None);
 }
@@ -104,7 +116,10 @@ fn keychain_unavailable_falls_back_to_env_without_error() {
 
     let resolved = resolve(&backend, &env, &req);
 
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("from_env"));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("from_env")
+    );
     assert_eq!(resolved.source, Some(Source::Env("GH_TOKEN".to_string())));
     assert_eq!(
         resolved.keychain_error, None,
@@ -122,7 +137,10 @@ fn env_vars_tried_in_order() {
     let req = SecretRequest::github("suaegi", "github.com");
 
     let resolved = resolve(&backend, &env, &req);
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("primary"));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("primary")
+    );
     assert_eq!(resolved.source, Some(Source::Env("GH_TOKEN".to_string())));
 }
 
@@ -133,8 +151,14 @@ fn second_env_var_used_when_first_absent() {
     let req = SecretRequest::github("suaegi", "github.com");
 
     let resolved = resolve(&backend, &env, &req);
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("secondary"));
-    assert_eq!(resolved.source, Some(Source::Env("GITHUB_TOKEN".to_string())));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("secondary")
+    );
+    assert_eq!(
+        resolved.source,
+        Some(Source::Env("GITHUB_TOKEN".to_string()))
+    );
 }
 
 #[test]
@@ -164,7 +188,10 @@ fn keychain_backend_error_is_surfaced_and_falls_back_to_env() {
 
     let resolved = resolve(&backend, &env, &req);
 
-    assert_eq!(resolved.secret.as_ref().map(Secret::expose), Some("from_env"));
+    assert_eq!(
+        resolved.secret.as_ref().map(Secret::expose),
+        Some("from_env")
+    );
     assert_eq!(resolved.source, Some(Source::Env("GH_TOKEN".to_string())));
     assert_eq!(
         resolved.keychain_error,
