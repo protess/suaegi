@@ -48,6 +48,9 @@ by tests or live-app QA.
   relaunch.
 - Orca terminal themes, scoped shell history, cursor blinking, OSC 52 clipboard,
   macOS Option-as-Alt/JIS yen handling, bell and agent-completion notifications.
+- macOS terminal typography resolves Orca's `SF Mono` CSS alias to the native
+  `.SF NS Mono` family, uses Orca's 500 default weight, and migrates the former
+  400 default once without overwriting a user-selected weight.
 - Extended Orca terminal controls now affect the native renderer and input
   path: horizontal/vertical grid padding, normal/fast/TUI wheel multipliers,
   cursor/background and focused/unfocused pane opacity, divider thickness,
@@ -310,7 +313,7 @@ paths remain implemented rather than counted complete by method name alone.
 
 ## Verification baseline
 
-- `cargo test -p suaegi-app --lib`: 728 passed, 2 ignored after the current
+- `cargo test -p suaegi-app --lib`: 731 passed, 2 ignored after the current
   UI/runtime, settings-route, integration-preflight, Floating Workspace,
   browser dialog, orchestration, Linear, and daemon loop.
 - `cargo test --workspace`: passing after the final native Claude Agent Teams,
