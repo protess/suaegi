@@ -3122,6 +3122,14 @@ impl AppState {
         state.repos = load.state.repos;
         state.workspace_root = load.state.settings.workspace_root;
         state.ui_settings = load.state.settings.ui;
+        if !state.ui_settings.terminal_font_defaults_orca_v2 {
+            if state.ui_settings.terminal_font_family == "SF Mono"
+                && state.ui_settings.terminal_font_weight == 400
+            {
+                state.ui_settings.terminal_font_weight = 500;
+            }
+            state.ui_settings.terminal_font_defaults_orca_v2 = true;
+        }
         if state.ui_settings.left_sidebar_appearance == "solid" {
             state.ui_settings.left_sidebar_appearance = "match-terminal".to_string();
         }
@@ -24069,6 +24077,44 @@ mod tests {
             Some(&wt("/tmp/was-active")),
             "the field is written on every save; booting must actually read it back"
         );
+    }
+
+    #[test]
+    fn legacy_sf_mono_default_migrates_to_orcas_medium_weight_once() {
+        let mut disk = PersistedState::default();
+        disk.settings.ui.terminal_font_family = "SF Mono".into();
+        disk.settings.ui.terminal_font_weight = 400;
+        disk.settings.ui.terminal_font_defaults_orca_v2 = false;
+
+        let state = AppState::from_load(LoadDiagnostics {
+            state: disk,
+            origin: LoadOrigin::Loaded,
+            save_blocked: false,
+        });
+
+        assert_eq!(state.ui_settings().terminal_font_weight, 500);
+        assert!(state.ui_settings().terminal_font_defaults_orca_v2);
+    }
+
+    #[test]
+    fn explicit_nondefault_terminal_weight_survives_the_typography_migration() {
+        let mut disk = PersistedState::default();
+        disk.settings.ui.terminal_font_family = "SF Mono".into();
+        disk.settings.ui.terminal_font_weight = 300;
+        disk.settings.ui.terminal_font_defaults_orca_v2 = false;
+
+        let state = AppState::from_load(LoadDiagnostics {
+            state: disk,
+            origin: LoadOrigin::Loaded,
+            save_blocked: false,
+        });
+
+        assert_eq!(
+            state.ui_settings().terminal_font_weight,
+            300,
+            "only Suaegi's old 400 default may be upgraded"
+        );
+        assert!(state.ui_settings().terminal_font_defaults_orca_v2);
     }
 
     /// **디스크 → `from_load` → `begin_layout_restore`의 이음매.** 위의 복원
