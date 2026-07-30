@@ -19,8 +19,9 @@ pub fn compute_max_markdown_toc_panel_width(container_width: f64) -> f64 {
     if !container_width.is_finite() || container_width <= 0.0 {
         return MARKDOWN_TOC_PANEL_MAX_WIDTH;
     }
-    MARKDOWN_TOC_PANEL_MAX_WIDTH
-        .min((container_width - MARKDOWN_TOC_PANEL_MIN_EDITOR_WIDTH).max(MARKDOWN_TOC_PANEL_MIN_WIDTH))
+    MARKDOWN_TOC_PANEL_MAX_WIDTH.min(
+        (container_width - MARKDOWN_TOC_PANEL_MIN_EDITOR_WIDTH).max(MARKDOWN_TOC_PANEL_MIN_WIDTH),
+    )
 }
 
 /// `Math.min(maxWidth, Math.max(200, width))`. Non-number / non-finite `width`
@@ -68,11 +69,19 @@ mod tests {
     fn respects_the_remaining_editor_width_when_a_container_size_is_known() {
         assert_eq!(compute_max_markdown_toc_panel_width(700.0), 380.0);
         assert_eq!(
-            clamp_markdown_toc_panel_width(Some(500.0), Some(700.0), MARKDOWN_TOC_PANEL_DEFAULT_WIDTH),
+            clamp_markdown_toc_panel_width(
+                Some(500.0),
+                Some(700.0),
+                MARKDOWN_TOC_PANEL_DEFAULT_WIDTH
+            ),
             380.0
         );
         assert_eq!(
-            clamp_markdown_toc_panel_width(Some(350.0), Some(700.0), MARKDOWN_TOC_PANEL_DEFAULT_WIDTH),
+            clamp_markdown_toc_panel_width(
+                Some(350.0),
+                Some(700.0),
+                MARKDOWN_TOC_PANEL_DEFAULT_WIDTH
+            ),
             350.0
         );
     }
@@ -80,13 +89,21 @@ mod tests {
     #[test]
     fn treats_the_second_argument_as_container_width_not_a_precomputed_max() {
         let max_for_700 = compute_max_markdown_toc_panel_width(700.0); // 380
-        // Re-fed as a container: computeMax(380) = min(600, max(200, 60)) = 200.
+                                                                       // Re-fed as a container: computeMax(380) = min(600, max(200, 60)) = 200.
         assert_eq!(
-            clamp_markdown_toc_panel_width(Some(350.0), Some(max_for_700), MARKDOWN_TOC_PANEL_DEFAULT_WIDTH),
+            clamp_markdown_toc_panel_width(
+                Some(350.0),
+                Some(max_for_700),
+                MARKDOWN_TOC_PANEL_DEFAULT_WIDTH
+            ),
             200.0
         );
         assert_eq!(
-            clamp_markdown_toc_panel_width(Some(350.0), Some(700.0), MARKDOWN_TOC_PANEL_DEFAULT_WIDTH),
+            clamp_markdown_toc_panel_width(
+                Some(350.0),
+                Some(700.0),
+                MARKDOWN_TOC_PANEL_DEFAULT_WIDTH
+            ),
             350.0
         );
     }
@@ -97,7 +114,11 @@ mod tests {
     #[test]
     fn pin_decimal_pass_through() {
         assert_eq!(
-            clamp_markdown_toc_panel_width(Some(350.5), Some(700.0), MARKDOWN_TOC_PANEL_DEFAULT_WIDTH),
+            clamp_markdown_toc_panel_width(
+                Some(350.5),
+                Some(700.0),
+                MARKDOWN_TOC_PANEL_DEFAULT_WIDTH
+            ),
             350.5
         );
         assert_eq!(compute_max_markdown_toc_panel_width(700.5), 380.5);

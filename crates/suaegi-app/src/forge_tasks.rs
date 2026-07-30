@@ -10,14 +10,17 @@ use std::path::{Path, PathBuf};
 use iced::Task;
 use suaegi_core::domain::WorktreeId;
 use suaegi_forge::{
-    creation_eligibility, glab_creation_eligibility, http_creation_eligibility, AnyForge,
-    CommentLookup, CreateReviewInput, CreationBlockedReason, CreationEligibility, ForgeError,
-    ForgeProvider, ForgeUnavailable, GhRunner, GlabRunner, MergeMethod, MergeOptions,
-    MergeabilityState, PrActions, Review, ReviewLookup, ReviewThreadLookup,
+    creation_eligibility, glab_creation_eligibility, http_creation_eligibility,
+    token_creation_eligibility, AnyForge, CommentLookup, CreateReviewInput, CreationBlockedReason,
+    CreationEligibility, ForgeError, ForgeProvider, ForgeUnavailable, GhRunner, GlabRunner,
+    MergeMethod, MergeOptions, MergeabilityState, PrActions, Review, ReviewLookup,
+    ReviewThreadLookup,
 };
 use suaegi_git::runner::GitRunner;
 
-use crate::forge_ui::{create_error_text, merge_result_display, GithubFetch, MergeResultDisplay, PrDetails};
+use crate::forge_ui::{
+    create_error_text, merge_result_display, GithubFetch, MergeResultDisplay, PrDetails,
+};
 use crate::state::{Message, OpId};
 
 // ---- `*_now`: 실제 gh 작업. iced::Task 없이 직접 테스트 가능(하지만 gh를 때리므로
@@ -66,6 +69,9 @@ pub async fn fetch_status_now(
                 AnyForge::GithubHttp(http) => {
                     http_creation_eligibility(http, &git_runner, &worktree_path, branch).await
                 }
+                AnyForge::Token(provider) => {
+                    token_creation_eligibility(provider, &git_runner, &worktree_path, branch).await
+                }
             }
         }
     };
@@ -89,7 +95,7 @@ async fn fetch_only(
             // provider-중립 문구: GitLab worktree에서도 노출되므로 "GitHub"을 박지 않는다.
             return GithubFetch::Unavailable(ForgeUnavailable::Other(
                 "The forge is unavailable".to_string(),
-            ))
+            ));
         }
     };
 
@@ -118,7 +124,10 @@ async fn fetch_only(
 /// PR 생성. 에러는 여기서 **분류된 문구**로 접는다(raw stderr는 UI에 안 닿는다).
 pub async fn create_pr_now(input: CreateReviewInput) -> Result<Review, String> {
     let provider = AnyForge::select(&input.worktree_path).await;
-    provider.create_review(input).await.map_err(create_error_text)
+    provider
+        .create_review(input)
+        .await
+        .map_err(create_error_text)
 }
 
 // ---- Plan 7b: PR 패널 세부(머지가능성·리뷰·코멘트) + 확인된 파괴적 머지 ----

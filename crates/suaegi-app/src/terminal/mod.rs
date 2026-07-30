@@ -23,6 +23,7 @@ pub mod palette;
 pub mod render;
 pub mod state;
 
+use alacritty_terminal::vte::ansi::CursorShape;
 use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{operation, tree, Tree};
@@ -68,6 +69,25 @@ pub struct Terminal<'a> {
     font: Font,
     text_size: Pixels,
     line_height: text::LineHeight,
+    ligatures_enabled: bool,
+    right_click_to_paste: bool,
+    middle_click_to_paste: bool,
+    focus_follows_mouse: bool,
+    cursor_style: Option<CursorShape>,
+    cursor_blink_phase_visible: bool,
+    cursor_opacity: f32,
+    background_opacity: f32,
+    active_pane_opacity: f32,
+    inactive_pane_opacity: f32,
+    padding_x: f32,
+    padding_y: f32,
+    scroll_sensitivity: f32,
+    fast_scroll_sensitivity: f32,
+    tui_scroll_multiplier: u8,
+    mouse_hide_while_typing: bool,
+    theme_name: &'a str,
+    mac_option_as_alt: &'a str,
+    jis_yen_to_backslash: bool,
     /// 단축키 화음이 플랫폼마다 다르다. **필드로 두는 이유**는 `cfg!`가
     /// `classify_shortcut` 안에 들어가면 한쪽 플랫폼의 테스트가 아예 돌지 않기
     /// 때문이다 — 경계는 `Platform::host()` 한 곳뿐이고 여기는 그걸 주입받는다.
@@ -83,6 +103,25 @@ impl<'a> Terminal<'a> {
             font: Font::MONOSPACE,
             text_size: Pixels(13.0),
             line_height: text::LineHeight::default(),
+            ligatures_enabled: true,
+            right_click_to_paste: false,
+            middle_click_to_paste: false,
+            focus_follows_mouse: false,
+            cursor_style: None,
+            cursor_blink_phase_visible: true,
+            cursor_opacity: 1.0,
+            background_opacity: 1.0,
+            active_pane_opacity: 1.0,
+            inactive_pane_opacity: 0.8,
+            padding_x: 4.0,
+            padding_y: 4.0,
+            scroll_sensitivity: 1.15,
+            fast_scroll_sensitivity: 5.0,
+            tui_scroll_multiplier: 1,
+            mouse_hide_while_typing: false,
+            theme_name: "Builtin Tango Light",
+            mac_option_as_alt: "auto",
+            jis_yen_to_backslash: false,
             platform: Platform::host(),
         }
     }
@@ -116,9 +155,104 @@ impl<'a> Terminal<'a> {
         self
     }
 
+    pub fn ligatures_enabled(mut self, enabled: bool) -> Self {
+        self.ligatures_enabled = enabled;
+        self
+    }
+
+    pub fn right_click_to_paste(mut self, enabled: bool) -> Self {
+        self.right_click_to_paste = enabled;
+        self
+    }
+
+    pub fn middle_click_to_paste(mut self, enabled: bool) -> Self {
+        self.middle_click_to_paste = enabled;
+        self
+    }
+
+    pub fn focus_follows_mouse(mut self, enabled: bool) -> Self {
+        self.focus_follows_mouse = enabled;
+        self
+    }
+
+    pub fn cursor_style(mut self, style: &str) -> Self {
+        self.cursor_style = match style {
+            "bar" => Some(CursorShape::Beam),
+            "underline" => Some(CursorShape::Underline),
+            "block" => Some(CursorShape::Block),
+            _ => None,
+        };
+        self
+    }
+
+    pub fn theme_name(mut self, name: &'a str) -> Self {
+        self.theme_name = name;
+        self
+    }
+
+    pub fn cursor_blink_phase_visible(mut self, visible: bool) -> Self {
+        self.cursor_blink_phase_visible = visible;
+        self
+    }
+
+    pub fn cursor_opacity(mut self, opacity: f32) -> Self {
+        self.cursor_opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn background_opacity(mut self, opacity: f32) -> Self {
+        self.background_opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn pane_opacity(mut self, active: f32, inactive: f32) -> Self {
+        self.active_pane_opacity = active.clamp(0.0, 1.0);
+        self.inactive_pane_opacity = inactive.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn padding(mut self, horizontal: f32, vertical: f32) -> Self {
+        self.padding_x = horizontal.max(0.0);
+        self.padding_y = vertical.max(0.0);
+        self
+    }
+
+    pub fn scroll_sensitivity(mut self, normal: f32, fast: f32, tui: u8) -> Self {
+        self.scroll_sensitivity = normal.clamp(0.1, 10.0);
+        self.fast_scroll_sensitivity = fast.clamp(1.0, 20.0);
+        self.tui_scroll_multiplier = tui.clamp(1, 10);
+        self
+    }
+
+    pub fn mouse_hide_while_typing(mut self, enabled: bool) -> Self {
+        self.mouse_hide_while_typing = enabled;
+        self
+    }
+
+    pub fn mac_option_as_alt(mut self, value: &'a str) -> Self {
+        self.mac_option_as_alt = value;
+        self
+    }
+
+    pub fn jis_yen_to_backslash(mut self, enabled: bool) -> Self {
+        self.jis_yen_to_backslash = enabled;
+        self
+    }
+
     /// 이번 프레임에 그릴 스냅샷. Task 5의 드로우가 쓴다.
     pub fn snapshot(&self) -> &'a TerminalSnapshot {
         self.snapshot
+    }
+}
+
+fn terminal_content_bounds(bounds: Rectangle, padding_x: f32, padding_y: f32) -> Rectangle {
+    let horizontal = padding_x.min(bounds.width / 2.0);
+    let vertical = padding_y.min(bounds.height / 2.0);
+    Rectangle {
+        x: bounds.x + horizontal,
+        y: bounds.y + vertical,
+        width: (bounds.width - horizontal * 2.0).max(0.0),
+        height: (bounds.height - vertical * 2.0).max(0.0),
     }
 }
 
@@ -219,22 +353,75 @@ where
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        let content_bounds =
+            terminal_content_bounds(layout.bounds(), self.padding_x, self.padding_y);
+        match event {
+            Event::Keyboard(iced::keyboard::Event::KeyPressed { .. })
+                if self.mouse_hide_while_typing =>
+            {
+                state.mouse_hidden_after_typing = true;
+            }
+            Event::Mouse(iced_mouse::Event::CursorMoved { .. }) => {
+                state.mouse_hidden_after_typing = false;
+            }
+            _ => {}
+        }
 
         // 리사이즈는 **레이아웃 사실**이다. 포커스에도 커서 위치에도 걸리지
         // 않으므로 Task 4의 게이팅보다 앞에 둔다.
-        state::emit_resize(state, self.id, layout.bounds().size(), shell);
+        state::emit_resize(state, self.id, content_bounds.size(), shell);
 
-        input::update(state, self.id, event, clipboard, shell, self.platform);
-
-        // 그리드 크기는 **스냅샷의 것**을 넘긴다 — 사용자가 보고 클릭하는 것이
-        // 스냅샷이므로 히트테스트도 같은 좌표계여야 한다.
-        mouse::update(
+        input::update(
             state,
             self.id,
             event,
-            layout.bounds(),
+            clipboard,
+            shell,
+            self.platform,
+            self.mac_option_as_alt,
+            self.jis_yen_to_backslash,
+        );
+
+        let paste_kind = match event {
+            Event::Mouse(iced_mouse::Event::ButtonPressed(iced_mouse::Button::Right))
+                if self.right_click_to_paste =>
+            {
+                Some(iced::advanced::clipboard::Kind::Standard)
+            }
+            Event::Mouse(iced_mouse::Event::ButtonPressed(iced_mouse::Button::Middle))
+                if self.middle_click_to_paste =>
+            {
+                Some(iced::advanced::clipboard::Kind::Primary)
+            }
+            _ => None,
+        };
+        if let Some(kind) = paste_kind {
+            if let Some(contents) = clipboard.read(kind) {
+                shell.publish((self.id, TermCommand::Paste(contents)));
+            }
+            return;
+        }
+
+        if self.focus_follows_mouse
+            && !state.focused
+            && matches!(event, Event::Mouse(iced_mouse::Event::CursorMoved { .. }))
+            && cursor.is_over(content_bounds)
+        {
+            shell.publish((self.id, TermCommand::FocusRequested));
+        }
+
+        // 그리드 크기는 **스냅샷의 것**을 넘긴다 — 사용자가 보고 클릭하는 것이
+        // 스냅샷이므로 히트테스트도 같은 좌표계여야 한다.
+        mouse::update_configured(
+            state,
+            self.id,
+            event,
+            content_bounds,
             cursor,
             self.snapshot.size,
+            self.scroll_sensitivity,
+            self.fast_scroll_sensitivity,
+            self.tui_scroll_multiplier,
             shell,
         );
 
@@ -242,7 +429,7 @@ where
         // `Disabled`로 리셋되므로, 요청하지 않으면 런타임이 창의 IME를 꺼
         // (`set_ime_allowed(false)`) 조합 자체가 안 일어난다. 포커스가 없으면
         // `Disabled`를 내 이 pane이 IME를 가로채지 않게 한다.
-        shell.request_input_method(&ime_strategy(state, layout.bounds(), self.snapshot));
+        shell.request_input_method(&ime_strategy(state, content_bounds, self.snapshot));
     }
 
     fn draw(
@@ -271,13 +458,17 @@ where
     /// 걸러주지 않는 경우 창 전체에서 텍스트 커서가 된다.
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: iced_mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> iced_mouse::Interaction {
-        if cursor.is_over(layout.bounds()) {
+        if tree.state.downcast_ref::<State>().mouse_hidden_after_typing
+            && cursor.is_over(layout.bounds())
+        {
+            iced_mouse::Interaction::Hidden
+        } else if cursor.is_over(layout.bounds()) {
             iced_mouse::Interaction::Text
         } else {
             iced_mouse::Interaction::None

@@ -10,8 +10,7 @@ use chrono_tz::Tz;
 
 use crate::cron::{
     cron_has_possible_occurrence, is_js_integer, js_number, js_trim, parse_cron_expression,
-    CronError,
-    ParsedCron, DAY_CODES, WEEKDAY_CODES,
+    CronError, ParsedCron, DAY_CODES, WEEKDAY_CODES,
 };
 
 /// RRULE frequency (`:16`). Only these three are supported; anything else is

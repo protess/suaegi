@@ -41,9 +41,9 @@ fn strip_remotes_segment_prefix(s: &str) -> &str {
         return s;
     };
     match rest.find('/') {
-        Some(0) => s,             // empty segment: `refs/remotes//x`
+        Some(0) => s, // empty segment: `refs/remotes//x`
         Some(slash_at) => &rest[slash_at + 1..],
-        None => s,                // no trailing slash: `refs/remotes/origin`
+        None => s, // no trailing slash: `refs/remotes/origin`
     }
 }
 

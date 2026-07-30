@@ -537,9 +537,15 @@ mod tests {
             PrReviewState::from_api("CHANGES_REQUESTED"),
             PrReviewState::ChangesRequested
         );
-        assert_eq!(PrReviewState::from_api("COMMENTED"), PrReviewState::Commented);
+        assert_eq!(
+            PrReviewState::from_api("COMMENTED"),
+            PrReviewState::Commented
+        );
         // 알 수 없는 상태는 Approved로 오독하지 않고 Other.
-        assert_eq!(PrReviewState::from_api("WEIRD_NEW_STATE"), PrReviewState::Other);
+        assert_eq!(
+            PrReviewState::from_api("WEIRD_NEW_STATE"),
+            PrReviewState::Other
+        );
     }
 
     #[test]

@@ -6,10 +6,10 @@
 //! (no hollow tests — this repo has shipped ≥5).
 
 use suaegi_automation::{
-    backfill_automation_run_numbers, get_automation_legacy_repo_id,
-    get_automation_run_project_id, get_automation_run_repo_id, is_final_automation_run_status,
-    next_automation_run_number, prune_automation_runs, AutomationIdentity, AutomationRun,
-    AutomationRunContext, AutomationRunStatus, MAX_AUTOMATION_RUNS_PER_AUTOMATION,
+    backfill_automation_run_numbers, get_automation_legacy_repo_id, get_automation_run_project_id,
+    get_automation_run_repo_id, is_final_automation_run_status, next_automation_run_number,
+    prune_automation_runs, AutomationIdentity, AutomationRun, AutomationRunContext,
+    AutomationRunStatus, MAX_AUTOMATION_RUNS_PER_AUTOMATION,
 };
 
 /// Mirrors the oracle `run()` factory: final status by default (`skipped_precheck`),
@@ -34,7 +34,12 @@ fn with_created(mut r: AutomationRun, created_at: i64) -> AutomationRun {
 /// `created_at = from + i`.
 fn make_runs(automation_id: &str, count: i64, from: i64) -> Vec<AutomationRun> {
     (0..count)
-        .map(|i| with_created(run(&format!("{automation_id}-{}", from + i), automation_id), from + i))
+        .map(|i| {
+            with_created(
+                run(&format!("{automation_id}-{}", from + i), automation_id),
+                from + i,
+            )
+        })
         .collect()
 }
 
@@ -60,7 +65,10 @@ fn final_status_covers_completed_dispatch_failed_and_all_skipped() {
         AutomationRunStatus::SkippedUnavailable,
         AutomationRunStatus::SkippedNeedsInteractiveAuth,
     ] {
-        assert!(is_final_automation_run_status(status), "{status:?} is final");
+        assert!(
+            is_final_automation_run_status(status),
+            "{status:?} is final"
+        );
     }
     for status in [
         AutomationRunStatus::Pending,
@@ -205,7 +213,10 @@ fn leaves_an_existing_run_number_untouched() {
         run_number: Some(42),
         ..run("a-0", "a")
     }];
-    assert_eq!(backfill_automation_run_numbers(&runs)[0].run_number, Some(42));
+    assert_eq!(
+        backfill_automation_run_numbers(&runs)[0].run_number,
+        Some(42)
+    );
 }
 
 #[test]

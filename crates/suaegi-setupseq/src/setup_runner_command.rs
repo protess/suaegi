@@ -199,7 +199,8 @@ fn is_js_regex_dot_char(c: char) -> bool {
 /// (both call sites pass ASCII literals), so slicing at `prefix.len()` bytes
 /// is always a valid `char` boundary regardless of what follows.
 fn strip_ascii_ci_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() >= prefix.len() && value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    if value.len() >= prefix.len()
+        && value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     {
         Some(&value[prefix.len()..])
     } else {
@@ -483,10 +484,7 @@ mod tests {
         // `""` is the CommandLineToArgvW convention, not a cmd.exe escape.
         let path = "C:\\a\"&calc&\".cmd";
         let resolution = resolve_setup_runner_command(path, SetupRunnerCommandPlatform::Windows);
-        assert_eq!(
-            resolution.command,
-            "cmd.exe /c \"C:\\a\"\"&calc&\"\".cmd\""
-        );
+        assert_eq!(resolution.command, "cmd.exe /c \"C:\\a\"\"&calc&\"\".cmd\"");
     }
 
     // -----------------------------------------------------------------
@@ -502,7 +500,10 @@ mod tests {
     #[test]
     fn k8_unc_path_without_a_break_character_converts_normally() {
         let path = "//wsl.localhost/Ubuntu/home/jin/repo/setup-runner.sh";
-        assert_eq!(wsl_unc_to_linux_path(path), "/home/jin/repo/setup-runner.sh");
+        assert_eq!(
+            wsl_unc_to_linux_path(path),
+            "/home/jin/repo/setup-runner.sh"
+        );
     }
 
     #[test]

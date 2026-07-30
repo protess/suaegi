@@ -1,38 +1,49 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+#[cfg(test)]
 use iced::advanced::clipboard;
 use iced::widget::pane_grid;
+use iced::Point;
 use suaegi_core::domain::{
-    JiraConnectionConfig, PersistedPane, PersistedState, Repo, RepoId, SessionState, Settings,
-    Worktree, WorktreeId, SCHEMA_VERSION,
+    AutomationConfig, AutomationRunRecord, BrowserTabSetting, JiraConnectionConfig,
+    OpenInApplicationSetting, PersistedPane, PersistedState, ProjectHostSetupSetting,
+    QuickCommandSetting, Repo, RepoId, RuntimeEnvironmentSetting, SessionState, Settings,
+    SleepingAgentSession, SshHostSetting, UiSettings, Worktree, WorktreeId, SCHEMA_VERSION,
 };
 use suaegi_git::compare::{CompareOutcome, FileDiff};
 
+use crate::content_search::ContentSearchState;
 use crate::diff_panel::{panel_state_for, patch_state_for, DiffState};
+use crate::editor::EditorState;
+use crate::file_explorer::FileExplorerState;
 use crate::forge_ui::{GithubFetch, GithubStatus, MergeResultDisplay, PrDetails};
 use crate::pr_panel::PrPanelState;
+use crate::quick_open::QuickOpenState;
+use crate::source_control::{SourceControlOperation, SourceControlState};
 use suaegi_forge::{
     CreateReviewInput, CreationEligibility, MergeMethod, MergeOptions, Review, ReviewLookup,
 };
+use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
+use suaegi_keys::{KeybindingActionId, KeybindingFileSnapshot};
 use suaegi_secrets::Secret;
+use suaegi_term::agent::{agent_def_by_id, PromptInjection};
+use suaegi_term::grid::TerminalSnapshot;
+use suaegi_term::input_types::{CopyTargets, MouseAction, TermMouseButton, WriteOutcome};
+use suaegi_term::presence::AgentPresence;
 use suaegi_tracker::{
     IssuePage, JiraAuthType, JiraConnection, JiraIssue, JiraPage, JiraViewer, LinearWorkspace,
     LinkedJiraIssue, LinkedLinearIssue, Lookup,
 };
-use suaegi_git::worktree::{BranchDeletion, CreatedWorktree, RemoveOutcome, WorktreeEntry};
-use suaegi_term::agent::{agent_def_by_id, PromptInjection};
-use suaegi_term::grid::TerminalSnapshot;
-use suaegi_term::input_types::{CopyTargets, WriteOutcome};
-use suaegi_term::presence::AgentPresence;
 
-use crate::agent_status::server::HookServer;
 use crate::agent_status::contract::{
     hook_outcome, reduce, BadgeInput, BadgeState, HookEvent, HookOutcome, HookState, Hydration,
     HydrationStep, PaneKey, SpawnNonce, LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
 };
+use crate::agent_status::server::HookServer;
+use crate::automation::AutomationUiState;
 use crate::layout::{leaves_in_order, to_configuration, to_persisted, without_leaf, LeafOutcome};
 use crate::persistence_thread::{
     LoadDiagnostics, LoadOrigin, PersistenceHandle, SaveReport, SaveStatus,
@@ -40,6 +51,18 @@ use crate::persistence_thread::{
 use crate::prompt_inject::{GateAction, GateObservation, PromptGate};
 use crate::session_store::{SessionId, SessionStore, StartedSession};
 use crate::terminal::contract::TermCommand;
+
+const SOURCE_CONTROL_AI_ACTION_IDS: &[&str] = &[
+    "commitMessage",
+    "pullRequest",
+    "branchName",
+    "fixCommitFailure",
+    "fixPushFailure",
+    "fixChecks",
+    "resolveConflicts",
+    "resolveComments",
+];
+const FLOATING_WORKSPACE_ID_PREFIX: &str = "__suaegi_floating_workspace__";
 
 /// 포커스 전환이 내야 할 `FOCUS_IN_OUT` 리포트를 **순서대로**.
 ///
@@ -66,21 +89,130 @@ fn focus_reports(previous: Option<SessionId>, next: Option<SessionId>) -> Vec<(S
     reports
 }
 
+fn valid_agent_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(characters.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && name.len() <= 256
+        && !name.starts_with("SUAEGI_")
+        && !name.starts_with("ORCA_")
+}
+
+fn parse_agent_env_draft(value: &str) -> Option<HashMap<String, String>> {
+    if value.len() > 64 * 1024 {
+        return None;
+    }
+    let mut env = HashMap::new();
+    for line in value.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (name, value) = line.split_once('=')?;
+        let name = name.trim();
+        if !valid_agent_env_name(name) || value.len() > 16 * 1024 || value.contains('\0') {
+            return None;
+        }
+        env.insert(name.to_string(), value.to_string());
+        if env.len() > 256 {
+            return None;
+        }
+    }
+    Some(env)
+}
+
+fn format_agent_env(env: &HashMap<String, String>) -> String {
+    let mut entries = env.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    entries
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn next_opacity(value: u8) -> u8 {
+    match value {
+        0 => 25,
+        25 => 50,
+        50 => 75,
+        75 => 80,
+        80 => 90,
+        90 => 100,
+        _ => 0,
+    }
+}
+
+fn next_terminal_padding(value: u16) -> u16 {
+    match value {
+        0 => 2,
+        2 => 4,
+        4 => 8,
+        8 => 12,
+        12 => 16,
+        _ => 0,
+    }
+}
+
+fn valid_provider_session_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 512
+        && !value.starts_with('-')
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_string())
+}
+
 /// 추출된 선택 텍스트를 **요청된 클립보드에만** 쓴다.
 ///
 /// 기본값은 호출부가 정한다: 명시적 복사는 양쪽(`CopyTargets::EXPLICIT`),
 /// 드래그 완료는 primary에만(`DRAG_COMPLETE`) — X11/Wayland의 중클릭 붙여넣기
 /// 관례다. Primary는 macOS/Windows에서 no-op이므로 양쪽에 쓰는 것이 안전하다.
+fn verify_clipboard_write(
+    expected: &str,
+    actual: Option<&str>,
+    accepted: bool,
+) -> Result<(), String> {
+    if accepted && actual == Some(expected) {
+        Ok(())
+    } else {
+        Err("Clipboard write verification failed.".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verified_standard_clipboard_write(text: &str) -> Result<(), String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let value = NSString::from_str(text);
+    // SAFETY: AppKit exports this as a process-lifetime NSString constant.
+    let string_type = unsafe { NSPasteboardTypeString };
+    let accepted = pasteboard.setString_forType(&value, string_type);
+    let actual = pasteboard
+        .stringForType(string_type)
+        .map(|value| value.to_string());
+    verify_clipboard_write(text, actual.as_deref(), accepted)
+}
+
 fn clipboard_writes(targets: CopyTargets, text: String) -> iced::Task<Message> {
-    iced::Task::batch(clipboard_kinds(targets).into_iter().map(|kind| match kind {
-        clipboard::Kind::Standard => iced::clipboard::write(text.clone()),
-        clipboard::Kind::Primary => iced::clipboard::write_primary(text.clone()),
-    }))
+    let mut tasks = Vec::new();
+    if targets.standard {
+        #[cfg(target_os = "macos")]
+        tasks.push(iced::Task::done(Message::TerminalClipboardWriteFinished(
+            verified_standard_clipboard_write(&text),
+        )));
+        #[cfg(not(target_os = "macos"))]
+        tasks.push(iced::clipboard::write(text.clone()));
+    }
+    if targets.primary {
+        tasks.push(iced::clipboard::write_primary(text));
+    }
+    iced::Task::batch(tasks)
 }
 
 /// 어느 클립보드에 쓸 것인가. **`Task`는 들여다볼 수 없으므로** 결정을 값으로
 /// 뽑아야 검사할 수 있다 — 그리고 이건 검사할 값이 있는 결정이다: 드래그 완료가
 /// standard까지 쓰면 사용자가 복사한 적 없는 텍스트가 시스템 클립보드를 덮어쓴다.
+#[cfg(test)]
 fn clipboard_kinds(targets: CopyTargets) -> Vec<clipboard::Kind> {
     let mut kinds = Vec::new();
     if targets.standard {
@@ -90,6 +222,27 @@ fn clipboard_kinds(targets: CopyTargets) -> Vec<clipboard::Kind> {
         kinds.push(clipboard::Kind::Primary);
     }
     kinds
+}
+
+fn workspace_seed_name(explicit_name: &str, prompt: Option<&str>, fallback_name: &str) -> String {
+    let explicit_name = explicit_name.trim();
+    if !explicit_name.is_empty() {
+        return explicit_name.to_string();
+    }
+    if let Some(slug) = prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(suaegi_workname::slugify_for_workspace_name)
+        .filter(|slug| !slug.is_empty())
+    {
+        return slug;
+    }
+    let fallback_name = fallback_name.trim();
+    if fallback_name.is_empty() {
+        "workspace".to_string()
+    } else {
+        fallback_name.to_string()
+    }
 }
 
 /// 비동기 작업 하나를 식별한다. 결과가 순서를 바꿔 도착해도 대상을 잃지 않게 한다.
@@ -140,6 +293,9 @@ pub enum WorktreeListing {
 /// 표에 없는 값이면 로그인 셸로 안전하게 떨어뜨린다.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeMeta {
+    /// Sidebar title can intentionally diverge from the git branch after
+    /// first-work auto naming (for example `PR 1094 - Review`).
+    pub display_name: Option<String>,
     pub created_with_agent: Option<String>,
     pub created_at_unix_ms: u64,
     /// Plan 7a: 이 worktree 브랜치에 연결된 GitHub PR 번호. `created_at_unix_ms`와
@@ -188,6 +344,30 @@ impl std::fmt::Display for AgentChoice {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparsePresetChoice {
+    pub id: String,
+    pub label: String,
+}
+
+impl std::fmt::Display for SparsePresetChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmRecipeChoice {
+    pub id: String,
+    pub label: String,
+}
+
+impl std::fmt::Display for VmRecipeChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
 /// 설치된 에이전트 id 목록 → 피커 옵션. 항상 맨 앞에 로그인 셸(기본)을 둔다.
 /// 순수 함수라 설치 감지(PATH 스캔)와 분리해 직접 테스트한다.
 pub(crate) fn agent_choices(installed: &[&'static str]) -> Vec<AgentChoice> {
@@ -196,7 +376,7 @@ pub(crate) fn agent_choices(installed: &[&'static str]) -> Vec<AgentChoice> {
     choices
 }
 
-/// 현재 런타임에서 PATH로 설치가 확인되는 33행의 id들. `boot`이 한 번만 부른다.
+/// 현재 런타임에서 PATH로 설치가 확인되는 에이전트 id들. `boot`이 한 번만 부른다.
 fn detect_installed_agents() -> Vec<&'static str> {
     use suaegi_term::agent::{agent_defs, current_runtime, detect_installed, PathProbe};
     let probe = PathProbe;
@@ -208,8 +388,1024 @@ fn detect_installed_agents() -> Vec<&'static str> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightSidebarTab {
+    Explorer,
+    Agents,
+    SourceControl,
+    Checks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Agents,
+    ProviderAccounts,
+    Orchestration,
+    ComputerUse,
+    Voice,
+    General,
+    Integrations,
+    Mobile,
+    Git,
+    TaskSources,
+    Terminal,
+    QuickCommands,
+    Browser,
+    MobileEmulator,
+    FloatingWorkspace,
+    Appearance,
+    InputEditing,
+    Notifications,
+    Shortcuts,
+    StatsUsage,
+    SshHosts,
+    RemoteServers,
+    MacPermissions,
+    Privacy,
+    Advanced,
+    Plugins,
+    EphemeralVms,
+    Experimental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Issues,
+    PullRequests,
+    Projects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPreset {
+    Open,
+    AssignedToMe,
+    NeedsReview,
+    Mine,
+}
+
+impl TaskPreset {
+    fn query(self, kind: TaskKind) -> &'static str {
+        match (kind, self) {
+            (TaskKind::Issues, TaskPreset::AssignedToMe) => "assignee:@me is:issue is:open",
+            (TaskKind::PullRequests, TaskPreset::NeedsReview) => {
+                "review-requested:@me is:pr is:open"
+            }
+            (TaskKind::PullRequests, TaskPreset::Mine) => "author:@me is:pr is:open",
+            (TaskKind::PullRequests, _) => "is:pr is:open",
+            _ => "is:issue is:open",
+        }
+    }
+}
+
+fn mobile_install_url(platform: MobilePlatform, channel: MobileIosChannel) -> &'static str {
+    match (platform, channel) {
+        (MobilePlatform::Ios, MobileIosChannel::Preview) => {
+            "https://testflight.apple.com/join/YjeGMQBA"
+        }
+        (MobilePlatform::Ios, MobileIosChannel::Stable) => {
+            "https://apps.apple.com/app/orca-ide/id6766130217"
+        }
+        (MobilePlatform::Android, _) => {
+            "https://github.com/stablyai/orca/releases/download/mobile-android-v0.0.31/app-release.apk"
+        }
+    }
+}
+
+fn open_external_url(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
+fn current_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn prepare_browser_upload(params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+
+    const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+    let element = params
+        .get("element")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "browser upload requires an element reference".to_string())?;
+    let files = params
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "browser upload requires one or more files".to_string())?;
+    if files.is_empty() || files.len() > 16 {
+        return Err("Browser upload accepts between 1 and 16 files.".into());
+    }
+    let mut total = 0_u64;
+    let mut uploads = Vec::with_capacity(files.len());
+    for file in files {
+        let raw = file
+            .as_str()
+            .ok_or_else(|| "Browser upload file paths must be strings.".to_string())?;
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err(format!("Browser upload path must be absolute: {raw}"));
+        }
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("Could not open browser upload file {raw}: {error}"))?;
+        let metadata = path
+            .metadata()
+            .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "Browser upload path is not a file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_FILE_BYTES {
+            return Err(format!(
+                "Browser upload file exceeds the 8 MiB limit: {}",
+                path.display()
+            ));
+        }
+        total = total.saturating_add(metadata.len());
+        if total > MAX_TOTAL_BYTES {
+            return Err("Browser upload exceeds the 32 MiB total limit.".into());
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mime = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "pdf" => "application/pdf",
+            "json" => "application/json",
+            "txt" | "md" | "csv" => "text/plain",
+            _ => "application/octet-stream",
+        };
+        uploads.push(serde_json::json!({
+            "name": path.file_name().and_then(|name| name.to_str()).unwrap_or("upload"),
+            "type": mime,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "lastModified": metadata.modified().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64),
+        }));
+    }
+    Ok(serde_json::json!({"element": element, "uploads": uploads}))
+}
+
+fn fork_sync_result_text(result: &crate::fork_sync::ForkSyncResult) -> String {
+    use crate::fork_sync::{ForkSyncBlockedReason as Reason, ForkSyncStatus as Status};
+    let branch = result.branch_name.as_deref().unwrap_or("default branch");
+    match result.status {
+        Status::Synced => format!(
+            "Fork updated — fast-forwarded {branch} by {} commit{}.",
+            result.behind,
+            if result.behind == 1 { "" } else { "s" }
+        ),
+        Status::UpToDate => format!("Fork already up to date — {branch} matches upstream."),
+        Status::Blocked => {
+            let reason = match result.reason {
+                Some(Reason::MissingOrigin) => "origin remote is missing",
+                Some(Reason::MissingUpstream) => "upstream remote is missing",
+                Some(Reason::UpstreamMismatch) => "upstream remote no longer matches this fork",
+                Some(Reason::MissingUpstreamDefaultBranch) => {
+                    "upstream default branch could not be resolved"
+                }
+                Some(Reason::MissingOriginBranch) => {
+                    "origin does not have the upstream default branch"
+                }
+                Some(Reason::Diverged) => "origin has commits that are not in upstream",
+                None => "the fork could not be fast-forwarded safely",
+            };
+            format!("Fork sync skipped — {reason}.")
+        }
+    }
+}
+
+fn cli_install_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".local/bin/suaegi"))
+}
+
+#[cfg(unix)]
+fn install_cli_link() -> Result<PathBuf, String> {
+    use std::os::unix::fs::symlink;
+
+    let destination =
+        cli_install_path().ok_or_else(|| "The home directory could not be found.".to_string())?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "The CLI install directory is invalid.".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+        if !metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{} already exists and was not changed.",
+                destination.display()
+            ));
+        }
+        std::fs::remove_file(&destination)
+            .map_err(|error| format!("Could not replace {}: {error}", destination.display()))?;
+    }
+
+    let executable =
+        std::env::current_exe().map_err(|error| format!("Could not locate Suaegi: {error}"))?;
+    symlink(&executable, &destination)
+        .map_err(|error| format!("Could not install {}: {error}", destination.display()))?;
+    Ok(destination)
+}
+
+#[cfg(not(unix))]
+fn install_cli_link() -> Result<PathBuf, String> {
+    Err("CLI installation is currently available on macOS and Linux.".to_string())
+}
+
+fn toggle_worktree_preference(values: &mut Vec<String>, worktree: String) {
+    if let Some(index) = values.iter().position(|value| value == &worktree) {
+        values.remove(index);
+    } else {
+        values.push(worktree);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskProvider {
+    Github,
+    Gitlab,
+    Jira,
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceControlAiPrDefault {
+    Draft,
+    UseTemplate,
+    GenerateDetailsOnOpen,
+    OpenAfterCreate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileStage {
+    Intro,
+    Install,
+    Pair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobilePlatform {
+    Ios,
+    Android,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileIosChannel {
+    Preview,
+    Stable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileConnectionMode {
+    Anywhere,
+    LocalNetwork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpAction {
+    KeyboardShortcuts,
+    Feedback,
+    Docs,
+    Changelog,
+    Github,
+    Discord,
+    X,
+    CheckForUpdates,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEvent {
+    pub worktree: String,
+    pub status: String,
+    pub detail: String,
+}
+
+fn native_chat_supported_agent(agent: Option<&str>) -> bool {
+    matches!(agent, Some("claude" | "openclaude" | "codex" | "grok"))
+}
+
+fn claude_agent_teams_args(existing: Option<String>, mode: &str) -> Option<String> {
+    if mode != "in-process" {
+        return existing;
+    }
+    let existing = existing.unwrap_or_default();
+    if existing
+        .split_whitespace()
+        .any(|argument| argument == "--teammate-mode" || argument.starts_with("--teammate-mode="))
+    {
+        return Some(existing);
+    }
+    Some(if existing.trim().is_empty() {
+        "--teammate-mode in-process".into()
+    } else {
+        format!("{} --teammate-mode in-process", existing.trim())
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiSetting {
+    ConfirmClosePinnedTabs,
+    ConfirmCloseRunningTerminal,
+    ConfirmWorkspaceDelete,
+    ConfirmAutomationDelete,
+    NestWorkspaces,
+    AutoSaveFiles,
+    EditorWordWrap,
+    EditorMinimap,
+    RichMarkdownSpellcheck,
+    MarkdownReviewTools,
+    PrimarySelectionMiddleClickPaste,
+    DiffWordWrap,
+    CombinedDiffFileTreeVisibleByDefault,
+    RefreshLocalBaseRef,
+    AutoRenameBranchFromWork,
+    EnableGithubAttribution,
+    ShowGitIgnoredFiles,
+    SourceControlCompareAgainstUpstream,
+    ShowTitlebarAppName,
+    ShowTasksButton,
+    ShowAutomationsButton,
+    ShowPinnedWorktreesInGroups,
+    ShowMenuBarIcon,
+    WindowBackgroundBlur,
+    TerminalCursorBlink,
+    TerminalMouseHideWhileTyping,
+    TerminalUseSeparateLightTheme,
+    TerminalFocusFollowsMouse,
+    TerminalClipboardOnSelect,
+    TerminalAllowOsc52Clipboard,
+    TerminalScopeHistoryByWorktree,
+    TerminalRightClickToPaste,
+    TerminalJisYenToBackslash,
+    NotificationsEnabled,
+    NotificationAgentTaskComplete,
+    NotificationTerminalBell,
+    NotificationSuppressWhenFocused,
+    AnonymousTelemetry,
+    ShowUsageStatus,
+    ShowResourceStatus,
+    ShowPortsStatus,
+    ShowMobileSidebar,
+    FloatingWorkspaceEnabled,
+    OpenLinksInApp,
+    LocalhostWorktreeLabels,
+    MobileEmulatorEnabled,
+    AgentStatusHooksEnabled,
+    TabAutoGenerateTitle,
+    KeepComputerAwakeWhileAgentsRun,
+    PromptCacheTimerEnabled,
+    GeminiCliOauthEnabled,
+    OrchestrationEnabled,
+    ComputerUseEnabled,
+    VoiceEnabled,
+    VoiceConfirmBeforeInsert,
+    ShowGithubTasks,
+    ShowGitlabTasks,
+    ShowJiraTasks,
+    ShowLinearTasks,
+    ElectronHttp1CompatibilityMode,
+    TerminalHiddenViewParking,
+    TerminalMainSideEffectAuthority,
+    TerminalHiddenDeliveryGate,
+    TerminalModelQueryAuthority,
+    ExperimentalNativeChat,
+    ExperimentalPet,
+    ExperimentalActivity,
+    ExperimentalTerminalAttention,
+    ExperimentalAgentHibernation,
+    CompactWorktreeCards,
+    ExperimentalEphemeralVms,
+    PluginSystemEnabled,
+    HideDefaultBranch,
+    HideDetachedHead,
+    HideSleeping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiChoice {
+    TabOrder,
+    AutoSaveDelay,
+    DefaultDiffView,
+    BranchPrefix,
+    SourceControlViewMode,
+    SourceControlGroupOrder,
+    Theme,
+    Language,
+    UiZoom,
+    AppFontFamily,
+    AppIcon,
+    LeftSidebarAppearance,
+    LeftSidebarTintOpacity,
+    UsagePercentageMode,
+    TerminalFontSize,
+    TerminalFontFamily,
+    TerminalFontWeight,
+    TerminalLineHeight,
+    TerminalScrollSensitivity,
+    TerminalFastScrollSensitivity,
+    TerminalTuiScrollMultiplier,
+    TerminalGpuAcceleration,
+    TerminalLigatures,
+    TerminalCursorStyle,
+    TerminalThemeDark,
+    TerminalThemeLight,
+    SetupScriptLaunchMode,
+    TerminalPaddingX,
+    TerminalPaddingY,
+    TerminalCursorOpacity,
+    TerminalBackgroundOpacity,
+    TerminalInactivePaneOpacity,
+    TerminalActivePaneOpacity,
+    TerminalPaneOpacityTransition,
+    TerminalDividerThickness,
+    TerminalScrollbackRows,
+    TerminalShortcutPolicy,
+    TerminalMacOptionAsAlt,
+    NotificationSound,
+    NotificationVolume,
+    FloatingWorkspaceTrigger,
+    BrowserSearchEngine,
+    BrowserDefaultZoom,
+    DefaultTaskSource,
+    DefaultTaskViewPreset,
+    DefaultAgent,
+    PromptCacheTtl,
+    AgentHibernationIdle,
+    VoiceModel,
+    VoiceLanguage,
+    VoiceDictationMode,
+    NativeChatDefaultView,
+    ClaudeAgentTeamsMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceDictationState {
+    Idle,
+    Recording,
+    Transcribing,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretDraft(String);
+
+impl SecretDraft {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SecretDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiTextSetting {
+    BranchPrefixCustom,
+    EditorFontFamily,
+    LeftSidebarTintColor,
+    TerminalFontFamily,
+    TerminalWordSeparator,
+    TerminalDividerColorDark,
+    TerminalDividerColorLight,
+    TerminalColorForeground,
+    TerminalColorBackground,
+    TerminalColorCursor,
+    TerminalColorCursorAccent,
+    TerminalColorSelectionBackground,
+    TerminalColorSelectionForeground,
+    TerminalColorBlack,
+    TerminalColorRed,
+    TerminalColorGreen,
+    TerminalColorYellow,
+    TerminalColorBlue,
+    TerminalColorMagenta,
+    TerminalColorCyan,
+    TerminalColorWhite,
+    TerminalColorBrightBlack,
+    TerminalColorBrightRed,
+    TerminalColorBrightGreen,
+    TerminalColorBrightYellow,
+    TerminalColorBrightBlue,
+    TerminalColorBrightMagenta,
+    TerminalColorBrightCyan,
+    TerminalColorBrightWhite,
+    TerminalColorBold,
+    FloatingWorkspaceCwd,
+    BrowserHomePage,
+    AndroidSdkPath,
+    OpenCodeWorkspaceId,
+    MiniMaxGroupId,
+    MiniMaxUsageModels,
+    HttpProxyUrl,
+    HttpProxyBypassRules,
+}
+
+impl UiTextSetting {
+    fn terminal_color_key(self) -> Option<&'static str> {
+        Some(match self {
+            Self::TerminalColorForeground => "foreground",
+            Self::TerminalColorBackground => "background",
+            Self::TerminalColorCursor => "cursor",
+            Self::TerminalColorCursorAccent => "cursorAccent",
+            Self::TerminalColorSelectionBackground => "selectionBackground",
+            Self::TerminalColorSelectionForeground => "selectionForeground",
+            Self::TerminalColorBlack => "black",
+            Self::TerminalColorRed => "red",
+            Self::TerminalColorGreen => "green",
+            Self::TerminalColorYellow => "yellow",
+            Self::TerminalColorBlue => "blue",
+            Self::TerminalColorMagenta => "magenta",
+            Self::TerminalColorCyan => "cyan",
+            Self::TerminalColorWhite => "white",
+            Self::TerminalColorBrightBlack => "brightBlack",
+            Self::TerminalColorBrightRed => "brightRed",
+            Self::TerminalColorBrightGreen => "brightGreen",
+            Self::TerminalColorBrightYellow => "brightYellow",
+            Self::TerminalColorBrightBlue => "brightBlue",
+            Self::TerminalColorBrightMagenta => "brightMagenta",
+            Self::TerminalColorBrightCyan => "brightCyan",
+            Self::TerminalColorBrightWhite => "brightWhite",
+            Self::TerminalColorBold => "bold",
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardStatus {
+    Todo,
+    InProgress,
+    InReview,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPopover {
+    Usage,
+    Resources,
+    Ports,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortListener {
+    pub pid: u32,
+    pub process: String,
+    pub address: String,
+    pub workspace: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWorktreeRemoval {
+    repo_id: RepoId,
+    worktree_id: WorktreeId,
+    worktree_path: PathBuf,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSetupSession {
+    worktree_id: WorktreeId,
+    worktree_path: PathBuf,
+    command: String,
+    mode: String,
+    wait_for_agent: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSetupSession {
+    worktree_id: WorktreeId,
+    mode: String,
+    pane_open: bool,
+    completed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCliTerminal {
+    request: crate::local_rpc::LocalRpcRequest,
+    worktree_id: WorktreeId,
+    split_target: Option<SessionId>,
+    direction: pane_grid::Axis,
+    focus: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentScope {
+    Workspace,
+    Project,
+    All,
+}
+
+impl BoardStatus {
+    fn persisted(self) -> &'static str {
+        match self {
+            BoardStatus::Todo => "todo",
+            BoardStatus::InProgress => "in_progress",
+            BoardStatus::InReview => "in_review",
+            BoardStatus::Done => "done",
+        }
+    }
+
+    fn from_persisted(value: Option<&String>) -> Self {
+        match value.map(String::as_str) {
+            Some("todo") => BoardStatus::Todo,
+            Some("in_review" | "in-review") => BoardStatus::InReview,
+            Some("done" | "completed") => BoardStatus::Done,
+            _ => BoardStatus::InProgress,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatingWorkspaceContent {
+    #[default]
+    Empty,
+    Terminal,
+    Browser,
+    Markdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingWorkspaceDragTarget {
+    Panel,
+    Resize,
+    Trigger,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatingWorkspaceDrag {
+    target: FloatingWorkspaceDragTarget,
+    start_pointer: Point,
+    start_x: i32,
+    start_y: i32,
+    start_width: u16,
+    start_height: u16,
+    moved: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
+    LocalRpcRequested(crate::local_rpc::LocalRpcRequest),
+    // ---- Native window chrome (Orca-style inset title bar) ----
+    WindowClose,
+    WindowMinimize,
+    WindowMaximize,
+    WindowDrag,
+    WindowOpened(iced::window::Id),
+    AppWindowFocusChanged(bool),
+    AppWindowResized(iced::Size),
+    BrowserOpenRequested,
+    BrowserClosed,
+    BrowserTabCreated,
+    BrowserTabSelected(String),
+    BrowserTabClosed(String),
+    BrowserAddressChanged(String),
+    BrowserNavigateRequested,
+    BrowserBack,
+    BrowserForward,
+    BrowserReload,
+    BrowserZoomReset,
+    BrowserOpenExternal,
+    BrowserLocationTick,
+    BrowserProfileNameChanged(String),
+    BrowserProfileAdded,
+    BrowserProfileSelected(String),
+    BrowserProfileRemoved(String),
+    BrowserProfileRemovalFinished(
+        String,
+        Result<(), String>,
+        Option<crate::local_rpc::LocalRpcRequest>,
+    ),
+    BrowserCookiesClearRequested,
+    BrowserCookiesImportRequested,
+    BrowserDetectedCookiesImportRequested(crate::browser::DetectedBrowserProfile),
+    BrowserCookiesImportFinished(Result<Option<crate::browser::CookieImportBundle>, String>),
+    EmulatorAvailabilityRequested,
+    EmulatorAvailabilityFinished(crate::emulator::EmulatorAvailability),
+    EmulatorDefaultDeviceSelected(Option<String>),
+    EmulatorLaunchDefaultRequested,
+    EmulatorLaunchFinished(Result<(), String>),
+    EmulatorClosed,
+    EmulatorFrameTick,
+    EmulatorFrameFinished(String, Result<Vec<u8>, String>),
+    EmulatorPointerMoved(iced::Point),
+    EmulatorTapRequested,
+    EmulatorControlRequested(String),
+    EmulatorControlFinished(Result<(), String>),
+    EmulatorTextChanged(String),
+    EmulatorTextSubmitted,
+    HostedIntegrationsRefreshRequested,
+    HostedIntegrationsRefreshFinished(crate::hosted_integrations::HostedIntegrationStatuses),
+    UsageProviderToggled(crate::usage::UsageProvider),
+    UsageRefreshRequested,
+    UsageRefreshFinished(crate::usage::UsageSnapshot),
+    RateLimitsRefreshRequested,
+    GeminiRateLimitsRefreshRequested,
+    GeminiRateLimitsRefreshFinished(crate::rate_limits::GeminiRateLimits),
+    ProviderRateLimitsRefreshRequested,
+    ProviderRateLimitsRefreshFinished(
+        crate::rate_limits::RateLimitProvider,
+        crate::rate_limits::ProviderRateLimits,
+    ),
+    ProviderSecretDraftChanged(crate::provider_credentials::ProviderSecret, SecretDraft),
+    ProviderSecretSaveRequested(crate::provider_credentials::ProviderSecret),
+    ProviderSecretSaveFinished(
+        crate::provider_credentials::ProviderSecret,
+        Result<(), String>,
+    ),
+    ProviderSecretClearRequested(crate::provider_credentials::ProviderSecret),
+    ProviderSecretClearFinished(
+        crate::provider_credentials::ProviderSecret,
+        Result<(), String>,
+    ),
+    GhosttyImportRequested,
+    GhosttyImportFinished(Box<Result<crate::ghostty_import::GhosttyImport, String>>),
+    WarpThemeImportRequested,
+    YamlThemeImportRequested,
+    YamlThemeFilesPicked(Vec<PathBuf>),
+    TerminalThemeImportFinished(Result<crate::warp_theme_import::ThemeImportResult, String>),
+    CustomTerminalThemeRemoved(String),
+    ActivityOpened,
+    ActivityClosed,
+    ActivityCleared,
+    NativeChatToggled(SessionId),
+    NativeChatDraftChanged(SessionId, String),
+    NativeChatSubmitted(SessionId),
+    RemoteRuntimeNameChanged(String),
+    RemoteRuntimePairingCodeChanged(SecretDraft),
+    RemoteRuntimeSaveRequested,
+    RemoteRuntimeSaveFinished(Result<RuntimeEnvironmentSetting, String>),
+    RemoteRuntimeRpcSaveFinished(
+        crate::local_rpc::LocalRpcRequest,
+        Result<RuntimeEnvironmentSetting, String>,
+    ),
+    RemoteRuntimeCheckRequested(usize),
+    RemoteRuntimeCheckFinished(String, crate::remote_runtime::RuntimeReachability),
+    RemoteServerUpdateCheckRequested(usize),
+    RemoteServerUpdateCheckFinished(String, crate::remote_runtime::RemoteServerUpdateState),
+    RemoteServerUpdateRequested(usize),
+    RemoteServerUpdateFinished(String, crate::remote_runtime::RemoteServerUpdateState),
+    PluginsRefreshRequested,
+    PluginsRefreshFinished(Vec<crate::plugins::PluginEntry>),
+    PluginEnabledToggled(String),
+    PluginConsentReviewRequested(String),
+    PluginConsentGranted(String, String),
+    PluginConsentKeptDisabled(String),
+    PluginDevPathChanged(String),
+    PluginDevPathAdded,
+    PluginDevPathRemoved(String),
+    PluginLocalInstallRequested,
+    PluginLocalInstallFinished(Result<String, String>),
+    PluginRollbackRequested(String),
+    PluginRollbackFinished(Result<String, String>),
+    PluginRemoveRequested(String),
+    PluginRemoveCancelled,
+    PluginRemoveConfirmed(String),
+    PluginRemoveFinished(Result<String, String>),
+    PluginCommandInvoked(String, String),
+    PluginHostCallRequested(crate::plugin_worker::PluginHostRequest),
+    PluginPanelOpened(String, String),
+    PluginPanelClosed,
+    PluginPanelCallRequested(crate::plugin_panel::PanelCall),
+    PluginPanelCallFinished {
+        plugin_key: String,
+        panel_id: String,
+        request_id: String,
+        result: Result<serde_json::Value, String>,
+    },
+    PluginPanelWatchdogTick,
+    PluginPanelPongReceived {
+        plugin_key: String,
+        panel_id: String,
+        ping_id: u64,
+    },
+    PluginEventDeliveryFinished(Result<usize, String>),
+    PluginWorkerReapTick,
+    EphemeralVmSuspendRequested(String),
+    EphemeralVmResumeRequested(String),
+    EphemeralVmCleanupRequested(String),
+    EphemeralVmRecipeUseRequested(RepoId, String),
+    EphemeralVmProvisionFinished {
+        repo_id: RepoId,
+        created_with_agent: Option<String>,
+        initial_prompt: Option<String>,
+        result: Result<crate::ephemeral_vm::RuntimeRecord, String>,
+    },
+    EphemeralVmLifecycleFinished(String, Result<crate::ephemeral_vm::RuntimeRecord, String>),
+    PluginWorkerCommandFinished(String, Result<serde_json::Value, String>),
+    PluginMarketplaceLoadRequested,
+    PluginMarketplaceLoaded(Result<Vec<crate::plugin_marketplace::SourceState>, String>),
+    PluginMarketplaceUrlChanged(String),
+    PluginMarketplaceRefChanged(String),
+    PluginMarketplaceAddRequested,
+    PluginMarketplaceRefreshRequested(Option<String>),
+    PluginMarketplaceRemoveRequested(String),
+    PluginMarketplaceInstallRequested(String, String, String),
+    PluginMarketplaceInstallFinished(Result<String, String>),
+    PluginKillListRefreshRequested,
+    PluginKillListRefreshFinished(Result<crate::plugin_kill_list::PluginKillList, String>),
+    RemoteRuntimeRemoveRequested(usize),
+    RemoteRuntimeRemoveFinished(String, Result<(), String>),
+    RemoteRuntimeRpcRemoveFinished(
+        crate::local_rpc::LocalRpcRequest,
+        RuntimeEnvironmentSetting,
+        Result<(), String>,
+    ),
+    RemoteRuntimeActiveSelected(Option<String>),
+    RemoteRuntimeActivateFinished(String, crate::remote_runtime::RuntimeReachability),
+    RemoteProviderAccountsRefreshRequested,
+    RemoteProviderAccountsRefreshFinished(
+        Result<crate::remote_runtime::RemoteProviderAccounts, String>,
+    ),
+    RemoteProviderAccountMutationFinished(
+        crate::managed_accounts::Provider,
+        Result<crate::remote_runtime::RemoteProviderAccounts, String>,
+    ),
+    VoiceEnabledToggled,
+    VoiceDictationShortcutPressed,
+    VoiceDictationShortcutReleased,
+    VoiceDictationToggled,
+    VoiceApiKeyDraftChanged(SecretDraft),
+    VoiceApiKeySaveRequested,
+    VoiceApiKeyClearRequested,
+    VoiceModelDownloadRequested(String),
+    VoiceModelDownloadFinished(String, Result<(), String>),
+    VoiceModelDeleteRequested(String),
+    VoiceModelDeleteFinished(String, Result<(), String>),
+    VoiceTranscriptionFinished(Result<String, String>),
+    VoiceTranscriptInsertConfirmed,
+    VoiceTranscriptInsertCancelled,
+    NavigationBack,
+    NavigationForward,
+    LeftSidebarToggled,
+    OnboardingOpened,
+    OnboardingClosed,
+    OnboardingOpenFullDiskAccess,
+    OnboardingInstallCli,
+    MobileOpened,
+    MobileClosed,
+    MobileGetStarted,
+    MobileBack,
+    MobileContinue,
+    MobilePlatformSelected(MobilePlatform),
+    MobileIosChannelSelected(MobileIosChannel),
+    MobileConnectionModeSelected(MobileConnectionMode),
+    MobileGeneratePairingRequested,
+    MobileOpenInstallLink,
+    MobileCopyInstallLink,
+    SettingsSearchChanged(String),
+    SettingsOpened(SettingsSection),
+    SettingsSectionSelected(SettingsSection),
+    SettingsWorkspaceRootChanged(String),
+    SettingsWorkspaceBrowseRequested,
+    SettingsWorkspaceRootPicked(Option<PathBuf>),
+    UiSettingToggled(UiSetting),
+    UiChoiceCycled(UiChoice),
+    UiChoiceSelected(UiChoice, String),
+    UiTextSettingChanged(UiTextSetting, String),
+    AgentAvailabilityToggled(String),
+    AgentCommandOverrideChanged(String, String),
+    AgentDefaultArgsChanged(String, String),
+    AgentDefaultEnvChanged(String, String),
+    AgentPermissionModeSelected(bool),
+    AgentSettingsExpansionToggled(String),
+    AgentDetectionRefreshRequested,
+    ProviderManagedAccountImportRequested(crate::managed_accounts::Provider),
+    ProviderManagedAccountImportFinished(
+        crate::managed_accounts::Provider,
+        Result<suaegi_core::domain::ManagedProviderAccountSetting, String>,
+    ),
+    ProviderManagedAccountSelected(crate::managed_accounts::Provider, Option<String>),
+    ProviderManagedAccountAddRequested(crate::managed_accounts::Provider),
+    ProviderManagedAccountAddFinished(
+        crate::managed_accounts::Provider,
+        Result<suaegi_core::domain::ManagedProviderAccountSetting, String>,
+    ),
+    ProviderManagedAccountReauthenticateRequested(crate::managed_accounts::Provider, String),
+    ProviderManagedAccountReauthenticateFinished(
+        crate::managed_accounts::Provider,
+        Result<suaegi_core::domain::ManagedProviderAccountSetting, String>,
+    ),
+    ProviderManagedAccountRemoveRequested(crate::managed_accounts::Provider, String),
+    ProviderManagedAccountRemoveCancelled,
+    ProviderManagedAccountRemoveConfirmed,
+    KeybindingDraftChanged(KeybindingActionId, String),
+    KeybindingApplyRequested(KeybindingActionId),
+    KeybindingResetRequested(KeybindingActionId),
+    KeybindingsFileOpenRequested,
+    KeybindingShortcut(KeybindingActionId, Option<usize>),
+    TerminalCursorBlinkTick,
+    FloatingWorkspaceToggled,
+    FloatingWorkspaceMinimized,
+    FloatingWorkspaceMaximizedToggled,
+    FloatingWorkspaceLauncherRequested,
+    FloatingWorkspaceContentClosed,
+    FloatingWorkspaceContentSelected(FloatingWorkspaceContent),
+    FloatingWorkspaceTerminalSelected(SessionId),
+    FloatingWorkspaceTerminalClosed(SessionId),
+    FloatingWorkspaceDragStarted(FloatingWorkspaceDragTarget),
+    FloatingWorkspacePointerMoved(Point),
+    FloatingWorkspacePointerReleased,
+    FloatingWorkspaceTerminalRequested,
+    FloatingWorkspaceClaudeRequested,
+    FloatingWorkspaceBrowserRequested,
+    FloatingWorkspaceNewMarkdownRequested,
+    FloatingWorkspaceOpenMarkdownRequested,
+    FloatingWorkspaceMarkdownPicked(Option<PathBuf>),
+    FloatingWorkspaceMarkdownReady(Result<PathBuf, String>),
+    FloatingWorkspaceBrowseRequested,
+    FloatingWorkspaceDirectoryPicked(Option<PathBuf>),
+    NotificationCustomSoundBrowseRequested,
+    NotificationCustomSoundPicked(Option<PathBuf>),
+    NotificationCustomSoundCleared,
+    DiagnosticsReviewRequested,
+    AndroidSdkBrowseRequested,
+    AndroidSdkDirectoryPicked(Option<PathBuf>),
+    QuickCommandAdded,
+    QuickCommandLabelChanged(usize, String),
+    QuickCommandBodyChanged(usize, String),
+    QuickCommandAppendEnterToggled(usize),
+    QuickCommandRemoved(usize),
+    QuickCommandRun(usize),
+    OpenInApplicationAdded,
+    OpenInApplicationLabelChanged(usize, String),
+    OpenInApplicationCommandChanged(usize, String),
+    OpenInApplicationRemoved(usize),
+    SshHostAdded,
+    SshHostLabelChanged(usize, String),
+    SshHostHostnameChanged(usize, String),
+    SshHostUserChanged(usize, String),
+    SshHostPortChanged(usize, String),
+    SshHostIdentityFileChanged(usize, String),
+    SshHostProxyCommandChanged(usize, String),
+    SshHostJumpHostChanged(usize, String),
+    SshHostConnectionReuseToggled(usize),
+    SshHostRelayKeepAliveToggled(usize),
+    SshHostRelayGracePeriodChanged(usize, String),
+    SshHostRemoved(usize),
+    SshHostConnect(usize),
+    SshHostTestRequested(usize),
+    SshHostTestFinished(String, crate::ssh::SshConnectionCheck),
+    SshConfigImportRequested,
+    SshConfigImportFinished(Result<Vec<SshHostSetting>, String>),
+    SettingsTerminalCommandRequested(String),
+    OpenSystemSettings(String),
+    LaunchApplication(String),
+    HelpToggled,
+    HelpActionSelected(HelpAction),
+    ExternalUrlRequested(String),
+    WorkspaceOptionsToggled,
+    ProjectActionsToggled(RepoId),
+    ProjectRemoveRequested(RepoId),
+    ProjectRemoveCancelled,
+    ProjectRemoveConfirmed,
+    WorktreeActionsToggled(WorktreeId),
+    WorktreeOpenInFinder(WorktreeId),
+    WorktreeOpenInEditor(WorktreeId),
+    WorktreeOpenInApplication(WorktreeId, usize),
+    WorktreeCopyPath(WorktreeId),
+    WorktreeRefreshRequested(WorktreeId),
+    WorktreeBoardStatusSet(WorktreeId, BoardStatus),
+    WorktreePinToggled(WorktreeId),
+    WorktreeSleepToggled(WorktreeId),
+    WorktreeUnreadToggled(WorktreeId),
+    WorkspaceBoardToggled,
+    StatusPopoverToggled(StatusPopover),
+    MemorySnapshotRefreshRequested,
+    MemorySnapshotLoaded(Box<crate::memory::MemorySnapshot>),
+    PortsRefreshRequested,
+    PortsLoaded {
+        op: OpId,
+        result: Result<Vec<PortListener>, String>,
+    },
+    PortOpenRequested(String),
+    LocalhostLabelReady(Result<String, String>),
+    RevealActiveWorkspace,
+    RightSidebarTabSelected(RightSidebarTab),
+    RightSidebarToggled,
+    AgentScopeSelected(AgentScope),
+    AgentHistoryQueryChanged(String),
     RepoProbed {
         request: OpId,
         requested_path: PathBuf,
@@ -232,6 +1428,8 @@ pub enum Message {
         /// 실려 와, 성공 시 `pending_prompts`(메모리, 비영속)에 담겼다가 그
         /// worktree의 **첫** 세션 시작 때 한 번 소비된다.
         initial_prompt: Option<String>,
+        /// The Ask/Run/Skip decision captured when creation was submitted.
+        run_setup: bool,
         result: Result<CreatedWorktree, String>,
     },
     WorktreeRemoved {
@@ -243,11 +1441,17 @@ pub enum Message {
 
     // ---- Task 4: sidebar interactions ----
     RepoPathInputChanged(String),
+    RepoAddToggled,
+    RepoBrowseRequested,
+    RepoFolderPicked(Option<PathBuf>),
+    IntegrationsToggled,
     AddRepoSubmitted,
     WorktreeNameInputChanged {
         repo_id: RepoId,
         value: String,
     },
+    /// Opens or closes the inline creation controls for one repository.
+    WorktreeCreateToggled(RepoId),
     /// 사이드바 에이전트 피커의 선택 변경. `CreateWorktreeSubmitted`가 이 드래프트를
     /// 읽어 새 worktree의 시작 에이전트로 굳힌다.
     WorktreeAgentSelected {
@@ -261,17 +1465,280 @@ pub enum Message {
         repo_id: RepoId,
         value: String,
     },
+    WorktreeSetupRunToggled(RepoId),
+    WorktreeSparsePresetSelected(RepoId, String),
+    WorktreeVmRecipeSelected(RepoId, String),
     CreateWorktreeSubmitted {
         repo_id: RepoId,
     },
+    RepoSetupScriptChanged(RepoId, String),
+    RepoArchiveScriptChanged(RepoId, String),
+    RepoSetupRunPolicySelected(RepoId, String),
+    RepoSetupAgentWaitToggled(RepoId),
+    RepoHookSourcePolicySelected(RepoId, String),
+    RepoDisplayNameChanged(RepoId, String),
+    RepoBadgeColorChanged(RepoId, String),
+    RepoIconChanged(RepoId, String),
+    RepoBaseRefChanged(RepoId, String),
+    RepoWorktreeBasePathChanged(RepoId, String),
+    RepoSharedPathsChanged(RepoId, String),
+    RepoSharedPathAdded(RepoId),
+    RepoSharedPathRemoved(RepoId, String),
+    RepoSparsePresetNameChanged(RepoId, String),
+    RepoSparsePresetDirectoriesChanged(RepoId, String),
+    RepoSparsePresetSaved(RepoId),
+    RepoSparsePresetRemoved(RepoId, String),
+    RepoUpstreamDiscovered(
+        RepoId,
+        Option<suaegi_core::domain::GithubRepositoryIdentitySetting>,
+    ),
+    RepoForkSyncModeSelected(RepoId, String),
+    RepoForkSyncRequested(RepoId),
+    RepoForkSyncFinished(RepoId, Result<crate::fork_sync::ForkSyncResult, String>),
+    RepoExternalWorktreeVisibilitySelected(RepoId, String),
+    RepoExternalWorktreeImported(RepoId, WorktreeId),
+    RepoExternalWorktreesImportedAll(RepoId),
+    RepoExternalWorktreesKeptHidden(RepoId),
+    RepoExternalWorktreeDiscoverySuppressed(RepoId),
+    RepoHostSetupHostSelected(RepoId, String),
+    RepoHostSetupPathChanged(RepoId, String),
+    RepoHostSetupKindSelected(RepoId, String),
+    RepoHostSetupCloneUrlChanged(RepoId, String),
+    RepoHostSetupCloneDestinationChanged(RepoId, String),
+    RepoHostSetupExistingRequested(RepoId),
+    RepoHostSetupExistingFinished(RepoId, String, String, Result<String, String>),
+    RepoHostSetupCloneRequested(RepoId),
+    RepoHostSetupCloneFinished(RepoId, String, Result<String, String>),
+    RepoHostSetupPlannedRequested(RepoId),
+    RepoHostSetupOpenTerminal(RepoId, String),
+    RepoHostSetupRemoved(RepoId, String),
+    SourceControlAiEnabledToggled,
+    SourceControlAiAgentSelected(String),
+    SourceControlAiModelChanged(String),
+    SourceControlAiThinkingSelected(String),
+    SourceControlAiCustomCommandChanged(String),
+    SourceControlAiModelsRefreshRequested,
+    SourceControlAiModelsRefreshFinished(String, Result<Vec<String>, String>),
+    DaemonSessionsRefreshRequested,
+    DaemonSessionsRefreshFinished(Result<Vec<suaegi_term::daemon::SessionInfo>, String>),
+    DaemonSessionKillRequested(String),
+    DaemonKillAllRequested,
+    DaemonRestartRequested,
+    DaemonActionCancelled,
+    DaemonActionConfirmed,
+    DaemonActionFinished(Result<String, String>),
+    SourceControlAiActionAgentSelected(String, String),
+    SourceControlAiActionTemplateChanged(String, String),
+    SourceControlAiActionArgsChanged(String, String),
+    SourceControlAiPrDefaultToggled(SourceControlAiPrDefault),
+    RepoSourceControlAiVisibilitySelected(RepoId, String),
+    RepoSourceControlAiCustomCommandChanged(RepoId, String),
+    RepoSourceControlAiActionAgentSelected(RepoId, String, String),
+    RepoSourceControlAiActionTemplateChanged(RepoId, String, String),
+    RepoSourceControlAiActionArgsChanged(RepoId, String, String),
+    RepoSourceControlAiActionReset(RepoId, String),
+    RepoSourceControlAiPrDefaultSelected(RepoId, SourceControlAiPrDefault, String),
+    RepoSourceControlAiReset(RepoId),
+    McpStarterCreateRequested(RepoId),
+    McpConfigOpenRequested(RepoId, String),
     RemoveWorktreeRequested {
         repo_id: RepoId,
         worktree_id: WorktreeId,
         worktree_path: PathBuf,
         branch: Option<String>,
     },
+    RemoveWorktreeConfirmed,
+    RemoveWorktreeCancelled,
+    ArchiveScriptFinished {
+        repo_id: RepoId,
+        worktree_id: WorktreeId,
+        worktree_path: PathBuf,
+        branch: Option<String>,
+        result: crate::repo_hooks::HookRunResult,
+    },
     /// UI 선택 표시만 한다. worktree 선택으로 세션을 시작하는 것은 Task 5의 몫이다.
     WorktreeSelected(WorktreeId),
+    /// Plan 9 M7: 선택한 worktree의 파일 트리를 열거나, 이미 같은 트리면 닫는다.
+    FileExplorerToggled {
+        worktree: WorktreeId,
+    },
+    FileExplorerClosed,
+    FileExplorerRefreshRequested {
+        worktree: WorktreeId,
+    },
+    FileExplorerWatchTick,
+    FileExplorerFilterChanged(String),
+    FileExplorerCollapseAll,
+    FileExplorerDirectoryToggled {
+        path: String,
+    },
+    FileExplorerDirectoryLoaded {
+        worktree: WorktreeId,
+        path: String,
+        op: OpId,
+        result: Result<Vec<crate::file_explorer::ExplorerEntry>, String>,
+    },
+    FileExplorerStatusLoaded {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<HashMap<String, suaegi_git::status::FileStatus>, String>,
+    },
+    EditorFileRequested {
+        worktree: WorktreeId,
+        path: String,
+    },
+    EditorFileLoaded {
+        worktree: WorktreeId,
+        path: String,
+        op: OpId,
+        result: Result<crate::editor::EditorLoad, String>,
+    },
+    EditorExternalSignatureChecked {
+        worktree: WorktreeId,
+        path: String,
+        expected: suaegi_git::fs::FileSignature,
+        result: Result<suaegi_git::fs::FileSignature, String>,
+    },
+    EditorAction(iced::widget::text_editor::Action),
+    EditorFindOpened(bool),
+    EditorFindQueryChanged(String),
+    EditorReplacementChanged(String),
+    EditorFindNext(bool),
+    EditorReplaceCurrent,
+    EditorReplaceAll,
+    EditorFindClosed,
+    EditorMarkdownPreviewToggled,
+    EditorMarkdownLinkClicked(String),
+    EditorAutoSave(u64),
+    EditorSaveRequested,
+    EditorFileSaved {
+        worktree: WorktreeId,
+        path: String,
+        op: OpId,
+        result: Result<suaegi_git::fs::WriteOutcome, String>,
+    },
+    EditorTabSelected {
+        worktree: WorktreeId,
+        path: String,
+    },
+    EditorTabCloseRequested {
+        worktree: WorktreeId,
+        path: String,
+    },
+    FileOpenChangedLoaded {
+        request: crate::local_rpc::LocalRpcRequest,
+        worktree: WorktreeId,
+        mode: String,
+        result: Result<Vec<suaegi_git::status::DetailedFileStatus>, String>,
+    },
+    EditorCloseRequested,
+    EditorCloseCancelled,
+    EditorDiscardConfirmed,
+    QuickOpenRequested {
+        worktree: WorktreeId,
+    },
+    WorkspaceSearchRequested,
+    WorkspaceSearchSelected(WorktreeId),
+    QuickOpenShortcutPressed,
+    QuickOpenLoaded {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<Vec<String>, String>,
+    },
+    QuickOpenQueryChanged(String),
+    QuickOpenSelectionMoved(isize),
+    QuickOpenSelected,
+    QuickOpenPathSelected(String),
+    QuickOpenClosed,
+    ContentSearchRequested {
+        worktree: WorktreeId,
+    },
+    ContentSearchQueryChanged(String),
+    ContentSearchCaseToggled(bool),
+    ContentSearchWordToggled(bool),
+    ContentSearchRegexToggled(bool),
+    ContentSearchSubmitted,
+    ContentSearchFinished {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<suaegi_search::SearchResult, String>,
+    },
+    ContentSearchPathSelected(String),
+    ContentSearchClosed,
+    TasksOpened,
+    TasksClosed,
+    TaskKindSelected(TaskKind),
+    TaskPresetSelected(TaskPreset),
+    TaskProviderSelected(TaskProvider),
+    TaskRepoSelectionToggled(RepoId),
+    TaskRepoSelectionAll,
+    TaskQueryChanged(String),
+    TaskQueryCleared,
+    TaskCreateRequested,
+    TaskProjectsOpenRequested,
+    TaskRefreshRequested,
+    TaskItemsLoaded {
+        op: OpId,
+        repo_id: RepoId,
+        kind: TaskKind,
+        result: Result<Vec<crate::tasks::TaskWorkItem>, String>,
+    },
+    TaskItemOpen(String),
+    SourceControlToggled {
+        worktree: WorktreeId,
+    },
+    SourceControlClosed,
+    SourceControlFilterChanged(String),
+    SourceControlRefreshRequested,
+    SourceControlStatusLoaded {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<Vec<suaegi_git::status::DetailedFileStatus>, String>,
+    },
+    SourceControlStageRequested(String),
+    SourceControlUnstageRequested(String),
+    SourceControlDiscardRequested(String),
+    SourceControlDiscardCancelled,
+    SourceControlDiscardConfirmed,
+    SourceControlCommitMessageChanged(String),
+    SourceControlAiCommitMessageRequested,
+    SourceControlAiCommitMessageGenerated {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<String, String>,
+    },
+    SourceControlAiLaunchActionRequested(String),
+    HostedReviewAiActionRequested {
+        worktree: WorktreeId,
+        action: String,
+        detail: String,
+    },
+    SourceControlCommitRequested,
+    SourceControlFetchRequested,
+    SourceControlPullRequested,
+    SourceControlPushRequested,
+    SourceControlOperationFinished {
+        worktree: WorktreeId,
+        op: OpId,
+        operation: SourceControlOperation,
+        result: Result<String, String>,
+    },
+    AutomationOpened,
+    AutomationClosed,
+    AutomationNewRequested,
+    AutomationTemplateSelected(crate::automation::AutomationTemplate),
+    AutomationNameChanged(String),
+    AutomationScheduleChanged(String),
+    AutomationPromptChanged(String),
+    AutomationTimezoneChanged(String),
+    AutomationWorktreeSelected(String),
+    AutomationCreated,
+    AutomationToggled(String),
+    AutomationDeleteRequested(String),
+    AutomationDeleteCancelled,
+    AutomationDeleted(String),
+    AutomationRunNow(String),
+    AutomationTick(i64),
     /// 영속화 스레드(Task 2)의 저장 결과. `AppState::boot`이 `PersistenceHandle`을
     /// 스폰하며 `results` 스트림을 `Task::stream(...)`으로 여기로 연결한다.
     Saved(SaveReport),
@@ -302,6 +1769,14 @@ pub enum Message {
     /// 갱신하지 않는다 — in-flight가 아닌 세션마다 `request_presence`를 내는
     /// 트리거일 뿐이다.
     PresenceTick,
+    /// A background hibernation kill completed. The sleeping record is made
+    /// durable only after this succeeds, so a failed kill cannot create a
+    /// phantom sleeping pane.
+    AgentHibernationStopped {
+        id: SessionId,
+        worktree_id: WorktreeId,
+        result: Result<(), String>,
+    },
 
     // ---- Task 6: workbench.rs의 pane_grid + 세션 구독 ----
     /// 세션별 구독(`workbench::subscription`)이 `generation()` 변화를 감지했다는
@@ -320,6 +1795,10 @@ pub enum Message {
     /// 타이틀바 닫기 버튼. 마지막 pane이면 pane_grid 자체를 비운다(pane_grid는
     /// 마지막 pane을 `close()`로 지울 수 없다 — 형제가 없기 때문).
     PaneCloseRequested(pane_grid::Pane),
+    PinnedPaneCloseConfirmed,
+    PinnedPaneCloseCancelled,
+    RunningPaneCloseConfirmed,
+    RunningPaneCloseCancelled,
 
     // ---- Plan 4 Task 7: 터미널 위젯 배선 ----
     /// 터미널 위젯이 발행한 커맨드. 위젯은 세션을 **절대 만지지 않는다** —
@@ -329,6 +1808,11 @@ pub enum Message {
         id: SessionId,
         command: TermCommand,
     },
+    TerminalPasteRead {
+        id: SessionId,
+        text: Option<String>,
+    },
+    TerminalClipboardWriteFinished(Result<(), String>),
     /// 리사이즈 워커의 완료. 합치기의 in-flight 가드를 풀고, 대기 중이던
     /// 최신 리사이즈가 있으면 이어서 보낸다. **실패해도 반드시 온다** —
     /// 안 오면 그 세션은 다시는 리사이즈되지 않는다.
@@ -352,6 +1836,11 @@ pub enum Message {
     /// 없는 것도 같은 이유다: 배지는 `agent_status::contract::reduce`에서
     /// 파생되지 전달되지 않는다.
     HookArrived(HookEvent),
+    AutoBranchRenameFinished {
+        repo_id: RepoId,
+        worktree_id: WorktreeId,
+        outcome: crate::branch_rename::BranchRenameOutcome,
+    },
     /// 배지 재계산 틱. `PresenceTick`과 같은 티어에 둔다 — 나이 기반 규칙
     /// (`HOOK_STALE_AFTER`)은 새 이벤트가 없어도 상태를 바꾸므로 무언가가
     /// **요청은 `OpId`를 나르지 않는다.** 뷰가 발급할 수 없기 때문이다 —
@@ -361,6 +1850,7 @@ pub enum Message {
     DiffRequested {
         worktree: WorktreeId,
     },
+    DiffFileTreeToggled,
     FileDiffRequested {
         worktree: WorktreeId,
         path: String,
@@ -423,6 +1913,13 @@ pub enum Message {
     CreatePrBodyChanged(String),
     CreatePrBaseChanged(String),
     CreatePrDraftToggled(bool),
+    CreatePrUseTemplateToggled(bool),
+    CreatePrGenerateDetailsRequested,
+    CreatePrDetailsGenerated {
+        worktree: WorktreeId,
+        op: OpId,
+        result: Result<crate::source_control_ai::GeneratedPullRequestFields, String>,
+    },
     /// 다이얼로그 제출 → gh `pr create`(UI 스레드 밖).
     CreatePrSubmitted,
     CreatePrCancelled,
@@ -468,7 +1965,7 @@ pub enum Message {
 
     // ---- N1: Linear 트래커 UI ----
     /// 마스킹된 API 키 입력의 변경. 값은 `LinearState::api_key_input`(평문 버퍼)에만 잠깐 산다.
-    LinearApiKeyChanged(String),
+    LinearApiKeyChanged(SecretDraft),
     /// 연결 제출 — 입력 버퍼를 `Secret`로 감싸 `test_connection`을 UI 스레드 밖에서 발급한다.
     LinearConnectSubmitted,
     /// `tracker_tasks::connect`의 완료. Found면 워크스페이스를 굳히고 이슈 조회를 잇는다;
@@ -497,7 +1994,7 @@ pub enum Message {
     JiraSiteUrlChanged(String),
     JiraEmailChanged(String),
     /// 마스킹된 토큰 입력의 변경. 값은 `JiraState::token_input`(평문 버퍼)에만 잠깐 산다.
-    JiraTokenChanged(String),
+    JiraTokenChanged(SecretDraft),
     /// Cloud/Server 토글. `JiraAuthType`을 정한다(REST 버전·인증 헤더·바디 포맷이 갈린다).
     JiraCloudToggled(bool),
     /// 연결 제출 — 입력들로 `JiraConnection`을 조립하고 토큰을 `Secret`로 감싸 `test_connection`을
@@ -534,6 +2031,9 @@ pub(crate) struct CreatePrDraft {
     pub body: String,
     pub base: String,
     pub draft: bool,
+    pub use_template: bool,
+    pub generating: bool,
+    pub generation_op: Option<OpId>,
     /// gh `pr create`가 진행 중 — 버튼을 잠그고 중복 제출을 막는다.
     pub submitting: bool,
     /// 마지막 제출 실패의 **분류된** 문구(raw stderr 아님).
@@ -650,6 +2150,27 @@ impl std::fmt::Debug for JiraState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RepoHostSetupDraft {
+    pub host_id: String,
+    pub path: String,
+    pub kind: String,
+    pub clone_url: String,
+    pub clone_destination: String,
+}
+
+impl Default for RepoHostSetupDraft {
+    fn default() -> Self {
+        Self {
+            host_id: String::new(),
+            path: String::new(),
+            kind: "git".to_string(),
+            clone_url: String::new(),
+            clone_destination: String::new(),
+        }
+    }
+}
+
 pub struct AppState {
     /// repo별로 마지막에 발급한 목록 요청의 OpId. 그보다 오래된 응답은 버린다.
     latest_list_op: HashMap<RepoId, OpId>,
@@ -659,8 +2180,16 @@ pub struct AppState {
     /// 그룹 순서가 프레임마다 흔들리지 않게 한다.
     repos: Vec<Repo>,
     repo_path_input: String,
+    adding_repo: bool,
+    integrations_open: bool,
     /// repo별 "새 worktree 이름" 입력창의 임시 값.
     worktree_name_draft: HashMap<RepoId, String>,
+    /// Orca's blank-name fallback: one stable, globally de-duplicated marine
+    /// creature suggestion per open creation form.
+    worktree_suggested_name: HashMap<RepoId, String>,
+    /// Inline creation is progressive disclosure: only one repository form is
+    /// expanded at a time.
+    creating_worktree_for: Option<RepoId>,
     /// repo별 에이전트 피커의 선택. 엔트리가 없으면 로그인 셸(기본) — 피커를
     /// 무시한 사용자는 오늘의 동작을 그대로 받는다. `AgentChoice::LOGIN_SHELL`을
     /// 고르면 엔트리를 지운다(= 없음과 같다).
@@ -668,16 +2197,174 @@ pub struct AppState {
     /// repo별 "초기 프롬프트" 입력창의 임시 값. 비었으면 주입 없음(기본). 이름
     /// 드래프트와 같은 수명 — `CreateWorktreeSubmitted`가 스냅샷하고 성공 시 지운다.
     worktree_prompt_draft: HashMap<RepoId, String>,
+    /// Explicit per-create answer when the repository setup policy is `ask`.
+    worktree_setup_run_draft: HashMap<RepoId, bool>,
+    worktree_sparse_preset_draft: HashMap<RepoId, String>,
+    worktree_vm_recipe_draft: HashMap<RepoId, String>,
     /// PATH에서 설치가 확인된 에이전트 id(피커에 나열). **부팅 때 한 번** 스캔한다
     /// (`detect_installed`는 에이전트마다 PATH를 훑으므로 프레임마다 하면 비싸다).
     /// 앱 실행 중 새로 설치한 에이전트는 재부팅 전까지 안 보인다 — v1 한계.
     installed_agents: Vec<&'static str>,
     selected_worktree: Option<WorktreeId>,
+    navigation_back: Vec<WorktreeId>,
+    navigation_forward: Vec<WorktreeId>,
+    navigation_replay: bool,
+    left_sidebar_open: bool,
+    browser_open: bool,
+    browser_address_draft: String,
+    browser_current_url: String,
+    browser_error: Option<String>,
+    browser_tabs: Vec<BrowserTabSetting>,
+    active_browser_tab_id: Option<String>,
+    browser_profile_name_draft: String,
+    browser_cookie_importing: bool,
+    browser_cookie_status: Option<String>,
+    pending_cli_terminals: HashMap<SessionId, PendingCliTerminal>,
+    emulator_availability: Option<crate::emulator::EmulatorAvailability>,
+    emulator_refreshing: bool,
+    emulator_status: Option<String>,
+    emulator_launch_after_refresh: bool,
+    emulator_panel_open: bool,
+    emulator_active_device: Option<crate::emulator::EmulatorDevice>,
+    emulator_frame: Option<Vec<u8>>,
+    emulator_frame_loading: bool,
+    emulator_pointer: Option<iced::Point>,
+    emulator_text_draft: String,
+    hosted_integrations: Option<crate::hosted_integrations::HostedIntegrationStatuses>,
+    hosted_integrations_refreshing: bool,
+    ssh_importing: bool,
+    ssh_testing: HashSet<String>,
+    ssh_status: HashMap<String, String>,
+    usage_snapshot: Option<crate::usage::UsageSnapshot>,
+    usage_scanning: bool,
+    usage_refresh_pending: bool,
+    memory_snapshot: Option<crate::memory::MemorySnapshot>,
+    memory_snapshot_loading: bool,
+    gemini_rate_limits: Option<crate::rate_limits::GeminiRateLimits>,
+    gemini_rate_limits_fetching: bool,
+    provider_rate_limits:
+        HashMap<crate::rate_limits::RateLimitProvider, crate::rate_limits::ProviderRateLimits>,
+    provider_rate_limits_fetching: HashSet<crate::rate_limits::RateLimitProvider>,
+    provider_secret_drafts: HashMap<crate::provider_credentials::ProviderSecret, SecretDraft>,
+    provider_secrets_configured: HashSet<crate::provider_credentials::ProviderSecret>,
+    provider_secret_status: HashMap<crate::provider_credentials::ProviderSecret, String>,
+    ghostty_importing: bool,
+    ghostty_import_status: Option<String>,
+    terminal_theme_importing: bool,
+    terminal_theme_import_status: Option<String>,
+    terminal_attention_sessions: HashSet<SessionId>,
+    activity_open: bool,
+    activity_events: Vec<ActivityEvent>,
+    native_chat_sessions: HashSet<SessionId>,
+    native_chat_drafts: HashMap<SessionId, String>,
+    remote_runtime_name_draft: String,
+    remote_runtime_pairing_draft: SecretDraft,
+    remote_runtime_saving: bool,
+    remote_runtime_checking: HashSet<String>,
+    remote_runtime_status: HashMap<String, String>,
+    remote_server_updates: HashMap<String, crate::remote_runtime::RemoteServerUpdateState>,
+    plugins: Vec<crate::plugins::PluginEntry>,
+    plugins_loading: bool,
+    plugins_error: Option<String>,
+    plugin_dev_path_draft: String,
+    plugin_consent_review: Option<crate::plugins::PluginEntry>,
+    plugin_remove_confirmation: Option<String>,
+    active_plugin_panel: Option<(String, String, String)>,
+    plugin_panel_error: Option<String>,
+    plugin_marketplaces: Vec<crate::plugin_marketplace::SourceState>,
+    plugin_marketplace_loading: bool,
+    plugin_marketplace_url_draft: String,
+    plugin_marketplace_ref_draft: String,
+    plugin_kill_list: Option<crate::plugin_kill_list::PluginKillList>,
+    plugin_kill_list_loading: bool,
+    ephemeral_vm_runtimes: Vec<crate::ephemeral_vm::RuntimeRecord>,
+    ephemeral_vm_busy: HashSet<String>,
+    remote_provider_accounts: Option<crate::remote_runtime::RemoteProviderAccounts>,
+    remote_provider_accounts_loading: bool,
+    remote_provider_accounts_error: Option<String>,
+    voice_dictation_state: VoiceDictationState,
+    voice_api_key_draft: String,
+    voice_status: Option<String>,
+    pending_voice_transcript: Option<String>,
+    voice_model_busy: Option<String>,
+    app_window_size: iced::Size,
+    tasks_open: bool,
+    task_kind: TaskKind,
+    task_preset: TaskPreset,
+    task_provider: TaskProvider,
+    task_query: String,
+    task_repo_selection: HashSet<RepoId>,
+    task_items: Vec<crate::tasks::TaskWorkItem>,
+    task_items_by_repo: HashMap<RepoId, Vec<crate::tasks::TaskWorkItem>>,
+    task_items_pending: HashSet<RepoId>,
+    task_item_errors: HashMap<RepoId, String>,
+    task_items_loading: bool,
+    task_items_error: Option<String>,
+    task_items_op: Option<OpId>,
+    onboarding_open: bool,
+    mobile_open: bool,
+    mobile_stage: MobileStage,
+    mobile_platform: MobilePlatform,
+    mobile_ios_channel: MobileIosChannel,
+    mobile_connection_mode: MobileConnectionMode,
+    mobile_pairing_error: Option<String>,
+    settings_search_query: String,
+    settings_section: SettingsSection,
+    help_open: bool,
+    workspace_options_open: bool,
+    project_actions_open: Option<RepoId>,
+    project_remove_confirm: Option<RepoId>,
+    worktree_remove_confirm: Option<PendingWorktreeRemoval>,
+    pinned_pane_close_confirm: Option<pane_grid::Pane>,
+    running_pane_close_confirm: Option<pane_grid::Pane>,
+    worktree_actions_open: Option<WorktreeId>,
+    workspace_board_open: bool,
+    status_popover: Option<StatusPopover>,
+    port_listeners: Vec<PortListener>,
+    ports_loading: bool,
+    ports_error: Option<String>,
+    ports_op: Option<OpId>,
+    right_sidebar_tab: RightSidebarTab,
+    right_sidebar_open: bool,
+    agent_scope: AgentScope,
+    agent_history_query: String,
     /// 가장 최근 git 작업(등록/목록/생성/삭제) 실패 메시지. 다음 실패가 오면
     /// 덮어쓴다 — worktree마다 개별 배지를 다는 건 Task 7 이후 범위.
     last_error: Option<String>,
     next_op_id: u64,
+    pending_repo_add_rpcs: HashMap<OpId, crate::local_rpc::LocalRpcRequest>,
+    pending_worktree_create_rpcs: HashMap<OpId, crate::local_rpc::LocalRpcRequest>,
+    pending_worktree_remove_rpcs: HashMap<OpId, crate::local_rpc::LocalRpcRequest>,
     workspace_root: PathBuf,
+    ui_settings: UiSettings,
+    /// Raw `NAME=value` editor buffers for per-agent launch environments.
+    /// Persisted settings keep a structured map; the raw form remains in
+    /// memory so temporarily incomplete input is not destroyed while typing.
+    agent_env_drafts: HashMap<String, String>,
+    terminal_color_drafts: HashMap<String, String>,
+    expanded_agent_settings: HashSet<String>,
+    provider_account_importing: HashSet<crate::managed_accounts::Provider>,
+    provider_account_remove_confirm: Option<(crate::managed_accounts::Provider, String)>,
+    keybinding_snapshot: Option<KeybindingFileSnapshot>,
+    keybinding_drafts: HashMap<KeybindingActionId, String>,
+    editor_auto_save_generation: u64,
+    diagnostics_status: Option<String>,
+    mcp_create_confirm: Option<RepoId>,
+    repo_shared_path_drafts: HashMap<RepoId, String>,
+    repo_sparse_preset_name_drafts: HashMap<RepoId, String>,
+    repo_sparse_preset_directory_drafts: HashMap<RepoId, String>,
+    repo_host_setup_drafts: HashMap<RepoId, RepoHostSetupDraft>,
+    repo_host_setup_busy: HashSet<RepoId>,
+    repo_host_setup_status: HashMap<RepoId, String>,
+    fork_syncing: HashSet<RepoId>,
+    fork_sync_status: HashMap<RepoId, String>,
+    source_control_ai_discovered_models: HashMap<String, Vec<String>>,
+    source_control_ai_models_loading: HashSet<String>,
+    source_control_ai_models_status: Option<String>,
+    daemon_sessions: Vec<suaegi_term::daemon::SessionInfo>,
+    daemon_sessions_loading: bool,
+    daemon_sessions_status: Option<String>,
+    daemon_action_confirm: Option<String>,
 
     /// 사이드바 상태 표시줄이 읽는 영속화 진단 정보. `AppState::boot`이
     /// `PersistenceHandle::spawn`의 `LoadDiagnostics`로 채운다. 기본값
@@ -696,15 +2383,41 @@ pub struct AppState {
     /// 만들 수 없으므로(항상 최소 하나) 첫 세션이 열릴 때 비로소 생성한다.
     panes: Option<pane_grid::State<SessionId>>,
     focused_pane: Option<pane_grid::Pane>,
+    app_window_focused: bool,
+    terminal_cursor_phase_visible: bool,
+    /// A repository-independent terminal surface matching Orca's Floating
+    /// Workspace. Closing the panel deliberately leaves this PTY alive.
+    floating_workspace_open: bool,
+    floating_workspace_maximized: bool,
+    floating_workspace_content: FloatingWorkspaceContent,
+    floating_workspace_session: Option<SessionId>,
+    floating_workspace_sessions: Vec<SessionId>,
+    floating_workspace_markdown_root: Option<PathBuf>,
+    floating_workspace_pointer: Point,
+    floating_workspace_drag: Option<FloatingWorkspaceDrag>,
+    floating_pending_commands: Vec<String>,
+    keep_awake_process: Option<std::process::Child>,
     /// worktree당 세션 하나. 이미 열린 worktree를 다시 선택하면 새 세션을 또
     /// 띄우지 않고 기존 pane에 포커스만 옮긴다.
     worktree_sessions: HashMap<WorktreeId, SessionId>,
     /// `worktree_sessions`의 역방향 조회 — pane을 닫을 때 어느 worktree의
     /// 자리가 비었는지 알아야 한다.
     session_worktrees: HashMap<SessionId, WorktreeId>,
+    /// Setup terminals use the same PTY store but never replace the primary
+    /// worktree ↔ session mapping.
+    pending_setup_sessions: HashMap<SessionId, PendingSetupSession>,
+    setup_sessions: HashMap<SessionId, ActiveSetupSession>,
+    worktree_setup_sessions: HashMap<WorktreeId, SessionId>,
+    setup_waiting_worktrees: HashSet<WorktreeId>,
+    deferred_setup_agent_starts: HashSet<WorktreeId>,
     /// 세션 시작을 요청했지만 아직 `SessionStarted`가 도착하지 않은 worktree.
     /// 없으면 같은 worktree를 두 번 빠르게 클릭했을 때 세션이 두 개 뜬다.
     pending_session_starts: HashMap<WorktreeId, SessionId>,
+    sleeping_agent_sessions: HashMap<WorktreeId, SleepingAgentSession>,
+    waking_agent_sessions: HashSet<WorktreeId>,
+    pending_agent_hibernations: HashMap<SessionId, SleepingAgentSession>,
+    live_agent_resume: HashMap<WorktreeId, LiveAgentResume>,
+    terminal_last_input_at: HashMap<SessionId, Instant>,
     /// 제거 요청을 보냈지만 `WorktreeRemoved` 응답이 아직 안 온 worktree.
     /// `RemoveWorktreeRequested`가 세션을 닫는 건 그 시점에 `worktree_sessions`에
     /// 이미 올라온 세션뿐이다 — 시작 요청이 in flight인 채로(`pending_session_starts`)
@@ -718,12 +2431,17 @@ pub struct AppState {
     /// 채워둔다 — `SessionStarted`가 도착하기 전에도(또는 실패해도) 어떤
     /// worktree를 위한 시도였는지 사용자에게 보여줄 수 있다.
     session_titles: HashMap<SessionId, String>,
+    manual_session_titles: HashMap<SessionId, String>,
+    /// 첫 에이전트 프롬프트에서 파생한 안정적인 제목. OSC 타이틀과 분리해
+    /// 설정을 끄면 즉시 원래 제목으로 돌아갈 수 있게 한다.
+    generated_session_titles: HashMap<SessionId, String>,
 
     // ---- Plan 6b-B: 초기 프롬프트 주입 ----
     /// worktree별 **일회성** 초기 프롬프트. `WorktreeCreated`가 담고, 그 worktree의
     /// **첫** `start_session_for`가 `remove`로 소비한다 — 그래서 세션을 닫았다
     /// 다시 열거나 재시작 후 복원해도 다시 주입되지 않는다. **영속화하지 않는다.**
     pending_prompts: HashMap<WorktreeId, String>,
+    pending_agent_overrides: HashMap<WorktreeId, String>,
     /// stdin-after-start 세션의 주입 대기 프롬프트. `start_session_for`가 시작을
     /// **요청**할 때 담고, `SessionStarted`가 세션이 **실제로 살아난** 뒤 게이트로
     /// 옮긴다(`prompt_gates`). 시작이 실패/거절되면 여기서 지워 새지 않게 한다.
@@ -787,6 +2505,13 @@ pub struct AppState {
     /// worktree(= `PaneKey`)별 배지 장부. `reduce`의 입력 중 훅에서 오는 절반을
     /// 여기 모으고, 나머지 절반(presence)은 `session_store`에서 읽는다.
     badges: HashMap<WorktreeId, PaneBadge>,
+    /// Claude가 working→idle로 바뀐 시각. 설정의 TTL 동안만 사이드바에
+    /// 남아 prompt-cache 만료까지의 카운트다운을 그린다.
+    prompt_cache_started: HashMap<WorktreeId, Instant>,
+    /// First-work branch renames are slow git operations. These sets prevent
+    /// duplicate work on repeated hook events and bound settled re-probes.
+    auto_branch_rename_in_flight: HashSet<WorktreeId>,
+    auto_branch_rename_settled: HashSet<WorktreeId>,
     /// 훅 서버의 포트·토큰. `None`이면 서버가 안 떴다는 뜻이고, 그때는 **배지 없이
     /// 계속 간다** — 훅은 편의 기능이지 세션의 전제가 아니다.
     hook_endpoint: Option<(u16, String)>,
@@ -812,6 +2537,21 @@ pub struct AppState {
     /// 취소 손잡이를 `AppState`에 흩뿌리면 이 구조체를 동시에 고치는 다른
     /// 작업과 충돌 면적이 그만큼 넓어진다. 안쪽 불변식도 한곳에 모인다.
     diff: DiffState,
+
+    // ---- Plan 9 M7: lazy file explorer ----
+    file_explorer: FileExplorerState,
+    // ---- Plan 9 M8: minimal embedded editor ----
+    editor: EditorState,
+    // ---- Quick Open palette over the ported lister/fuzzy backend ----
+    quick_open: QuickOpenState,
+    // ---- Streamed repository content search ----
+    content_search: ContentSearchState,
+    // ---- Working-tree source-control write surface ----
+    source_control: SourceControlState,
+    // ---- Persisted scheduled prompts + editor state ----
+    automations: Vec<AutomationConfig>,
+    automation_runs: Vec<AutomationRunRecord>,
+    automation_ui: AutomationUiState,
 
     // ---- Plan 7a-1: GitHub PR 상태 · 생성 ----
     /// worktree별 마지막 PR 상태 조회 결과 캐시. **엔트리 없음 = 아직 조회 안 함**
@@ -855,6 +2595,10 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 struct PaneBadge {
     expected: SpawnNonce,
+    /// 데몬 PTY를 재부착하면 프로세스는 이전 GUI가 심은 nonce를 계속 가진다.
+    /// 그 PTY가 여전히 같은 daemon session이라는 확인 뒤에만 첫 hook의 nonce로
+    /// 한 번 재결합한다. 새 PTY에는 절대 열리지 않는다.
+    allow_reattach_nonce_bind: bool,
     /// 마지막으로 관측한 훅 상태와 그 시각. `None` = 훅을 하나도 못 봤다.
     hook: Option<(HookState, Instant)>,
     /// **이 pane이 훅을 하나라도 받았는가.** 로그인 셸(`AgentKind::Custom`) 안에서
@@ -874,12 +2618,20 @@ impl PaneBadge {
     fn new(expected: SpawnNonce) -> Self {
         Self {
             expected,
+            allow_reattach_nonce_bind: false,
             hook: None,
             received_hook: false,
             previous: BadgeState::Unknown,
             no_agent_streak: 0,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct LiveAgentResume {
+    provider_session_id: String,
+    turn_started_at: Option<Instant>,
+    done_at: Option<Instant>,
 }
 
 /// 진행 중인 복원의 장부. 잎마다 종단 결과가 하나씩 모이고, `pending`이 비면
@@ -897,41 +2649,240 @@ struct LayoutRestore {
 
 impl Default for AppState {
     fn default() -> Self {
+        let ui_settings = UiSettings::default();
+        let agent_env_drafts = ui_settings
+            .agent_default_env
+            .iter()
+            .map(|(agent, env)| (agent.clone(), format_agent_env(env)))
+            .collect();
+        let terminal_color_drafts = ui_settings.terminal_color_overrides.clone();
         Self {
             latest_list_op: HashMap::new(),
             worktrees_by_repo: HashMap::new(),
             repos: Vec::new(),
             repo_path_input: String::new(),
+            adding_repo: false,
+            integrations_open: false,
             worktree_name_draft: HashMap::new(),
+            worktree_suggested_name: HashMap::new(),
+            creating_worktree_for: None,
             // 기본은 빈 목록 = 피커에 로그인 셸만. 실제 앱 경로(`boot`)만 PATH를
             // 스캔한다 — 손으로 세우는 테스트 상태는 스캔 비용을 치르지 않는다.
             worktree_agent_draft: HashMap::new(),
             worktree_prompt_draft: HashMap::new(),
+            worktree_setup_run_draft: HashMap::new(),
+            worktree_sparse_preset_draft: HashMap::new(),
+            worktree_vm_recipe_draft: HashMap::new(),
             installed_agents: Vec::new(),
             selected_worktree: None,
+            navigation_back: Vec::new(),
+            navigation_forward: Vec::new(),
+            navigation_replay: false,
+            left_sidebar_open: true,
+            browser_open: false,
+            browser_address_draft: String::new(),
+            browser_current_url: String::new(),
+            browser_error: None,
+            browser_tabs: Vec::new(),
+            active_browser_tab_id: None,
+            browser_profile_name_draft: String::new(),
+            browser_cookie_importing: false,
+            browser_cookie_status: None,
+            pending_cli_terminals: HashMap::new(),
+            emulator_availability: None,
+            emulator_refreshing: false,
+            emulator_status: None,
+            emulator_launch_after_refresh: false,
+            emulator_panel_open: false,
+            emulator_active_device: None,
+            emulator_frame: None,
+            emulator_frame_loading: false,
+            emulator_pointer: None,
+            emulator_text_draft: String::new(),
+            hosted_integrations: None,
+            hosted_integrations_refreshing: false,
+            ssh_importing: false,
+            ssh_testing: HashSet::new(),
+            ssh_status: HashMap::new(),
+            usage_snapshot: None,
+            usage_scanning: false,
+            usage_refresh_pending: false,
+            memory_snapshot: None,
+            memory_snapshot_loading: false,
+            gemini_rate_limits: None,
+            gemini_rate_limits_fetching: false,
+            provider_rate_limits: HashMap::new(),
+            provider_rate_limits_fetching: HashSet::new(),
+            provider_secret_drafts: HashMap::new(),
+            provider_secrets_configured: HashSet::new(),
+            provider_secret_status: HashMap::new(),
+            ghostty_importing: false,
+            ghostty_import_status: None,
+            terminal_theme_importing: false,
+            terminal_theme_import_status: None,
+            terminal_attention_sessions: HashSet::new(),
+            activity_open: false,
+            activity_events: Vec::new(),
+            native_chat_sessions: HashSet::new(),
+            native_chat_drafts: HashMap::new(),
+            remote_runtime_name_draft: String::new(),
+            remote_runtime_pairing_draft: SecretDraft::new(String::new()),
+            remote_runtime_saving: false,
+            remote_runtime_checking: HashSet::new(),
+            remote_runtime_status: HashMap::new(),
+            remote_server_updates: HashMap::new(),
+            plugins: Vec::new(),
+            plugins_loading: false,
+            plugins_error: None,
+            plugin_dev_path_draft: String::new(),
+            plugin_consent_review: None,
+            plugin_remove_confirmation: None,
+            active_plugin_panel: None,
+            plugin_panel_error: None,
+            plugin_marketplaces: Vec::new(),
+            plugin_marketplace_loading: false,
+            plugin_marketplace_url_draft: String::new(),
+            plugin_marketplace_ref_draft: "main".into(),
+            plugin_kill_list: crate::plugin_kill_list::read_cache(
+                &crate::plugin_kill_list::default_cache_path(),
+            )
+            .ok()
+            .flatten(),
+            plugin_kill_list_loading: false,
+            ephemeral_vm_runtimes: crate::ephemeral_vm::list(
+                &crate::ephemeral_vm::default_store_path(),
+            )
+            .unwrap_or_default(),
+            ephemeral_vm_busy: HashSet::new(),
+            remote_provider_accounts: None,
+            remote_provider_accounts_loading: false,
+            remote_provider_accounts_error: None,
+            voice_dictation_state: VoiceDictationState::Idle,
+            voice_api_key_draft: String::new(),
+            voice_status: None,
+            pending_voice_transcript: None,
+            voice_model_busy: None,
+            app_window_size: iced::Size::new(1228.0, 768.0),
+            tasks_open: true,
+            task_kind: TaskKind::Issues,
+            task_preset: TaskPreset::Open,
+            task_provider: TaskProvider::Github,
+            task_query: "is:issue is:open".to_string(),
+            task_repo_selection: HashSet::new(),
+            task_items: Vec::new(),
+            task_items_by_repo: HashMap::new(),
+            task_items_pending: HashSet::new(),
+            task_item_errors: HashMap::new(),
+            task_items_loading: false,
+            task_items_error: None,
+            task_items_op: None,
+            onboarding_open: false,
+            mobile_open: false,
+            mobile_stage: MobileStage::Intro,
+            mobile_platform: MobilePlatform::Ios,
+            mobile_ios_channel: MobileIosChannel::Preview,
+            mobile_connection_mode: MobileConnectionMode::Anywhere,
+            mobile_pairing_error: None,
+            settings_search_query: String::new(),
+            settings_section: SettingsSection::General,
+            help_open: false,
+            workspace_options_open: false,
+            project_actions_open: None,
+            project_remove_confirm: None,
+            worktree_remove_confirm: None,
+            pinned_pane_close_confirm: None,
+            running_pane_close_confirm: None,
+            worktree_actions_open: None,
+            workspace_board_open: false,
+            status_popover: None,
+            port_listeners: Vec::new(),
+            ports_loading: false,
+            ports_error: None,
+            ports_op: None,
+            right_sidebar_tab: RightSidebarTab::Explorer,
+            right_sidebar_open: true,
+            agent_scope: AgentScope::Workspace,
+            agent_history_query: String::new(),
             last_error: None,
             next_op_id: 0,
+            pending_repo_add_rpcs: HashMap::new(),
+            pending_worktree_create_rpcs: HashMap::new(),
+            pending_worktree_remove_rpcs: HashMap::new(),
             // `suaegi_core`의 기본 workspace root 계산을 재사용한다 (홈 디렉터리
             // 아래 `suaegi-workspaces`) — 여기서 `dirs`에 직접 의존하지 않는다.
             workspace_root: PersistedState::default().settings.workspace_root,
+            ui_settings,
+            agent_env_drafts,
+            terminal_color_drafts,
+            expanded_agent_settings: HashSet::new(),
+            provider_account_importing: HashSet::new(),
+            provider_account_remove_confirm: None,
+            keybinding_snapshot: None,
+            keybinding_drafts: HashMap::new(),
+            editor_auto_save_generation: 0,
+            diagnostics_status: None,
+            mcp_create_confirm: None,
+            repo_shared_path_drafts: HashMap::new(),
+            repo_sparse_preset_name_drafts: HashMap::new(),
+            repo_sparse_preset_directory_drafts: HashMap::new(),
+            repo_host_setup_drafts: HashMap::new(),
+            repo_host_setup_busy: HashSet::new(),
+            repo_host_setup_status: HashMap::new(),
+            fork_syncing: HashSet::new(),
+            fork_sync_status: HashMap::new(),
+            source_control_ai_discovered_models: HashMap::new(),
+            source_control_ai_models_loading: HashSet::new(),
+            source_control_ai_models_status: None,
+            daemon_sessions: Vec::new(),
+            daemon_sessions_loading: false,
+            daemon_sessions_status: None,
+            daemon_action_confirm: None,
             load_origin: LoadOrigin::Fresh,
             last_save_status: None,
             persistence: None,
             session_store: SessionStore::new(),
             panes: None,
             focused_pane: None,
+            app_window_focused: true,
+            terminal_cursor_phase_visible: true,
+            floating_workspace_open: false,
+            floating_workspace_maximized: false,
+            floating_workspace_content: FloatingWorkspaceContent::Empty,
+            floating_workspace_session: None,
+            floating_workspace_sessions: Vec::new(),
+            floating_workspace_markdown_root: None,
+            floating_workspace_pointer: Point::ORIGIN,
+            floating_workspace_drag: None,
+            floating_pending_commands: Vec::new(),
+            keep_awake_process: None,
             worktree_sessions: HashMap::new(),
             session_worktrees: HashMap::new(),
+            pending_setup_sessions: HashMap::new(),
+            setup_sessions: HashMap::new(),
+            worktree_setup_sessions: HashMap::new(),
+            setup_waiting_worktrees: HashSet::new(),
+            deferred_setup_agent_starts: HashSet::new(),
             pending_session_starts: HashMap::new(),
+            sleeping_agent_sessions: HashMap::new(),
+            waking_agent_sessions: HashSet::new(),
+            pending_agent_hibernations: HashMap::new(),
+            live_agent_resume: HashMap::new(),
+            terminal_last_input_at: HashMap::new(),
             pending_worktree_removals: HashSet::new(),
             session_titles: HashMap::new(),
+            manual_session_titles: HashMap::new(),
+            generated_session_titles: HashMap::new(),
             pending_prompts: HashMap::new(),
+            pending_agent_overrides: HashMap::new(),
             pending_injections: HashMap::new(),
             prompt_gates: HashMap::new(),
             next_presence_seq: 0,
             last_input_loss: None,
             // 부팅을 거치지 않는 경로는 하이드레이션할 것이 없다 — 열어둔다.
             badges: HashMap::new(),
+            prompt_cache_started: HashMap::new(),
+            auto_branch_rename_in_flight: HashSet::new(),
+            auto_branch_rename_settled: HashSet::new(),
             // 서버 없이도 앱은 완전히 동작한다 — 배지만 `Unknown`에 머문다.
             hook_endpoint: None,
             hook_server: None,
@@ -945,6 +2896,14 @@ impl Default for AppState {
             worktree_meta: HashMap::new(),
             layout_generation: 0,
             diff: DiffState::default(),
+            file_explorer: FileExplorerState::default(),
+            editor: EditorState::default(),
+            quick_open: QuickOpenState::default(),
+            content_search: ContentSearchState::default(),
+            source_control: SourceControlState::default(),
+            automations: Vec::new(),
+            automation_runs: Vec::new(),
+            automation_ui: AutomationUiState::default(),
             github_status: HashMap::new(),
             latest_forge_op: HashMap::new(),
             create_pr: None,
@@ -964,6 +2923,66 @@ impl Default for AppState {
 /// 공유해야 하므로 여기 한 곳에 둔다.
 pub(crate) fn worktree_id_for(path: &Path) -> WorktreeId {
     WorktreeId(path.to_string_lossy().into_owned())
+}
+
+fn ephemeral_worktree_id(runtime_id: &str) -> WorktreeId {
+    WorktreeId(format!("ephemeral:{runtime_id}"))
+}
+
+fn parse_rpc_settings_section(value: &str) -> Option<SettingsSection> {
+    Some(match value {
+        "agents" => SettingsSection::Agents,
+        "provider-accounts" | "providers" => SettingsSection::ProviderAccounts,
+        "orchestration" => SettingsSection::Orchestration,
+        "computer-use" | "computer" => SettingsSection::ComputerUse,
+        "voice" => SettingsSection::Voice,
+        "general" => SettingsSection::General,
+        "integrations" => SettingsSection::Integrations,
+        "mobile" => SettingsSection::Mobile,
+        "git" => SettingsSection::Git,
+        "task-sources" | "tasks" => SettingsSection::TaskSources,
+        "terminal" => SettingsSection::Terminal,
+        "quick-commands" => SettingsSection::QuickCommands,
+        "browser" => SettingsSection::Browser,
+        "mobile-emulator" | "emulator" => SettingsSection::MobileEmulator,
+        "floating-workspace" => SettingsSection::FloatingWorkspace,
+        "appearance" => SettingsSection::Appearance,
+        "input-editing" | "input" => SettingsSection::InputEditing,
+        "notifications" => SettingsSection::Notifications,
+        "shortcuts" => SettingsSection::Shortcuts,
+        "stats-usage" | "usage" => SettingsSection::StatsUsage,
+        "ssh-hosts" | "ssh" => SettingsSection::SshHosts,
+        "remote-servers" | "remote" => SettingsSection::RemoteServers,
+        "mac-permissions" | "permissions" => SettingsSection::MacPermissions,
+        "privacy" => SettingsSection::Privacy,
+        "advanced" => SettingsSection::Advanced,
+        "plugins" => SettingsSection::Plugins,
+        "ephemeral-vms" | "vms" => SettingsSection::EphemeralVms,
+        "experimental" => SettingsSection::Experimental,
+        _ => return None,
+    })
+}
+
+fn respond_browser_action(
+    request: &crate::local_rpc::LocalRpcRequest,
+    error: &Option<String>,
+    action: &str,
+) {
+    match error {
+        Some(error) => request.respond(Err(error.clone())),
+        None => request.respond(Ok(serde_json::json!({"action": action}))),
+    }
+}
+
+fn ephemeral_worktree_entry(
+    runtime: &crate::ephemeral_vm::RuntimeRecord,
+) -> suaegi_git::worktree::WorktreeEntry {
+    suaegi_git::worktree::WorktreeEntry {
+        path: PathBuf::from(ephemeral_worktree_id(&runtime.id).0),
+        branch: runtime.workspace_name.clone(),
+        head: None,
+        is_main: false,
+    }
 }
 
 impl AppState {
@@ -986,17 +3005,50 @@ impl AppState {
         state.persistence = Some(boot.handle);
         // **여기서 딱 한 번** 설치된 에이전트를 감지한다(위 필드 주석 참고).
         state.installed_agents = detect_installed_agents();
-        state.install_hooks();
+        state.ui_settings.voice_openai_api_key_configured = crate::speech::has_openai_key();
+        for provider in [
+            crate::provider_credentials::ProviderSecret::OpenCodeGo,
+            crate::provider_credentials::ProviderSecret::MiniMax,
+        ] {
+            if crate::provider_credentials::has(provider) {
+                state.provider_secrets_configured.insert(provider);
+            }
+        }
+        state.reload_keybindings();
+        state.apply_network_settings();
+        suaegi_term::grid::configure_semantic_escape_chars(
+            state.ui_settings.terminal_word_separator.clone(),
+        );
+        crate::terminal::palette::configure_custom_themes(
+            &state.ui_settings.terminal_custom_themes,
+        );
+        crate::terminal::palette::configure_color_overrides(
+            &state.ui_settings.terminal_color_overrides,
+        );
+        if state.ui_settings.agent_status_hooks_enabled {
+            state.install_hooks();
+        } else {
+            state.remove_hooks();
+        }
         state.attach_hook_server(hook_server);
 
-        let repo_ids: Vec<RepoId> = state.repos.iter().map(|repo| repo.id.clone()).collect();
+        let repos_to_refresh: Vec<(RepoId, PathBuf)> = state
+            .repos
+            .iter()
+            .map(|repo| (repo.id.clone(), repo.path.clone()))
+            .collect();
+        let repo_ids: Vec<RepoId> = repos_to_refresh
+            .iter()
+            .map(|(repo_id, _)| repo_id.clone())
+            .collect();
         // **여기서 게이트를 닫는다.** 이 줄 이후 `persist()`는 부팅이 끝날
         // 때까지 아무것도 쓰지 않는다 — 부분 복원된 상태가 디스크의 멀쩡한
         // 파일을 덮어쓰는 것이 이 게이트가 막는 유일한 사고다.
         state.hydration = Hydration::new(repo_ids.clone());
 
         let refresh_tasks: Vec<iced::Task<Message>> = repo_ids
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|repo_id| state.refresh_worktrees(repo_id))
             .collect();
 
@@ -1008,8 +3060,25 @@ impl AppState {
         let saved_task = iced::Task::stream(boot.results.map(Message::Saved));
 
         let mut tasks = refresh_tasks;
+        tasks.extend(
+            repos_to_refresh
+                .into_iter()
+                .map(|(repo_id, path)| crate::fork_sync::discover(repo_id, path)),
+        );
         tasks.push(restore_task);
         tasks.push(saved_task);
+        if let Some(worktree) = state.selected_worktree.clone() {
+            tasks.push(iced::Task::done(Message::FileExplorerToggled { worktree }));
+        }
+        if state.ui_settings.show_usage_status {
+            tasks.push(state.update(Message::RateLimitsRefreshRequested));
+        }
+        if state.ui_settings.show_resource_status {
+            tasks.push(state.update(Message::MemorySnapshotRefreshRequested));
+        }
+        if state.ui_settings.show_ports_status {
+            tasks.push(state.update(Message::PortsRefreshRequested));
+        }
 
         // N1: 저장된 Linear 키(키체인 우선, env fallback)가 있으면 메모리 토큰으로 올리고
         // 재연결(verify + 워크스페이스/이슈 조회)을 발급한다 — "연결"이 앱 재시작을 넘어
@@ -1028,8 +3097,9 @@ impl AppState {
         // 시도하지 않는다 — 연결 설정은 그대로 두어(폼이 미리 채워진 채) 다음 저장에 보존되고,
         // 사용자가 토큰만 다시 넣으면 재연결된다. 토큰은 절대 로그/JSON에 안 남는다.
         if let Some(connection) = state.jira.connection.clone() {
-            let resolved =
-                suaegi_secrets::load(&crate::tracker_tasks::jira_secret_request(&connection.site_url));
+            let resolved = suaegi_secrets::load(&crate::tracker_tasks::jira_secret_request(
+                &connection.site_url,
+            ));
             if let Some(token) = resolved.secret {
                 state.jira.token = Some(token.clone());
                 state.jira.connecting = true;
@@ -1051,6 +3121,63 @@ impl AppState {
         let mut state = AppState::default();
         state.repos = load.state.repos;
         state.workspace_root = load.state.settings.workspace_root;
+        state.ui_settings = load.state.settings.ui;
+        if state.ui_settings.left_sidebar_appearance == "solid" {
+            state.ui_settings.left_sidebar_appearance = "match-terminal".to_string();
+        }
+        state.ui_settings.app_icon =
+            crate::appearance::normalize_app_icon_id(&state.ui_settings.app_icon).to_string();
+        state.ui_settings.notification_sound =
+            crate::notification_sound::normalize_sound_id(&state.ui_settings.notification_sound)
+                .to_string();
+        state.ui_settings.terminal_custom_themes = crate::warp_theme_import::normalize_themes(
+            std::mem::take(&mut state.ui_settings.terminal_custom_themes),
+        );
+        if !matches!(
+            state.ui_settings.setup_script_launch_mode.as_str(),
+            "new-tab" | "split-vertical" | "split-horizontal"
+        ) {
+            state.ui_settings.setup_script_launch_mode = "new-tab".to_string();
+        }
+        for setting in state.ui_settings.repo_hook_settings.values_mut() {
+            crate::repo_hooks::normalize_setting(setting);
+        }
+        let custom_selection_exists = |selection: &str| {
+            selection.strip_prefix("custom:").is_none_or(|id| {
+                state
+                    .ui_settings
+                    .terminal_custom_themes
+                    .iter()
+                    .any(|theme| theme.id == id)
+            })
+        };
+        if !custom_selection_exists(&state.ui_settings.terminal_theme_dark) {
+            state.ui_settings.terminal_theme_dark = "Ghostty Default Style Dark".to_string();
+        }
+        if !custom_selection_exists(&state.ui_settings.terminal_theme_light) {
+            state.ui_settings.terminal_theme_light = "Builtin Tango Light".to_string();
+        }
+        if state
+            .ui_settings
+            .notification_custom_sound_path
+            .as_deref()
+            .is_some_and(|path| !crate::notification_sound::is_supported_custom_sound(path))
+        {
+            state.ui_settings.notification_custom_sound_path = None;
+            if state.ui_settings.notification_sound == "custom" {
+                state.ui_settings.notification_sound = "system".to_string();
+            }
+        }
+        state.apply_task_defaults();
+        state.agent_env_drafts = state
+            .ui_settings
+            .agent_default_env
+            .iter()
+            .map(|(agent, env)| (agent.clone(), format_agent_env(env)))
+            .collect();
+        state.terminal_color_drafts = state.ui_settings.terminal_color_overrides.clone();
+        state.automations = load.state.settings.automations;
+        state.automation_runs = load.state.settings.automation_runs;
         // N2 §2: 저장된 Jira 연결 설정(non-secret)을 메모리로 올린다. 부팅(`boot`)이 이걸로 키체인
         // 토큰을 짚어 재연결하고, `persisted_snapshot`이 다시 `Settings`로 굳혀 왕복이 닫힌다.
         // 연결 폼 입력도 미리 채워, 키체인 토큰이 없을 때 사용자가 site/email을 다시 안 쳐도 되게 한다
@@ -1073,7 +3200,36 @@ impl AppState {
         // **부팅 시 실제로 읽는다.** 여기까지가 이 필드의 오랜 공백이었다 —
         // `persisted_snapshot`이 쓰기만 하고 아무도 읽지 않았다.
         state.selected_worktree = load.state.session.active_worktree_id;
+        state.browser_tabs = load.state.session.browser_tabs;
+        state.active_browser_tab_id = load.state.session.active_browser_tab_id;
+        if let Some(tab) = state
+            .active_browser_tab_id
+            .as_ref()
+            .and_then(|id| state.browser_tabs.iter().find(|tab| &tab.id == id))
+        {
+            state.browser_current_url = tab.url.clone();
+            state.browser_address_draft = if tab.url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                String::new()
+            } else {
+                tab.url.clone()
+            };
+        }
+        state.tasks_open = state.selected_worktree.is_none();
         state.pending_restore_tree = load.state.session.panes;
+        state.sleeping_agent_sessions = load
+            .state
+            .session
+            .sleeping_agent_sessions
+            .into_iter()
+            .filter_map(|mut record| {
+                if record.agent != "claude" {
+                    return None;
+                }
+                record.provider_session_id =
+                    valid_provider_session_id(&record.provider_session_id)?;
+                Some((record.worktree_id.clone(), record))
+            })
+            .collect();
         // 디스크에 저장된 worktree 목록을 그대로 신뢰하지 않고 화면에 먼저
         // 보여주기 위한 최선의 추정치로만 쓴다 — `boot()`이 곧바로 git 재조회를
         // 발급해 정정한다(위 문서 참고). `latest_list_op`는 일부러 세우지 않는다:
@@ -1088,6 +3244,7 @@ impl AppState {
             state.worktree_meta.insert(
                 worktree.id.clone(),
                 WorktreeMeta {
+                    display_name: Some(worktree.display_name),
                     created_with_agent: worktree.created_with_agent,
                     created_at_unix_ms: worktree.created_at_unix_ms,
                     linked_github_pr: worktree.linked_github_pr,
@@ -1114,6 +3271,30 @@ impl AppState {
                     is_main: false,
                 });
         }
+        for runtime in &state.ephemeral_vm_runtimes {
+            if runtime.status == crate::ephemeral_vm::RuntimeStatus::Cleaned {
+                continue;
+            }
+            let Some(repo_id) = runtime.repo_id.as_ref().map(|id| RepoId(id.clone())) else {
+                continue;
+            };
+            if !state.repos.iter().any(|repo| repo.id == repo_id) {
+                continue;
+            }
+            let worktree_id = ephemeral_worktree_id(&runtime.id);
+            state.worktree_meta.insert(
+                worktree_id,
+                WorktreeMeta {
+                    display_name: runtime.workspace_name.clone(),
+                    created_at_unix_ms: runtime.created_at,
+                    ..WorktreeMeta::default()
+                },
+            );
+            worktrees_by_repo
+                .entry(repo_id)
+                .or_default()
+                .push(ephemeral_worktree_entry(runtime));
+        }
         state.worktrees_by_repo = worktrees_by_repo;
         state
     }
@@ -1123,44 +3304,48 @@ impl AppState {
     /// 새로 합성한다 — 생성 시각/생성 에이전트 같은 메타데이터는 이 씨딩
     /// 시점에 알 수 없으므로 기본값을 쓴다(세션 레이아웃 복원은 Plan 5).
     fn persisted_snapshot(&self) -> PersistedState {
+        let mut sleeping_agent_sessions: Vec<_> =
+            self.sleeping_agent_sessions.values().cloned().collect();
+        sleeping_agent_sessions.sort_by(|left, right| left.worktree_id.0.cmp(&right.worktree_id.0));
         let worktrees = self
             .worktrees_by_repo
             .iter()
             .flat_map(|(repo_id, entries)| {
-                entries.iter().map(move |entry| {
-                    let id = worktree_id_for(&entry.path);
-                    // Task 6: 자리표시자가 아니라 실제 메타데이터를 읽는다.
-                    // 아직 모르는 worktree(밖에서 만들어진 것)는 기본값이다 —
-                    // **거짓말을 쓰지 않는다**는 점에서 자리표시자와 같지만,
-                    // 아는 것을 매 저장마다 지워버리지는 않는다.
-                    let meta = self.worktree_meta.get(&id).cloned().unwrap_or_default();
-                    Worktree {
-                        id,
-                        repo_id: repo_id.clone(),
-                        path: entry.path.clone(),
-                        branch: entry.branch.clone().unwrap_or_default(),
-                        display_name: entry
-                            .branch
-                            .clone()
-                            .unwrap_or_else(|| "worktree".to_string()),
-                        created_with_agent: meta.created_with_agent,
-                        created_at_unix_ms: meta.created_at_unix_ms,
-                        linked_github_pr: meta.linked_github_pr,
-                        // N1 §1.3: Linear 링크를 meta에서 **재주입**한다. `linked_github_pr`과
-                        // 똑같이 — 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다.
-                        linked_linear_issue: meta.linked_linear_issue.clone(),
-                        linked_linear_issue_workspace_id: meta
-                            .linked_linear_issue_workspace_id
-                            .clone(),
-                        linked_linear_issue_organization_url_key: meta
-                            .linked_linear_issue_organization_url_key
-                            .clone(),
-                        // N2 §2: Jira 링크도 meta에서 **재주입**한다 — from_load 씨딩과 짝을 이룬다.
-                        // 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다(forge #14).
-                        linked_jira_issue: meta.linked_jira_issue.clone(),
-                        linked_jira_site: meta.linked_jira_site.clone(),
-                    }
-                })
+                entries
+                    .iter()
+                    .filter(|entry| !worktree_id_for(&entry.path).0.starts_with("ephemeral:"))
+                    .map(move |entry| {
+                        let id = worktree_id_for(&entry.path);
+                        // Task 6: 자리표시자가 아니라 실제 메타데이터를 읽는다.
+                        // 아직 모르는 worktree(밖에서 만들어진 것)는 기본값이다 —
+                        // **거짓말을 쓰지 않는다**는 점에서 자리표시자와 같지만,
+                        // 아는 것을 매 저장마다 지워버리지는 않는다.
+                        let meta = self.worktree_meta.get(&id).cloned().unwrap_or_default();
+                        let display_name = self.worktree_display_name(&id, entry);
+                        Worktree {
+                            id,
+                            repo_id: repo_id.clone(),
+                            path: entry.path.clone(),
+                            branch: entry.branch.clone().unwrap_or_default(),
+                            display_name,
+                            created_with_agent: meta.created_with_agent,
+                            created_at_unix_ms: meta.created_at_unix_ms,
+                            linked_github_pr: meta.linked_github_pr,
+                            // N1 §1.3: Linear 링크를 meta에서 **재주입**한다. `linked_github_pr`과
+                            // 똑같이 — 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다.
+                            linked_linear_issue: meta.linked_linear_issue.clone(),
+                            linked_linear_issue_workspace_id: meta
+                                .linked_linear_issue_workspace_id
+                                .clone(),
+                            linked_linear_issue_organization_url_key: meta
+                                .linked_linear_issue_organization_url_key
+                                .clone(),
+                            // N2 §2: Jira 링크도 meta에서 **재주입**한다 — from_load 씨딩과 짝을 이룬다.
+                            // 여기서 None으로 합성하면 한 번 저장에 링크가 사라진다(forge #14).
+                            linked_jira_issue: meta.linked_jira_issue.clone(),
+                            linked_jira_site: meta.linked_jira_site.clone(),
+                        }
+                    })
             })
             .collect();
         PersistedState {
@@ -1170,9 +3355,13 @@ impl AppState {
             session: SessionState {
                 active_worktree_id: self.selected_worktree.clone(),
                 panes: self.persisted_layout(),
+                sleeping_agent_sessions,
+                browser_tabs: self.browser_tabs.clone(),
+                active_browser_tab_id: self.active_browser_tab_id.clone(),
             },
             settings: Settings {
                 workspace_root: self.workspace_root.clone(),
+                ui: self.ui_settings.clone(),
                 // N2 §2: 활성 Jira 연결(있으면)을 non-secret 설정으로 굳힌다 — 부팅 재연결의 근거.
                 // **토큰은 절대 여기 없다**(키체인 전용). auth_type을 is_cloud로 평평하게 매핑한다.
                 jira_connection: self.jira.connection.as_ref().map(|c| JiraConnectionConfig {
@@ -1180,6 +3369,8 @@ impl AppState {
                     email: c.email.clone(),
                     is_cloud: c.auth_type.is_cloud(),
                 }),
+                automations: self.automations.clone(),
+                automation_runs: self.automation_runs.clone(),
             },
         }
     }
@@ -1221,6 +3412,30 @@ impl AppState {
         if let Some(handle) = &self.persistence {
             handle.save(self.persisted_snapshot());
         }
+    }
+
+    fn apply_network_settings(&self) {
+        suaegi_http::configure(
+            self.ui_settings.http_proxy_url.clone(),
+            self.ui_settings.http_proxy_bypass_rules.clone(),
+            self.ui_settings.electron_http1_compatibility_mode,
+        );
+    }
+
+    fn reload_keybindings(&mut self) {
+        let snapshot = crate::keybindings::load();
+        crate::keybindings::publish(&snapshot);
+        self.keybinding_drafts.clear();
+        for definition in suaegi_keys::KEYBINDING_DEFINITIONS {
+            let value = suaegi_keys::get_effective_keybindings_for_action(
+                definition.id,
+                crate::keybindings::host_platform(),
+                Some(&snapshot.overrides),
+            )
+            .join(", ");
+            self.keybinding_drafts.insert(definition.id, value);
+        }
+        self.keybinding_snapshot = Some(snapshot);
     }
 
     /// 부팅 진행 한 단계를 반영하고, **그것이 게이트를 여는 단계였다면 곧바로
@@ -1369,7 +3584,7 @@ impl AppState {
         });
 
         if let Some(config) = config {
-            let panes = pane_grid::State::with_configuration(config);
+            let mut panes = pane_grid::State::with_configuration(config);
             // 복원된 `active_worktree_id`의 pane에 포커스를 준다. 그 세션이
             // 살아나지 못했으면 아무 pane이나 — 포커스가 없는 워크벤치는
             // 키 입력이 갈 곳이 없다.
@@ -1386,6 +3601,9 @@ impl AppState {
                         .map(|(pane, _)| *pane)
                 })
                 .or_else(|| panes.panes.keys().next().copied());
+            if let Some(pane) = self.focused_pane {
+                panes.maximize(pane);
+            }
             self.panes = Some(panes);
         }
 
@@ -1399,8 +3617,18 @@ impl AppState {
     /// 한쪽만 `session_titles`나 `pending_session_starts`를 채우고 다른 쪽이
     /// 조용히 새기 시작한다.
     fn start_session_for(&mut self, id: &WorktreeId) -> Option<(SessionId, iced::Task<Message>)> {
+        if self.setup_waiting_worktrees.contains(id) {
+            self.deferred_setup_agent_starts.insert(id.clone());
+            return None;
+        }
         let (repo_id, entry) = self.find_worktree(id)?;
-        let session_id = self.session_store.next_id();
+        let remote_runtime = self.ephemeral_runtime_for_worktree(id).cloned();
+        let sleeping = self.sleeping_agent_sessions.get(id).cloned();
+        let session_id = self
+            .worktree_sessions
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| self.session_store.next_id());
         let title = entry
             .branch
             .clone()
@@ -1433,7 +3661,9 @@ impl AppState {
         // 만들어진 worktree**는 설정 파일을 영영 못 받고, 파일이 지워진 경우도
         // 복구되지 않는다 — 그러면 그 pane의 배지는 영구히 `Unknown`이다.
         // 멱등하고 파일 하나짜리 쓰기이므로 매번 해도 싸다.
-        self.inject_into_worktree(&entry.path);
+        if self.ui_settings.agent_status_hooks_enabled && remote_runtime.is_none() {
+            self.inject_into_worktree(&entry.path);
+        }
 
         // **스폰마다 새 nonce를 발급하고 배지를 리셋한다.** 같은 worktree의 옛
         // 세션이 남긴 훅이 새 세션의 배지를 덮지 못하게 하는 지점이 여기다 —
@@ -1441,30 +3671,164 @@ impl AppState {
         let nonce = SpawnNonce::next();
         self.badges.insert(id.clone(), PaneBadge::new(nonce));
 
-        let env = match &self.hook_endpoint {
-            Some((port, token)) => {
+        let mut env = match (
+            &self.hook_endpoint,
+            self.ui_settings.agent_status_hooks_enabled,
+        ) {
+            (Some((port, token)), true) => {
                 crate::agent_status::inject::spawn_env(&PaneKey(id.clone()), nonce, *port, token)
             }
             // 서버가 안 떴다 — 배지 없이 계속 간다. 훅 스크립트는 env가 비면
             // 조용히 아무것도 하지 않는다.
-            None => Vec::new(),
+            _ => Vec::new(),
         };
+        let terminal_handle = format!("term_{}", session_id.0);
+        env.extend([
+            ("ORCA_PANE_KEY".into(), id.0.clone()),
+            ("ORCA_TERMINAL_HANDLE".into(), terminal_handle.clone()),
+            ("SUAEGI_TERMINAL_HANDLE".into(), terminal_handle),
+        ]);
+        let proxy = self.ui_settings.http_proxy_url.trim();
+        if !proxy.is_empty() {
+            env.push(("HTTP_PROXY".to_string(), proxy.to_string()));
+            env.push(("HTTPS_PROXY".to_string(), proxy.to_string()));
+            env.push(("http_proxy".to_string(), proxy.to_string()));
+            env.push(("https_proxy".to_string(), proxy.to_string()));
+        }
+        let bypass = self.ui_settings.http_proxy_bypass_rules.trim();
+        if !bypass.is_empty() {
+            env.push(("NO_PROXY".to_string(), bypass.to_string()));
+            env.push(("no_proxy".to_string(), bypass.to_string()));
+        }
+        if self.ui_settings.terminal_scope_history_by_worktree {
+            crate::terminal_history::inject(&mut env, &id.0);
+        }
+        crate::attribution::inject(&mut env, self.ui_settings.enable_github_attribution);
 
         // worktree 생성 시 고른 에이전트를 그대로 띄운다(6c). 디스크에 굳은
         // `created_with_agent` 문자열을 **레지스트리로 다시 검증**해 `&'static str`
         // id로 만든다 — 표에 없는 값(제거된 에이전트, 손상된 저장본)은 `None`으로
         // 떨어져 로그인 셸이 된다(오늘의 기본과 동일). 고른 게 없으면 `None` →
         // 로그인 셸이라 기존 동작이 그대로다.
-        let agent_def = worktree
-            .created_with_agent
-            .as_deref()
-            .and_then(agent_def_by_id);
+        let pending_agent_override = self.pending_agent_overrides.remove(id);
+        let agent_def = if sleeping.is_some() {
+            agent_def_by_id("claude")
+        } else {
+            pending_agent_override
+                .as_deref()
+                .or(worktree.created_with_agent.as_deref())
+                .and_then(agent_def_by_id)
+        };
         let agent_id: Option<&'static str> = agent_def.map(|def| def.id);
+        let mut command_override = agent_id
+            .and_then(|agent| self.ui_settings.agent_command_overrides.get(agent))
+            .cloned();
+        let mut configured_args = agent_id
+            .and_then(|agent| self.ui_settings.agent_default_args.get(agent))
+            .cloned();
+        if let Some(profile_env) =
+            agent_id.and_then(|agent| self.ui_settings.agent_default_env.get(agent))
+        {
+            for (name, value) in profile_env {
+                if valid_agent_env_name(name) && value.len() <= 16 * 1024 && !value.contains('\0') {
+                    env.retain(|(existing, _)| existing != name);
+                    env.push((name.clone(), value.clone()));
+                }
+            }
+        }
+        if agent_id == Some("claude") {
+            match self.ui_settings.claude_agent_teams_mode.as_str() {
+                "in-process" => {
+                    env.retain(|(name, _)| name != "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
+                    env.push((
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
+                        "1".to_string(),
+                    ));
+                    configured_args = claude_agent_teams_args(
+                        configured_args,
+                        &self.ui_settings.claude_agent_teams_mode,
+                    );
+                }
+                "native-panes-shim" if cfg!(not(target_os = "windows")) => {
+                    let direct_command = command_override
+                        .as_deref()
+                        .and_then(|command| {
+                            suaegi_gen_prompt::tokenize_custom_command_template(command).ok()
+                        })
+                        .filter(|tokens| {
+                            tokens.first().is_some_and(|program| {
+                                Path::new(program)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    == Some("claude")
+                            })
+                        });
+                    if command_override.is_none() || direct_command.is_some() {
+                        if let Some(program) =
+                            direct_command.and_then(|tokens| tokens.first().cloned())
+                        {
+                            env.retain(|(name, _)| name != "SUAEGI_AGENT_TEAMS_CLAUDE_BIN");
+                            env.push(("SUAEGI_AGENT_TEAMS_CLAUDE_BIN".into(), program));
+                        }
+                        if let Ok(executable) = std::env::current_exe() {
+                            command_override = Some(format!(
+                                "{} claude-teams",
+                                crate::agent_status::inject::posix_single_quote(
+                                    &executable.to_string_lossy()
+                                )
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let managed_home = match agent_id {
+            Some("codex") => self
+                .ui_settings
+                .active_codex_managed_account_id
+                .as_deref()
+                .and_then(|id| {
+                    self.ui_settings
+                        .codex_managed_accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                })
+                .map(|account| ("CODEX_HOME", account.config_dir.as_str())),
+            Some("claude") => self
+                .ui_settings
+                .active_claude_managed_account_id
+                .as_deref()
+                .and_then(|id| {
+                    self.ui_settings
+                        .claude_managed_accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                })
+                .map(|account| ("CLAUDE_CONFIG_DIR", account.config_dir.as_str())),
+            _ => None,
+        };
+        if let Some((name, value)) = managed_home {
+            env.retain(|(existing, _)| existing != name);
+            env.push((name.to_string(), value.to_string()));
+        }
 
         // **일회성 초기 프롬프트를 여기서 소비한다.** `pending_prompts`에서 빼므로
         // 세션을 닫았다 다시 열거나 재시작 후 복원해도 다시 주입되지 않는다 —
         // 이 값은 영속화되지 않고 오직 이 첫 시작에만 실린다.
-        let prompt = self.pending_prompts.remove(id);
+        let prompt = if sleeping.is_some() {
+            None
+        } else {
+            self.pending_prompts.remove(id)
+        };
+        if self.ui_settings.tab_auto_generate_title {
+            if let Some(generated) = prompt
+                .as_deref()
+                .and_then(crate::tab_title::derive_generated_tab_title)
+            {
+                self.generated_session_titles.insert(session_id, generated);
+            }
+        }
 
         // argv/flag 에이전트는 프롬프트가 스폰 시점에 argv로 들어간다
         // (`build_spawn_by_id` → `apply_prompt_injection`). stdin-after-start
@@ -1476,10 +3840,390 @@ impl AppState {
             self.pending_injections.insert(session_id, prompt.clone());
         }
 
-        let task =
-            self.session_store
-                .start(session_id, &worktree, agent_id, prompt, env);
+        let task = if let Some(runtime) = remote_runtime {
+            match runtime.recipe_result.connection() {
+                crate::ephemeral_vm::RecipeConnection::Ssh {
+                    target,
+                    project_root,
+                } => {
+                    let remote_spawn = agent_id.map(|_| {
+                        suaegi_term::agent::build_spawn_by_id_with_profile(
+                            agent_id,
+                            prompt.as_deref(),
+                            PathBuf::from("/"),
+                            50,
+                            80,
+                            command_override
+                                .as_deref()
+                                .and_then(|value| {
+                                    suaegi_gen_prompt::tokenize_custom_command_template(value).ok()
+                                })
+                                .as_deref(),
+                            &configured_args
+                                .as_deref()
+                                .and_then(|value| {
+                                    suaegi_gen_prompt::tokenize_custom_command_template(value).ok()
+                                })
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let remote_environment = env
+                        .into_iter()
+                        .filter(|(name, _)| {
+                            !name.starts_with("SUAEGI_")
+                                && !matches!(name.as_str(), "CODEX_HOME" | "CLAUDE_CONFIG_DIR")
+                        })
+                        .chain(
+                            remote_spawn
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|spawn| spawn.env.iter().cloned()),
+                        )
+                        .collect::<Vec<_>>();
+                    let program = remote_spawn.as_ref().map(|spawn| {
+                        (
+                            spawn.program.as_str(),
+                            spawn.args.as_slice(),
+                            remote_environment.as_slice(),
+                        )
+                    });
+                    match crate::ssh::recipe_terminal_spawn(&target, &project_root, program, 50, 80)
+                    {
+                        Ok(spawn) => self.session_store.start_raw(
+                            session_id,
+                            id.clone(),
+                            agent_id,
+                            spawn,
+                            self.ui_settings.terminal_scrollback_rows as usize,
+                        ),
+                        Err(error) => iced::Task::done(Message::SessionStarted {
+                            id: session_id,
+                            worktree_id: id.clone(),
+                            result: Err(error),
+                        }),
+                    }
+                }
+                crate::ephemeral_vm::RecipeConnection::OrcaServer { project_root, .. } => {
+                    let spawn_result = runtime
+                        .runtime_environment
+                        .clone()
+                        .ok_or_else(|| {
+                            runtime.pairing_error.clone().unwrap_or_else(|| {
+                                "The provisioned Orca server is not paired.".to_string()
+                            })
+                        })
+                        .and_then(|environment| {
+                            let remote_spawn = agent_id.map(|_| {
+                                suaegi_term::agent::build_spawn_by_id_with_profile(
+                                    agent_id,
+                                    prompt.as_deref(),
+                                    PathBuf::from("/"),
+                                    50,
+                                    80,
+                                    command_override
+                                        .as_deref()
+                                        .and_then(|value| {
+                                            suaegi_gen_prompt::tokenize_custom_command_template(
+                                                value,
+                                            )
+                                            .ok()
+                                        })
+                                        .as_deref(),
+                                    &configured_args
+                                        .as_deref()
+                                        .and_then(|value| {
+                                            suaegi_gen_prompt::tokenize_custom_command_template(
+                                                value,
+                                            )
+                                            .ok()
+                                        })
+                                        .unwrap_or_default(),
+                                )
+                            });
+                            let remote_environment = env
+                                .into_iter()
+                                .filter(|(name, _)| {
+                                    !name.starts_with("SUAEGI_")
+                                        && !matches!(
+                                            name.as_str(),
+                                            "CODEX_HOME" | "CLAUDE_CONFIG_DIR"
+                                        )
+                                })
+                                .chain(
+                                    remote_spawn
+                                        .as_ref()
+                                        .into_iter()
+                                        .flat_map(|spawn| spawn.env.iter().cloned()),
+                                )
+                                .collect::<Vec<_>>();
+                            let program = remote_spawn.as_ref().map(|spawn| {
+                                (
+                                    spawn.program.as_str(),
+                                    spawn.args.as_slice(),
+                                    remote_environment.as_slice(),
+                                )
+                            });
+                            crate::runtime_terminal_bridge::spawn(
+                                environment,
+                                &project_root,
+                                program,
+                                50,
+                                80,
+                            )
+                        });
+                    match spawn_result {
+                        Ok(spawn) => self.session_store.start_raw(
+                            session_id,
+                            id.clone(),
+                            agent_id,
+                            spawn,
+                            self.ui_settings.terminal_scrollback_rows as usize,
+                        ),
+                        Err(error) => iced::Task::done(Message::SessionStarted {
+                            id: session_id,
+                            worktree_id: id.clone(),
+                            result: Err(error),
+                        }),
+                    }
+                }
+            }
+        } else if let Some(record) = sleeping {
+            self.waking_agent_sessions.insert(id.clone());
+            self.session_store.start_resumed_claude(
+                session_id,
+                &worktree,
+                record.provider_session_id,
+                env,
+                self.ui_settings.terminal_scrollback_rows as usize,
+            )
+        } else {
+            self.session_store.start_profiled(
+                session_id,
+                &worktree,
+                agent_id,
+                prompt,
+                env,
+                self.ui_settings.terminal_scrollback_rows as usize,
+                command_override.as_deref(),
+                configured_args.as_deref(),
+            )
+        };
         Some((session_id, task))
+    }
+
+    fn start_setup_session(
+        &mut self,
+        repo_id: &RepoId,
+        worktree_id: WorktreeId,
+        worktree_path: &Path,
+    ) -> iced::Task<Message> {
+        let Some(repo) = self.repo_by_id(repo_id).cloned() else {
+            return iced::Task::none();
+        };
+        let setting = self.repo_hook_setting(repo_id);
+        let script = match crate::repo_hooks::effective_setup_script(&setting, worktree_path) {
+            Ok(Some(script)) => script,
+            Ok(None) => return iced::Task::none(),
+            Err(error) => {
+                self.last_error = Some(error);
+                return iced::Task::none();
+            }
+        };
+        let runner = match crate::repo_hooks::prepare_setup_runner(worktree_path, &script) {
+            Ok(path) => path,
+            Err(error) => {
+                self.last_error = Some(error);
+                return iced::Task::none();
+            }
+        };
+        let mut command = suaegi_setupseq::build_setup_runner_command(
+            &runner.to_string_lossy(),
+            suaegi_setupseq::SetupRunnerCommandPlatform::Posix,
+        );
+        command.push('\r');
+
+        let session_id = self.session_store.next_id();
+        let wait_for_agent = setting.setup_agent_startup_policy == "wait-for-setup";
+        if wait_for_agent {
+            self.setup_waiting_worktrees.insert(worktree_id.clone());
+        }
+        self.session_titles.insert(session_id, "Setup".to_string());
+        self.pending_setup_sessions.insert(
+            session_id,
+            PendingSetupSession {
+                worktree_id: worktree_id.clone(),
+                worktree_path: worktree_path.to_path_buf(),
+                command,
+                mode: self.ui_settings.setup_script_launch_mode.clone(),
+                wait_for_agent,
+            },
+        );
+        let worktree = Worktree {
+            id: worktree_id,
+            repo_id: repo.id.clone(),
+            path: worktree_path.to_path_buf(),
+            branch: String::new(),
+            display_name: "Setup".to_string(),
+            created_with_agent: None,
+            created_at_unix_ms: 0,
+            linked_github_pr: None,
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
+            linked_jira_issue: None,
+            linked_jira_site: None,
+        };
+        self.session_store.start_configured(
+            session_id,
+            &worktree,
+            None,
+            None,
+            crate::repo_hooks::setup_env(&repo, worktree_path),
+            self.ui_settings.terminal_scrollback_rows as usize,
+        )
+    }
+
+    fn open_setup_pane_if_requested(&mut self, worktree_id: &WorktreeId) {
+        let Some(&setup_id) = self.worktree_setup_sessions.get(worktree_id) else {
+            return;
+        };
+        let Some(active) = self.setup_sessions.get(&setup_id) else {
+            return;
+        };
+        if active.pane_open || active.mode == "new-tab" {
+            return;
+        }
+        let Some(&primary_id) = self.worktree_sessions.get(worktree_id) else {
+            return;
+        };
+        let Some(panes) = &mut self.panes else {
+            return;
+        };
+        let Some(primary_pane) = panes
+            .iter()
+            .find_map(|(pane, session)| (*session == primary_id).then_some(*pane))
+        else {
+            return;
+        };
+        let axis = if active.mode == "split-horizontal" {
+            pane_grid::Axis::Horizontal
+        } else {
+            pane_grid::Axis::Vertical
+        };
+        panes.restore();
+        if panes.split(axis, primary_pane, setup_id).is_some() {
+            if let Some(active) = self.setup_sessions.get_mut(&setup_id) {
+                active.pane_open = true;
+            }
+            self.focused_pane = Some(primary_pane);
+        }
+    }
+
+    fn start_floating_workspace(&mut self, agent_id: Option<&'static str>) -> iced::Task<Message> {
+        let raw = self.ui_settings.floating_workspace_cwd.trim();
+        let path = if raw.is_empty() || raw == "~" {
+            dirs::home_dir()
+        } else if let Some(rest) = raw.strip_prefix("~/") {
+            dirs::home_dir().map(|home| home.join(rest))
+        } else {
+            Some(PathBuf::from(raw))
+        };
+        let Some(path) = path else {
+            self.last_error = Some("Could not resolve the Floating Workspace directory".into());
+            return iced::Task::none();
+        };
+        if !path.is_dir() {
+            self.last_error = Some(format!(
+                "Floating Workspace directory does not exist: {}",
+                path.display()
+            ));
+            return iced::Task::none();
+        }
+
+        let session_id = self.session_store.next_id();
+        let worktree_id = WorktreeId(format!("{FLOATING_WORKSPACE_ID_PREFIX}:{}", session_id.0));
+        self.pending_session_starts
+            .insert(worktree_id.clone(), session_id);
+        let title = if agent_id == Some("claude") {
+            "Claude".to_string()
+        } else {
+            let terminal_number = self.floating_workspace_sessions.len()
+                + self
+                    .pending_session_starts
+                    .keys()
+                    .filter(|id| id.0.starts_with(FLOATING_WORKSPACE_ID_PREFIX))
+                    .count();
+            format!("Terminal {terminal_number}")
+        };
+        self.session_titles.insert(session_id, title);
+
+        let mut env = Vec::new();
+        let proxy = self.ui_settings.http_proxy_url.trim();
+        if !proxy.is_empty() {
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                env.push((key.to_string(), proxy.to_string()));
+            }
+        }
+        let bypass = self.ui_settings.http_proxy_bypass_rules.trim();
+        if !bypass.is_empty() {
+            env.push(("NO_PROXY".to_string(), bypass.to_string()));
+            env.push(("no_proxy".to_string(), bypass.to_string()));
+        }
+        if self.ui_settings.terminal_scope_history_by_worktree {
+            crate::terminal_history::inject(&mut env, FLOATING_WORKSPACE_ID_PREFIX);
+        }
+        crate::attribution::inject(&mut env, self.ui_settings.enable_github_attribution);
+
+        let worktree = Worktree {
+            id: worktree_id,
+            repo_id: RepoId(FLOATING_WORKSPACE_ID_PREFIX.to_string()),
+            path,
+            branch: String::new(),
+            display_name: "Floating Workspace".to_string(),
+            created_with_agent: None,
+            created_at_unix_ms: 0,
+            linked_github_pr: None,
+            linked_linear_issue: None,
+            linked_linear_issue_workspace_id: None,
+            linked_linear_issue_organization_url_key: None,
+            linked_jira_issue: None,
+            linked_jira_site: None,
+        };
+        self.session_store.start_configured(
+            session_id,
+            &worktree,
+            agent_id,
+            None,
+            env,
+            self.ui_settings.terminal_scrollback_rows as usize,
+        )
+    }
+
+    fn open_floating_markdown(&mut self, path: PathBuf) -> iced::Task<Message> {
+        const FLOATING_ID: &str = "__suaegi_floating_workspace__";
+        if self.floating_workspace_owns_browser() {
+            self.browser_open = false;
+            crate::browser::set_visible(false);
+        }
+        let Some(root) = path.parent().map(Path::to_path_buf) else {
+            self.last_error = Some("Could not resolve the Markdown file directory.".into());
+            return iced::Task::none();
+        };
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            self.last_error = Some("The selected Markdown file name is not valid UTF-8.".into());
+            return iced::Task::none();
+        };
+        self.floating_workspace_markdown_root = Some(root.clone());
+        self.floating_workspace_content = FloatingWorkspaceContent::Markdown;
+        self.floating_workspace_open = true;
+        let worktree = WorktreeId(FLOATING_ID.to_string());
+        let op = self.next_op();
+        self.editor.begin_load(worktree.clone(), name.clone(), op);
+        crate::editor::load_file(worktree, root, name, op)
     }
 
     /// 레이아웃이 바뀐 뒤 저장을 예약한다. **리사이즈 전용이다** — 다른 트리거
@@ -1519,7 +4263,7 @@ impl AppState {
     /// 실패한 스캔 한 번이 살아 있는 세션을 전부 죽이고, 레이아웃 복원이 붙은
     /// 지금은 **복원된 레이아웃 전체가 지워진다.**
     pub fn apply_worktree_listing(&mut self, repo: RepoId, op: OpId, listing: WorktreeListing) {
-        let WorktreeListing::Authoritative(entries) = listing else {
+        let WorktreeListing::Authoritative(mut entries) = listing else {
             // 저하된 조회는 증거가 아니다. 목록도 갈지 않는다 — 화면에 있던
             // 최선의 추정치가 "아무것도 모른다"보다 낫다.
             return;
@@ -1529,6 +4273,15 @@ impl AppState {
                 return;
             }
         }
+        entries.extend(
+            self.ephemeral_vm_runtimes
+                .iter()
+                .filter(|runtime| {
+                    runtime.repo_id.as_deref() == Some(repo.0.as_str())
+                        && runtime.status != crate::ephemeral_vm::RuntimeStatus::Cleaned
+                })
+                .map(ephemeral_worktree_entry),
+        );
         let still_present: HashSet<WorktreeId> =
             entries.iter().map(|e| worktree_id_for(&e.path)).collect();
         let vanished: Vec<WorktreeId> = self
@@ -1545,8 +4298,25 @@ impl AppState {
             .collect();
         self.worktrees_by_repo.insert(repo, entries);
         for id in &vanished {
+            if self.file_explorer.worktree() == Some(id) {
+                self.file_explorer.close();
+            }
+            if self.editor.contains_worktree(id) {
+                self.editor.close_worktree(id);
+            }
+            if self.quick_open.worktree() == Some(id) {
+                self.quick_open.close();
+            }
+            if self.content_search.worktree() == Some(id) {
+                self.content_search.close();
+            }
             // 사라진 worktree의 메타데이터를 남겨두면 맵이 앱 수명 내내 자란다.
             self.worktree_meta.remove(id);
+            self.auto_branch_rename_in_flight.remove(id);
+            self.auto_branch_rename_settled.remove(id);
+            self.sleeping_agent_sessions.remove(id);
+            self.waking_agent_sessions.remove(id);
+            self.live_agent_resume.remove(id);
             // 세션이 없던 worktree라면 `close_session`이 지나가지 않으므로
             // 여기서도 지운다 — 안 그러면 맵이 앱 수명 내내 자란다.
             self.badges.remove(id);
@@ -1595,8 +4365,679 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn worktree_is_visible(&self, entry: &WorktreeEntry) -> bool {
+        let id = worktree_id_for(&entry.path);
+        let hidden_by_general_setting = self.ui_settings.hide_default_branch && entry.is_main
+            || self.ui_settings.hide_detached_head && entry.branch.is_none()
+            || self.ui_settings.hide_sleeping && self.worktree_is_sleeping(&id);
+        if hidden_by_general_setting {
+            return false;
+        }
+        let Some(repo_id) = self
+            .worktrees_by_repo
+            .iter()
+            .find_map(|(repo_id, entries)| {
+                entries
+                    .iter()
+                    .any(|candidate| candidate.path == entry.path)
+                    .then_some(repo_id)
+            })
+        else {
+            return true;
+        };
+        if !self.is_external_worktree(repo_id, entry) {
+            return true;
+        }
+        if self
+            .ui_settings
+            .repo_imported_external_worktree_paths
+            .get(&repo_id.0)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| Path::new(path) == entry.path.as_path())
+            })
+        {
+            return true;
+        }
+        self.ui_settings
+            .repo_external_worktree_visibility
+            .get(&repo_id.0)
+            .is_none_or(|visibility| visibility == "show")
+    }
+
+    fn is_external_worktree(&self, repo: &RepoId, entry: &WorktreeEntry) -> bool {
+        if entry.is_main
+            || self
+                .repo_by_id(repo)
+                .is_some_and(|record| record.path == entry.path)
+        {
+            return false;
+        }
+        let id = worktree_id_for(&entry.path);
+        self.worktree_meta
+            .get(&id)
+            .is_none_or(|meta| meta.created_at_unix_ms == 0)
+    }
+
+    pub(crate) fn external_worktree_inbox(&self, repo: &RepoId) -> Vec<&WorktreeEntry> {
+        if self
+            .ui_settings
+            .repo_external_worktree_discovery_suppressed_at
+            .contains_key(&repo.0)
+            || self
+                .ui_settings
+                .repo_external_worktree_visibility
+                .get(&repo.0)
+                .is_none_or(|visibility| visibility != "hide")
+        {
+            return Vec::new();
+        }
+        let baseline = self
+            .ui_settings
+            .repo_external_worktree_inbox_baseline_paths
+            .get(&repo.0);
+        let imported = self
+            .ui_settings
+            .repo_imported_external_worktree_paths
+            .get(&repo.0);
+        self.worktrees_for(repo)
+            .iter()
+            .filter(|entry| self.is_external_worktree(repo, entry))
+            .filter(|entry| {
+                let is_listed = |paths: Option<&Vec<String>>| {
+                    paths.is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .any(|path| Path::new(path) == entry.path.as_path())
+                    })
+                };
+                !is_listed(baseline) && !is_listed(imported)
+            })
+            .collect()
+    }
+
     pub(crate) fn repo_path_input(&self) -> &str {
         &self.repo_path_input
+    }
+
+    pub(crate) fn is_adding_repo(&self) -> bool {
+        self.adding_repo
+    }
+
+    pub(crate) fn integrations_open(&self) -> bool {
+        self.integrations_open
+    }
+
+    pub(crate) fn settings_search_query(&self) -> &str {
+        &self.settings_search_query
+    }
+
+    pub(crate) fn settings_section(&self) -> SettingsSection {
+        self.settings_section
+    }
+
+    pub(crate) fn help_open(&self) -> bool {
+        self.help_open
+    }
+
+    pub(crate) fn workspace_options_open(&self) -> bool {
+        self.workspace_options_open
+    }
+
+    pub(crate) fn project_actions_open(&self) -> Option<&RepoId> {
+        self.project_actions_open.as_ref()
+    }
+
+    pub(crate) fn project_actions_repo_name(&self) -> Option<&str> {
+        self.project_actions_open
+            .as_ref()
+            .and_then(|repo| self.repo_by_id(repo))
+            .map(|repo| repo.display_name.as_str())
+    }
+
+    pub(crate) fn project_remove_confirm_name(&self) -> Option<&str> {
+        self.project_remove_confirm
+            .as_ref()
+            .and_then(|repo| self.repo_by_id(repo))
+            .map(|repo| repo.display_name.as_str())
+    }
+
+    pub(crate) fn worktree_remove_confirm_name(&self) -> Option<String> {
+        let pending = self.worktree_remove_confirm.as_ref()?;
+        self.find_worktree(&pending.worktree_id).map(|(_, entry)| {
+            entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string())
+        })
+    }
+
+    pub(crate) fn pinned_pane_close_confirm_name(&self) -> Option<String> {
+        let pane = self.pinned_pane_close_confirm?;
+        let session = *self.panes.as_ref()?.get(pane)?;
+        let worktree = self.session_worktrees.get(&session)?;
+        self.find_worktree(worktree).map(|(_, entry)| {
+            entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string())
+        })
+    }
+
+    pub(crate) fn running_pane_close_confirm_name(&self) -> Option<String> {
+        let pane = self.running_pane_close_confirm?;
+        let session = *self.panes.as_ref()?.get(pane)?;
+        let worktree = self.session_worktrees.get(&session)?;
+        self.find_worktree(worktree).map(|(_, entry)| {
+            entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string())
+        })
+    }
+
+    pub(crate) fn worktree_actions_open(&self) -> Option<&WorktreeId> {
+        self.worktree_actions_open.as_ref()
+    }
+
+    pub(crate) fn worktree_actions_label(&self) -> Option<String> {
+        let worktree = self.worktree_actions_open.as_ref()?;
+        let (_, entry) = self.find_worktree(worktree)?;
+        Some(
+            entry
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string()),
+        )
+    }
+
+    pub(crate) fn worktree_actions_index(&self) -> Option<usize> {
+        let target = self.worktree_actions_open.as_ref()?;
+        let mut index = 0usize;
+        for repo in &self.repos {
+            for entry in self.worktrees_for(&repo.id) {
+                if &worktree_id_for(&entry.path) == target {
+                    return Some(index);
+                }
+                index += 1;
+            }
+        }
+        None
+    }
+
+    pub(crate) fn worktree_actions_remove_message(&self) -> Option<Message> {
+        let worktree_id = self.worktree_actions_open.as_ref()?.clone();
+        let (repo_id, entry) = self.find_worktree(&worktree_id)?;
+        Some(Message::RemoveWorktreeRequested {
+            repo_id,
+            worktree_id,
+            worktree_path: entry.path,
+            branch: entry.branch,
+        })
+    }
+
+    pub(crate) fn workspace_board_open(&self) -> bool {
+        self.workspace_board_open
+    }
+
+    pub(crate) fn browser_open(&self) -> bool {
+        self.browser_open
+    }
+
+    pub(crate) fn browser_tabs(&self) -> &[BrowserTabSetting] {
+        &self.browser_tabs
+    }
+
+    pub(crate) fn active_browser_tab_id(&self) -> Option<&str> {
+        self.active_browser_tab_id.as_deref()
+    }
+
+    pub(crate) fn browser_address_draft(&self) -> &str {
+        &self.browser_address_draft
+    }
+
+    pub(crate) fn browser_error(&self) -> Option<&str> {
+        self.browser_error.as_deref()
+    }
+
+    pub(crate) fn browser_profile_name_draft(&self) -> &str {
+        &self.browser_profile_name_draft
+    }
+
+    pub(crate) fn browser_cookie_importing(&self) -> bool {
+        self.browser_cookie_importing
+    }
+
+    pub(crate) fn browser_cookie_status(&self) -> Option<&str> {
+        self.browser_cookie_status.as_deref()
+    }
+
+    pub(crate) fn emulator_availability(&self) -> Option<&crate::emulator::EmulatorAvailability> {
+        self.emulator_availability.as_ref()
+    }
+
+    pub(crate) fn emulator_refreshing(&self) -> bool {
+        self.emulator_refreshing
+    }
+
+    pub(crate) fn emulator_status(&self) -> Option<&str> {
+        self.emulator_status.as_deref()
+    }
+
+    pub(crate) fn emulator_panel_open(&self) -> bool {
+        self.emulator_panel_open
+    }
+
+    pub(crate) fn emulator_active_device(&self) -> Option<&crate::emulator::EmulatorDevice> {
+        self.emulator_active_device.as_ref()
+    }
+
+    pub(crate) fn emulator_frame(&self) -> Option<&[u8]> {
+        self.emulator_frame.as_deref()
+    }
+
+    pub(crate) fn emulator_text_draft(&self) -> &str {
+        &self.emulator_text_draft
+    }
+
+    pub(crate) fn hosted_integrations(
+        &self,
+    ) -> Option<&crate::hosted_integrations::HostedIntegrationStatuses> {
+        self.hosted_integrations.as_ref()
+    }
+
+    pub(crate) fn hosted_integrations_refreshing(&self) -> bool {
+        self.hosted_integrations_refreshing
+    }
+
+    pub(crate) fn ssh_importing(&self) -> bool {
+        self.ssh_importing
+    }
+
+    pub(crate) fn ssh_testing(&self, id: &str) -> bool {
+        self.ssh_testing.contains(id)
+    }
+
+    pub(crate) fn ssh_status(&self, id: &str) -> Option<&str> {
+        self.ssh_status.get(id).map(String::as_str)
+    }
+
+    pub(crate) fn usage_snapshot(&self) -> Option<&crate::usage::UsageSnapshot> {
+        self.usage_snapshot.as_ref()
+    }
+
+    pub(crate) fn usage_scanning(&self) -> bool {
+        self.usage_scanning
+    }
+
+    pub(crate) fn memory_snapshot(&self) -> Option<&crate::memory::MemorySnapshot> {
+        self.memory_snapshot.as_ref()
+    }
+
+    pub(crate) fn memory_snapshot_loading(&self) -> bool {
+        self.memory_snapshot_loading
+    }
+
+    pub(crate) fn gemini_rate_limits(&self) -> Option<&crate::rate_limits::GeminiRateLimits> {
+        self.gemini_rate_limits.as_ref()
+    }
+
+    pub(crate) fn gemini_rate_limits_fetching(&self) -> bool {
+        self.gemini_rate_limits_fetching
+    }
+
+    pub(crate) fn provider_rate_limits(
+        &self,
+        provider: crate::rate_limits::RateLimitProvider,
+    ) -> Option<&crate::rate_limits::ProviderRateLimits> {
+        self.provider_rate_limits.get(&provider)
+    }
+
+    pub(crate) fn provider_rate_limits_fetching(
+        &self,
+        provider: crate::rate_limits::RateLimitProvider,
+    ) -> bool {
+        self.provider_rate_limits_fetching.contains(&provider)
+    }
+
+    pub(crate) fn provider_secret_draft(
+        &self,
+        provider: crate::provider_credentials::ProviderSecret,
+    ) -> &str {
+        self.provider_secret_drafts
+            .get(&provider)
+            .map(|draft| draft.0.as_str())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn provider_secret_configured(
+        &self,
+        provider: crate::provider_credentials::ProviderSecret,
+    ) -> bool {
+        self.provider_secrets_configured.contains(&provider)
+    }
+
+    pub(crate) fn provider_secret_status(
+        &self,
+        provider: crate::provider_credentials::ProviderSecret,
+    ) -> Option<&str> {
+        self.provider_secret_status
+            .get(&provider)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn ghostty_importing(&self) -> bool {
+        self.ghostty_importing
+    }
+
+    pub(crate) fn ghostty_import_status(&self) -> Option<&str> {
+        self.ghostty_import_status.as_deref()
+    }
+
+    pub(crate) fn terminal_theme_importing(&self) -> bool {
+        self.terminal_theme_importing
+    }
+
+    pub(crate) fn terminal_theme_import_status(&self) -> Option<&str> {
+        self.terminal_theme_import_status.as_deref()
+    }
+
+    pub(crate) fn session_needs_attention(&self, session: SessionId) -> bool {
+        self.ui_settings.experimental_terminal_attention
+            && self.terminal_attention_sessions.contains(&session)
+    }
+
+    pub(crate) fn pet_mood(&self) -> &'static str {
+        let mut saw_done = false;
+        for entries in self.worktrees_by_repo.values() {
+            for entry in entries {
+                match self.worktree_badge(&worktree_id_for(&entry.path)) {
+                    BadgeState::Waiting => return "needs your attention",
+                    BadgeState::Working => return "swimming with agents…",
+                    BadgeState::Done => saw_done = true,
+                    BadgeState::Unknown => {}
+                }
+            }
+        }
+        if saw_done {
+            "all caught up"
+        } else {
+            "ready"
+        }
+    }
+
+    pub(crate) fn remote_runtime_name_draft(&self) -> &str {
+        &self.remote_runtime_name_draft
+    }
+
+    pub(crate) fn remote_runtime_pairing_draft(&self) -> &str {
+        &self.remote_runtime_pairing_draft.0
+    }
+
+    pub(crate) fn remote_runtime_saving(&self) -> bool {
+        self.remote_runtime_saving
+    }
+
+    pub(crate) fn remote_runtime_checking(&self, id: &str) -> bool {
+        self.remote_runtime_checking.contains(id)
+    }
+
+    pub(crate) fn remote_runtime_status(&self, id: &str) -> Option<&str> {
+        self.remote_runtime_status.get(id).map(String::as_str)
+    }
+
+    pub(crate) fn remote_server_update(
+        &self,
+        id: &str,
+    ) -> Option<&crate::remote_runtime::RemoteServerUpdateState> {
+        self.remote_server_updates.get(id)
+    }
+
+    pub(crate) fn plugins(&self) -> &[crate::plugins::PluginEntry] {
+        &self.plugins
+    }
+
+    pub(crate) fn plugins_loading(&self) -> bool {
+        self.plugins_loading
+    }
+
+    pub(crate) fn plugins_error(&self) -> Option<&str> {
+        self.plugins_error.as_deref()
+    }
+
+    pub(crate) fn plugin_dev_path_draft(&self) -> &str {
+        &self.plugin_dev_path_draft
+    }
+
+    pub(crate) fn plugin_consent_review(&self) -> Option<&crate::plugins::PluginEntry> {
+        self.plugin_consent_review.as_ref()
+    }
+
+    pub(crate) fn plugin_remove_confirmation(&self) -> Option<&str> {
+        self.plugin_remove_confirmation.as_deref()
+    }
+
+    pub(crate) fn active_plugin_panel(&self) -> Option<(&str, &str, &str)> {
+        self.active_plugin_panel
+            .as_ref()
+            .map(|(plugin, panel, title)| (plugin.as_str(), panel.as_str(), title.as_str()))
+    }
+
+    pub(crate) fn plugin_panel_error(&self) -> Option<&str> {
+        self.plugin_panel_error.as_deref()
+    }
+
+    pub(crate) fn plugin_marketplaces(&self) -> &[crate::plugin_marketplace::SourceState] {
+        &self.plugin_marketplaces
+    }
+
+    pub(crate) fn plugin_marketplace_listings(
+        &self,
+    ) -> Vec<crate::plugin_marketplace::CatalogListing> {
+        crate::plugin_marketplace::listings(&self.plugin_marketplaces)
+    }
+
+    pub(crate) fn plugin_marketplace_loading(&self) -> bool {
+        self.plugin_marketplace_loading
+    }
+
+    pub(crate) fn plugin_marketplace_url_draft(&self) -> &str {
+        &self.plugin_marketplace_url_draft
+    }
+
+    pub(crate) fn plugin_marketplace_ref_draft(&self) -> &str {
+        &self.plugin_marketplace_ref_draft
+    }
+
+    pub(crate) fn plugin_kill_list_reason(&self, plugin_key: &str) -> Option<&str> {
+        self.plugin_kill_list
+            .as_ref()
+            .and_then(|list| crate::plugin_kill_list::find(list, plugin_key))
+            .map(|entry| entry.reason.as_str())
+    }
+
+    pub(crate) fn voice_dictation_state(&self) -> VoiceDictationState {
+        self.voice_dictation_state
+    }
+
+    pub(crate) fn voice_api_key_draft(&self) -> &str {
+        &self.voice_api_key_draft
+    }
+
+    pub(crate) fn voice_status(&self) -> Option<&str> {
+        self.voice_status.as_deref()
+    }
+
+    pub(crate) fn pending_voice_transcript(&self) -> Option<&str> {
+        self.pending_voice_transcript.as_deref()
+    }
+
+    pub(crate) fn voice_model_busy(&self) -> Option<&str> {
+        self.voice_model_busy.as_deref()
+    }
+
+    pub(crate) fn status_popover(&self) -> Option<StatusPopover> {
+        self.status_popover
+    }
+
+    pub(crate) fn port_listeners(&self) -> &[PortListener] {
+        &self.port_listeners
+    }
+
+    pub(crate) fn ports_loading(&self) -> bool {
+        self.ports_loading
+    }
+
+    pub(crate) fn ports_error(&self) -> Option<&str> {
+        self.ports_error.as_deref()
+    }
+
+    pub(crate) fn board_status(&self, worktree: &WorktreeId) -> BoardStatus {
+        BoardStatus::from_persisted(self.ui_settings.board_statuses.get(&worktree.0))
+    }
+
+    pub(crate) fn worktree_comment(&self, worktree: &WorktreeId) -> Option<&str> {
+        self.ui_settings
+            .worktree_comments
+            .get(&worktree.0)
+            .map(String::as_str)
+            .filter(|comment| !comment.is_empty())
+    }
+
+    pub(crate) fn worktree_is_pinned(&self, worktree: &WorktreeId) -> bool {
+        self.ui_settings.pinned_worktrees.contains(&worktree.0)
+    }
+
+    pub(crate) fn worktree_is_sleeping(&self, worktree: &WorktreeId) -> bool {
+        self.ephemeral_runtime_for_worktree(worktree)
+            .is_some_and(|runtime| {
+                matches!(
+                    runtime.status,
+                    crate::ephemeral_vm::RuntimeStatus::Suspended
+                        | crate::ephemeral_vm::RuntimeStatus::SuspendFailed
+                )
+            })
+            || self.ui_settings.sleeping_worktrees.contains(&worktree.0)
+    }
+
+    pub(crate) fn worktree_is_unread(&self, worktree: &WorktreeId) -> bool {
+        self.ui_settings.unread_worktrees.contains(&worktree.0)
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub(crate) fn ui_settings(&self) -> &UiSettings {
+        &self.ui_settings
+    }
+
+    pub(crate) fn terminal_cursor_phase_visible(&self) -> bool {
+        self.terminal_cursor_phase_visible
+    }
+
+    pub(crate) fn floating_workspace_open(&self) -> bool {
+        self.floating_workspace_open
+    }
+
+    pub(crate) fn floating_workspace_maximized(&self) -> bool {
+        self.floating_workspace_maximized
+    }
+
+    pub(crate) fn floating_workspace_content(&self) -> FloatingWorkspaceContent {
+        self.floating_workspace_content
+    }
+
+    pub(crate) fn floating_workspace_panel_geometry(&self) -> (f32, f32, f32, f32) {
+        const MARGIN: f32 = 18.0;
+        const MIN_WIDTH: f32 = 420.0;
+        const MIN_HEIGHT: f32 = 280.0;
+        let available_width = (self.app_window_size.width - MARGIN * 2.0).max(1.0);
+        let available_height = (self.app_window_size.height - MARGIN * 2.0).max(1.0);
+        if self.floating_workspace_maximized {
+            return (MARGIN, MARGIN, available_width, available_height);
+        }
+        let width = f32::from(self.ui_settings.floating_workspace_panel_width)
+            .clamp(MIN_WIDTH.min(available_width), available_width);
+        let height = f32::from(self.ui_settings.floating_workspace_panel_height)
+            .clamp(MIN_HEIGHT.min(available_height), available_height);
+        let default_x = self.app_window_size.width - width - MARGIN;
+        let default_y = self.app_window_size.height - height - MARGIN;
+        let x = if self.ui_settings.floating_workspace_panel_x < 0 {
+            default_x
+        } else {
+            self.ui_settings.floating_workspace_panel_x as f32
+        }
+        .clamp(0.0, (self.app_window_size.width - width).max(0.0));
+        let y = if self.ui_settings.floating_workspace_panel_y < 0 {
+            default_y
+        } else {
+            self.ui_settings.floating_workspace_panel_y as f32
+        }
+        .clamp(0.0, (self.app_window_size.height - height).max(0.0));
+        (x, y, width, height)
+    }
+
+    pub(crate) fn floating_workspace_trigger_position(&self) -> (f32, f32) {
+        const SIZE: f32 = 40.0;
+        const MARGIN: f32 = 18.0;
+        let default_x = self.app_window_size.width - SIZE - MARGIN;
+        let default_y = self.app_window_size.height - SIZE - MARGIN;
+        let x = if self.ui_settings.floating_workspace_trigger_x < 0 {
+            default_x
+        } else {
+            self.ui_settings.floating_workspace_trigger_x as f32
+        }
+        .clamp(0.0, (self.app_window_size.width - SIZE).max(0.0));
+        let y = if self.ui_settings.floating_workspace_trigger_y < 0 {
+            default_y
+        } else {
+            self.ui_settings.floating_workspace_trigger_y as f32
+        }
+        .clamp(0.0, (self.app_window_size.height - SIZE).max(0.0));
+        (x, y)
+    }
+
+    pub(crate) fn floating_workspace_owns_browser(&self) -> bool {
+        self.floating_workspace_content == FloatingWorkspaceContent::Browser
+    }
+
+    pub(crate) fn floating_workspace_owns_editor(&self) -> bool {
+        self.editor
+            .worktree()
+            .is_some_and(|worktree| worktree.0 == "__suaegi_floating_workspace__")
+    }
+
+    pub(crate) fn floating_workspace_session(&self) -> Option<SessionId> {
+        self.floating_workspace_session
+    }
+
+    pub(crate) fn floating_workspace_sessions(&self) -> &[SessionId] {
+        &self.floating_workspace_sessions
+    }
+
+    pub(crate) fn floating_workspace_has_attention(&self) -> bool {
+        !self.floating_workspace_open
+            && self
+                .floating_workspace_sessions
+                .iter()
+                .any(|id| self.terminal_attention_sessions.contains(id))
+    }
+
+    pub(crate) fn diagnostics_status(&self) -> Option<&str> {
+        self.diagnostics_status.as_deref()
+    }
+
+    pub(crate) fn keybinding_snapshot(&self) -> Option<&KeybindingFileSnapshot> {
+        self.keybinding_snapshot.as_ref()
+    }
+
+    pub(crate) fn keybinding_draft(&self, action: KeybindingActionId) -> &str {
+        self.keybinding_drafts
+            .get(&action)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     pub(crate) fn worktree_name_draft(&self, repo: &RepoId) -> &str {
@@ -1606,9 +5047,150 @@ impl AppState {
             .unwrap_or("")
     }
 
+    pub(crate) fn worktree_suggested_name(&self, repo: &RepoId) -> &str {
+        self.worktree_suggested_name
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("workspace")
+    }
+
+    fn fresh_worktree_suggestion(&self) -> String {
+        let used: Vec<String> = self
+            .worktrees_by_repo
+            .values()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let random_unit = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| f64::from(duration.subsec_nanos()) / 1_000_000_000.0)
+            .unwrap_or(0.0);
+        suaegi_workname::get_suggested_creature_name(used.iter().map(String::as_str), random_unit)
+    }
+
+    pub(crate) fn is_creating_worktree_for(&self, repo: &RepoId) -> bool {
+        self.creating_worktree_for.as_ref() == Some(repo)
+    }
+
     /// 이 repo의 에이전트 피커에 나열할 옵션(로그인 셸 + 설치된 에이전트들).
     pub(crate) fn agent_picker_choices(&self) -> Vec<AgentChoice> {
-        agent_choices(&self.installed_agents)
+        let enabled = self
+            .installed_agents
+            .iter()
+            .copied()
+            .filter(|id| {
+                !self
+                    .ui_settings
+                    .disabled_agents
+                    .iter()
+                    .any(|disabled| disabled == id)
+            })
+            .collect::<Vec<_>>();
+        agent_choices(&enabled)
+    }
+
+    pub(crate) fn is_agent_installed(&self, id: &str) -> bool {
+        self.installed_agents.contains(&id)
+    }
+
+    pub(crate) fn agent_env_draft(&self, id: &str) -> &str {
+        self.agent_env_drafts
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn terminal_color_draft(&self, key: &str) -> &str {
+        self.terminal_color_drafts
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn agent_settings_expanded(&self, id: &str) -> bool {
+        self.expanded_agent_settings.contains(id)
+    }
+
+    pub(crate) fn agent_permission_yolo(&self) -> bool {
+        let yolo_args = suaegi_core::domain::orca_yolo_agent_args();
+        let args_all_manual = yolo_args.keys().all(|agent| {
+            self.ui_settings
+                .agent_default_args
+                .get(agent)
+                .is_none_or(|args| args.trim().is_empty())
+        });
+        let yolo_env = suaegi_core::domain::orca_yolo_agent_env();
+        let env_all_manual = yolo_env.keys().all(|agent| {
+            self.ui_settings
+                .agent_default_env
+                .get(agent)
+                .is_none_or(HashMap::is_empty)
+        });
+        !(args_all_manual && env_all_manual)
+    }
+
+    pub(crate) fn provider_account_importing(
+        &self,
+        provider: crate::managed_accounts::Provider,
+    ) -> bool {
+        self.provider_account_importing.contains(&provider)
+    }
+
+    pub(crate) fn provider_accounts(
+        &self,
+        provider: crate::managed_accounts::Provider,
+    ) -> (
+        &[suaegi_core::domain::ManagedProviderAccountSetting],
+        Option<&str>,
+    ) {
+        if self.ui_settings.active_runtime_environment_id.is_some() {
+            if let Some(snapshot) = &self.remote_provider_accounts {
+                return match provider {
+                    crate::managed_accounts::Provider::Claude => (
+                        snapshot.claude.as_slice(),
+                        snapshot.active_claude.as_deref(),
+                    ),
+                    crate::managed_accounts::Provider::Codex => {
+                        (snapshot.codex.as_slice(), snapshot.active_codex.as_deref())
+                    }
+                };
+            }
+            return (&[], None);
+        }
+        match provider {
+            crate::managed_accounts::Provider::Claude => (
+                self.ui_settings.claude_managed_accounts.as_slice(),
+                self.ui_settings.active_claude_managed_account_id.as_deref(),
+            ),
+            crate::managed_accounts::Provider::Codex => (
+                self.ui_settings.codex_managed_accounts.as_slice(),
+                self.ui_settings.active_codex_managed_account_id.as_deref(),
+            ),
+        }
+    }
+
+    pub(crate) fn remote_provider_accounts_loading(&self) -> bool {
+        self.remote_provider_accounts_loading
+    }
+
+    pub(crate) fn remote_provider_accounts_error(&self) -> Option<&str> {
+        self.remote_provider_accounts_error.as_deref()
+    }
+
+    pub(crate) fn provider_account_removal_pending(
+        &self,
+        provider: crate::managed_accounts::Provider,
+        account_id: &str,
+    ) -> bool {
+        self.provider_account_remove_confirm
+            .as_ref()
+            .is_some_and(|pending| pending.0 == provider && pending.1 == account_id)
     }
 
     /// 이 repo의 현재 피커 선택. 엔트리가 없으면 로그인 셸(기본).
@@ -1616,7 +5198,36 @@ impl AppState {
         self.worktree_agent_draft
             .get(repo)
             .copied()
-            .unwrap_or(AgentChoice::LOGIN_SHELL)
+            .unwrap_or_else(|| match self.ui_settings.default_agent.as_str() {
+                "blank" => AgentChoice::LOGIN_SHELL,
+                "auto" => self
+                    .installed_agents
+                    .iter()
+                    .copied()
+                    .find(|id| {
+                        !self
+                            .ui_settings
+                            .disabled_agents
+                            .iter()
+                            .any(|disabled| disabled == id)
+                    })
+                    .map(|id| AgentChoice(Some(id)))
+                    .unwrap_or(AgentChoice::LOGIN_SHELL),
+                selected => self
+                    .installed_agents
+                    .iter()
+                    .copied()
+                    .find(|id| {
+                        *id == selected
+                            && !self
+                                .ui_settings
+                                .disabled_agents
+                                .iter()
+                                .any(|disabled| disabled == id)
+                    })
+                    .map(|id| AgentChoice(Some(id)))
+                    .unwrap_or(AgentChoice::LOGIN_SHELL),
+            })
     }
 
     /// 이 repo의 초기-프롬프트 입력창 값. 비었으면 빈 문자열(주입 없음).
@@ -1627,14 +5238,666 @@ impl AppState {
             .unwrap_or("")
     }
 
+    pub(crate) fn repo_hook_setting(&self, repo: &RepoId) -> suaegi_core::domain::RepoHookSetting {
+        self.ui_settings
+            .repo_hook_settings
+            .get(&repo.0)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn repo_has_setup_script(&self, repo: &RepoId) -> bool {
+        let Some(repo_record) = self.repo_by_id(repo) else {
+            return false;
+        };
+        let setting = self.repo_hook_setting(repo);
+        crate::repo_hooks::effective_setup_script(&setting, &repo_record.path)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub(crate) fn mcp_target_for_repo(&self, repo: &RepoId) -> Option<(WorktreeId, PathBuf)> {
+        if let Some(selected) = self.selected_worktree.as_ref() {
+            if let Some((selected_repo, entry)) = self.find_worktree(selected) {
+                if &selected_repo == repo {
+                    return Some((selected.clone(), entry.path));
+                }
+            }
+        }
+        let repo_record = self.repo_by_id(repo)?;
+        let entry = self
+            .worktrees_for(repo)
+            .iter()
+            .find(|entry| entry.is_main || entry.path == repo_record.path)
+            .or_else(|| self.worktrees_for(repo).first())?;
+        Some((worktree_id_for(&entry.path), entry.path.clone()))
+    }
+
+    pub(crate) fn mcp_create_confirming(&self, repo: &RepoId) -> bool {
+        self.mcp_create_confirm.as_ref() == Some(repo)
+    }
+
+    pub(crate) fn repo_shared_path_draft(&self, repo: &RepoId) -> &str {
+        self.repo_shared_path_drafts
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_sparse_preset_name_draft(&self, repo: &RepoId) -> &str {
+        self.repo_sparse_preset_name_drafts
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_sparse_preset_directory_draft(&self, repo: &RepoId) -> &str {
+        self.repo_sparse_preset_directory_drafts
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_host_setup_draft(&self, repo: &RepoId) -> RepoHostSetupDraft {
+        let mut draft = self
+            .repo_host_setup_drafts
+            .get(repo)
+            .cloned()
+            .unwrap_or_default();
+        if draft.host_id.is_empty() {
+            draft.host_id = self
+                .ui_settings
+                .ssh_hosts
+                .iter()
+                .find(|host| {
+                    self.ui_settings
+                        .repo_host_setups
+                        .get(&repo.0)
+                        .is_none_or(|setups| setups.iter().all(|setup| setup.host_id != host.id))
+                })
+                .map(|host| host.id.clone())
+                .unwrap_or_default();
+        }
+        draft
+    }
+
+    pub(crate) fn repo_host_setup_path_draft(&self, repo: &RepoId) -> &str {
+        self.repo_host_setup_drafts
+            .get(repo)
+            .map(|draft| draft.path.as_str())
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_host_setup_clone_url_draft(&self, repo: &RepoId) -> &str {
+        self.repo_host_setup_drafts
+            .get(repo)
+            .map(|draft| draft.clone_url.as_str())
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_host_setup_clone_destination_draft(&self, repo: &RepoId) -> &str {
+        self.repo_host_setup_drafts
+            .get(repo)
+            .map(|draft| draft.clone_destination.as_str())
+            .unwrap_or("")
+    }
+
+    pub(crate) fn repo_host_setup_busy(&self, repo: &RepoId) -> bool {
+        self.repo_host_setup_busy.contains(repo)
+    }
+
+    pub(crate) fn repo_host_setup_status(&self, repo: &RepoId) -> Option<&str> {
+        self.repo_host_setup_status.get(repo).map(String::as_str)
+    }
+
+    fn finish_repo_host_setup(
+        &mut self,
+        repo: &RepoId,
+        host_id: String,
+        path: String,
+        kind: String,
+        method: &str,
+    ) {
+        let now = current_unix_ms().min(u64::MAX as u128) as u64;
+        let display_name = self
+            .repo_by_id(repo)
+            .map(|record| record.display_name.clone())
+            .unwrap_or_else(|| "Project".to_string());
+        let setups = self
+            .ui_settings
+            .repo_host_setups
+            .entry(repo.0.clone())
+            .or_default();
+        if let Some(existing) = setups.iter_mut().find(|setup| setup.host_id == host_id) {
+            existing.path = path;
+            existing.kind = kind;
+            existing.setup_state = "ready".to_string();
+            existing.setup_method = method.to_string();
+            existing.updated_at_unix_ms = now;
+        } else {
+            setups.push(ProjectHostSetupSetting {
+                id: format!("{}::{host_id}", repo.0),
+                host_id,
+                path,
+                display_name,
+                worktree_base_path: String::new(),
+                git_username: String::new(),
+                kind,
+                setup_state: "ready".to_string(),
+                setup_method: method.to_string(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            });
+        }
+        setups.sort_by(|left, right| left.host_id.cmp(&right.host_id));
+    }
+
+    pub(crate) fn repo_fork_syncing(&self, repo: &RepoId) -> bool {
+        self.fork_syncing.contains(repo)
+    }
+
+    pub(crate) fn repo_fork_sync_status(&self, repo: &RepoId) -> Option<&str> {
+        self.fork_sync_status.get(repo).map(String::as_str)
+    }
+
+    pub(crate) fn source_control_ai_models(&self, agent_id: &str) -> Vec<String> {
+        self.source_control_ai_discovered_models
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::source_control_ai::models_for(agent_id)
+                    .iter()
+                    .map(|model| model.to_string())
+                    .collect()
+            })
+    }
+
+    pub(crate) fn source_control_ai_models_loading(&self, agent_id: &str) -> bool {
+        self.source_control_ai_models_loading.contains(agent_id)
+    }
+
+    pub(crate) fn source_control_ai_models_status(&self) -> Option<&str> {
+        self.source_control_ai_models_status.as_deref()
+    }
+
+    pub(crate) fn daemon_sessions(&self) -> &[suaegi_term::daemon::SessionInfo] {
+        &self.daemon_sessions
+    }
+
+    pub(crate) fn daemon_sessions_loading(&self) -> bool {
+        self.daemon_sessions_loading
+    }
+
+    pub(crate) fn daemon_sessions_status(&self) -> Option<&str> {
+        self.daemon_sessions_status.as_deref()
+    }
+
+    pub(crate) fn daemon_action_confirm(&self) -> Option<&str> {
+        self.daemon_action_confirm.as_deref()
+    }
+
+    pub(crate) fn sparse_preset_choices(&self, repo: &RepoId) -> Vec<SparsePresetChoice> {
+        let mut choices = vec![SparsePresetChoice {
+            id: String::new(),
+            label: "Full checkout".to_string(),
+        }];
+        choices.extend(
+            self.ui_settings
+                .repo_sparse_presets
+                .get(&repo.0)
+                .into_iter()
+                .flatten()
+                .map(|preset| SparsePresetChoice {
+                    id: preset.id.clone(),
+                    label: preset.name.clone(),
+                }),
+        );
+        choices
+    }
+
+    pub(crate) fn selected_sparse_preset_choice(&self, repo: &RepoId) -> SparsePresetChoice {
+        let selected = self
+            .worktree_sparse_preset_draft
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("");
+        self.sparse_preset_choices(repo)
+            .into_iter()
+            .find(|choice| choice.id == selected)
+            .unwrap_or(SparsePresetChoice {
+                id: String::new(),
+                label: "Full checkout".to_string(),
+            })
+    }
+
+    pub(crate) fn vm_recipe_choices(&self, repo: &RepoId) -> Vec<VmRecipeChoice> {
+        let mut choices = vec![VmRecipeChoice {
+            id: String::new(),
+            label: "Local machine".to_string(),
+        }];
+        let mut seen = HashSet::new();
+        if let Some(repo_record) = self.repo_by_id(repo) {
+            if let Ok(recipes) = crate::repo_hooks::load_environment_recipes(&repo_record.path) {
+                for recipe in recipes {
+                    seen.insert(recipe.id.clone());
+                    choices.push(VmRecipeChoice {
+                        id: recipe.id,
+                        label: format!("{} · this repository", recipe.name),
+                    });
+                }
+            }
+        }
+        for plugin in &self.plugins {
+            if plugin.status != crate::plugins::PluginStatus::Idle
+                || plugin.blocked_by_kill_list.is_some()
+            {
+                continue;
+            }
+            for recipe in &plugin.vm_recipe_specs {
+                if seen.insert(recipe.id.clone()) {
+                    choices.push(VmRecipeChoice {
+                        id: recipe.id.clone(),
+                        label: format!("{} · {}", recipe.name, plugin.name),
+                    });
+                }
+            }
+        }
+        choices
+    }
+
+    pub(crate) fn selected_vm_recipe_choice(&self, repo: &RepoId) -> VmRecipeChoice {
+        let selected = self
+            .worktree_vm_recipe_draft
+            .get(repo)
+            .map(String::as_str)
+            .unwrap_or("");
+        self.vm_recipe_choices(repo)
+            .into_iter()
+            .find(|choice| choice.id == selected)
+            .unwrap_or(VmRecipeChoice {
+                id: String::new(),
+                label: "Local machine".to_string(),
+            })
+    }
+
+    fn vm_recipe_for(
+        &self,
+        repo: &RepoId,
+        recipe_id: &str,
+    ) -> Option<crate::plugin_content::VmRecipe> {
+        self.repo_by_id(repo)
+            .and_then(|repo| crate::repo_hooks::load_environment_recipes(&repo.path).ok())
+            .into_iter()
+            .flatten()
+            .find(|recipe| recipe.id == recipe_id)
+            .or_else(|| {
+                self.plugins
+                    .iter()
+                    .filter(|plugin| {
+                        plugin.status == crate::plugins::PluginStatus::Idle
+                            && plugin.blocked_by_kill_list.is_none()
+                    })
+                    .flat_map(|plugin| plugin.vm_recipe_specs.iter())
+                    .find(|recipe| recipe.id == recipe_id)
+                    .cloned()
+            })
+    }
+
+    fn ephemeral_runtime_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+    ) -> Option<&crate::ephemeral_vm::RuntimeRecord> {
+        let runtime_id = worktree.0.strip_prefix("ephemeral:")?;
+        self.ephemeral_vm_runtimes
+            .iter()
+            .find(|runtime| runtime.id == runtime_id)
+    }
+
+    fn remote_ssh_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+    ) -> Option<(crate::ephemeral_vm::RecipeSshTarget, String)> {
+        match self
+            .ephemeral_runtime_for_worktree(worktree)?
+            .recipe_result
+            .connection()
+        {
+            crate::ephemeral_vm::RecipeConnection::Ssh {
+                target,
+                project_root,
+            } => Some((*target, project_root)),
+            crate::ephemeral_vm::RecipeConnection::OrcaServer { .. } => None,
+        }
+    }
+
+    fn remote_orca_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+    ) -> Option<(RuntimeEnvironmentSetting, String)> {
+        let runtime = self.ephemeral_runtime_for_worktree(worktree)?;
+        let project_root = match runtime.recipe_result.connection() {
+            crate::ephemeral_vm::RecipeConnection::OrcaServer { project_root, .. } => project_root,
+            crate::ephemeral_vm::RecipeConnection::Ssh { .. } => return None,
+        };
+        Some((runtime.runtime_environment.clone()?, project_root))
+    }
+
+    pub(crate) fn ephemeral_vm_runtimes(&self) -> &[crate::ephemeral_vm::RuntimeRecord] {
+        &self.ephemeral_vm_runtimes
+    }
+
+    pub(crate) fn ephemeral_vm_busy(&self, runtime_id: &str) -> bool {
+        self.ephemeral_vm_busy.contains(runtime_id)
+    }
+
+    pub(crate) fn worktree_setup_run_selection(&self, repo: &RepoId) -> bool {
+        if let Some(selected) = self.worktree_setup_run_draft.get(repo) {
+            return *selected;
+        }
+        let setting = self.repo_hook_setting(repo);
+        match setting.setup_run_policy.as_str() {
+            "run-by-default" => true,
+            "skip-by-default" => false,
+            _ => false,
+        }
+    }
+
     pub(crate) fn selected_worktree(&self) -> Option<&WorktreeId> {
         self.selected_worktree.as_ref()
+    }
+
+    pub(crate) fn can_navigate_back(&self) -> bool {
+        !self.navigation_back.is_empty()
+    }
+
+    pub(crate) fn can_navigate_forward(&self) -> bool {
+        !self.navigation_forward.is_empty()
+    }
+
+    pub(crate) fn cli_installed(&self) -> bool {
+        cli_install_path().is_some_and(|path| path.exists())
+    }
+
+    pub(crate) fn cli_install_path(&self) -> String {
+        cli_install_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.local/bin/suaegi".to_string())
+    }
+
+    pub(crate) fn left_sidebar_open(&self) -> bool {
+        self.left_sidebar_open
+    }
+
+    pub(crate) fn task_query(&self) -> &str {
+        &self.task_query
+    }
+
+    pub(crate) fn task_kind(&self) -> TaskKind {
+        self.task_kind
+    }
+
+    pub(crate) fn task_preset(&self) -> TaskPreset {
+        self.task_preset
+    }
+
+    pub(crate) fn task_provider(&self) -> TaskProvider {
+        self.task_provider
+    }
+
+    pub(crate) fn task_repo_selected(&self, repo: &RepoId) -> bool {
+        self.task_repo_selection.contains(repo)
+    }
+
+    pub(crate) fn task_repo_selection_is_all(&self) -> bool {
+        !self.repos.is_empty() && self.task_repo_selection.len() == self.repos.len()
+    }
+
+    fn reconcile_task_repo_selection(&mut self) {
+        let eligible = self
+            .repos
+            .iter()
+            .map(|repo| repo.id.clone())
+            .collect::<HashSet<_>>();
+        let persisted = self.ui_settings.default_repo_selection.as_ref().map(|ids| {
+            ids.iter()
+                .map(|id| RepoId(id.clone()))
+                .filter(|id| eligible.contains(id))
+                .collect::<HashSet<_>>()
+        });
+        self.task_repo_selection = persisted
+            .filter(|selected| !selected.is_empty())
+            .unwrap_or(eligible);
+    }
+
+    fn apply_task_defaults(&mut self) {
+        let preferred = match self.ui_settings.default_task_source.as_str() {
+            "gitlab" => TaskProvider::Gitlab,
+            "jira" => TaskProvider::Jira,
+            "linear" => TaskProvider::Linear,
+            _ => TaskProvider::Github,
+        };
+        self.task_provider = if self.task_provider_visible(preferred) {
+            preferred
+        } else if self.ui_settings.show_github_tasks {
+            TaskProvider::Github
+        } else if self.ui_settings.show_gitlab_tasks {
+            TaskProvider::Gitlab
+        } else if self.ui_settings.show_jira_tasks {
+            TaskProvider::Jira
+        } else {
+            TaskProvider::Linear
+        };
+        (self.task_kind, self.task_preset) =
+            match self.ui_settings.default_task_view_preset.as_str() {
+                "review" => (TaskKind::PullRequests, TaskPreset::NeedsReview),
+                "my-issues" => (TaskKind::Issues, TaskPreset::AssignedToMe),
+                "my-prs" => (TaskKind::PullRequests, TaskPreset::Mine),
+                "prs" => (TaskKind::PullRequests, TaskPreset::Open),
+                _ => (TaskKind::Issues, TaskPreset::Open),
+            };
+        self.task_query = if self.task_provider == TaskProvider::Github {
+            self.task_preset.query(self.task_kind).to_string()
+        } else {
+            String::new()
+        };
+        self.reconcile_task_repo_selection();
+    }
+
+    fn task_provider_visible(&self, provider: TaskProvider) -> bool {
+        match provider {
+            TaskProvider::Github => self.ui_settings.show_github_tasks,
+            TaskProvider::Gitlab => self.ui_settings.show_gitlab_tasks,
+            TaskProvider::Jira => self.ui_settings.show_jira_tasks,
+            TaskProvider::Linear => self.ui_settings.show_linear_tasks,
+        }
+    }
+
+    pub(crate) fn task_items(&self) -> &[crate::tasks::TaskWorkItem] {
+        &self.task_items
+    }
+
+    pub(crate) fn task_items_loading(&self) -> bool {
+        self.task_items_loading
+    }
+
+    pub(crate) fn task_items_error(&self) -> Option<&str> {
+        self.task_items_error.as_deref()
+    }
+
+    pub(crate) fn tasks_open(&self) -> bool {
+        self.tasks_open
+    }
+
+    pub(crate) fn activity_open(&self) -> bool {
+        self.activity_open && self.ui_settings.experimental_activity
+    }
+
+    pub(crate) fn activity_events(&self) -> &[ActivityEvent] {
+        &self.activity_events
+    }
+
+    pub(crate) fn native_chat_open(&self, session: SessionId) -> bool {
+        self.ui_settings.experimental_native_chat && self.native_chat_sessions.contains(&session)
+    }
+
+    pub(crate) fn native_chat_draft(&self, session: SessionId) -> &str {
+        self.native_chat_drafts
+            .get(&session)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub(crate) fn onboarding_open(&self) -> bool {
+        self.onboarding_open
+    }
+
+    pub(crate) fn mobile_open(&self) -> bool {
+        self.mobile_open
+    }
+
+    pub(crate) fn mobile_stage(&self) -> MobileStage {
+        self.mobile_stage
+    }
+
+    pub(crate) fn mobile_platform(&self) -> MobilePlatform {
+        self.mobile_platform
+    }
+
+    pub(crate) fn mobile_ios_channel(&self) -> MobileIosChannel {
+        self.mobile_ios_channel
+    }
+
+    pub(crate) fn mobile_connection_mode(&self) -> MobileConnectionMode {
+        self.mobile_connection_mode
+    }
+
+    pub(crate) fn mobile_pairing_error(&self) -> Option<&str> {
+        self.mobile_pairing_error.as_deref()
+    }
+
+    pub(crate) fn mobile_install_url(&self) -> &'static str {
+        mobile_install_url(self.mobile_platform, self.mobile_ios_channel)
+    }
+
+    pub(crate) fn right_sidebar_tab(&self) -> RightSidebarTab {
+        self.right_sidebar_tab
+    }
+
+    pub(crate) fn right_sidebar_open(&self) -> bool {
+        self.right_sidebar_open
+    }
+
+    pub(crate) fn agent_history_query(&self) -> &str {
+        &self.agent_history_query
+    }
+
+    pub(crate) fn agent_scope(&self) -> AgentScope {
+        self.agent_scope
+    }
+
+    pub(crate) fn repo_name_for_worktree(&self, worktree: &WorktreeId) -> Option<&str> {
+        let (repo_id, _) = self.find_worktree(worktree)?;
+        self.repo_by_id(&repo_id)
+            .map(|repo| repo.display_name.as_str())
+    }
+
+    pub(crate) fn branch_context_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+    ) -> Option<(String, String)> {
+        let (repo_id, entry) = self.find_worktree(worktree)?;
+        let branch = entry.branch.unwrap_or_else(|| "(detached)".to_string());
+        let base = self
+            .repo_by_id(&repo_id)
+            .and_then(|repo| repo.worktree_base_ref.clone())
+            .unwrap_or_else(|| "main".to_string());
+        Some((branch, base))
     }
 
     // ---- Task 6: accessors the workbench view (and its subscription) read ----
 
     pub(crate) fn panes(&self) -> Option<&pane_grid::State<SessionId>> {
         self.panes.as_ref()
+    }
+
+    pub(crate) fn open_tab_items(&self) -> Vec<(WorktreeId, String)> {
+        let Some(panes) = self.panes.as_ref() else {
+            return Vec::new();
+        };
+        let mut items: Vec<(WorktreeId, String)> = panes
+            .iter()
+            .filter_map(|(_, session_id)| {
+                self.session_worktrees
+                    .get(session_id)
+                    .cloned()
+                    .map(|worktree| (worktree, self.session_tab_title(*session_id)))
+            })
+            .collect();
+        if self.ui_settings.tab_order_mru {
+            let mut recency = HashMap::<WorktreeId, usize>::new();
+            let mut next = 0usize;
+            if let Some(active) = &self.selected_worktree {
+                recency.insert(active.clone(), next);
+                next += 1;
+            }
+            for worktree in self.navigation_back.iter().rev() {
+                if !recency.contains_key(worktree) {
+                    recency.insert(worktree.clone(), next);
+                    next += 1;
+                }
+            }
+            items.sort_by_key(|(worktree, _)| recency.get(worktree).copied().unwrap_or(usize::MAX));
+        }
+        items
+    }
+
+    pub(crate) fn session_tab_title(&self, session_id: SessionId) -> String {
+        let title = self
+            .manual_session_titles
+            .get(&session_id)
+            .filter(|title| !title.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                if self.ui_settings.tab_auto_generate_title {
+                    self.generated_session_titles
+                        .get(&session_id)
+                        .filter(|title| !title.trim().is_empty())
+                        .cloned()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let Some(worktree) = self.session_worktrees.get(&session_id) else {
+                    return self.session_title(session_id).to_string();
+                };
+                let path = Path::new(&worktree.0);
+                let leaf = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("terminal");
+                let parent = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str());
+                parent.map_or_else(|| leaf.to_string(), |parent| format!("../{parent}/{leaf}"))
+            });
+        if self.hibernated_worktree_for_session(session_id).is_some() {
+            format!("{title} — Sleeping")
+        } else {
+            title
+        }
+    }
+
+    pub(crate) fn hibernated_worktree_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Option<WorktreeId> {
+        let worktree = self.session_worktrees.get(&session_id)?;
+        self.sleeping_agent_sessions
+            .contains_key(worktree)
+            .then(|| worktree.clone())
     }
 
     pub(crate) fn session_store(&self) -> &SessionStore {
@@ -1662,6 +5925,36 @@ impl AppState {
             .get(worktree_id)
             .map(|&id| self.session_store.presence(id))
             .unwrap_or(AgentPresence::Unknown)
+    }
+
+    pub(crate) fn worktree_display_name(
+        &self,
+        worktree_id: &WorktreeId,
+        entry: &WorktreeEntry,
+    ) -> String {
+        self.worktree_meta
+            .get(worktree_id)
+            .and_then(|meta| meta.display_name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| name.trim().to_string())
+            .or_else(|| {
+                entry
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "worktree".to_string())
     }
 
     // ---- Plan 7a-1: 사이드바가 읽는 PR 상태/다이얼로그 접근자 ----
@@ -1699,7 +5992,10 @@ impl AppState {
     /// `forge_tasks`가 UI 스레드 밖에서 돌린다 — 여기서는 `Checking`만 세우고 op를 건다.
     fn request_github_status(&mut self, worktree: WorktreeId, force: bool) -> iced::Task<Message> {
         // 조회가 이미 진행 중이면 중복 발급하지 않는다(강제여도 in-flight는 존중).
-        if matches!(self.github_status.get(&worktree), Some(GithubStatus::Checking)) {
+        if matches!(
+            self.github_status.get(&worktree),
+            Some(GithubStatus::Checking)
+        ) {
             return iced::Task::none();
         }
         // on-activate는 **1회**다: 캐시가 있으면(성공이든 실패든) 다시 조회하지 않는다.
@@ -1774,8 +6070,49 @@ impl AppState {
         let path = crate::agent_status::inject::hook_script_path();
         match crate::agent_status::inject::install_hook_script(&path) {
             Ok(()) => self.hook_script = Some(path),
-            Err(e) => eprintln!("suaegi: could not install the hook script: {e} (badges will stay Unknown)"),
+            Err(e) => eprintln!(
+                "suaegi: could not install the hook script: {e} (badges will stay Unknown)"
+            ),
         }
+    }
+
+    fn remove_hooks(&mut self) {
+        let path = crate::agent_status::inject::hook_script_path();
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("suaegi: could not remove the hook script: {error}");
+            }
+        }
+        self.hook_script = None;
+    }
+
+    fn set_agent_hooks_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            let path = crate::agent_status::inject::hook_script_path();
+            crate::agent_status::inject::install_hook_script(&path)
+                .map_err(|error| format!("Could not install the agent hook script: {error}"))?;
+            self.hook_script = Some(path);
+            let worktrees = self
+                .worktrees_by_repo
+                .values()
+                .flatten()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            for worktree in worktrees {
+                self.inject_into_worktree(&worktree);
+            }
+        } else {
+            let path = crate::agent_status::inject::hook_script_path();
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("Could not remove the agent hook script: {error}"));
+                }
+            }
+            self.hook_script = None;
+        }
+        self.ui_settings.agent_status_hooks_enabled = enabled;
+        self.persist();
+        Ok(())
     }
 
     /// worktree 하나에 훅 설정을 쓴다. 실패해도 조용히 넘어간다(위와 같은 이유).
@@ -1801,7 +6138,8 @@ impl AppState {
         if !self.is_suaegi_worktree(worktree_path) {
             return;
         }
-        if let Err(e) = crate::agent_status::inject::write_worktree_settings(worktree_path, script) {
+        if let Err(e) = crate::agent_status::inject::write_worktree_settings(worktree_path, script)
+        {
             eprintln!("suaegi: could not write hook settings into the worktree: {e}");
         }
     }
@@ -1811,6 +6149,16 @@ impl AppState {
     /// 필요하다.
     fn attach_hook_server(&mut self, server: Option<HookServer>) {
         if let Some(server) = server {
+            if let Err(error) = crate::agent_status::inject::write_hook_endpoint(
+                &crate::agent_status::inject::hook_endpoint_path(),
+                server.port(),
+                server.token(),
+            ) {
+                eprintln!(
+                    "suaegi: could not publish the current hook endpoint: {error} \
+                     (surviving terminals may keep stale status)"
+                );
+            }
             self.hook_endpoint = Some((server.port(), server.token().to_string()));
             self.hook_server = Some(server);
         }
@@ -1876,27 +6224,243 @@ impl AppState {
         }
     }
 
+    pub(crate) fn prompt_cache_remaining_seconds(&self, worktree_id: &WorktreeId) -> Option<u64> {
+        if !self.ui_settings.prompt_cache_timer_enabled {
+            return None;
+        }
+        let started = *self.prompt_cache_started.get(worktree_id)?;
+        let ttl = Duration::from_secs(
+            u64::from(self.ui_settings.prompt_cache_ttl_minutes).saturating_mul(60),
+        );
+        let remaining = started
+            .checked_add(ttl)?
+            .checked_duration_since(Instant::now())?;
+        Some(
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0)),
+        )
+    }
+
+    fn sync_keep_awake(&mut self) {
+        let should_run = self.ui_settings.keep_computer_awake_while_agents_run
+            && self.badges.keys().any(|id| {
+                matches!(
+                    self.worktree_badge(id),
+                    BadgeState::Working | BadgeState::Waiting
+                )
+            });
+        if should_run && self.keep_awake_process.is_none() {
+            #[cfg(all(target_os = "macos", not(test)))]
+            {
+                self.keep_awake_process = std::process::Command::new("caffeinate")
+                    .args(["-i", "-w", &std::process::id().to_string()])
+                    .spawn()
+                    .ok();
+            }
+        } else if !should_run {
+            if let Some(mut child) = self.keep_awake_process.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn note_agent_resume_hook(&mut self, event: &HookEvent, outcome: HookOutcome) {
+        // Subagent session IDs cannot resume the pane's lead conversation.
+        if event.agent_id.is_some() {
+            return;
+        }
+        let Some(provider_session_id) = valid_provider_session_id(&event.claude_session_id) else {
+            return;
+        };
+        let now = Instant::now();
+        let entry = self
+            .live_agent_resume
+            .entry(event.pane_key.0.clone())
+            .or_insert_with(|| LiveAgentResume {
+                provider_session_id: provider_session_id.clone(),
+                turn_started_at: None,
+                done_at: None,
+            });
+        if entry.provider_session_id != provider_session_id {
+            *entry = LiveAgentResume {
+                provider_session_id,
+                turn_started_at: None,
+                done_at: None,
+            };
+        }
+        match outcome {
+            HookOutcome::Reset => {
+                entry.turn_started_at = None;
+                entry.done_at = None;
+            }
+            HookOutcome::Set(HookState::Working) => {
+                if matches!(
+                    event.event,
+                    crate::agent_status::contract::HookEventName::UserPromptSubmit
+                ) {
+                    entry.turn_started_at = Some(now);
+                }
+                entry.done_at = None;
+            }
+            HookOutcome::Set(HookState::Waiting) => {
+                entry.done_at = None;
+            }
+            HookOutcome::Set(HookState::Done) => {
+                entry.done_at = Some(now);
+            }
+            HookOutcome::Ignore => {}
+        }
+    }
+
+    fn poll_agent_hibernation(&mut self) -> iced::Task<Message> {
+        if !self.ui_settings.experimental_agent_hibernation {
+            return iced::Task::none();
+        }
+        let idle = Duration::from_millis(
+            self.ui_settings
+                .agent_hibernation_idle_ms
+                .clamp(60_000, 24 * 60 * 60_000),
+        );
+        let mut candidates = Vec::new();
+        for (worktree_id, live) in &self.live_agent_resume {
+            if self.selected_worktree.as_ref() == Some(worktree_id)
+                || self.sleeping_agent_sessions.contains_key(worktree_id)
+                || self.waking_agent_sessions.contains(worktree_id)
+            {
+                continue;
+            }
+            let Some(done_at) = live.done_at else {
+                continue;
+            };
+            let Some(turn_started_at) = live.turn_started_at else {
+                // Without a turn boundary we cannot prove that later input is
+                // not an unsent TUI draft.
+                continue;
+            };
+            if done_at.elapsed() < idle || self.worktree_badge(worktree_id) != BadgeState::Done {
+                continue;
+            }
+            let Some(&session_id) = self.worktree_sessions.get(worktree_id) else {
+                continue;
+            };
+            if self.pending_agent_hibernations.contains_key(&session_id)
+                || self.focused_session() == Some(session_id)
+                || self
+                    .terminal_last_input_at
+                    .get(&session_id)
+                    .is_some_and(|input_at| *input_at > turn_started_at)
+                || self
+                    .native_chat_drafts
+                    .get(&session_id)
+                    .is_some_and(|draft| !draft.trim().is_empty())
+            {
+                continue;
+            }
+            let Some(session) = self.session_store.session(session_id) else {
+                continue;
+            };
+            candidates.push((
+                session_id,
+                worktree_id.clone(),
+                live.provider_session_id.clone(),
+                session,
+            ));
+        }
+
+        let mut tasks = Vec::with_capacity(candidates.len());
+        for (id, worktree_id, provider_session_id, session) in candidates {
+            let record = SleepingAgentSession {
+                worktree_id: worktree_id.clone(),
+                agent: "claude".to_string(),
+                provider_session_id,
+                captured_at_unix_ms: u64::try_from(current_unix_ms()).unwrap_or(u64::MAX),
+            };
+            self.pending_agent_hibernations.insert(id, record);
+            tasks.push(crate::background::blocking(move |mut sender| {
+                let result = session
+                    .kill()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = sender.try_send(Message::AgentHibernationStopped {
+                    id,
+                    worktree_id,
+                    result,
+                });
+            }));
+        }
+        iced::Task::batch(tasks)
+    }
+
     /// 훅 이벤트 하나를 장부에 반영한다.
     ///
     /// **nonce가 다르면 버린다.** 세션이 교체된 뒤 도착한 옛 프로세스의 훅이
     /// 새 세션의 배지를 덮는 것을 막는 유일한 방어다.
-    fn apply_hook(&mut self, event: &HookEvent) {
+    fn apply_hook(&mut self, event: &HookEvent) -> bool {
         let worktree_id = &event.pane_key.0;
+        let outcome = hook_outcome(event);
+        let should_notify = matches!(outcome, HookOutcome::Set(HookState::Done))
+            && self.ui_settings.notifications_enabled
+            && self.ui_settings.notification_agent_task_complete
+            && !(self.ui_settings.notification_suppress_when_focused && self.app_window_focused);
         // presence를 **먼저** 읽는다(아래에서 `badges`를 가변 대여하므로).
         let presence = self.worktree_presence(worktree_id);
-        let Some(badge) = self.badges.get_mut(worktree_id) else {
+        let Some((expected_nonce, allow_reattach_nonce_bind)) = self
+            .badges
+            .get(worktree_id)
+            .map(|badge| (badge.expected, badge.allow_reattach_nonce_bind))
+        else {
             // 우리가 스폰한 적 없는 pane의 이벤트다.
-            return;
+            return false;
         };
-        if event.spawn_nonce != badge.expected {
-            // 옛 세대의 늦은 훅. **조용히 버린다** — 오류가 아니다.
-            return;
+        if event.spawn_nonce != expected_nonce {
+            if !allow_reattach_nonce_bind {
+                // 옛 세대의 늦은 훅. **조용히 버린다** — 오류가 아니다.
+                return false;
+            }
+            // create_or_attach가 기존 daemon PTY임을 확인한 경우에만 허용되는 단발성
+            // 재결합이다. endpoint 파일이 포트/token을 갱신한 뒤 살아남은 Claude가
+            // 처음 보내는 이벤트가 그 PTY의 원래 nonce를 증명한다.
+            if let Some(badge) = self.badges.get_mut(worktree_id) {
+                badge.expected = event.spawn_nonce;
+                badge.allow_reattach_nonce_bind = false;
+            }
+        } else if allow_reattach_nonce_bind {
+            if let Some(badge) = self.badges.get_mut(worktree_id) {
+                badge.allow_reattach_nonce_bind = false;
+            }
         }
+        self.note_agent_resume_hook(event, outcome);
+        if self.ui_settings.tab_auto_generate_title {
+            if let (Some(session_id), Some(title)) = (
+                self.worktree_sessions.get(worktree_id).copied(),
+                event
+                    .prompt
+                    .as_deref()
+                    .and_then(crate::tab_title::derive_generated_tab_title),
+            ) {
+                self.generated_session_titles
+                    .entry(session_id)
+                    .or_insert(title);
+            }
+        }
+        let badge = self
+            .badges
+            .get_mut(worktree_id)
+            .expect("badge existence was checked above");
+        let badge_before = reduce(&BadgeInput {
+            presence,
+            hook: badge.hook,
+            previous: badge.previous,
+            no_agent_streak: badge.no_agent_streak,
+            now: Instant::now(),
+        });
         // 이 세대의 훅이 **하나라도** 도착했다 = claude가 이 pane을 소유한다.
         // 출처가 `Ignore`(유령)든 `Reset`(SessionStart)이든, 이 pane은 훅-권위이고
         // 그 뒤로 OSC-title이 배지를 덮어선 안 된다([`note_title_status_for_badge`]).
         badge.received_hook = true;
-        match hook_outcome(event) {
+        match outcome {
             HookOutcome::Ignore => {}
             HookOutcome::Reset => badge.hook = None,
             HookOutcome::Set(state) => badge.hook = Some((state, Instant::now())),
@@ -1917,6 +6481,189 @@ impl AppState {
                 now: Instant::now(),
             });
         }
+        let badge_after = reduce(&BadgeInput {
+            presence,
+            hook: badge.hook,
+            previous: badge.previous,
+            no_agent_streak: badge.no_agent_streak,
+            now: Instant::now(),
+        });
+        let reset_cache_timer = matches!(
+            outcome,
+            HookOutcome::Reset | HookOutcome::Set(HookState::Working)
+        );
+        let start_cache_timer = self.ui_settings.prompt_cache_timer_enabled
+            && badge_before == BadgeState::Working
+            && badge_after == BadgeState::Done;
+        // End the mutable badge borrow before touching the independent timer map.
+        let _ = badge;
+        if reset_cache_timer {
+            self.prompt_cache_started.remove(worktree_id);
+        } else if start_cache_timer {
+            self.prompt_cache_started
+                .insert(worktree_id.clone(), Instant::now());
+        }
+        if self.ui_settings.experimental_terminal_attention
+            && matches!(badge_after, BadgeState::Waiting | BadgeState::Done)
+        {
+            if let Some(session_id) = self.worktree_sessions.get(worktree_id).copied() {
+                if self.focused_session() != Some(session_id) {
+                    self.terminal_attention_sessions.insert(session_id);
+                }
+            }
+        }
+        if self.ui_settings.experimental_activity {
+            let status = match outcome {
+                HookOutcome::Reset => Some("Session started"),
+                HookOutcome::Set(HookState::Working) => Some("Working"),
+                HookOutcome::Set(HookState::Waiting) => Some("Needs attention"),
+                HookOutcome::Set(HookState::Done) => Some("Completed"),
+                HookOutcome::Ignore => None,
+            };
+            if let Some(status) = status {
+                let label = self
+                    .find_worktree(worktree_id)
+                    .and_then(|(_, entry)| entry.branch.clone())
+                    .unwrap_or_else(|| worktree_id.0.clone());
+                let detail = event
+                    .tool_name
+                    .clone()
+                    .or_else(|| event.prompt.clone())
+                    .unwrap_or_else(|| format!("{:?}", event.event));
+                self.activity_events.insert(
+                    0,
+                    ActivityEvent {
+                        worktree: label,
+                        status: status.into(),
+                        detail: detail.chars().take(160).collect(),
+                    },
+                );
+                self.activity_events.truncate(200);
+            }
+        }
+        if should_notify {
+            crate::notification_sound::show(
+                "Agent task completed",
+                &self.ui_settings.notification_sound,
+                self.ui_settings.notification_custom_sound_path.as_deref(),
+                self.ui_settings.notification_volume,
+            );
+        }
+        self.sync_keep_awake();
+        true
+    }
+
+    fn deliver_plugin_event(
+        &self,
+        event: &'static str,
+        payload: serde_json::Value,
+    ) -> iced::Task<Message> {
+        if !self.ui_settings.plugin_system_enabled {
+            return iced::Task::none();
+        }
+        iced::Task::perform(
+            crate::plugin_worker::deliver_event(self.plugins.clone(), event.to_string(), payload),
+            Message::PluginEventDeliveryFinished,
+        )
+    }
+
+    fn maybe_auto_rename_branch(&mut self, event: &HookEvent) -> iced::Task<Message> {
+        if !self.ui_settings.auto_rename_branch_from_work
+            || !matches!(hook_outcome(event), HookOutcome::Set(HookState::Working))
+        {
+            return iced::Task::none();
+        }
+        let worktree_id = event.pane_key.0.clone();
+        let current_nonce = self.badges.get(&worktree_id).map(|badge| badge.expected);
+        if current_nonce != Some(event.spawn_nonce)
+            || self.auto_branch_rename_in_flight.contains(&worktree_id)
+            || self.auto_branch_rename_settled.contains(&worktree_id)
+        {
+            return iced::Task::none();
+        }
+        let Some(prompt) = event
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_string)
+        else {
+            return iced::Task::none();
+        };
+        // Only worktrees created by Suaegi are eligible. Imported worktrees
+        // have a zero/unknown creation timestamp and may coincidentally use a
+        // creature branch chosen by their owner.
+        if self
+            .worktree_meta
+            .get(&worktree_id)
+            .is_none_or(|meta| meta.created_at_unix_ms == 0)
+        {
+            self.remember_auto_branch_rename_settled(worktree_id);
+            return iced::Task::none();
+        }
+        let Some((repo_id, entry)) = self.find_worktree(&worktree_id) else {
+            return iced::Task::none();
+        };
+        let Some(branch) = entry.branch.clone() else {
+            return iced::Task::none();
+        };
+        if !suaegi_workname::is_auto_generated_creature_branch_name(
+            branch.rsplit('/').next().unwrap_or(&branch),
+        ) {
+            self.remember_auto_branch_rename_settled(worktree_id);
+            return iced::Task::none();
+        }
+        let worktree_path = entry.path.clone();
+        let repo_id = repo_id.clone();
+        let source_control_ai_generation = self
+            .ui_settings
+            .repo_source_control_ai
+            .get(&repo_id.0)
+            .and_then(|overrides| overrides.enabled)
+            .unwrap_or(self.ui_settings.source_control_ai.enabled)
+            .then(|| {
+                self.source_control_ai_request(
+                    &repo_id,
+                    crate::source_control_ai::TextOperation::BranchName,
+                )
+            });
+        let configured_prefix = match self.ui_settings.branch_prefix.as_str() {
+            "custom" => Some(self.ui_settings.branch_prefix_custom.trim().to_string())
+                .filter(|prefix| !prefix.is_empty()),
+            "git-username" => std::env::var("GIT_AUTHOR_NAME")
+                .ok()
+                .or_else(|| std::env::var("USER").ok())
+                .filter(|prefix| !prefix.trim().is_empty()),
+            _ => None,
+        };
+        self.auto_branch_rename_in_flight
+            .insert(worktree_id.clone());
+        iced::Task::perform(
+            crate::branch_rename::rename_from_first_work(
+                worktree_path,
+                branch,
+                prompt,
+                configured_prefix,
+                source_control_ai_generation,
+            ),
+            move |outcome| Message::AutoBranchRenameFinished {
+                repo_id,
+                worktree_id,
+                outcome,
+            },
+        )
+    }
+
+    fn remember_auto_branch_rename_settled(&mut self, worktree_id: WorktreeId) {
+        const SETTLED_LIMIT: usize = 500;
+        if self.auto_branch_rename_settled.len() >= SETTLED_LIMIT {
+            // HashSet has no insertion order; boundedness matters more than
+            // which rare old entry gets re-probed.
+            if let Some(old) = self.auto_branch_rename_settled.iter().next().cloned() {
+                self.auto_branch_rename_settled.remove(&old);
+            }
+        }
+        self.auto_branch_rename_settled.insert(worktree_id);
     }
 
     /// presence 관측 하나를 배지 장부에 반영한다. `reduce`가 `NoAgent` streak를
@@ -1951,6 +6698,7 @@ impl AppState {
                 now: Instant::now(),
             });
         }
+        self.sync_keep_awake();
     }
 
     /// 모든 세션의 타이틀 변경을 드레인하고, OscTitle 세션은 최신 타이틀에서 배지
@@ -1967,9 +6715,7 @@ impl AppState {
             let Some(source) = self.session_store.status_source(id) else {
                 continue;
             };
-            if let Some(state) =
-                crate::agent_status::title::title_status_update(&changes, source)
-            {
+            if let Some(state) = crate::agent_status::title::title_status_update(&changes, source) {
                 if let Some(worktree_id) = self.session_worktrees.get(&id) {
                     updates.push((worktree_id.clone(), state));
                 }
@@ -2074,6 +6820,7 @@ impl AppState {
                 now: Instant::now(),
             });
         }
+        self.sync_keep_awake();
     }
 
     pub(crate) fn session_title(&self, id: SessionId) -> &str {
@@ -2117,6 +6864,1316 @@ impl AppState {
         &self.diff
     }
 
+    pub(crate) fn file_explorer(&self) -> &FileExplorerState {
+        &self.file_explorer
+    }
+
+    pub(crate) fn editor(&self) -> &EditorState {
+        &self.editor
+    }
+
+    pub(crate) fn quick_open(&self) -> &QuickOpenState {
+        &self.quick_open
+    }
+
+    pub(crate) fn content_search(&self) -> &ContentSearchState {
+        &self.content_search
+    }
+
+    pub(crate) fn source_control(&self) -> &SourceControlState {
+        &self.source_control
+    }
+
+    pub(crate) fn automations(&self) -> &[AutomationConfig] {
+        &self.automations
+    }
+
+    pub(crate) fn automation_ui(&self) -> &AutomationUiState {
+        &self.automation_ui
+    }
+
+    pub(crate) fn automation_worktree_choices(&self) -> Vec<String> {
+        let mut choices: Vec<String> = self
+            .worktrees_by_repo
+            .values()
+            .flatten()
+            .map(|entry| worktree_id_for(&entry.path).0)
+            .collect();
+        choices.sort();
+        choices
+    }
+
+    fn open_editor_file(&mut self, worktree: WorktreeId, path: String) -> iced::Task<Message> {
+        if self.editor.is_document(&worktree, &path) {
+            self.editor.activate(&worktree, &path);
+            return iced::Task::none();
+        }
+        self.load_editor_document(worktree, path)
+    }
+
+    fn load_editor_document(&mut self, worktree: WorktreeId, path: String) -> iced::Task<Message> {
+        if worktree.0 == "__suaegi_floating_workspace__" {
+            let Some(root) = self.floating_workspace_markdown_root.clone() else {
+                return iced::Task::none();
+            };
+            let op = self.next_op();
+            self.editor.begin_load(worktree.clone(), path.clone(), op);
+            return crate::editor::load_file(worktree, root, path, op);
+        }
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        self.editor.begin_load(worktree.clone(), path.clone(), op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_fs::read_file(target, project_root, path),
+                move |result| Message::EditorFileLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_orca::read_file(environment, project_root, path),
+                move |result| Message::EditorFileLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::editor::load_file(worktree, entry.path, path, op)
+    }
+
+    fn request_file_open_changed(
+        &self,
+        request: crate::local_rpc::LocalRpcRequest,
+        worktree: WorktreeId,
+        mode: String,
+    ) -> iced::Task<Message> {
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            request.respond(Err(format!("Worktree not found: {}", worktree.0)));
+            return iced::Task::none();
+        };
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let request = request.clone();
+            let worktree = worktree.clone();
+            let mode = mode.clone();
+            return iced::Task::perform(
+                crate::remote_git::status_detailed(target, project_root),
+                move |result| Message::FileOpenChangedLoaded {
+                    request: request.clone(),
+                    worktree: worktree.clone(),
+                    mode: mode.clone(),
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let request = request.clone();
+            let worktree = worktree.clone();
+            let mode = mode.clone();
+            return iced::Task::perform(
+                crate::remote_orca::status_detailed(environment, project_root),
+                move |result| Message::FileOpenChangedLoaded {
+                    request: request.clone(),
+                    worktree: worktree.clone(),
+                    mode: mode.clone(),
+                    result,
+                },
+            );
+        }
+        iced::Task::perform(
+            crate::source_control::status_now(entry.path),
+            move |result| Message::FileOpenChangedLoaded {
+                request: request.clone(),
+                worktree: worktree.clone(),
+                mode: mode.clone(),
+                result,
+            },
+        )
+    }
+
+    fn watch_editor_file(&self) -> iced::Task<Message> {
+        let Some((worktree, path, expected)) = self.editor.external_watch_target() else {
+            return iced::Task::none();
+        };
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            return iced::Task::none();
+        };
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            iced::Task::perform(
+                crate::remote_fs::file_signature(target, project_root, path.clone()),
+                {
+                    let worktree = worktree.clone();
+                    let path = path.clone();
+                    let expected = expected.clone();
+                    move |result| Message::EditorExternalSignatureChecked {
+                        worktree: worktree.clone(),
+                        path: path.clone(),
+                        expected: expected.clone(),
+                        result,
+                    }
+                },
+            )
+        } else if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            iced::Task::perform(
+                crate::remote_orca::file_signature(environment, project_root, path.clone()),
+                {
+                    let worktree = worktree.clone();
+                    let path = path.clone();
+                    let expected = expected.clone();
+                    move |result| Message::EditorExternalSignatureChecked {
+                        worktree: worktree.clone(),
+                        path: path.clone(),
+                        expected: expected.clone(),
+                        result,
+                    }
+                },
+            )
+        } else {
+            iced::Task::perform(
+                crate::editor::file_signature_now(entry.path.clone(), path.clone()),
+                {
+                    let worktree = worktree.clone();
+                    let path = path.clone();
+                    let expected = expected.clone();
+                    move |result| Message::EditorExternalSignatureChecked {
+                        worktree: worktree.clone(),
+                        path: path.clone(),
+                        expected: expected.clone(),
+                        result,
+                    }
+                },
+            )
+        }
+    }
+
+    /// Low-frequency tools share one context slot instead of accumulating
+    /// horizontally and squeezing the terminal/editor.
+    fn close_context_panels(&mut self) {
+        self.active_plugin_panel = None;
+        self.plugin_panel_error = None;
+        crate::plugin_panel::set_visible(false);
+        self.browser_open = false;
+        crate::browser::set_visible(false);
+        self.quick_open.close();
+        self.content_search.close();
+        self.source_control.close();
+        self.file_explorer.close();
+        self.automation_ui.close();
+        self.diff.close();
+        self.pr_panel.close();
+        self.integrations_open = false;
+        self.help_open = false;
+        self.workspace_options_open = false;
+        self.project_actions_open = None;
+        self.worktree_actions_open = None;
+        self.workspace_board_open = false;
+        self.activity_open = false;
+        self.status_popover = None;
+        self.create_pr = None;
+    }
+
+    fn plugin_panel_bounds(&self) -> crate::plugin_panel::PanelBounds {
+        crate::plugin_panel::PanelBounds {
+            left: (self.app_window_size.width - crate::file_explorer::WIDTH).max(0.0),
+            top: 26.0,
+            width: crate::file_explorer::WIDTH,
+            height: (self.app_window_size.height - 26.0 - crate::browser::STATUS_BAR_HEIGHT)
+                .max(1.0),
+        }
+    }
+
+    fn browser_bounds(&self) -> (f32, f32, f32, f32) {
+        if self.floating_workspace_owns_browser() {
+            let header = 37.0;
+            let (panel_left, panel_top, panel_width, panel_height) =
+                self.floating_workspace_panel_geometry();
+            return (
+                panel_left,
+                panel_top + header + crate::browser::TOOLBAR_HEIGHT,
+                panel_width,
+                (panel_height - header - crate::browser::TOOLBAR_HEIGHT).max(1.0),
+            );
+        }
+        let left = if self.left_sidebar_open {
+            crate::sidebar::WIDTH
+        } else {
+            32.0
+        };
+        let top = crate::browser::TOOLBAR_HEIGHT;
+        let width = (self.app_window_size.width - left).max(1.0);
+        let height =
+            (self.app_window_size.height - top - crate::browser::STATUS_BAR_HEIGHT).max(1.0);
+        (left, top, width, height)
+    }
+
+    fn remember_active_browser_tab(&mut self) {
+        let Some(id) = self.active_browser_tab_id.as_deref() else {
+            return;
+        };
+        if let Some(tab) = self.browser_tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.url = self.browser_current_url.clone();
+        }
+    }
+
+    fn create_browser_tab(&mut self, url: String, profile_id: String) -> String {
+        let id = format!("page-{}", current_unix_ms());
+        self.browser_tabs.push(BrowserTabSetting {
+            id: id.clone(),
+            worktree_id: self.selected_worktree.clone(),
+            url,
+            title: String::new(),
+            profile_id,
+        });
+        id
+    }
+
+    fn activate_browser_tab(&mut self, id: &str) -> Result<(), String> {
+        self.remember_active_browser_tab();
+        let tab = self
+            .browser_tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .cloned()
+            .ok_or_else(|| format!("Browser tab not found: {id}"))?;
+        self.active_browser_tab_id = Some(tab.id);
+        self.browser_current_url = tab.url;
+        self.browser_address_draft =
+            if self.browser_current_url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                String::new()
+            } else {
+                self.browser_current_url.clone()
+            };
+        Ok(())
+    }
+
+    fn normalized_browser_url(&self, raw: &str) -> Option<String> {
+        let engine = match self.ui_settings.browser_search_engine.as_str() {
+            "duckduckgo" => suaegi_browser_url::SearchEngine::DuckDuckGo,
+            "bing" => suaegi_browser_url::SearchEngine::Bing,
+            "kagi" => suaegi_browser_url::SearchEngine::Kagi,
+            _ => suaegi_browser_url::SearchEngine::Google,
+        };
+        suaegi_browser_url::normalize_browser_navigation_url(
+            raw,
+            suaegi_browser_url::SearchFallback::Engine(engine),
+            suaegi_browser_url::SearchUrlOptions::default(),
+        )
+    }
+
+    fn webview_url(url: &str) -> &str {
+        if url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+            "about:blank"
+        } else {
+            url
+        }
+    }
+
+    fn open_browser_url(&mut self, raw: &str) {
+        let Some(url) = self.normalized_browser_url(raw) else {
+            self.browser_error = Some("Enter a valid web address or search query.".to_string());
+            return;
+        };
+        self.browser_address_draft = if url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+            String::new()
+        } else {
+            url.clone()
+        };
+        self.browser_current_url = url.clone();
+        self.browser_error = crate::browser::load(Self::webview_url(&url)).err();
+        self.remember_active_browser_tab();
+        self.persist();
+    }
+
+    fn route_web_url(&mut self, raw: &str) -> iced::Task<Message> {
+        if self.ui_settings.open_links_in_app {
+            if let Some(url) = suaegi_browser_url::normalize_external_browser_url(raw) {
+                self.browser_current_url = url.clone();
+                self.browser_address_draft = url;
+                return self.update(Message::BrowserOpenRequested);
+            }
+        }
+        open_external_url(raw);
+        iced::Task::none()
+    }
+
+    fn open_quick_open(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.quick_open.worktree() == Some(&worktree) {
+            self.quick_open.close();
+            return iced::Task::none();
+        }
+        let Some(path) = self
+            .find_worktree(&worktree)
+            .map(|(_repo, entry)| entry.path.clone())
+        else {
+            return iced::Task::none();
+        };
+        let excludes = self
+            .worktrees_by_repo
+            .values()
+            .flatten()
+            .filter(|entry| entry.path != path)
+            .map(|entry| entry.path.clone())
+            .collect();
+        let op = self.next_op();
+        self.close_context_panels();
+        self.quick_open.begin(worktree.clone(), op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_search::list_files(target, project_root),
+                move |result| Message::QuickOpenLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_orca::list_files(environment, project_root),
+                move |result| Message::QuickOpenLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::quick_open::list_files(worktree, path, excludes, op)
+    }
+
+    fn open_selected_quick_open_file(&mut self) -> iced::Task<Message> {
+        let Some((worktree, path)) = self.quick_open.selected_file() else {
+            return iced::Task::none();
+        };
+        self.quick_open.close();
+        self.open_editor_file(worktree, path)
+    }
+
+    fn open_content_search(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.content_search.worktree() == Some(&worktree) {
+            self.content_search.close();
+            return iced::Task::none();
+        }
+        if self.find_worktree(&worktree).is_none() {
+            return iced::Task::none();
+        }
+        self.close_context_panels();
+        self.right_sidebar_open = true;
+        self.right_sidebar_tab = RightSidebarTab::Explorer;
+        self.content_search.open(worktree);
+        iced::widget::operation::focus(crate::content_search::input_id())
+    }
+
+    fn run_content_search(&mut self) -> iced::Task<Message> {
+        let Some(worktree) = self.content_search.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        let Some(path) = self
+            .find_worktree(&worktree)
+            .map(|(_repo, entry)| entry.path.clone())
+        else {
+            self.content_search.close();
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        let Some(request) = self.content_search.begin_search(path, op) else {
+            return iced::Task::none();
+        };
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_search::search(target, project_root, request.options),
+                move |result| Message::ContentSearchFinished {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_orca::search(environment, project_root, request.options),
+                move |result| Message::ContentSearchFinished {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::content_search::run(request)
+    }
+
+    fn open_source_control(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.source_control.worktree() == Some(&worktree) {
+            self.source_control.close();
+            return iced::Task::none();
+        }
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        self.close_context_panels();
+        self.right_sidebar_open = true;
+        self.right_sidebar_tab = RightSidebarTab::SourceControl;
+        self.source_control.begin_load(worktree.clone(), op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_git::status_detailed(target, project_root),
+                move |result| Message::SourceControlStatusLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_orca::status_detailed(environment, project_root),
+                move |result| Message::SourceControlStatusLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::source_control::load_status(worktree, entry.path, op)
+    }
+
+    fn request_task_items(&mut self) -> iced::Task<Message> {
+        self.task_items_error = None;
+        if !matches!(
+            self.task_provider,
+            TaskProvider::Github | TaskProvider::Gitlab
+        ) {
+            self.task_items_loading = false;
+            self.task_items.clear();
+            self.task_items_by_repo.clear();
+            self.task_items_pending.clear();
+            self.task_item_errors.clear();
+            return iced::Task::none();
+        }
+        let targets = self
+            .repos
+            .iter()
+            .filter(|repo| self.task_repo_selection.contains(&repo.id))
+            .map(|repo| (repo.id.clone(), repo.path.clone()))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.task_items_loading = false;
+            self.task_items.clear();
+            return iced::Task::none();
+        }
+        let op = self.next_op();
+        self.task_items_op = Some(op);
+        self.task_items_loading = true;
+        self.task_items.clear();
+        self.task_items_by_repo.clear();
+        self.task_item_errors.clear();
+        self.task_items_pending = targets.iter().map(|(id, _)| id.clone()).collect();
+        let provider = self.task_provider;
+        let kind = self.task_kind;
+        let preset = self.task_preset;
+        let query = self.task_query.clone();
+        iced::Task::batch(
+            targets
+                .into_iter()
+                .map(|(repo_id, repo_path)| match provider {
+                    TaskProvider::Github => {
+                        crate::tasks::load_github_work(op, repo_id, repo_path, kind, query.clone())
+                    }
+                    TaskProvider::Gitlab => crate::tasks::load_gitlab_work(
+                        op,
+                        repo_id,
+                        repo_path,
+                        kind,
+                        preset,
+                        query.clone(),
+                    ),
+                    TaskProvider::Jira | TaskProvider::Linear => iced::Task::none(),
+                }),
+        )
+    }
+
+    fn finish_task_item_batch(&mut self) {
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        for repo in &self.repos {
+            for item in self.task_items_by_repo.get(&repo.id).into_iter().flatten() {
+                if seen.insert(item.url.clone()) {
+                    items.push(item.clone());
+                }
+            }
+        }
+        items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.url.cmp(&right.url))
+        });
+        self.task_items = items;
+        self.task_items_loading = false;
+        self.task_items_op = None;
+        self.task_items_error = if self.task_items.is_empty() && !self.task_item_errors.is_empty() {
+            Some(format!(
+                "{} selected project{} could not be loaded.",
+                self.task_item_errors.len(),
+                if self.task_item_errors.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+        } else {
+            None
+        };
+    }
+
+    fn request_remote_provider_accounts(&mut self) -> iced::Task<Message> {
+        let Some(environment) = self
+            .ui_settings
+            .active_runtime_environment_id
+            .as_deref()
+            .and_then(|id| {
+                self.ui_settings
+                    .runtime_environments
+                    .iter()
+                    .find(|environment| environment.id == id)
+            })
+            .cloned()
+        else {
+            self.remote_provider_accounts = None;
+            self.remote_provider_accounts_loading = false;
+            self.remote_provider_accounts_error = None;
+            return iced::Task::none();
+        };
+        if self.remote_provider_accounts_loading {
+            return iced::Task::none();
+        }
+        self.remote_provider_accounts_loading = true;
+        self.remote_provider_accounts_error = None;
+        iced::Task::perform(
+            crate::remote_runtime::list_provider_accounts(environment),
+            Message::RemoteProviderAccountsRefreshFinished,
+        )
+    }
+
+    fn accept_remote_provider_accounts(
+        &mut self,
+        snapshot: crate::remote_runtime::RemoteProviderAccounts,
+    ) {
+        use crate::rate_limits::RateLimitProvider;
+        if let Some(limits) = snapshot.claude_limits.clone() {
+            self.provider_rate_limits
+                .insert(RateLimitProvider::Claude, limits);
+        } else {
+            self.provider_rate_limits.remove(&RateLimitProvider::Claude);
+        }
+        if let Some(limits) = snapshot.codex_limits.clone() {
+            self.provider_rate_limits
+                .insert(RateLimitProvider::Codex, limits);
+        } else {
+            self.provider_rate_limits.remove(&RateLimitProvider::Codex);
+        }
+        self.remote_provider_accounts = Some(snapshot);
+        self.remote_provider_accounts_error = None;
+    }
+
+    fn source_control_ai_request(
+        &self,
+        repo: &RepoId,
+        operation: crate::source_control_ai::TextOperation,
+    ) -> crate::source_control_ai::GenerationRequest {
+        let mut environment = Vec::new();
+        if let Some(account) = self
+            .ui_settings
+            .active_claude_managed_account_id
+            .as_deref()
+            .and_then(|id| {
+                self.ui_settings
+                    .claude_managed_accounts
+                    .iter()
+                    .find(|account| account.id == id)
+            })
+        {
+            environment.push(("CLAUDE_CONFIG_DIR".to_string(), account.config_dir.clone()));
+        }
+        if let Some(account) = self
+            .ui_settings
+            .active_codex_managed_account_id
+            .as_deref()
+            .and_then(|id| {
+                self.ui_settings
+                    .codex_managed_accounts
+                    .iter()
+                    .find(|account| account.id == id)
+            })
+        {
+            environment.push(("CODEX_HOME".to_string(), account.config_dir.clone()));
+        }
+        let proxy = self.ui_settings.http_proxy_url.trim();
+        if !proxy.is_empty() {
+            environment.extend([
+                ("HTTP_PROXY".to_string(), proxy.to_string()),
+                ("HTTPS_PROXY".to_string(), proxy.to_string()),
+                ("http_proxy".to_string(), proxy.to_string()),
+                ("https_proxy".to_string(), proxy.to_string()),
+            ]);
+        }
+        let bypass = self.ui_settings.http_proxy_bypass_rules.trim();
+        if !bypass.is_empty() {
+            environment.extend([
+                ("NO_PROXY".to_string(), bypass.to_string()),
+                ("no_proxy".to_string(), bypass.to_string()),
+            ]);
+        }
+        crate::source_control_ai::GenerationRequest {
+            operation,
+            settings: self.ui_settings.source_control_ai.clone(),
+            repo_overrides: self
+                .ui_settings
+                .repo_source_control_ai
+                .get(&repo.0)
+                .cloned(),
+            agent_command_overrides: self.ui_settings.agent_command_overrides.clone(),
+            environment,
+        }
+    }
+
+    fn source_control_ai_pr_defaults(
+        &self,
+        repo: &RepoId,
+    ) -> suaegi_core::domain::SourceControlAiPrCreationDefaults {
+        let global = &self.ui_settings.source_control_ai.pr_creation_defaults;
+        let overrides = self
+            .ui_settings
+            .repo_source_control_ai
+            .get(&repo.0)
+            .map(|overrides| &overrides.pr_creation_defaults);
+        suaegi_core::domain::SourceControlAiPrCreationDefaults {
+            draft: overrides
+                .and_then(|value| value.draft)
+                .unwrap_or(global.draft),
+            use_template: overrides
+                .and_then(|value| value.use_template)
+                .unwrap_or(global.use_template),
+            generate_details_on_open: overrides
+                .and_then(|value| value.generate_details_on_open)
+                .unwrap_or(global.generate_details_on_open),
+            open_after_create: overrides
+                .and_then(|value| value.open_after_create)
+                .unwrap_or(global.open_after_create),
+        }
+    }
+
+    fn refresh_source_control(&mut self) -> iced::Task<Message> {
+        let Some(worktree) = self.source_control.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.source_control.close();
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        if !self.source_control.begin_refresh(op) {
+            return iced::Task::none();
+        }
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_git::status_detailed(target, project_root),
+                move |result| Message::SourceControlStatusLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::source_control::load_status(worktree, entry.path, op)
+    }
+
+    fn run_source_control_operation(
+        &mut self,
+        operation: SourceControlOperation,
+    ) -> iced::Task<Message> {
+        let Some(worktree) = self.source_control.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.source_control.close();
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        if !self.source_control.begin_operation(op, operation.clone()) {
+            return iced::Task::none();
+        }
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_operation = operation.clone();
+            return iced::Task::perform(
+                crate::remote_git::run_operation(target, project_root, operation),
+                move |result| Message::SourceControlOperationFinished {
+                    worktree: message_worktree.clone(),
+                    op,
+                    operation: message_operation.clone(),
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_operation = operation.clone();
+            return iced::Task::perform(
+                crate::remote_orca::run_operation(environment, project_root, operation),
+                move |result| Message::SourceControlOperationFinished {
+                    worktree: message_worktree.clone(),
+                    op,
+                    operation: message_operation.clone(),
+                    result,
+                },
+            );
+        }
+        crate::source_control::run_operation(worktree, entry.path, op, operation)
+    }
+
+    fn dispatch_source_control_prompt(
+        &mut self,
+        worktree: WorktreeId,
+        prompt: String,
+    ) -> iced::Task<Message> {
+        self.selected_worktree = Some(worktree.clone());
+        if let Some(&session_id) = self.worktree_sessions.get(&worktree) {
+            let Some(session) = self.session_store.session(session_id) else {
+                self.last_error = Some("The workspace terminal is unavailable.".to_string());
+                return iced::Task::none();
+            };
+            let mut bytes = prompt.into_bytes();
+            bytes.push(b'\r');
+            if !session.write(bytes) {
+                self.last_error = Some("Could not send the Source Control AI action.".to_string());
+            }
+            return iced::Task::none();
+        }
+        if self.pending_session_starts.contains_key(&worktree) {
+            self.last_error =
+                Some("The workspace terminal is still starting. Try again shortly.".to_string());
+            return iced::Task::none();
+        }
+        self.pending_prompts.insert(worktree.clone(), prompt);
+        match self.start_session_for(&worktree) {
+            Some((_session_id, task)) => task,
+            None => {
+                self.pending_prompts.remove(&worktree);
+                self.last_error = Some("The workspace is unavailable.".to_string());
+                iced::Task::none()
+            }
+        }
+    }
+
+    fn dispatch_automation_prompt(&mut self, config: &AutomationConfig) -> iced::Task<Message> {
+        if let Some(&session_id) = self.worktree_sessions.get(&config.worktree_id) {
+            if self.worktree_badge(&config.worktree_id) != BadgeState::Done {
+                self.automation_ui.error = Some(format!(
+                    "{} was not dispatched because its agent is not confirmed idle",
+                    config.name
+                ));
+                return iced::Task::none();
+            }
+            let Some(session) = self.session_store.session(session_id) else {
+                self.automation_ui.error = Some("Automation session disappeared".to_string());
+                return iced::Task::none();
+            };
+            let mut bytes = config.prompt.as_bytes().to_vec();
+            bytes.push(b'\r');
+            if session.write(bytes) {
+                self.automation_ui.notice = Some(format!("Dispatched {}", config.name));
+            } else {
+                self.automation_ui.error =
+                    Some(format!("Could not write automation {}", config.name));
+            }
+            return iced::Task::none();
+        }
+        if self
+            .pending_session_starts
+            .contains_key(&config.worktree_id)
+        {
+            self.automation_ui.error = Some(format!(
+                "{} is still starting; automation was not dispatched",
+                config.name
+            ));
+            return iced::Task::none();
+        }
+        if agent_def_by_id(&config.provider).is_none() {
+            self.automation_ui.error =
+                Some(format!("Unknown automation provider: {}", config.provider));
+            return iced::Task::none();
+        }
+        self.pending_agent_overrides
+            .insert(config.worktree_id.clone(), config.provider.clone());
+        self.pending_prompts
+            .insert(config.worktree_id.clone(), config.prompt.clone());
+        match self.start_session_for(&config.worktree_id) {
+            Some((_session_id, task)) => {
+                self.automation_ui.notice = Some(format!("Starting {}", config.name));
+                task
+            }
+            None => {
+                self.pending_agent_overrides.remove(&config.worktree_id);
+                self.pending_prompts.remove(&config.worktree_id);
+                self.automation_ui.error =
+                    Some(format!("Worktree for {} is unavailable", config.name));
+                iced::Task::none()
+            }
+        }
+    }
+
+    fn record_automation_run(
+        &mut self,
+        config: &AutomationConfig,
+        trigger: &str,
+        scheduled_for: i64,
+        status: &str,
+        error: Option<String>,
+    ) -> AutomationRunRecord {
+        let now = crate::automation::now_ms();
+        let run = AutomationRunRecord {
+            id: format!("run-{}-{}", now, self.next_op().0),
+            automation_id: config.id.clone(),
+            trigger: trigger.to_string(),
+            status: status.to_string(),
+            scheduled_for_unix_ms: scheduled_for,
+            started_at_unix_ms: now,
+            finished_at_unix_ms: (status != "dispatching").then_some(now),
+            error,
+        };
+        self.automation_runs.push(run.clone());
+        while self
+            .automation_runs
+            .iter()
+            .filter(|candidate| candidate.automation_id == config.id)
+            .count()
+            > 100
+        {
+            if let Some(index) = self
+                .automation_runs
+                .iter()
+                .position(|candidate| candidate.automation_id == config.id)
+            {
+                self.automation_runs.remove(index);
+            }
+        }
+        run
+    }
+
+    fn run_due_automations(&mut self, now: i64) -> iced::Task<Message> {
+        let mut due = Vec::new();
+        for (index, config) in self.automations.iter().enumerate() {
+            match crate::automation::due_at(config, now) {
+                Ok(Some(scheduled_for)) => due.push((index, scheduled_for, config.clone())),
+                Ok(None) => {}
+                Err(error) => {
+                    self.automation_ui.error = Some(format!("{}: {error}", config.name));
+                }
+            }
+        }
+        let mut tasks = Vec::new();
+        for (index, scheduled_for, config) in due {
+            self.automations[index].last_dispatched_unix_ms = Some(scheduled_for);
+            self.automation_ui.error = None;
+            tasks.push(self.dispatch_automation_prompt(&config));
+            let error = self.automation_ui.error.clone();
+            self.record_automation_run(
+                &config,
+                "scheduled",
+                scheduled_for,
+                if error.is_some() {
+                    "failed"
+                } else {
+                    "dispatched"
+                },
+                error,
+            );
+        }
+        if !tasks.is_empty() {
+            self.persist();
+        }
+        iced::Task::batch(tasks)
+    }
+
+    fn save_editor_file(&mut self) -> iced::Task<Message> {
+        let Some(worktree) = self.editor.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        if worktree.0 == "__suaegi_floating_workspace__" {
+            let Some(root) = self.floating_workspace_markdown_root.clone() else {
+                return iced::Task::none();
+            };
+            let op = self.next_op();
+            let Some(save) = self.editor.begin_save(op) else {
+                return iced::Task::none();
+            };
+            return crate::editor::save_file(root, save);
+        }
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.editor.close_worktree(&worktree);
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        let Some(save) = self.editor.begin_save(op) else {
+            return iced::Task::none();
+        };
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = save.worktree.clone();
+            let message_path = save.path.clone();
+            return iced::Task::perform(
+                crate::remote_fs::write_file(
+                    target,
+                    project_root,
+                    save.path,
+                    save.text,
+                    save.expected,
+                ),
+                move |result| Message::EditorFileSaved {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = save.worktree.clone();
+            let message_path = save.path.clone();
+            return iced::Task::perform(
+                crate::remote_orca::write_file(
+                    environment,
+                    project_root,
+                    save.path,
+                    save.text,
+                    save.expected,
+                ),
+                move |result| Message::EditorFileSaved {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::editor::save_file(entry.path, save)
+    }
+
+    fn schedule_editor_auto_save(&mut self) -> iced::Task<Message> {
+        self.editor_auto_save_generation = self.editor_auto_save_generation.saturating_add(1);
+        let generation = self.editor_auto_save_generation;
+        let delay_ms = self.ui_settings.auto_save_delay_ms.clamp(100, 10_000);
+        iced::Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                generation
+            },
+            Message::EditorAutoSave,
+        )
+    }
+
+    fn open_file_explorer(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.file_explorer.worktree() == Some(&worktree) {
+            self.file_explorer.close();
+            return iced::Task::none();
+        }
+        self.load_file_explorer(worktree)
+    }
+
+    /// Opens Explorer for workspace navigation without turning a repeated
+    /// workspace click into a close action. Orca keeps Explorer mounted as the
+    /// default right activity whenever a workspace is active.
+    fn ensure_file_explorer(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.file_explorer.worktree() == Some(&worktree) {
+            return iced::Task::none();
+        }
+        self.load_file_explorer(worktree)
+    }
+
+    fn load_file_explorer(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            return iced::Task::none();
+        };
+        let directory_op = self.next_op();
+        let status_op = self.next_op();
+        self.close_context_panels();
+        self.right_sidebar_open = true;
+        self.right_sidebar_tab = RightSidebarTab::Explorer;
+        self.file_explorer
+            .begin(worktree.clone(), directory_op, status_op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let directory_worktree = worktree.clone();
+            let status_worktree = worktree.clone();
+            let status_target = target.clone();
+            let status_root = project_root.clone();
+            return iced::Task::batch([
+                iced::Task::perform(
+                    crate::remote_fs::list_directory(target, project_root, String::new()),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: directory_worktree.clone(),
+                        path: String::new(),
+                        op: directory_op,
+                        result,
+                    },
+                ),
+                iced::Task::perform(
+                    crate::remote_git::status_map(status_target, status_root),
+                    move |result| Message::FileExplorerStatusLoaded {
+                        worktree: status_worktree.clone(),
+                        op: status_op,
+                        result,
+                    },
+                ),
+            ]);
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let directory_worktree = worktree.clone();
+            let status_worktree = worktree.clone();
+            return iced::Task::batch([
+                iced::Task::perform(
+                    crate::remote_orca::list_directory(
+                        environment.clone(),
+                        project_root.clone(),
+                        String::new(),
+                    ),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: directory_worktree.clone(),
+                        path: String::new(),
+                        op: directory_op,
+                        result,
+                    },
+                ),
+                iced::Task::perform(
+                    crate::remote_orca::status_map(environment, project_root),
+                    move |result| Message::FileExplorerStatusLoaded {
+                        worktree: status_worktree.clone(),
+                        op: status_op,
+                        result,
+                    },
+                ),
+            ]);
+        }
+        iced::Task::batch([
+            crate::file_explorer::load_directory(
+                worktree.clone(),
+                entry.path.clone(),
+                String::new(),
+                directory_op,
+            ),
+            crate::file_explorer::load_status(worktree, entry.path, status_op),
+        ])
+    }
+
+    fn refresh_file_explorer(&mut self, worktree: WorktreeId) -> iced::Task<Message> {
+        if self.file_explorer.worktree() != Some(&worktree) {
+            return iced::Task::none();
+        }
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.file_explorer.close();
+            return iced::Task::none();
+        };
+        let directory_op = self.next_op();
+        let status_op = self.next_op();
+        self.file_explorer.begin_refresh(directory_op, status_op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let directory_worktree = worktree.clone();
+            let status_worktree = worktree.clone();
+            let status_target = target.clone();
+            let status_root = project_root.clone();
+            return iced::Task::batch([
+                iced::Task::perform(
+                    crate::remote_fs::list_directory(target, project_root, String::new()),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: directory_worktree.clone(),
+                        path: String::new(),
+                        op: directory_op,
+                        result,
+                    },
+                ),
+                iced::Task::perform(
+                    crate::remote_git::status_map(status_target, status_root),
+                    move |result| Message::FileExplorerStatusLoaded {
+                        worktree: status_worktree.clone(),
+                        op: status_op,
+                        result,
+                    },
+                ),
+            ]);
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let directory_worktree = worktree.clone();
+            let status_worktree = worktree.clone();
+            return iced::Task::batch([
+                iced::Task::perform(
+                    crate::remote_orca::list_directory(
+                        environment.clone(),
+                        project_root.clone(),
+                        String::new(),
+                    ),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: directory_worktree.clone(),
+                        path: String::new(),
+                        op: directory_op,
+                        result,
+                    },
+                ),
+                iced::Task::perform(
+                    crate::remote_orca::status_map(environment, project_root),
+                    move |result| Message::FileExplorerStatusLoaded {
+                        worktree: status_worktree.clone(),
+                        op: status_op,
+                        result,
+                    },
+                ),
+            ]);
+        }
+        iced::Task::batch([
+            crate::file_explorer::load_directory(
+                worktree.clone(),
+                entry.path.clone(),
+                String::new(),
+                directory_op,
+            ),
+            crate::file_explorer::load_status(worktree, entry.path, status_op),
+        ])
+    }
+
+    fn refresh_file_explorer_preserving(&mut self) -> iced::Task<Message> {
+        let Some(worktree) = self.file_explorer.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.file_explorer.close();
+            return iced::Task::none();
+        };
+        let local_root = entry.path.clone();
+        let ssh = self.remote_ssh_for_worktree(&worktree);
+        let remote = self.remote_orca_for_worktree(&worktree);
+        let directories = self.file_explorer.expanded_directories();
+        let mut tasks = Vec::with_capacity(directories.len() + 1);
+
+        for path in directories {
+            let op = self.next_op();
+            self.file_explorer.begin_directory_refresh(&path, op);
+            let task = if let Some((target, project_root)) = ssh.clone() {
+                let message_worktree = worktree.clone();
+                let message_path = path.clone();
+                iced::Task::perform(
+                    crate::remote_fs::list_directory(target, project_root, path),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: message_worktree.clone(),
+                        path: message_path.clone(),
+                        op,
+                        result,
+                    },
+                )
+            } else if let Some((environment, project_root)) = remote.clone() {
+                let message_worktree = worktree.clone();
+                let message_path = path.clone();
+                iced::Task::perform(
+                    crate::remote_orca::list_directory(environment, project_root, path),
+                    move |result| Message::FileExplorerDirectoryLoaded {
+                        worktree: message_worktree.clone(),
+                        path: message_path.clone(),
+                        op,
+                        result,
+                    },
+                )
+            } else {
+                crate::file_explorer::load_directory(worktree.clone(), local_root.clone(), path, op)
+            };
+            tasks.push(task);
+        }
+
+        let status_op = self.next_op();
+        self.file_explorer.begin_status_refresh(status_op);
+        let status_task = if let Some((target, project_root)) = ssh {
+            let status_worktree = worktree.clone();
+            iced::Task::perform(
+                crate::remote_git::status_map(target, project_root),
+                move |result| Message::FileExplorerStatusLoaded {
+                    worktree: status_worktree.clone(),
+                    op: status_op,
+                    result,
+                },
+            )
+        } else if let Some((environment, project_root)) = remote {
+            let status_worktree = worktree.clone();
+            iced::Task::perform(
+                crate::remote_orca::status_map(environment, project_root),
+                move |result| Message::FileExplorerStatusLoaded {
+                    worktree: status_worktree.clone(),
+                    op: status_op,
+                    result,
+                },
+            )
+        } else {
+            crate::file_explorer::load_status(worktree, local_root, status_op)
+        };
+        tasks.push(status_task);
+        iced::Task::batch(tasks)
+    }
+
+    fn toggle_file_explorer_directory(&mut self, path: String) -> iced::Task<Message> {
+        let Some(worktree) = self.file_explorer.worktree().cloned() else {
+            return iced::Task::none();
+        };
+        let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
+            self.file_explorer.close();
+            return iced::Task::none();
+        };
+        let op = self.next_op();
+        if !self.file_explorer.toggle_directory(&path, op) {
+            return iced::Task::none();
+        }
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_fs::list_directory(target, project_root, path),
+                move |result| Message::FileExplorerDirectoryLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_orca::list_directory(environment, project_root, path),
+                move |result| Message::FileExplorerDirectoryLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        crate::file_explorer::load_directory(worktree, entry.path, path, op)
+    }
+
     /// 사이드바의 토글. 이미 그 worktree를 보고 있으면 **닫는다**(토글이니까).
     ///
     /// base ref는 repo에 등록된 기본 브랜치 하나로 고정한다 — 선택 UI는 범위
@@ -2132,13 +8189,45 @@ impl AppState {
         let Some(repo) = self.repo_by_id(&repo_id) else {
             return iced::Task::none();
         };
-        let base_ref = repo
-            .worktree_base_ref
-            .clone()
-            .unwrap_or_else(|| "main".to_string());
+        let base_ref = if self.ui_settings.source_control_compare_against_upstream {
+            "@{upstream}".to_string()
+        } else {
+            repo.worktree_base_ref
+                .clone()
+                .unwrap_or_else(|| "main".to_string())
+        };
 
         let op = self.next_op();
-        let cancel = self.diff.begin_compare(worktree.clone(), op);
+        self.close_context_panels();
+        self.right_sidebar_open = true;
+        self.right_sidebar_tab = RightSidebarTab::Checks;
+        let cancel = self.diff.begin_compare_with_file_tree(
+            worktree.clone(),
+            op,
+            self.ui_settings.combined_diff_file_tree_visible_by_default,
+        );
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_git::compare_worktree(target, project_root, base_ref, cancel),
+                move |result| Message::DiffLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            return iced::Task::perform(
+                crate::remote_orca::compare_worktree(environment, project_root, base_ref),
+                move |result| Message::DiffLoaded {
+                    worktree: message_worktree.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
         crate::git_tasks::compare_worktree(op, worktree, entry.path, base_ref, cancel)
     }
 
@@ -2155,13 +8244,42 @@ impl AppState {
         let Some(repo) = self.repo_by_id(&repo_id) else {
             return iced::Task::none();
         };
-        let base_ref = repo
-            .worktree_base_ref
-            .clone()
-            .unwrap_or_else(|| "main".to_string());
+        let base_ref = if self.ui_settings.source_control_compare_against_upstream {
+            "@{upstream}".to_string()
+        } else {
+            repo.worktree_base_ref
+                .clone()
+                .unwrap_or_else(|| "main".to_string())
+        };
 
         let op = self.next_op();
         self.diff.begin_patch(path.clone(), op);
+        if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_git::file_diff(target, project_root, base_ref, path, status),
+                move |result| Message::FileDiffLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
+        if let Some((environment, project_root)) = self.remote_orca_for_worktree(&worktree) {
+            let message_worktree = worktree.clone();
+            let message_path = path.clone();
+            return iced::Task::perform(
+                crate::remote_orca::file_diff(environment, project_root, base_ref, path, status),
+                move |result| Message::FileDiffLoaded {
+                    worktree: message_worktree.clone(),
+                    path: message_path.clone(),
+                    op,
+                    result,
+                },
+            );
+        }
         crate::git_tasks::file_patch(op, worktree, entry.path, base_ref, path, status)
     }
 
@@ -2174,6 +8292,40 @@ impl AppState {
         let op = self.next_op();
         self.note_list_issued(repo_id, op);
         crate::git_tasks::list_worktrees(op, repo)
+    }
+
+    fn begin_worktree_removal(
+        &mut self,
+        repo_id: RepoId,
+        worktree_id: WorktreeId,
+        worktree_path: PathBuf,
+        branch: Option<String>,
+    ) -> iced::Task<Message> {
+        let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
+            return iced::Task::none();
+        };
+        if self.selected_worktree.as_ref() == Some(&worktree_id) {
+            self.selected_worktree = None;
+        }
+        // Keep the terminal alive until git confirms removal. Dirty worktrees
+        // commonly reject non-forced deletion and must retain their session.
+        self.pending_worktree_removals.insert(worktree_id.clone());
+        let op = self.next_op();
+        let linked_paths = self
+            .ui_settings
+            .repo_symlink_paths
+            .get(&repo_id.0)
+            .cloned()
+            .unwrap_or_default();
+        crate::git_tasks::remove_worktree(
+            op,
+            repo,
+            worktree_id,
+            worktree_path,
+            false,
+            branch,
+            linked_paths,
+        )
     }
 
     /// `worktree_id`에 해당하는 (repo, entry) 쌍을 찾는다. `SessionStore::start`가
@@ -2219,6 +8371,15 @@ impl AppState {
         if let Some(entries) = self.worktrees_by_repo.get_mut(repo_id) {
             entries.retain(|entry| worktree_id_for(&entry.path) != *worktree_id);
         }
+        if self.file_explorer.worktree() == Some(worktree_id) {
+            self.file_explorer.close();
+        }
+        if self.editor.contains_worktree(worktree_id) {
+            self.editor.close_worktree(worktree_id);
+        }
+        if self.source_control.worktree() == Some(worktree_id) {
+            self.source_control.close();
+        }
     }
 
     /// 첫 세션이면 `pane_grid::State`를 새로 만든다(pane_grid는 pane 없이
@@ -2245,6 +8406,127 @@ impl AppState {
                 }
             }
         }
+        if let (Some(panes), Some(pane)) = (&mut self.panes, self.focused_pane) {
+            panes.maximize(pane);
+        }
+    }
+
+    fn open_split_pane_for_session(
+        &mut self,
+        id: SessionId,
+        target_session: SessionId,
+        axis: pane_grid::Axis,
+        focus: bool,
+    ) {
+        let Some(panes) = &mut self.panes else {
+            self.open_pane_for_session(id);
+            return;
+        };
+        let target = panes
+            .iter()
+            .find_map(|(pane, session)| (*session == target_session).then_some(*pane))
+            .or(self.focused_pane)
+            .or_else(|| panes.panes.keys().next().copied());
+        let Some(target) = target else {
+            return;
+        };
+        panes.restore();
+        if let Some((new_pane, _)) = panes.split(axis, target, id) {
+            self.focused_pane = Some(if focus { new_pane } else { target });
+            if focus {
+                panes.maximize(new_pane);
+            }
+        }
+    }
+
+    fn rpc_terminal_id(&self, handle: &str) -> Option<SessionId> {
+        let raw = handle
+            .strip_prefix("term_")
+            .or_else(|| handle.strip_prefix("term-"))
+            .unwrap_or(handle);
+        let id = SessionId(raw.parse().ok()?);
+        self.session_store.session(id).map(|_| id)
+    }
+
+    fn rpc_terminal_json(&self, id: SessionId) -> serde_json::Value {
+        let worktree = self.session_worktrees.get(&id);
+        serde_json::json!({
+            "handle": format!("term_{}", id.0),
+            "sessionId": id.0,
+            "title": self.session_tab_title(id),
+            "worktreeId": worktree.map(|id| &id.0),
+            "running": self.session_store.is_running(id),
+            "exitCode": self.session_store.exit_code(id),
+            "active": self.focused_session() == Some(id),
+            "agent": self.session_store.agent(id),
+            "presence": format!("{:?}", self.session_store.presence(id)).to_lowercase(),
+            "preview": self.session_store.snapshot_text(id).trim_end(),
+        })
+    }
+
+    fn start_rpc_terminal(
+        &mut self,
+        pending: PendingCliTerminal,
+        command: Option<String>,
+        title: Option<String>,
+        extra_env: Vec<(String, String)>,
+        env_remove: Vec<String>,
+    ) -> iced::Task<Message> {
+        let worktree_id = pending.worktree_id.clone();
+        let Some((_repo, entry)) = self.find_worktree(&worktree_id) else {
+            pending
+                .request
+                .respond(Err(format!("Worktree not found: {}", worktree_id.0)));
+            return iced::Task::none();
+        };
+        let path = entry.path.clone();
+        let id = self.session_store.next_id();
+        let manual_title = title.filter(|title| !title.trim().is_empty());
+        let label = manual_title.clone().unwrap_or_else(|| {
+            command
+                .as_deref()
+                .and_then(|command| command.split_whitespace().next())
+                .unwrap_or("Terminal")
+                .to_string()
+        });
+        self.session_titles.insert(id, label);
+        if let Some(title) = manual_title {
+            self.manual_session_titles
+                .insert(id, title.trim().chars().take(100).collect());
+        }
+        self.pending_cli_terminals.insert(id, pending);
+        let (program, args) = command.map_or_else(
+            || ("/bin/zsh".to_string(), vec!["-l".to_string()]),
+            |command| ("/bin/zsh".to_string(), vec!["-lc".to_string(), command]),
+        );
+        let terminal_handle = format!("term_{}", id.0);
+        let mut env = vec![
+            ("ORCA_PANE_KEY".into(), worktree_id.0.clone()),
+            ("ORCA_TERMINAL_HANDLE".into(), terminal_handle.clone()),
+            ("SUAEGI_TERMINAL_HANDLE".into(), terminal_handle),
+        ];
+        for (name, value) in extra_env {
+            env.retain(|(existing, _)| existing != &name);
+            env.push((name, value));
+        }
+        let spawn = suaegi_term::pty::PtySpawn {
+            program,
+            args,
+            cwd: Some(path),
+            env,
+            env_remove,
+            rows: 50,
+            cols: 80,
+        };
+        let daemon_id = format!("terminal:{}:{}:{}", current_unix_ms(), id.0, worktree_id.0);
+        self.session_store.start_raw_named(
+            id,
+            worktree_id,
+            None,
+            spawn,
+            self.ui_settings.terminal_scrollback_rows as usize,
+            daemon_id,
+        )
     }
 
     /// 세션을 스토어에서 닫고(Reaper로 은퇴) 그 세션에 딸린 상태를 **전부**
@@ -2260,12 +8542,27 @@ impl AppState {
     /// 계약이다 — 세션 소멸과 pane 소멸을 한 함수로 묶어 어길 수 없게 한다.
     fn close_session(&mut self, id: SessionId) {
         self.session_store.close(id);
+        self.pending_setup_sessions.remove(&id);
+        if let Some(setup) = self.setup_sessions.remove(&id) {
+            if self.worktree_setup_sessions.get(&setup.worktree_id) == Some(&id) {
+                self.worktree_setup_sessions.remove(&setup.worktree_id);
+            }
+            self.setup_waiting_worktrees.remove(&setup.worktree_id);
+        }
+        self.pending_agent_hibernations.remove(&id);
+        self.terminal_last_input_at.remove(&id);
+        self.terminal_attention_sessions.remove(&id);
+        self.native_chat_sessions.remove(&id);
+        self.native_chat_drafts.remove(&id);
         // 무장된(또는 대기 중인) 주입은 세션과 함께 사라진다 — 닫힌 세션에
         // 프롬프트를 써넣을 수는 없고, 남겨두면 맵이 무한히 자란다.
         self.prompt_gates.remove(&id);
         self.pending_injections.remove(&id);
         if let Some(worktree_id) = self.session_worktrees.remove(&id) {
             self.worktree_sessions.remove(&worktree_id);
+            self.sleeping_agent_sessions.remove(&worktree_id);
+            self.waking_agent_sessions.remove(&worktree_id);
+            self.live_agent_resume.remove(&worktree_id);
             // **배지 장부도 같이 간다.** 남겨두면 세션이 사라진 뒤에도 마지막
             // 훅 상태가 살아 있는데, presence는 세션이 없으므로 `Unknown`으로
             // 떨어지고 — 리듀서의 `Unknown` 팔은 훅을 그대로 신뢰한다. 마지막
@@ -2275,6 +8572,7 @@ impl AppState {
             // 지우면 `worktree_badge`가 `None` 가지를 타 `Unknown`이 된다 —
             // 세션이 없을 때 정직한 답이다. 맵이 무한히 자라는 것도 같이 막는다.
             self.badges.remove(&worktree_id);
+            self.prompt_cache_started.remove(&worktree_id);
             // **복원 중이라면 이 잎의 결과를 되물러야 한다.** 복원이 끝나기
             // 전에 worktree가 밖에서 지워지면(권위 있는 재조회가 그걸 본다)
             // 이미 `Started`로 적힌 잎이 죽은 세션을 가리키게 되고, 그대로
@@ -2288,11 +8586,14 @@ impl AppState {
             }
         }
         self.session_titles.remove(&id);
+        self.manual_session_titles.remove(&id);
+        self.generated_session_titles.remove(&id);
         if self.last_input_loss == Some(id) {
             // 사라진 세션의 유실 경고를 남겨두면 지울 방법이 없다.
             self.last_input_loss = None;
         }
         self.close_panes_for_session(id);
+        self.sync_keep_awake();
     }
 
     /// `id`를 가리키던 pane을 pane_grid에서 지운다.
@@ -2378,6 +8679,9 @@ impl AppState {
         let previous = self.focused_session();
         let next = self.panes.as_ref().and_then(|p| p.get(pane)).copied();
         self.focused_pane = Some(pane);
+        if let Some(session) = next {
+            self.terminal_attention_sessions.remove(&session);
+        }
 
         // **포커스된 pane이 곧 활성 worktree다.** 이 줄이 없으면 플랜이 요구한
         // "포커스 변경 시 저장" 트리거가 아무것도 바꾸지 않는 공회전이 된다 —
@@ -2406,6 +8710,35 @@ impl AppState {
         }
     }
 
+    fn select_right_sidebar_tab(&mut self, tab: RightSidebarTab) -> iced::Task<Message> {
+        let Some(worktree) = self.selected_worktree.clone() else {
+            return iced::Task::none();
+        };
+        self.active_plugin_panel = None;
+        self.plugin_panel_error = None;
+        crate::plugin_panel::set_visible(false);
+        self.right_sidebar_open = true;
+        self.right_sidebar_tab = tab;
+        match tab {
+            RightSidebarTab::Explorer => self.ensure_file_explorer(worktree),
+            RightSidebarTab::Agents => {
+                self.close_context_panels();
+                iced::Task::none()
+            }
+            RightSidebarTab::SourceControl => {
+                if self.source_control.worktree() == Some(&worktree) {
+                    iced::Task::none()
+                } else {
+                    self.open_source_control(worktree)
+                }
+            }
+            RightSidebarTab::Checks => {
+                self.close_context_panels();
+                iced::Task::none()
+            }
+        }
+    }
+
     /// 위젯이 발행한 커맨드를 세션에 적용한다. 실행 스레드는 Task 0.8의 정책
     /// 표를 따른다: `Key`/`Paste`/`Mouse`/`Scroll`은 UI 스레드에서 곧바로(그리드가
     /// 짧은 term 락으로 인코딩 후 `try_send`), `Resize`와 선택 추출은 워커로.
@@ -2427,6 +8760,7 @@ impl AppState {
                 // mis-injection is worse than none.
                 self.prompt_gates.remove(&id);
                 self.pending_injections.remove(&id);
+                self.terminal_last_input_at.insert(id, Instant::now());
                 let outcome = session.send_key(&input);
                 self.note_write(id, outcome);
                 iced::Task::none()
@@ -2435,6 +8769,7 @@ impl AppState {
                 // 사용자가 직접 붙여넣는 것도 타이핑과 같다 — 주입을 취소한다.
                 self.prompt_gates.remove(&id);
                 self.pending_injections.remove(&id);
+                self.terminal_last_input_at.insert(id, Instant::now());
                 let outcome = session.send_paste(&text);
                 self.note_write(id, outcome);
                 iced::Task::none()
@@ -2469,7 +8804,13 @@ impl AppState {
                     } else {
                         iced::Task::none()
                     };
-                    let copy = match result.copy {
+                    let copy_request = result.copy.or_else(|| {
+                        (self.ui_settings.terminal_clipboard_on_select
+                            && matches!(intent.action, MouseAction::Release(TermMouseButton::Left)))
+                        .then(|| session.request_copy(CopyTargets::DRAG_COMPLETE))
+                        .flatten()
+                    });
+                    let copy = match copy_request {
                         Some(request) => self.session_store.request_extraction(id, request).1,
                         None => iced::Task::none(),
                     };
@@ -2484,13 +8825,8082 @@ impl AppState {
                     None => iced::Task::none(),
                 }
             }
+
+            TermCommand::FocusRequested => {
+                if self.floating_workspace_sessions.contains(&id) {
+                    if let Some(previous) = self.focused_session() {
+                        if let Some(session) = self.session_store.session(previous) {
+                            let outcome = session.report_focus(false);
+                            self.note_write(previous, outcome);
+                        }
+                    }
+                    let outcome = session.report_focus(true);
+                    self.note_write(id, outcome);
+                    return iced::widget::operation::focus(crate::terminal::widget_id_for(id));
+                }
+                let pane = self.panes.as_ref().and_then(|panes| {
+                    panes
+                        .iter()
+                        .find_map(|(pane, session)| (*session == id).then_some(*pane))
+                });
+                pane.map_or_else(iced::Task::none, |pane| self.focus_pane(pane))
+            }
         }
+    }
+
+    /// Executes the app-scoped half of Orca plugin API v1 on the UI owner.
+    ///
+    /// The worker cannot retain a terminal handle and write through it
+    /// directly. Membership is checked against the worktree that is active
+    /// when this request is handled, immediately before enqueueing input.
+    fn resolve_plugin_host_call(
+        &mut self,
+        request: &crate::plugin_worker::PluginHostRequest,
+    ) -> Result<serde_json::Value, String> {
+        const LABEL_LIMIT: usize = 512;
+        const TERMINAL_LIMIT: usize = 50;
+        const TERMINAL_ID_LIMIT: usize = 1024;
+        const TEXT_LIMIT: usize = 4096;
+        const NOTIFICATION_TITLE_LIMIT: usize = 120;
+        const NOTIFICATION_BODY_LIMIT: usize = 1000;
+        const EVENT_NAMES: [&str; 3] = [
+            "worktree.created",
+            "worktree.removed",
+            "agent.status.changed",
+        ];
+
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_key == request.plugin_key
+                    && plugin.status == crate::plugins::PluginStatus::Idle
+                    && plugin.blocked_by_kill_list.is_none()
+            })
+            .ok_or_else(|| "plugin is not approved and active".to_string())?;
+        let capability = crate::plugin_host::required_capability(&request.method)
+            .ok_or_else(|| "unknown plugin host method".to_string())?;
+        if !plugin
+            .capabilities
+            .iter()
+            .any(|granted| granted == capability)
+        {
+            return Err(format!("plugin capability {capability} was not granted"));
+        }
+
+        let params = request
+            .params
+            .as_object()
+            .ok_or_else(|| "plugin host-call params must be an object".to_string())?;
+        match request.method.as_str() {
+            "workspace.readContext" => {
+                if !params.is_empty() {
+                    return Err("workspace.readContext params must be empty".into());
+                }
+                let Some(worktree_id) = self.selected_worktree.clone() else {
+                    return Ok(serde_json::Value::Null);
+                };
+                let Some((_, entry)) = self.find_worktree(&worktree_id) else {
+                    return Ok(serde_json::Value::Null);
+                };
+                let mut terminal_ids = self
+                    .session_worktrees
+                    .iter()
+                    .filter(|(_, owner)| *owner == &worktree_id)
+                    .filter(|(id, _)| self.session_store.session(**id).is_some())
+                    .map(|(id, _)| format!("terminal:local:{}", id.0))
+                    .filter(|id| !id.is_empty() && id.len() <= TERMINAL_ID_LIMIT)
+                    .collect::<Vec<_>>();
+                terminal_ids.sort();
+                terminal_ids.truncate(TERMINAL_LIMIT);
+                let branch = entry.branch.clone().unwrap_or_default();
+                let display_name = self.worktree_display_name(&worktree_id, &entry);
+                Ok(serde_json::json!({
+                    "branch": branch.chars().take(LABEL_LIMIT).collect::<String>(),
+                    "displayName": display_name.chars().take(LABEL_LIMIT).collect::<String>(),
+                    "terminals": terminal_ids
+                        .into_iter()
+                        .map(|id| serde_json::json!({"id": id}))
+                        .collect::<Vec<_>>()
+                }))
+            }
+            "terminal.sendText" => {
+                let terminal_id = params
+                    .get("terminalId")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= TERMINAL_ID_LIMIT)
+                    .ok_or_else(|| "terminal.sendText requires a valid terminalId".to_string())?;
+                let text = params
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| {
+                        let length = text.chars().count();
+                        length > 0 && length <= TEXT_LIMIT
+                    })
+                    .ok_or_else(|| {
+                        "terminal.sendText requires bounded non-empty text".to_string()
+                    })?;
+                let enter = match params.get("enter") {
+                    None => false,
+                    Some(value) => value
+                        .as_bool()
+                        .ok_or_else(|| "terminal.sendText enter must be a boolean".to_string())?,
+                };
+                let worktree_id = self.selected_worktree.clone().ok_or_else(|| {
+                    "no active worktree is available for terminal input".to_string()
+                })?;
+                let session_id = self
+                    .session_worktrees
+                    .iter()
+                    .find_map(|(id, owner)| {
+                        (owner == &worktree_id && format!("terminal:local:{}", id.0) == terminal_id)
+                            .then_some(*id)
+                    })
+                    .ok_or_else(|| "terminal is outside the active worktree".to_string())?;
+                let session = self
+                    .session_store
+                    .session(session_id)
+                    .ok_or_else(|| "terminal is no longer available".to_string())?;
+                self.prompt_gates.remove(&session_id);
+                self.pending_injections.remove(&session_id);
+                self.terminal_last_input_at
+                    .insert(session_id, Instant::now());
+                let paste = session.send_paste(text);
+                self.note_write(session_id, paste);
+                let accepted = paste == WriteOutcome::Queued;
+                let accepted = if enter && accepted {
+                    use suaegi_term::input_types::{
+                        KeyInput, KeyLocation, Mods, NamedKey, TermKey,
+                    };
+                    let outcome = session.send_key(&KeyInput {
+                        key: TermKey::Named(NamedKey::Enter),
+                        physical_latin: None,
+                        location: KeyLocation::Standard,
+                        mods: Mods::default(),
+                        text: None,
+                        repeat: false,
+                    });
+                    self.note_write(session_id, outcome);
+                    outcome == WriteOutcome::Queued
+                } else {
+                    accepted
+                };
+                Ok(serde_json::json!({"accepted": accepted}))
+            }
+            "notifications.show" => {
+                let title = params
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|title| {
+                        let length = title.chars().count();
+                        length > 0 && length <= NOTIFICATION_TITLE_LIMIT
+                    })
+                    .ok_or_else(|| "notifications.show requires a bounded title".to_string())?;
+                let body = match params.get("body") {
+                    None => "",
+                    Some(value) => value
+                        .as_str()
+                        .filter(|body| body.chars().count() <= NOTIFICATION_BODY_LIMIT)
+                        .ok_or_else(|| {
+                            "notifications.show body must be a bounded string".to_string()
+                        })?,
+                };
+                let delivered = crate::notification_sound::show_plugin(
+                    &format!("{}: {title}", request.plugin_key),
+                    body,
+                );
+                Ok(serde_json::json!({"delivered": delivered}))
+            }
+            "events.subscribe" => {
+                let events = params
+                    .get("events")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|events| !events.is_empty() && events.len() <= EVENT_NAMES.len())
+                    .ok_or_else(|| {
+                        "events.subscribe requires a bounded events array".to_string()
+                    })?;
+                let mut subscribed = Vec::with_capacity(events.len());
+                for event in events {
+                    let event = event
+                        .as_str()
+                        .filter(|event| EVENT_NAMES.contains(event))
+                        .ok_or_else(|| "events.subscribe contains an unknown event".to_string())?;
+                    if !subscribed.iter().any(|existing| existing == event) {
+                        subscribed.push(event.to_string());
+                    }
+                }
+                let subscribed =
+                    crate::plugin_worker::subscribe_events(&request.plugin_key, &subscribed);
+                Ok(serde_json::json!({"subscribed": subscribed}))
+            }
+            _ => Err("plugin host method is not app-scoped".into()),
+        }
+    }
+
+    fn dispatch_keybinding_shortcut(
+        &mut self,
+        action: KeybindingActionId,
+        index: Option<usize>,
+    ) -> iced::Task<Message> {
+        use suaegi_keys::KeybindingActionId as A;
+
+        match action {
+            A::AppForceReload => {
+                let mut tasks = Vec::new();
+                if self.browser_open {
+                    tasks.push(self.update(Message::BrowserReload));
+                }
+                if let Some(worktree) = self.selected_worktree.clone() {
+                    tasks.push(self.update(Message::WorktreeRefreshRequested(worktree.clone())));
+                    tasks.push(self.update(Message::GithubRefreshRequested {
+                        worktree: worktree.clone(),
+                    }));
+                    if self.file_explorer.worktree() == Some(&worktree) {
+                        tasks.push(self.update(Message::FileExplorerRefreshRequested { worktree }));
+                    }
+                }
+                if self.tasks_open {
+                    tasks.push(self.update(Message::TaskRefreshRequested));
+                }
+                tasks.push(self.update(Message::UsageRefreshRequested));
+                iced::Task::batch(tasks)
+            }
+            A::WorktreeQuickOpen => self.update(Message::QuickOpenShortcutPressed),
+            A::WorktreePalette => self.update(Message::WorkspaceSearchRequested),
+            A::WorktreeNavigateUp | A::WorktreeNavigateDown => {
+                let worktrees = self
+                    .repos
+                    .iter()
+                    .flat_map(|repo| {
+                        self.worktrees_by_repo
+                            .get(&repo.id)
+                            .into_iter()
+                            .flatten()
+                            .filter(|entry| self.worktree_is_visible(entry))
+                            .map(|entry| worktree_id_for(&entry.path))
+                    })
+                    .collect::<Vec<_>>();
+                if worktrees.is_empty() {
+                    return iced::Task::none();
+                }
+                let current = self
+                    .selected_worktree
+                    .as_ref()
+                    .and_then(|selected| worktrees.iter().position(|id| id == selected))
+                    .unwrap_or(0);
+                let next = if action == A::WorktreeNavigateDown {
+                    (current + 1) % worktrees.len()
+                } else {
+                    (current + worktrees.len() - 1) % worktrees.len()
+                };
+                self.update(Message::WorktreeSelected(worktrees[next].clone()))
+            }
+            A::WorkspaceCreate => {
+                let repo = self
+                    .selected_worktree
+                    .as_ref()
+                    .and_then(|worktree| self.find_worktree(worktree))
+                    .map(|(repo, _)| repo)
+                    .or_else(|| self.repos.first().map(|repo| repo.id.clone()));
+                repo.map_or_else(iced::Task::none, |repo| {
+                    self.update(Message::WorktreeCreateToggled(repo))
+                })
+            }
+            A::WorkspaceDelete => {
+                let Some(worktree) = self.selected_worktree.clone() else {
+                    return iced::Task::none();
+                };
+                let Some((repo_id, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                self.update(Message::RemoveWorktreeRequested {
+                    repo_id,
+                    worktree_id: worktree,
+                    worktree_path: entry.path,
+                    branch: entry.branch,
+                })
+            }
+            A::AppSettings => self.update(Message::SettingsOpened(SettingsSection::General)),
+            A::SettingsSearch => {
+                let open = self.update(Message::SettingsOpened(SettingsSection::General));
+                iced::Task::batch([
+                    open,
+                    iced::widget::operation::focus(crate::settings::search_input_id()),
+                ])
+            }
+            A::ViewTasks => self.update(Message::TasksOpened),
+            A::SidebarLeftToggle => self.update(Message::LeftSidebarToggled),
+            A::SidebarRightToggle => self.update(Message::RightSidebarToggled),
+            A::SidebarExplorerToggle => {
+                self.update(Message::RightSidebarTabSelected(RightSidebarTab::Explorer))
+            }
+            A::SidebarSourceControlToggle => {
+                let Some(worktree) = self.selected_worktree.clone() else {
+                    return iced::Task::none();
+                };
+                self.update(Message::SourceControlToggled { worktree })
+            }
+            A::SidebarChecksToggle => {
+                self.update(Message::RightSidebarTabSelected(RightSidebarTab::Checks))
+            }
+            A::SidebarPortsToggle => {
+                self.update(Message::StatusPopoverToggled(StatusPopover::Ports))
+            }
+            A::SidebarSleepingWorkspacesToggle => {
+                self.update(Message::UiSettingToggled(UiSetting::HideSleeping))
+            }
+            A::SidebarSearchToggle | A::SidebarFocusWorktreeList => {
+                self.update(Message::WorkspaceSearchRequested)
+            }
+            A::FloatingTerminalToggle => self.update(Message::FloatingWorkspaceToggled),
+            A::FloatingWorkspaceMaximize => {
+                if !self.floating_workspace_open {
+                    self.floating_workspace_open = true;
+                    self.floating_workspace_maximized = true;
+                    if self.floating_workspace_owns_browser() {
+                        return self.update(Message::BrowserOpenRequested);
+                    }
+                    iced::Task::none()
+                } else if !self.floating_workspace_maximized {
+                    self.update(Message::FloatingWorkspaceMaximizedToggled)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            A::FloatingWorkspaceMinimize => self.update(Message::FloatingWorkspaceMinimized),
+            A::WorkspaceOpenBoard => self.update(Message::WorkspaceBoardToggled),
+            A::VoiceDictation => self.update(Message::VoiceDictationToggled),
+            A::WorktreeHistoryBack => self.update(Message::NavigationBack),
+            A::WorktreeHistoryForward => self.update(Message::NavigationForward),
+            A::EditorSave => self.update(Message::EditorSaveRequested),
+            A::EditorFind => self.update(Message::EditorFindOpened(false)),
+            A::EditorReplace => self.update(Message::EditorFindOpened(true)),
+            A::TabNewTerminal if self.floating_workspace_open => {
+                self.update(Message::FloatingWorkspaceTerminalRequested)
+            }
+            A::TabNewBrowser if self.floating_workspace_open => {
+                self.update(Message::FloatingWorkspaceBrowserRequested)
+            }
+            A::TabNewBrowser => self.update(Message::BrowserOpenRequested),
+            A::TabNewSimulator => self.update(Message::EmulatorLaunchDefaultRequested),
+            A::TabNewMarkdown if self.floating_workspace_open => {
+                self.update(Message::FloatingWorkspaceNewMarkdownRequested)
+            }
+            A::TabOpenMarkdown if self.floating_workspace_open => {
+                self.update(Message::FloatingWorkspaceOpenMarkdownRequested)
+            }
+            A::TabNewMarkdown | A::TabOpenMarkdown => {
+                self.update(Message::QuickOpenShortcutPressed)
+            }
+            A::BrowserBack => self.update(Message::BrowserBack),
+            A::BrowserForward => self.update(Message::BrowserForward),
+            A::BrowserReload | A::BrowserHardReload => self.update(Message::BrowserReload),
+            A::BrowserFind => {
+                self.browser_error = crate::browser::find_in_page().err();
+                iced::Task::none()
+            }
+            A::BrowserFocusAddressBar => {
+                iced::widget::operation::focus(crate::browser::address_input_id())
+            }
+            A::FileExplorerCopyPath | A::FileExplorerCopyRelativePath => {
+                let Some((worktree, relative)) = self.editor.location() else {
+                    return iced::Task::none();
+                };
+                let copied = if action == A::FileExplorerCopyRelativePath {
+                    relative.to_string()
+                } else {
+                    self.find_worktree(worktree)
+                        .map(|(_, entry)| entry.path.join(relative).display().to_string())
+                        .unwrap_or_else(|| relative.to_string())
+                };
+                iced::clipboard::write(copied)
+            }
+            A::WorkspaceSelectByIndex => {
+                let Some(index) = index else {
+                    return iced::Task::none();
+                };
+                let target = self
+                    .repos
+                    .iter()
+                    .flat_map(|repo| {
+                        self.worktrees_by_repo
+                            .get(&repo.id)
+                            .into_iter()
+                            .flatten()
+                            .map(|entry| worktree_id_for(&entry.path))
+                    })
+                    .nth(index);
+                target.map_or_else(iced::Task::none, |id| {
+                    self.update(Message::WorktreeSelected(id))
+                })
+            }
+            A::TabSelectByIndex => {
+                let Some(index) = index else {
+                    return iced::Task::none();
+                };
+                let pane = self
+                    .panes
+                    .as_ref()
+                    .and_then(|panes| panes.iter().nth(index).map(|(pane, _)| *pane));
+                pane.map_or_else(iced::Task::none, |pane| self.focus_pane(pane))
+            }
+            A::TabClose | A::TerminalClosePane => {
+                if self.floating_workspace_open {
+                    self.update(Message::FloatingWorkspaceToggled)
+                } else {
+                    self.focused_pane.map_or_else(iced::Task::none, |pane| {
+                        self.update(Message::PaneCloseRequested(pane))
+                    })
+                }
+            }
+            A::TabNextSameType
+            | A::TabNextAllTypes
+            | A::TabNextTerminal
+            | A::TerminalFocusNextPane => self.focus_adjacent_pane(true),
+            A::TabPreviousSameType
+            | A::TabPreviousAllTypes
+            | A::TabPreviousRecent
+            | A::TabPreviousTerminal
+            | A::TerminalFocusPreviousPane => self.focus_adjacent_pane(false),
+            A::TabOpenQuickCommandsMenu => {
+                self.update(Message::SettingsOpened(SettingsSection::QuickCommands))
+            }
+            A::TerminalCopySelection => {
+                self.active_terminal_session()
+                    .map_or_else(iced::Task::none, |id| {
+                        self.dispatch_term_command(
+                            id,
+                            TermCommand::CopySelection {
+                                to: CopyTargets::EXPLICIT,
+                            },
+                        )
+                    })
+            }
+            A::TerminalPaste => {
+                self.active_terminal_session()
+                    .map_or_else(iced::Task::none, |id| {
+                        iced::clipboard::read()
+                            .map(move |text| Message::TerminalPasteRead { id, text })
+                    })
+            }
+            A::TerminalClear => {
+                self.active_terminal_session()
+                    .map_or_else(iced::Task::none, |id| {
+                        use suaegi_term::input_types::{KeyInput, KeyLocation, Mods, TermKey};
+                        self.dispatch_term_command(
+                            id,
+                            TermCommand::Key(KeyInput {
+                                key: TermKey::Char('l'),
+                                physical_latin: Some('l'),
+                                location: KeyLocation::Standard,
+                                mods: Mods {
+                                    ctrl: true,
+                                    ..Mods::default()
+                                },
+                                text: None,
+                                repeat: false,
+                            }),
+                        )
+                    })
+            }
+            A::TerminalClearPaneTitle => {
+                if let Some(id) = self.active_terminal_session() {
+                    self.session_titles.remove(&id);
+                    self.generated_session_titles.remove(&id);
+                }
+                iced::Task::none()
+            }
+            A::ZoomIn => {
+                self.ui_settings.ui_zoom_percent = (self.ui_settings.ui_zoom_percent + 10).min(200);
+                self.persist();
+                iced::Task::none()
+            }
+            A::ZoomOut => {
+                self.ui_settings.ui_zoom_percent =
+                    self.ui_settings.ui_zoom_percent.saturating_sub(10).max(50);
+                self.persist();
+                iced::Task::none()
+            }
+            A::ZoomReset => {
+                self.ui_settings.ui_zoom_percent = 100;
+                self.persist();
+                iced::Task::none()
+            }
+            _ => iced::Task::none(),
+        }
+    }
+
+    fn active_terminal_session(&self) -> Option<SessionId> {
+        if self.floating_workspace_open
+            && self.floating_workspace_content == FloatingWorkspaceContent::Terminal
+        {
+            return self.floating_workspace_session;
+        }
+        self.focused_session()
+            .or_else(|| self.panes.as_ref()?.iter().next().map(|(_, id)| *id))
+    }
+
+    fn run_in_available_terminal(&mut self, command: String) -> iced::Task<Message> {
+        if let Some(id) = self.active_terminal_session() {
+            return self.dispatch_term_command(id, TermCommand::Paste(command));
+        }
+        if !self.ui_settings.floating_workspace_enabled {
+            self.last_error =
+                Some("Open a workspace terminal or enable Floating Workspace first.".to_string());
+            return iced::Task::none();
+        }
+        self.floating_workspace_open = true;
+        self.floating_workspace_content = FloatingWorkspaceContent::Terminal;
+        self.floating_pending_commands.push(command);
+        self.start_floating_workspace(None)
+    }
+
+    fn focus_adjacent_pane(&mut self, forward: bool) -> iced::Task<Message> {
+        let Some(panes) = self.panes.as_ref() else {
+            return iced::Task::none();
+        };
+        let ordered: Vec<pane_grid::Pane> = panes.iter().map(|(pane, _)| *pane).collect();
+        if ordered.is_empty() {
+            return iced::Task::none();
+        }
+        let current = self
+            .focused_pane
+            .and_then(|pane| ordered.iter().position(|candidate| *candidate == pane))
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % ordered.len()
+        } else {
+            (current + ordered.len() - 1) % ordered.len()
+        };
+        self.focus_pane(ordered[next])
+    }
+
+    fn insert_voice_transcript(&mut self, transcript: String) -> iced::Task<Message> {
+        let Some(session_id) = self.focused_session() else {
+            self.voice_status =
+                Some("Focus a terminal pane before inserting dictated text.".to_string());
+            return iced::Task::none();
+        };
+        self.voice_status = Some("Dictation inserted into the focused pane.".to_string());
+        self.dispatch_term_command(session_id, TermCommand::Paste(transcript))
+    }
+
+    fn handle_local_rpc(
+        &mut self,
+        request: crate::local_rpc::LocalRpcRequest,
+    ) -> iced::Task<Message> {
+        let string_param = |name: &str| {
+            request
+                .params
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("Missing string parameter: {name}"))
+        };
+        match request.method.as_str() {
+            "status" => {
+                let worktree_count = self
+                    .worktrees_by_repo
+                    .values()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>();
+                request.respond(Ok(serde_json::json!({
+                    "app": "Suaegi",
+                    "running": true,
+                    "repositories": self.repos.len(),
+                    "worktrees": worktree_count,
+                    "activeWorktree": self.selected_worktree.as_ref().map(|id| &id.0),
+                    "surface": if self.integrations_open {
+                        "settings"
+                    } else if self.emulator_panel_open {
+                        "emulator"
+                    } else if self.browser_open {
+                        "browser"
+                    } else if self.workspace_board_open {
+                        "board"
+                    } else if self.activity_open {
+                        "activity"
+                    } else if self.automation_ui.open {
+                        "automations"
+                    } else if self.tasks_open {
+                        "tasks"
+                    } else {
+                        "workbench"
+                    },
+                })));
+                iced::Task::none()
+            }
+            "diagnostics.memory" => {
+                let state = crate::persistence_thread::default_data_file();
+                let persisted = suaegi_core::persistence::Store::new(state).load().state;
+                let snapshot = crate::memory::collect(&persisted, Some(std::process::id()));
+                request.respond(
+                    serde_json::to_value(snapshot)
+                        .map_err(|error| format!("Could not encode memory snapshot: {error}")),
+                );
+                iced::Task::none()
+            }
+            "environment.list" => {
+                let environments = self
+                    .ui_settings
+                    .runtime_environments
+                    .iter()
+                    .map(|environment| {
+                        serde_json::json!({
+                            "id": environment.id,
+                            "name": environment.name,
+                            "endpoint": environment.endpoint,
+                            "credentialsConfigured": environment.credentials_configured,
+                            "createdAtUnixMs": environment.created_at_unix_ms,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"environments": environments})));
+                iced::Task::none()
+            }
+            "environment.show" => {
+                let selector = match string_param("environment") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let environment =
+                    self.ui_settings
+                        .runtime_environments
+                        .iter()
+                        .find(|environment| {
+                            environment.id == selector
+                                || environment.name.eq_ignore_ascii_case(&selector)
+                        });
+                match environment {
+                    Some(environment) => request.respond(Ok(serde_json::json!({
+                        "environment": {
+                            "id": environment.id,
+                            "name": environment.name,
+                            "endpoint": environment.endpoint,
+                            "credentialsConfigured": environment.credentials_configured,
+                            "createdAtUnixMs": environment.created_at_unix_ms,
+                        }
+                    }))),
+                    None => request.respond(Err(format!("Environment not found: {selector}"))),
+                }
+                iced::Task::none()
+            }
+            "environment.add" => {
+                let name = match string_param("name") {
+                    Ok(value) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        request.respond(Err("Environment name cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let pairing_code = match string_param("pairingCode") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                if self
+                    .ui_settings
+                    .runtime_environments
+                    .iter()
+                    .any(|environment| environment.name.eq_ignore_ascii_case(name.trim()))
+                {
+                    request.respond(Err(format!(
+                        "An environment named \"{}\" already exists.",
+                        name.trim()
+                    )));
+                    return iced::Task::none();
+                }
+                iced::Task::perform(
+                    crate::remote_runtime::save_environment(name, pairing_code),
+                    move |result| Message::RemoteRuntimeRpcSaveFinished(request.clone(), result),
+                )
+            }
+            "environment.remove" => {
+                let selector = match string_param("environment") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let environment = self
+                    .ui_settings
+                    .runtime_environments
+                    .iter()
+                    .find(|environment| {
+                        environment.id == selector
+                            || environment.name.eq_ignore_ascii_case(&selector)
+                    })
+                    .cloned();
+                let Some(environment) = environment else {
+                    request.respond(Err(format!("Environment not found: {selector}")));
+                    return iced::Task::none();
+                };
+                iced::Task::perform(
+                    crate::remote_runtime::remove_environment(environment.id.clone()),
+                    move |result| {
+                        Message::RemoteRuntimeRpcRemoveFinished(
+                            request.clone(),
+                            environment.clone(),
+                            result,
+                        )
+                    },
+                )
+            }
+            "agent.hooks" => {
+                let action = request
+                    .params
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("status");
+                if !matches!(action, "status" | "on" | "off") {
+                    request.respond(Err(format!("Unknown agent hooks action: {action}")));
+                    return iced::Task::none();
+                }
+                if action != "status" {
+                    if let Err(error) = self.set_agent_hooks_enabled(action == "on") {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                }
+                let path = crate::agent_status::inject::hook_script_path();
+                request.respond(Ok(serde_json::json!({
+                    "enabled": self.ui_settings.agent_status_hooks_enabled,
+                    "settingsPath": crate::persistence_thread::default_data_file(),
+                    "appliedBy": "runtime",
+                    "statuses": [{
+                        "agent": "claude",
+                        "state": if path.is_file() { "installed" } else { "not-installed" },
+                        "path": path,
+                    }],
+                })));
+                iced::Task::none()
+            }
+            "repo.list" => {
+                let repositories = self
+                    .repos
+                    .iter()
+                    .map(|repo| {
+                        serde_json::json!({
+                            "id": repo.id.0,
+                            "name": repo.display_name,
+                            "path": repo.path,
+                            "baseRef": repo.worktree_base_ref,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"repositories": repositories})));
+                iced::Task::none()
+            }
+            "project.list" => {
+                let projects = self
+                    .repos
+                    .iter()
+                    .map(|repo| self.rpc_project_json(repo))
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"projects": projects})));
+                iced::Task::none()
+            }
+            "projectHostSetup.list" => {
+                let setups = self
+                    .ui_settings
+                    .repo_host_setups
+                    .iter()
+                    .flat_map(|(project_id, setups)| {
+                        setups
+                            .iter()
+                            .map(move |setup| Self::rpc_project_setup_json(project_id, setup))
+                    })
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"setups": setups})));
+                iced::Task::none()
+            }
+            "projectHostSetup.create" | "projectHostSetup.setupExistingFolder" => {
+                let project_id = match string_param("projectId") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let host_id = match string_param("hostId") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(repo) = self.rpc_repo(&project_id).cloned() else {
+                    request.respond(Err(format!("Project not found: {project_id}")));
+                    return iced::Task::none();
+                };
+                let existing_folder =
+                    request.method.as_str() == "projectHostSetup.setupExistingFolder";
+                let mut path = request
+                    .params
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if existing_folder && path.is_empty() {
+                    request.respond(Err("Project folder path cannot be empty.".into()));
+                    return iced::Task::none();
+                }
+                if host_id == "local" && !path.is_empty() {
+                    let candidate = PathBuf::from(&path);
+                    let absolute = if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."))
+                            .join(candidate)
+                    };
+                    if existing_folder && !absolute.is_dir() {
+                        request.respond(Err(format!(
+                            "Project folder does not exist: {}",
+                            absolute.display()
+                        )));
+                        return iced::Task::none();
+                    }
+                    path = absolute
+                        .canonicalize()
+                        .unwrap_or(absolute)
+                        .to_string_lossy()
+                        .into_owned();
+                } else if !path.is_empty() && !Path::new(&path).is_absolute() {
+                    request.respond(Err(
+                        "Remote project setup paths must be absolute on the target host.".into(),
+                    ));
+                    return iced::Task::none();
+                }
+                let kind = request
+                    .params
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("git");
+                if !matches!(kind, "git" | "folder") {
+                    request.respond(Err("Project setup kind must be git or folder.".into()));
+                    return iced::Task::none();
+                }
+                if existing_folder
+                    && host_id == "local"
+                    && kind == "git"
+                    && !Path::new(&path).join(".git").exists()
+                    && !Path::new(&path).join("HEAD").exists()
+                {
+                    request.respond(Err(format!("Project folder is not a Git checkout: {path}")));
+                    return iced::Task::none();
+                }
+                let setup_state = request
+                    .params
+                    .get("setupState")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(if existing_folder {
+                        "ready"
+                    } else {
+                        "not-set-up"
+                    });
+                if !matches!(
+                    setup_state,
+                    "ready" | "not-set-up" | "setting-up" | "error" | "unsupported"
+                ) {
+                    request.respond(Err(format!("Unknown project setup state: {setup_state}")));
+                    return iced::Task::none();
+                }
+                let setup_method = request
+                    .params
+                    .get("setupMethod")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(if existing_folder {
+                        "imported-existing-folder"
+                    } else {
+                        "provisioned"
+                    });
+                if !matches!(
+                    setup_method,
+                    "imported-existing-folder" | "cloned" | "provisioned"
+                ) {
+                    request.respond(Err(format!("Unknown project setup method: {setup_method}")));
+                    return iced::Task::none();
+                }
+                let setup_id = request
+                    .params
+                    .get("setupId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{project_id}::{host_id}"));
+                if setup_id.trim().is_empty() {
+                    request.respond(Err("Project setup id cannot be empty.".into()));
+                    return iced::Task::none();
+                }
+                if self
+                    .ui_settings
+                    .repo_host_setups
+                    .values()
+                    .flatten()
+                    .any(|setup| setup.id == setup_id)
+                {
+                    request.respond(Err(format!(
+                        "Project host setup already exists: {setup_id}"
+                    )));
+                    return iced::Task::none();
+                }
+                let display_name = request
+                    .params
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&repo.display_name)
+                    .trim()
+                    .chars()
+                    .take(160)
+                    .collect::<String>();
+                let now = current_unix_ms().min(u64::MAX as u128) as u64;
+                let setup = ProjectHostSetupSetting {
+                    id: setup_id,
+                    host_id,
+                    path,
+                    display_name,
+                    worktree_base_path: request
+                        .params
+                        .get("worktreeBasePath")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    git_username: request
+                        .params
+                        .get("gitUsername")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    kind: kind.to_string(),
+                    setup_state: setup_state.to_string(),
+                    setup_method: setup_method.to_string(),
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                };
+                self.ui_settings
+                    .repo_host_setups
+                    .entry(repo.id.0.clone())
+                    .or_default()
+                    .push(setup.clone());
+                self.persist();
+                let result = serde_json::json!({
+                    "project": self.rpc_project_json(&repo),
+                    "setup": Self::rpc_project_setup_json(&repo.id.0, &setup),
+                });
+                request.respond(Ok(if existing_folder {
+                    serde_json::json!({
+                        "result": {
+                            "project": result["project"].clone(),
+                            "setup": result["setup"].clone(),
+                            "repo": {
+                                "id": repo.id.0,
+                                "path": repo.path,
+                                "displayName": repo.display_name,
+                            },
+                        }
+                    })
+                } else {
+                    serde_json::json!({"result": result})
+                }));
+                iced::Task::none()
+            }
+            "projectHostSetup.update" => {
+                let setup_id = match string_param("setupId") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let updates = request.params.get("updates").unwrap_or(&request.params);
+                let location =
+                    self.ui_settings
+                        .repo_host_setups
+                        .iter()
+                        .find_map(|(project_id, setups)| {
+                            setups
+                                .iter()
+                                .position(|setup| setup.id == setup_id)
+                                .map(|index| (project_id.clone(), index))
+                        });
+                let Some((project_id, index)) = location else {
+                    request.respond(Err(format!("Project host setup not found: {setup_id}")));
+                    return iced::Task::none();
+                };
+                let Some(repo) = self.rpc_repo(&project_id).cloned() else {
+                    request.respond(Err(format!("Project not found: {project_id}")));
+                    return iced::Task::none();
+                };
+                let setup = &mut self
+                    .ui_settings
+                    .repo_host_setups
+                    .get_mut(&project_id)
+                    .expect("setup project was located")[index];
+                for (field, target) in [
+                    ("displayName", &mut setup.display_name),
+                    ("path", &mut setup.path),
+                    ("worktreeBasePath", &mut setup.worktree_base_path),
+                    ("gitUsername", &mut setup.git_username),
+                ] {
+                    if let Some(value) = updates.get(field).and_then(serde_json::Value::as_str) {
+                        *target = value.trim().chars().take(4_096).collect();
+                    }
+                }
+                if let Some(kind) = updates.get("kind").and_then(serde_json::Value::as_str) {
+                    if !matches!(kind, "git" | "folder") {
+                        request.respond(Err("Project setup kind must be git or folder.".into()));
+                        return iced::Task::none();
+                    }
+                    setup.kind = kind.to_string();
+                }
+                if let Some(state) = updates
+                    .get("setupState")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !matches!(
+                        state,
+                        "ready" | "not-set-up" | "setting-up" | "error" | "unsupported"
+                    ) {
+                        request.respond(Err(format!("Unknown project setup state: {state}")));
+                        return iced::Task::none();
+                    }
+                    setup.setup_state = state.to_string();
+                }
+                if let Some(method) = updates
+                    .get("setupMethod")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !matches!(
+                        method,
+                        "legacy-repo" | "imported-existing-folder" | "cloned" | "provisioned"
+                    ) {
+                        request.respond(Err(format!("Unknown project setup method: {method}")));
+                        return iced::Task::none();
+                    }
+                    setup.setup_method = method.to_string();
+                }
+                setup.updated_at_unix_ms = current_unix_ms().min(u64::MAX as u128) as u64;
+                let setup = setup.clone();
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "result": {
+                        "project": self.rpc_project_json(&repo),
+                        "setup": Self::rpc_project_setup_json(&project_id, &setup),
+                    }
+                })));
+                iced::Task::none()
+            }
+            "projectHostSetup.delete" => {
+                let setup_id = match string_param("setupId") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let location =
+                    self.ui_settings
+                        .repo_host_setups
+                        .iter()
+                        .find_map(|(project_id, setups)| {
+                            setups
+                                .iter()
+                                .position(|setup| setup.id == setup_id)
+                                .map(|index| (project_id.clone(), index))
+                        });
+                let Some((project_id, index)) = location else {
+                    request.respond(Err(format!("Project host setup not found: {setup_id}")));
+                    return iced::Task::none();
+                };
+                let Some(repo) = self.rpc_repo(&project_id).cloned() else {
+                    request.respond(Err(format!("Project not found: {project_id}")));
+                    return iced::Task::none();
+                };
+                let setup = self
+                    .ui_settings
+                    .repo_host_setups
+                    .get_mut(&project_id)
+                    .expect("setup project was located")
+                    .remove(index);
+                if self
+                    .ui_settings
+                    .repo_host_setups
+                    .get(&project_id)
+                    .is_some_and(Vec::is_empty)
+                {
+                    self.ui_settings.repo_host_setups.remove(&project_id);
+                }
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "result": {
+                        "project": self.rpc_project_json(&repo),
+                        "setup": Self::rpc_project_setup_json(&project_id, &setup),
+                    }
+                })));
+                iced::Task::none()
+            }
+            "repo.add" => {
+                let path = match string_param("path") {
+                    Ok(path) => PathBuf::from(path),
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let op = self.next_op();
+                self.pending_repo_add_rpcs.insert(op, request);
+                crate::git_tasks::add_repo(op, path)
+            }
+            "repo.set_base_ref" => {
+                let selector = match string_param("repo") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let reference = match string_param("ref") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                if let Err(error) = suaegi_git::refname::validate_user_ref(&reference) {
+                    request.respond(Err(error.to_string()));
+                    return iced::Task::none();
+                }
+                let Some(repo_id) = self.rpc_repo(&selector).map(|repo| repo.id.clone()) else {
+                    request.respond(Err(format!("Repository not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let task = self.update(Message::RepoBaseRefChanged(
+                    repo_id.clone(),
+                    reference.clone(),
+                ));
+                request.respond(Ok(serde_json::json!({
+                    "repoId": repo_id.0,
+                    "baseRef": reference,
+                })));
+                task
+            }
+            "worktree.list" => {
+                let active_worktree = self.selected_worktree.clone();
+                let worktrees = self
+                    .worktrees_by_repo
+                    .iter()
+                    .flat_map(|(repo_id, entries)| {
+                        let active_worktree = active_worktree.clone();
+                        entries.iter().map(move |entry| {
+                            let id = worktree_id_for(&entry.path);
+                            serde_json::json!({
+                                "id": id.0,
+                                "repoId": repo_id.0,
+                                "path": entry.path,
+                                "branch": entry.branch,
+                                "head": entry.head,
+                                "main": entry.is_main,
+                                "active": active_worktree.as_ref() == Some(&id),
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"worktrees": worktrees})));
+                iced::Task::none()
+            }
+            "worktree.show" => {
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                match self
+                    .rpc_worktree(&selector)
+                    .and_then(|id| self.rpc_worktree_json(&id))
+                {
+                    Some(worktree) => request.respond(Ok(serde_json::json!({
+                        "worktree": worktree
+                    }))),
+                    None => request.respond(Err(format!("Worktree not found: {selector}"))),
+                }
+                iced::Task::none()
+            }
+            "worktree.ps" => {
+                let limit = request
+                    .params
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 10_000) as usize;
+                let worktrees = self
+                    .worktrees_by_repo
+                    .values()
+                    .flatten()
+                    .filter_map(|entry| self.rpc_worktree_json(&worktree_id_for(&entry.path)))
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({
+                    "worktrees": worktrees,
+                    "total": self.worktrees_by_repo.values().map(Vec::len).sum::<usize>(),
+                })));
+                iced::Task::none()
+            }
+            "worktree.set" => {
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                if let Some(display_name) = request
+                    .params
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.worktree_meta
+                        .entry(worktree.clone())
+                        .or_default()
+                        .display_name = (!display_name.trim().is_empty())
+                        .then(|| display_name.trim().chars().take(100).collect());
+                }
+                if let Some(comment) = request
+                    .params
+                    .get("comment")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let comment = comment.trim().chars().take(500).collect::<String>();
+                    if comment.is_empty() {
+                        self.ui_settings.worktree_comments.remove(&worktree.0);
+                    } else {
+                        self.ui_settings
+                            .worktree_comments
+                            .insert(worktree.0.clone(), comment);
+                    }
+                }
+                if let Some(status) = request
+                    .params
+                    .get("workspaceStatus")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let status = match status {
+                        "todo" => BoardStatus::Todo,
+                        "in-progress" | "in_progress" => BoardStatus::InProgress,
+                        "in-review" | "in_review" => BoardStatus::InReview,
+                        "done" | "completed" => BoardStatus::Done,
+                        _ => {
+                            request.respond(Err(format!("Unknown workspace status: {status}")));
+                            return iced::Task::none();
+                        }
+                    };
+                    self.ui_settings
+                        .board_statuses
+                        .insert(worktree.0.clone(), status.persisted().to_string());
+                }
+                if request
+                    .params
+                    .get("noParent")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    self.ui_settings.worktree_parents.remove(&worktree.0);
+                } else if let Some(parent) = request
+                    .params
+                    .get("parentWorktree")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let Some(parent) = self.rpc_worktree(parent) else {
+                        request.respond(Err(format!("Parent worktree not found: {parent}")));
+                        return iced::Task::none();
+                    };
+                    if parent == worktree {
+                        request.respond(Err("A worktree cannot be its own parent.".into()));
+                        return iced::Task::none();
+                    }
+                    self.ui_settings
+                        .worktree_parents
+                        .insert(worktree.0.clone(), parent.0);
+                }
+                if let Some(issue) = request.params.get("linkedIssue") {
+                    let linked = if issue.is_null() {
+                        None
+                    } else {
+                        match issue.as_u64() {
+                            Some(number) if number > 0 => Some(number),
+                            _ => {
+                                request.respond(Err(
+                                    "linkedIssue must be a positive integer or null.".into(),
+                                ));
+                                return iced::Task::none();
+                            }
+                        }
+                    };
+                    self.worktree_meta
+                        .entry(worktree.clone())
+                        .or_default()
+                        .linked_github_pr = linked;
+                }
+                if let Some(linear) = request.params.get("linearIssue") {
+                    let linked = if linear.is_null() {
+                        None
+                    } else {
+                        match linear.as_str() {
+                            Some(value) if !value.trim().is_empty() => {
+                                Some(value.trim().chars().take(100).collect())
+                            }
+                            _ => {
+                                request.respond(Err(
+                                    "linearIssue must be a non-empty string or null.".into(),
+                                ));
+                                return iced::Task::none();
+                            }
+                        }
+                    };
+                    self.worktree_meta
+                        .entry(worktree.clone())
+                        .or_default()
+                        .linked_linear_issue = linked;
+                }
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "worktree": self.rpc_worktree_json(&worktree)
+                })));
+                iced::Task::none()
+            }
+            "worktree.create" => {
+                let name = match string_param("name") {
+                    Ok(name) if !name.trim().is_empty() => name,
+                    Ok(_) => {
+                        request.respond(Err("Worktree name cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let repo = request
+                    .params
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|selector| self.rpc_repo(selector).cloned())
+                    .or_else(|| {
+                        self.selected_worktree
+                            .as_ref()
+                            .and_then(|worktree| self.find_worktree(worktree))
+                            .and_then(|(repo, _)| self.repo_by_id(&repo).cloned())
+                    })
+                    .or_else(|| self.repos.first().cloned());
+                let Some(repo) = repo else {
+                    request.respond(Err(
+                        "No repository is available; pass a registered repository.".into(),
+                    ));
+                    return iced::Task::none();
+                };
+                let base_ref = request
+                    .params
+                    .get("baseBranch")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| repo.worktree_base_ref.clone())
+                    .unwrap_or_else(|| "main".into());
+                if let Err(error) = suaegi_git::refname::validate_user_ref(&base_ref) {
+                    request.respond(Err(error.to_string()));
+                    return iced::Task::none();
+                }
+                let selected_agent = request
+                    .params
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let run_setup = request
+                    .params
+                    .get("runSetup")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if selected_agent
+                    .as_deref()
+                    .is_some_and(|agent| agent_def_by_id(agent).is_none())
+                {
+                    request.respond(Err("Unknown agent id.".into()));
+                    return iced::Task::none();
+                }
+                let configured_root = self
+                    .ui_settings
+                    .repo_worktree_base_paths
+                    .get(&repo.id.0)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty());
+                let workspace_root = configured_root.map_or_else(
+                    || self.workspace_root.clone(),
+                    |value| {
+                        let path = PathBuf::from(value);
+                        if path.is_absolute() {
+                            path
+                        } else {
+                            repo.path.join(path)
+                        }
+                    },
+                );
+                let nest_workspaces = configured_root
+                    .map(|_| false)
+                    .unwrap_or(self.ui_settings.nest_workspaces);
+                let branch_prefix = match self.ui_settings.branch_prefix.as_str() {
+                    "custom" => Some(self.ui_settings.branch_prefix_custom.trim().to_string())
+                        .filter(|prefix| !prefix.is_empty()),
+                    "git-username" => std::env::var("GIT_AUTHOR_NAME")
+                        .ok()
+                        .or_else(|| std::env::var("USER").ok())
+                        .filter(|prefix| !prefix.trim().is_empty()),
+                    _ => None,
+                };
+                let linked_paths = self
+                    .ui_settings
+                    .repo_symlink_paths
+                    .get(&repo.id.0)
+                    .cloned()
+                    .unwrap_or_default();
+                let op = self.next_op();
+                self.pending_worktree_create_rpcs.insert(op, request);
+                crate::git_tasks::create_worktree(
+                    op,
+                    repo,
+                    name,
+                    base_ref,
+                    workspace_root,
+                    nest_workspaces,
+                    branch_prefix,
+                    self.ui_settings.refresh_local_base_ref,
+                    selected_agent,
+                    None,
+                    run_setup,
+                    linked_paths,
+                    Vec::new(),
+                )
+            }
+            "worktree.remove" => {
+                let selector = match string_param("worktree") {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree_id) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let Some((repo_id, entry)) = self.find_worktree(&worktree_id) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                if entry.is_main {
+                    request.respond(Err(
+                        "The primary repository checkout cannot be removed.".into()
+                    ));
+                    return iced::Task::none();
+                }
+                let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
+                    request.respond(Err("The worktree repository is no longer available.".into()));
+                    return iced::Task::none();
+                };
+                let force = request
+                    .params
+                    .get("force")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if self.selected_worktree.as_ref() == Some(&worktree_id) {
+                    self.selected_worktree = None;
+                }
+                self.pending_worktree_removals.insert(worktree_id.clone());
+                let linked_paths = self
+                    .ui_settings
+                    .repo_symlink_paths
+                    .get(&repo_id.0)
+                    .cloned()
+                    .unwrap_or_default();
+                let op = self.next_op();
+                self.pending_worktree_remove_rpcs.insert(op, request);
+                crate::git_tasks::remove_worktree(
+                    op,
+                    repo,
+                    worktree_id,
+                    entry.path,
+                    force,
+                    entry.branch,
+                    linked_paths,
+                )
+            }
+            "navigate" => {
+                let destination = match string_param("destination") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let task = match destination.as_str() {
+                    "browser" => self.update(Message::BrowserOpenRequested),
+                    "emulator" => self.update(Message::EmulatorAvailabilityRequested),
+                    "automations" => self.update(Message::AutomationOpened),
+                    "activity" => self.update(Message::ActivityOpened),
+                    "tasks" => self.update(Message::TasksOpened),
+                    "board" => {
+                        if self.workspace_board_open {
+                            iced::Task::none()
+                        } else {
+                            self.update(Message::WorkspaceBoardToggled)
+                        }
+                    }
+                    "settings" => self.update(Message::SettingsOpened(SettingsSection::General)),
+                    value if value.starts_with("settings:") => {
+                        match parse_rpc_settings_section(&value["settings:".len()..]) {
+                            Some(section) => self.update(Message::SettingsOpened(section)),
+                            None => {
+                                request.respond(Err(format!(
+                                    "Unknown settings section: {}",
+                                    &value["settings:".len()..]
+                                )));
+                                return iced::Task::none();
+                            }
+                        }
+                    }
+                    _ => {
+                        request.respond(Err(format!("Unknown destination: {destination}")));
+                        return iced::Task::none();
+                    }
+                };
+                request.respond(Ok(serde_json::json!({"opened": destination})));
+                task
+            }
+            "browser.goto" => {
+                let raw = match string_param("url") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(url) = self.normalized_browser_url(&raw) else {
+                    request.respond(Err("Enter a valid web address or search query.".to_string()));
+                    return iced::Task::none();
+                };
+                // Put the destination into state before creating the native
+                // view. A freshly-created WKWebView must receive the requested
+                // page as its initial request; issuing a second load in the
+                // same Iced update can otherwise race WebKit initialization.
+                self.browser_current_url = url.clone();
+                self.browser_address_draft = if url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                    String::new()
+                } else {
+                    url.clone()
+                };
+                let open = self.update(Message::BrowserOpenRequested);
+                self.remember_active_browser_tab();
+                self.persist();
+                if let Some(error) = self.browser_error.clone() {
+                    request.respond(Err(error));
+                } else {
+                    request.respond(Ok(serde_json::json!({
+                        "url": self.browser_current_url,
+                        "opened": true,
+                    })));
+                }
+                open
+            }
+            "browser.back" => {
+                let task = self.update(Message::BrowserBack);
+                respond_browser_action(&request, &self.browser_error, "back");
+                task
+            }
+            "browser.forward" => {
+                let task = self.update(Message::BrowserForward);
+                respond_browser_action(&request, &self.browser_error, "forward");
+                task
+            }
+            "browser.reload" => {
+                let task = self.update(Message::BrowserReload);
+                respond_browser_action(&request, &self.browser_error, "reload");
+                task
+            }
+            "browser.close" => {
+                let task = self.update(Message::BrowserClosed);
+                request.respond(Ok(serde_json::json!({"closed": true})));
+                task
+            }
+            "browser.tab.list" => {
+                let tabs = self
+                    .browser_tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| {
+                        serde_json::json!({
+                            "index": index,
+                            "browserPageId": tab.id,
+                            "url": tab.url,
+                            "title": if tab.title.is_empty() { &tab.url } else { &tab.title },
+                            "active": self.active_browser_tab_id.as_deref() == Some(tab.id.as_str()),
+                            "profileId": tab.profile_id,
+                            "profileLabel": if tab.profile_id == "default" {
+                                Some("Default")
+                            } else {
+                                self.ui_settings.browser_profiles.iter()
+                                    .find(|profile| profile.id == tab.profile_id)
+                                    .map(|profile| profile.label.as_str())
+                            },
+                            "worktreeId": tab.worktree_id.as_ref().map(|id| &id.0),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"tabs": tabs})));
+                iced::Task::none()
+            }
+            "browser.tab.current" => {
+                let tab = self.active_browser_tab_id.as_ref().and_then(|id| {
+                    self.browser_tabs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, tab)| &tab.id == id)
+                });
+                match tab {
+                    Some((index, tab)) => request.respond(Ok(serde_json::json!({
+                        "index": index,
+                        "browserPageId": tab.id,
+                        "url": tab.url,
+                        "title": if tab.title.is_empty() { &tab.url } else { &tab.title },
+                        "active": true,
+                        "profileId": tab.profile_id,
+                    }))),
+                    None => request.respond(Err("No browser tab is active.".into())),
+                }
+                iced::Task::none()
+            }
+            "browser.tab.show" => {
+                let page = match string_param("page") {
+                    Ok(page) => page,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                match self
+                    .browser_tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, tab)| tab.id == page)
+                {
+                    Some((index, tab)) => request.respond(Ok(serde_json::json!({
+                        "index": index,
+                        "browserPageId": tab.id,
+                        "url": tab.url,
+                        "title": if tab.title.is_empty() { &tab.url } else { &tab.title },
+                        "active": self.active_browser_tab_id.as_deref() == Some(tab.id.as_str()),
+                        "profileId": tab.profile_id,
+                    }))),
+                    None => request.respond(Err(format!("Browser tab not found: {page}"))),
+                }
+                iced::Task::none()
+            }
+            "browser.tab.create" => {
+                self.remember_active_browser_tab();
+                let raw = request
+                    .params
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&self.ui_settings.browser_home_page);
+                let Some(url) = self.normalized_browser_url(raw) else {
+                    request.respond(Err("Enter a valid browser URL.".into()));
+                    return iced::Task::none();
+                };
+                let profile = request
+                    .params
+                    .get("profile")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&self.ui_settings.browser_default_profile_id)
+                    .to_string();
+                if profile != "default"
+                    && !self
+                        .ui_settings
+                        .browser_profiles
+                        .iter()
+                        .any(|candidate| candidate.id == profile)
+                {
+                    request.respond(Err(format!("Browser profile not found: {profile}")));
+                    return iced::Task::none();
+                }
+                let id = self.create_browser_tab(url.clone(), profile.clone());
+                self.active_browser_tab_id = Some(id.clone());
+                self.browser_current_url = url.clone();
+                self.browser_address_draft = if url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                    String::new()
+                } else {
+                    url.clone()
+                };
+                self.persist();
+                let open = self.update(Message::BrowserOpenRequested);
+                request.respond(Ok(serde_json::json!({
+                    "browserPageId": id,
+                    "url": url,
+                    "profileId": profile,
+                    "active": true,
+                    "index": self.browser_tabs.len() - 1,
+                })));
+                open
+            }
+            "browser.tab.switch" => {
+                let id = if let Some(page) = request
+                    .params
+                    .get("page")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    page.to_string()
+                } else if let Some(index) = request
+                    .params
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    match self.browser_tabs.get(index as usize) {
+                        Some(tab) => tab.id.clone(),
+                        None => {
+                            request
+                                .respond(Err(format!("Browser tab index out of range: {index}")));
+                            return iced::Task::none();
+                        }
+                    }
+                } else {
+                    request.respond(Err("tab switch requires --page or --index".into()));
+                    return iced::Task::none();
+                };
+                if let Err(error) = self.activate_browser_tab(&id) {
+                    request.respond(Err(error));
+                    return iced::Task::none();
+                }
+                self.persist();
+                let open = self.update(Message::BrowserOpenRequested);
+                request.respond(Ok(serde_json::json!({
+                    "browserPageId": id,
+                    "url": self.browser_current_url,
+                    "active": true,
+                })));
+                open
+            }
+            "browser.tab.close" => {
+                let id = request
+                    .params
+                    .get("page")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        request
+                            .params
+                            .get("index")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|index| self.browser_tabs.get(index as usize))
+                            .map(|tab| tab.id.clone())
+                    })
+                    .or_else(|| self.active_browser_tab_id.clone());
+                let Some(id) = id else {
+                    request.respond(Err("No browser tab is open.".into()));
+                    return iced::Task::none();
+                };
+                if !self.browser_tabs.iter().any(|tab| tab.id == id) {
+                    request.respond(Err(format!("Browser tab not found: {id}")));
+                    return iced::Task::none();
+                }
+                let task = self.update(Message::BrowserTabClosed(id.clone()));
+                request.respond(Ok(serde_json::json!({"closed": id})));
+                task
+            }
+            "browser.profile.list" => {
+                let mut profiles = vec![serde_json::json!({
+                    "id": "default", "label": "Default", "scope": "default"
+                })];
+                profiles.extend(self.ui_settings.browser_profiles.iter().map(|profile| {
+                    serde_json::json!({
+                        "id": profile.id,
+                        "label": profile.label,
+                        "scope": "isolated",
+                    })
+                }));
+                request.respond(Ok(serde_json::json!({"profiles": profiles})));
+                iced::Task::none()
+            }
+            "browser.profile.create" => {
+                let label = match string_param("label") {
+                    Ok(label) if !label.trim().is_empty() => label,
+                    Ok(_) => {
+                        request.respond(Err("Profile label cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let id = format!("profile-{}", current_unix_ms());
+                self.ui_settings.browser_profiles.push(
+                    suaegi_core::domain::BrowserProfileSetting {
+                        id: id.clone(),
+                        label: label.clone(),
+                    },
+                );
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "id": id, "label": label, "scope": "isolated"
+                })));
+                iced::Task::none()
+            }
+            "browser.profile.delete" => {
+                let profile = match string_param("profile") {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                if profile == "default" {
+                    request.respond(Err("The default browser profile cannot be deleted.".into()));
+                    return iced::Task::none();
+                }
+                if self
+                    .browser_tabs
+                    .iter()
+                    .any(|tab| tab.profile_id == profile)
+                {
+                    request.respond(Err(format!(
+                        "Browser profile {profile} is still used by an open tab."
+                    )));
+                    return iced::Task::none();
+                }
+                let before = self.ui_settings.browser_profiles.len();
+                self.ui_settings
+                    .browser_profiles
+                    .retain(|candidate| candidate.id != profile);
+                if self.ui_settings.browser_profiles.len() == before {
+                    request.respond(Err(format!("Browser profile not found: {profile}")));
+                    return iced::Task::none();
+                }
+                self.persist();
+                let removal = crate::browser::begin_remove_profile_data(&profile);
+                iced::Task::perform(
+                    async move {
+                        removal.await.unwrap_or_else(|_| {
+                            Err("Browser profile deletion was cancelled.".into())
+                        })
+                    },
+                    move |result| {
+                        Message::BrowserProfileRemovalFinished(
+                            profile.clone(),
+                            result,
+                            Some(request.clone()),
+                        )
+                    },
+                )
+            }
+            method @ ("browser.profile.set"
+            | "browser.profile.show"
+            | "browser.profile.use-default"
+            | "browser.profile.clone") => {
+                let page = request
+                    .params
+                    .get("page")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.active_browser_tab_id.clone());
+                let Some(page) = page else {
+                    request.respond(Err("No browser tab is active.".into()));
+                    return iced::Task::none();
+                };
+                let Some(index) = self.browser_tabs.iter().position(|tab| tab.id == page) else {
+                    request.respond(Err(format!("Browser tab not found: {page}")));
+                    return iced::Task::none();
+                };
+                if method == "browser.profile.show" {
+                    let tab = &self.browser_tabs[index];
+                    request.respond(Ok(serde_json::json!({
+                        "browserPageId": tab.id,
+                        "profileId": tab.profile_id,
+                    })));
+                    return iced::Task::none();
+                }
+                let profile = if method == "browser.profile.use-default" {
+                    "default".to_string()
+                } else {
+                    match string_param("profile") {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            request.respond(Err(error));
+                            return iced::Task::none();
+                        }
+                    }
+                };
+                if profile != "default"
+                    && !self
+                        .ui_settings
+                        .browser_profiles
+                        .iter()
+                        .any(|candidate| candidate.id == profile)
+                {
+                    request.respond(Err(format!("Browser profile not found: {profile}")));
+                    return iced::Task::none();
+                }
+                if method == "browser.profile.clone" {
+                    let source = self.browser_tabs[index].clone();
+                    let id = self.create_browser_tab(source.url.clone(), profile.clone());
+                    self.active_browser_tab_id = Some(id.clone());
+                    self.browser_current_url = source.url;
+                    self.browser_address_draft = self.browser_current_url.clone();
+                    self.persist();
+                    let open = self.update(Message::BrowserOpenRequested);
+                    request.respond(Ok(serde_json::json!({
+                        "browserPageId": id,
+                        "profileId": profile,
+                        "active": true,
+                    })));
+                    return open;
+                }
+                self.browser_tabs[index].profile_id = profile.clone();
+                let active = self.active_browser_tab_id.as_deref() == Some(page.as_str());
+                if active {
+                    crate::browser::remove_tab(&page);
+                }
+                self.persist();
+                let task = if active {
+                    self.update(Message::BrowserOpenRequested)
+                } else {
+                    iced::Task::none()
+                };
+                request.respond(Ok(serde_json::json!({
+                    "browserPageId": page,
+                    "profileId": profile,
+                })));
+                task
+            }
+            "browser.cookie.get" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                let url = request
+                    .params
+                    .get("url")
+                    .and_then(serde_json::Value::as_str);
+                request.respond(crate::browser::cookies(url));
+                open
+            }
+            "browser.cookie.set" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                request.respond(crate::browser::set_cookie(&request.params));
+                open
+            }
+            "browser.cookie.delete" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                request.respond(crate::browser::delete_cookie(&request.params));
+                open
+            }
+            method @ ("browser.screenshot" | "browser.full-screenshot") => {
+                let open = self.update(Message::BrowserOpenRequested);
+                let format = request
+                    .params
+                    .get("format")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| *value == "jpeg")
+                    .unwrap_or("png")
+                    .to_string();
+                let callback_request = request.clone();
+                let callback_format = format.clone();
+                let respond = move |result: Result<Vec<u8>, String>| {
+                    use base64::Engine as _;
+                    callback_request.respond(result.map(|bytes| {
+                        serde_json::json!({
+                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                            "format": callback_format,
+                        })
+                    }));
+                };
+                let result = if method == "browser.full-screenshot" {
+                    crate::browser::full_screenshot(&format, respond)
+                } else {
+                    crate::browser::screenshot(&format, respond)
+                };
+                if let Err(error) = result {
+                    request.respond(Err(error));
+                }
+                open
+            }
+            "browser.pdf" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                let callback_request = request.clone();
+                if let Err(error) = crate::browser::pdf(move |result| {
+                    use base64::Engine as _;
+                    callback_request.respond(result.map(|bytes| {
+                        serde_json::json!({
+                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        })
+                    }));
+                }) {
+                    request.respond(Err(error));
+                }
+                open
+            }
+            "browser.upload" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                if let Some(error) = self.browser_error.clone() {
+                    request.respond(Err(error));
+                    return open;
+                }
+                let params = match prepare_browser_upload(&request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let script = match crate::browser::automation_script("upload", &params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let callback_request = request.clone();
+                if let Err(error) = crate::browser::evaluate(script, move |raw| {
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(value)
+                            if value.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            callback_request.respond(Ok(value
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null)));
+                        }
+                        Ok(value) => callback_request.respond(Err(value
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Browser upload failed.")
+                            .to_string())),
+                        Err(error) => callback_request.respond(Err(format!(
+                            "Browser returned an invalid upload result: {error}"
+                        ))),
+                    }
+                }) {
+                    request.respond(Err(error));
+                }
+                open
+            }
+            "browser.download" => {
+                let open = self.update(Message::BrowserOpenRequested);
+                if let Some(error) = self.browser_error.clone() {
+                    request.respond(Err(error));
+                    return open;
+                }
+                let destination = match string_param("path") {
+                    Ok(path) => PathBuf::from(path),
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let element = match string_param("element") {
+                    Ok(element) => element,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let completion_request = request.clone();
+                let download = match crate::browser::begin_download(destination, move |result| {
+                    completion_request.respond(result.map(|path| {
+                        serde_json::json!({
+                            "downloaded": true,
+                            "path": path,
+                        })
+                    }));
+                }) {
+                    Ok(download) => download,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let script = match crate::browser::automation_script(
+                    "click",
+                    &serde_json::json!({"element": element}),
+                ) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        crate::browser::cancel_download(download, error);
+                        return open;
+                    }
+                };
+                if let Err(error) = crate::browser::evaluate(script, move |raw| {
+                    let result = serde_json::from_str::<serde_json::Value>(&raw);
+                    match result {
+                        Ok(value)
+                            if value.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) => {}
+                        Ok(value) => crate::browser::cancel_download(
+                            download,
+                            value
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Browser download click failed.")
+                                .to_string(),
+                        ),
+                        Err(error) => crate::browser::cancel_download(
+                            download,
+                            format!("Browser returned an invalid download result: {error}"),
+                        ),
+                    }
+                }) {
+                    crate::browser::cancel_download(download, error);
+                }
+                open
+            }
+            method
+                if matches!(
+                    method,
+                    "browser.snapshot"
+                        | "browser.click"
+                        | "browser.dblclick"
+                        | "browser.focus"
+                        | "browser.hover"
+                        | "browser.fill"
+                        | "browser.type"
+                        | "browser.clear"
+                        | "browser.select-all"
+                        | "browser.select"
+                        | "browser.check"
+                        | "browser.uncheck"
+                        | "browser.keypress"
+                        | "browser.scroll"
+                        | "browser.scroll-into-view"
+                        | "browser.drag"
+                        | "browser.get"
+                        | "browser.is"
+                        | "browser.insert-text"
+                        | "browser.highlight"
+                        | "browser.find"
+                        | "browser.mouse-move"
+                        | "browser.mouse-down"
+                        | "browser.mouse-up"
+                        | "browser.mouse-wheel"
+                        | "browser.geolocation"
+                        | "browser.viewport"
+                        | "browser.set-device"
+                        | "browser.set-offline"
+                        | "browser.set-headers"
+                        | "browser.set-credentials"
+                        | "browser.set-preferences"
+                        | "browser.set-media"
+                        | "browser.clipboard-read"
+                        | "browser.clipboard-write"
+                        | "browser.capture-start"
+                        | "browser.capture-stop"
+                        | "browser.intercept-enable"
+                        | "browser.intercept-disable"
+                        | "browser.intercept-list"
+                        | "browser.console"
+                        | "browser.network"
+                        | "browser.storage-local-get"
+                        | "browser.storage-local-set"
+                        | "browser.storage-local-clear"
+                        | "browser.storage-session-get"
+                        | "browser.storage-session-set"
+                        | "browser.storage-session-clear"
+                        | "browser.eval"
+                        | "browser.dialog-accept"
+                        | "browser.dialog-dismiss"
+                ) =>
+            {
+                let open = self.update(Message::BrowserOpenRequested);
+                if let Some(error) = self.browser_error.clone() {
+                    request.respond(Err(error));
+                    return open;
+                }
+                let action = method.trim_start_matches("browser.");
+                let viewport = if action == "viewport" {
+                    request
+                        .params
+                        .get("width")
+                        .and_then(serde_json::Value::as_f64)
+                        .zip(
+                            request
+                                .params
+                                .get("height")
+                                .and_then(serde_json::Value::as_f64),
+                        )
+                        .map(|(width, height)| (width as f32, height as f32))
+                } else if action == "set-device" {
+                    request
+                        .params
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(crate::browser::device_viewport)
+                        .map(|(width, height, _, _)| (width, height))
+                } else {
+                    None
+                };
+                if matches!(action, "viewport" | "set-device") {
+                    let Some((width, height)) = viewport else {
+                        request.respond(Err(if action == "set-device" {
+                            "Unknown browser device.".into()
+                        } else {
+                            "Browser viewport requires positive width and height.".into()
+                        }));
+                        return open;
+                    };
+                    if let Err(error) = crate::browser::set_viewport(width, height) {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                }
+                if matches!(action, "dialog-accept" | "dialog-dismiss") {
+                    let accepted = action == "dialog-accept";
+                    let text = request
+                        .params
+                        .get("text")
+                        .and_then(serde_json::Value::as_str);
+                    request.respond(crate::browser::handle_dialog(accepted, text));
+                    return open;
+                }
+                let script = match crate::browser::automation_script(action, &request.params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return open;
+                    }
+                };
+                let callback_request = request.clone();
+                if let Err(error) = crate::browser::evaluate(script, move |raw| {
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(value)
+                            if value.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            callback_request.respond(Ok(value
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null)));
+                        }
+                        Ok(value) => {
+                            callback_request.respond(Err(value
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Browser command failed.")
+                                .to_string()));
+                        }
+                        Err(error) => callback_request.respond(Err(format!(
+                            "Browser returned an invalid automation result: {error}"
+                        ))),
+                    }
+                }) {
+                    request.respond(Err(error));
+                }
+                open
+            }
+            "terminal.list" => {
+                let worktree = request
+                    .params
+                    .get("worktree")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|selector| self.rpc_worktree(selector));
+                let limit = request
+                    .params
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 10_000) as usize;
+                let ids = self
+                    .session_store
+                    .sessions()
+                    .map(|(id, _)| id)
+                    .filter(|id| {
+                        worktree
+                            .as_ref()
+                            .is_none_or(|worktree| self.session_worktrees.get(id) == Some(worktree))
+                    })
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                let terminals = ids
+                    .into_iter()
+                    .map(|id| self.rpc_terminal_json(id))
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"terminals": terminals})));
+                iced::Task::none()
+            }
+            "terminal.show" | "terminal.read" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("No terminal is active.".into()));
+                    return iced::Task::none();
+                };
+                if request.method == "terminal.show" {
+                    request.respond(Ok(serde_json::json!({
+                        "terminal": self.rpc_terminal_json(id)
+                    })));
+                } else {
+                    let generation = self.session_store.snapshot_generation(id);
+                    let cursor = request
+                        .params
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_u64);
+                    let mut output = if cursor == Some(generation) {
+                        String::new()
+                    } else {
+                        self.session_store.snapshot_text(id).trim_end().to_string()
+                    };
+                    let limit = request
+                        .params
+                        .get("limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1_000)
+                        .clamp(1, 100_000) as usize;
+                    let lines = output.lines().collect::<Vec<_>>();
+                    if lines.len() > limit {
+                        output = lines[lines.len() - limit..].join("\n");
+                    }
+                    request.respond(Ok(serde_json::json!({
+                        "terminal": {
+                            "handle": format!("term_{}", id.0),
+                            "output": output,
+                            "nextCursor": generation,
+                            "oldestCursor": 0,
+                            "running": self.session_store.is_running(id),
+                            "exitCode": self.session_store.exit_code(id),
+                        }
+                    })));
+                }
+                iced::Task::none()
+            }
+            "terminal.send" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("No terminal is active.".into()));
+                    return iced::Task::none();
+                };
+                let mut bytes = Vec::new();
+                if request
+                    .params
+                    .get("interrupt")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    bytes.push(0x03);
+                }
+                if let Some(text) = request
+                    .params
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+                if request
+                    .params
+                    .get("enter")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    bytes.push(b'\r');
+                }
+                if bytes.is_empty() {
+                    request.respond(Err(
+                        "terminal send requires text, enter, or interrupt.".into()
+                    ));
+                    return iced::Task::none();
+                }
+                let Some(session) = self.session_store.session(id) else {
+                    request.respond(Err("Terminal is no longer available.".into()));
+                    return iced::Task::none();
+                };
+                if !session.write(bytes.clone()) {
+                    request.respond(Err("Terminal input queue is full.".into()));
+                } else {
+                    request.respond(Ok(serde_json::json!({
+                        "send": {
+                            "terminal": format!("term_{}", id.0),
+                            "bytesWritten": bytes.len(),
+                        }
+                    })));
+                }
+                iced::Task::none()
+            }
+            "terminal.focus" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("Terminal not found.".into()));
+                    return iced::Task::none();
+                };
+                let pane = self.panes.as_ref().and_then(|panes| {
+                    panes
+                        .iter()
+                        .find_map(|(pane, session)| (*session == id).then_some(*pane))
+                });
+                let Some(pane) = pane else {
+                    request.respond(Err(format!("Terminal term_{} has no visible pane.", id.0)));
+                    return iced::Task::none();
+                };
+                self.close_context_panels();
+                let task = self.focus_pane(pane);
+                request.respond(Ok(serde_json::json!({
+                    "focus": {"terminal": format!("term_{}", id.0), "focused": true}
+                })));
+                task
+            }
+            "terminal.rename" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("Terminal not found.".into()));
+                    return iced::Task::none();
+                };
+                self.generated_session_titles.remove(&id);
+                match request.params.get("title") {
+                    Some(serde_json::Value::String(title)) if !title.trim().is_empty() => {
+                        self.manual_session_titles
+                            .insert(id, title.trim().chars().take(100).collect());
+                    }
+                    _ => {
+                        self.manual_session_titles.remove(&id);
+                    }
+                }
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "rename": {
+                        "terminal": format!("term_{}", id.0),
+                        "title": self.session_tab_title(id),
+                    }
+                })));
+                iced::Task::none()
+            }
+            "terminal.close" | "terminal.closeTab" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("Terminal not found.".into()));
+                    return iced::Task::none();
+                };
+                self.close_session(id);
+                self.persist();
+                request.respond(Ok(serde_json::json!({
+                    "close": {"terminal": format!("term_{}", id.0), "closed": true}
+                })));
+                iced::Task::none()
+            }
+            "terminal.stop" => {
+                let selector = match string_param("worktree") {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let ids = self
+                    .session_worktrees
+                    .iter()
+                    .filter_map(|(id, candidate)| (candidate == &worktree).then_some(*id))
+                    .collect::<Vec<_>>();
+                for id in &ids {
+                    self.close_session(*id);
+                }
+                self.persist();
+                request.respond(Ok(serde_json::json!({"stopped": ids.len()})));
+                iced::Task::none()
+            }
+            "terminal.create" => {
+                let worktree = request
+                    .params
+                    .get("worktree")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|selector| self.rpc_worktree(selector))
+                    .or_else(|| self.selected_worktree.clone());
+                let Some(worktree) = worktree else {
+                    request.respond(Err("No worktree is active.".into()));
+                    return iced::Task::none();
+                };
+                let command = request
+                    .params
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let title = request
+                    .params
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let focus = request
+                    .params
+                    .get("focus")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                self.start_rpc_terminal(
+                    PendingCliTerminal {
+                        request,
+                        worktree_id: worktree,
+                        split_target: None,
+                        direction: pane_grid::Axis::Horizontal,
+                        focus,
+                    },
+                    command,
+                    title,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+            "terminal.split" => {
+                let target = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(target) = target else {
+                    request.respond(Err("Terminal not found.".into()));
+                    return iced::Task::none();
+                };
+                let Some(worktree) = self.session_worktrees.get(&target).cloned() else {
+                    request.respond(Err("Terminal has no worktree.".into()));
+                    return iced::Task::none();
+                };
+                let direction = match request
+                    .params
+                    .get("direction")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("horizontal")
+                {
+                    "horizontal" => pane_grid::Axis::Horizontal,
+                    "vertical" => pane_grid::Axis::Vertical,
+                    value => {
+                        request.respond(Err(format!("Unknown split direction: {value}")));
+                        return iced::Task::none();
+                    }
+                };
+                let command = request
+                    .params
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let extra_env = request
+                    .params
+                    .get("env")
+                    .and_then(serde_json::Value::as_object)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                let value = value.as_str()?;
+                                (valid_agent_env_name(name)
+                                    && value.len() <= 16 * 1024
+                                    && !value.contains('\0'))
+                                .then(|| (name.clone(), value.to_string()))
+                            })
+                            .take(256)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let env_remove = request
+                    .params
+                    .get("envToDelete")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .filter(|name| valid_agent_env_name(name))
+                            .take(64)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let focus = request
+                    .params
+                    .get("focus")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                self.start_rpc_terminal(
+                    PendingCliTerminal {
+                        request,
+                        worktree_id: worktree,
+                        split_target: Some(target),
+                        direction,
+                        focus,
+                    },
+                    command,
+                    Some("Terminal".into()),
+                    extra_env,
+                    env_remove,
+                )
+            }
+            "terminal.wait" => {
+                let id = request
+                    .params
+                    .get("terminal")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|handle| self.rpc_terminal_id(handle))
+                    .or_else(|| self.focused_session());
+                let Some(id) = id else {
+                    request.respond(Err("Terminal not found.".into()));
+                    return iced::Task::none();
+                };
+                let condition = request
+                    .params
+                    .get("for")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("exit")
+                    .to_string();
+                if !matches!(condition.as_str(), "exit" | "tui-idle") {
+                    request.respond(Err("--for must be exit or tui-idle.".into()));
+                    return iced::Task::none();
+                }
+                let timeout = request
+                    .params
+                    .get("timeoutMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(300_000)
+                    .clamp(1, 3_600_000);
+                let Some(session) = self.session_store.session(id) else {
+                    request.respond(Err("Terminal is no longer available.".into()));
+                    return iced::Task::none();
+                };
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let mut last_generation = session.generation();
+                    let mut stable_since = Instant::now();
+                    loop {
+                        let satisfied = if condition == "exit" {
+                            !session.is_running()
+                        } else if !session.is_running() {
+                            true
+                        } else {
+                            let generation = session.generation();
+                            if generation != last_generation {
+                                last_generation = generation;
+                                stable_since = Instant::now();
+                            }
+                            stable_since.elapsed() >= Duration::from_millis(750)
+                        };
+                        if satisfied {
+                            request.respond(Ok(serde_json::json!({
+                                "wait": {
+                                    "terminal": format!("term_{}", id.0),
+                                    "for": condition,
+                                    "satisfied": true,
+                                    "exitCode": session.exit_code(),
+                                }
+                            })));
+                            break;
+                        }
+                        if started.elapsed() >= Duration::from_millis(timeout) {
+                            request.respond(Ok(serde_json::json!({
+                                "wait": {
+                                    "terminal": format!("term_{}", id.0),
+                                    "for": condition,
+                                    "satisfied": false,
+                                    "timeoutMs": timeout,
+                                }
+                            })));
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
+                iced::Task::none()
+            }
+            "worktree.select" => {
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let task = self.update(Message::WorktreeSelected(worktree.clone()));
+                request.respond(Ok(serde_json::json!({"selected": worktree.0})));
+                task
+            }
+            "file.openChanged" => {
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let mode = request
+                    .params
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("diff")
+                    .to_string();
+                if !matches!(mode.as_str(), "edit" | "diff" | "both") {
+                    request.respond(Err("Invalid --mode. Use edit, diff, or both.".into()));
+                    return iced::Task::none();
+                }
+                let Some(worktree) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                self.request_file_open_changed(request, worktree, mode)
+            }
+            "file.open" | "file.diff" => {
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let path = match string_param("path") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let message = if request.method == "file.open" {
+                    Message::EditorFileRequested {
+                        worktree: worktree.clone(),
+                        path: path.clone(),
+                    }
+                } else {
+                    Message::FileDiffRequested {
+                        worktree: worktree.clone(),
+                        path: path.clone(),
+                    }
+                };
+                let task = self.update(message);
+                request.respond(Ok(serde_json::json!({
+                    "worktree": worktree.0,
+                    "path": path,
+                    "action": if request.method == "file.open" { "open" } else { "diff" },
+                })));
+                task
+            }
+            "automation.list" => {
+                request.respond(Ok(serde_json::json!({
+                    "automations": self.automations
+                })));
+                iced::Task::none()
+            }
+            "automation.show" => {
+                let id = match string_param("id") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                match self.automations.iter().find(|config| config.id == id) {
+                    Some(config) => request.respond(Ok(serde_json::json!({"automation": config}))),
+                    None => request.respond(Err(format!("Automation not found: {id}"))),
+                }
+                iced::Task::none()
+            }
+            "automation.create" => {
+                let name = match string_param("name") {
+                    Ok(value) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        request.respond(Err("Automation name cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let schedule = match string_param("schedule") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let prompt = match string_param("prompt") {
+                    Ok(value) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        request.respond(Err("Automation prompt cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let provider = match string_param("provider") {
+                    Ok(value) if agent_def_by_id(&value).is_some() => value,
+                    Ok(value) => {
+                        request.respond(Err(format!("Unknown automation provider: {value}")));
+                        return iced::Task::none();
+                    }
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let selector = match string_param("worktree") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(worktree_id) = self.rpc_worktree(&selector) else {
+                    request.respond(Err(format!("Worktree not found: {selector}")));
+                    return iced::Task::none();
+                };
+                let timezone = request
+                    .params
+                    .get("timezone")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Asia/Seoul")
+                    .to_string();
+                let Ok(tz) = timezone.parse::<suaegi_automation::Tz>() else {
+                    request.respond(Err(format!("Invalid IANA timezone: {timezone}")));
+                    return iced::Task::none();
+                };
+                let now = crate::automation::now_ms();
+                if !suaegi_automation::is_valid_automation_schedule(&schedule, now, tz) {
+                    request.respond(Err(format!("Invalid automation schedule: {schedule}")));
+                    return iced::Task::none();
+                }
+                let config = AutomationConfig {
+                    id: format!("automation-{}-{}", now, self.next_op().0),
+                    name: name.trim().chars().take(200).collect(),
+                    worktree_id,
+                    schedule,
+                    prompt: prompt.trim().chars().take(64 * 1024).collect(),
+                    timezone,
+                    provider,
+                    dtstart_unix_ms: now,
+                    enabled: request
+                        .params
+                        .get("enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                    last_dispatched_unix_ms: None,
+                };
+                self.automations.push(config.clone());
+                self.persist();
+                request.respond(Ok(serde_json::json!({"automation": config})));
+                iced::Task::none()
+            }
+            "automation.edit" => {
+                let id = match string_param("id") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let Some(index) = self.automations.iter().position(|config| config.id == id) else {
+                    request.respond(Err(format!("Automation not found: {id}")));
+                    return iced::Task::none();
+                };
+                let mut updated = self.automations[index].clone();
+                if let Some(name) = request
+                    .params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if name.trim().is_empty() {
+                        request.respond(Err("Automation name cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    updated.name = name.trim().chars().take(200).collect();
+                }
+                if let Some(prompt) = request
+                    .params
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if prompt.trim().is_empty() {
+                        request.respond(Err("Automation prompt cannot be empty.".into()));
+                        return iced::Task::none();
+                    }
+                    updated.prompt = prompt.trim().chars().take(64 * 1024).collect();
+                }
+                if let Some(provider) = request
+                    .params
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if agent_def_by_id(provider).is_none() {
+                        request.respond(Err(format!("Unknown automation provider: {provider}")));
+                        return iced::Task::none();
+                    }
+                    updated.provider = provider.to_string();
+                }
+                if let Some(enabled) = request
+                    .params
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    updated.enabled = enabled;
+                }
+                if let Some(selector) = request
+                    .params
+                    .get("worktree")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let Some(worktree) = self.rpc_worktree(selector) else {
+                        request.respond(Err(format!("Worktree not found: {selector}")));
+                        return iced::Task::none();
+                    };
+                    updated.worktree_id = worktree;
+                }
+                if let Some(timezone) = request
+                    .params
+                    .get("timezone")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if timezone.parse::<suaegi_automation::Tz>().is_err() {
+                        request.respond(Err(format!("Invalid IANA timezone: {timezone}")));
+                        return iced::Task::none();
+                    }
+                    updated.timezone = timezone.to_string();
+                }
+                if let Some(schedule) = request
+                    .params
+                    .get("schedule")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    updated.schedule = schedule.to_string();
+                }
+                let Ok(tz) = updated.timezone.parse::<suaegi_automation::Tz>() else {
+                    request.respond(Err(format!("Invalid IANA timezone: {}", updated.timezone)));
+                    return iced::Task::none();
+                };
+                if !suaegi_automation::is_valid_automation_schedule(
+                    &updated.schedule,
+                    updated.dtstart_unix_ms,
+                    tz,
+                ) {
+                    request.respond(Err(format!(
+                        "Invalid automation schedule: {}",
+                        updated.schedule
+                    )));
+                    return iced::Task::none();
+                }
+                self.automations[index] = updated.clone();
+                self.persist();
+                request.respond(Ok(serde_json::json!({"automation": updated})));
+                iced::Task::none()
+            }
+            "automation.remove" => {
+                let id = match string_param("id") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let before = self.automations.len();
+                self.automations.retain(|config| config.id != id);
+                if self.automations.len() == before {
+                    request.respond(Err(format!("Automation not found: {id}")));
+                    return iced::Task::none();
+                }
+                self.automation_runs.retain(|run| run.automation_id != id);
+                self.persist();
+                request.respond(Ok(serde_json::json!({"removed": id})));
+                iced::Task::none()
+            }
+            "automation.run" => {
+                let id = match string_param("id") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                if !self.automations.iter().any(|config| config.id == id) {
+                    request.respond(Err(format!("Automation not found: {id}")));
+                    return iced::Task::none();
+                }
+                let task = self.update(Message::AutomationRunNow(id.clone()));
+                let run = self
+                    .automation_runs
+                    .iter()
+                    .rev()
+                    .find(|run| run.automation_id == id)
+                    .cloned();
+                request.respond(Ok(serde_json::json!({"run": run})));
+                task
+            }
+            "automation.runs" => {
+                let automation_id = request.params.get("id").and_then(serde_json::Value::as_str);
+                let runs = self
+                    .automation_runs
+                    .iter()
+                    .filter(|run| automation_id.is_none_or(|id| run.automation_id == id))
+                    .rev()
+                    .collect::<Vec<_>>();
+                request.respond(Ok(serde_json::json!({"runs": runs})));
+                iced::Task::none()
+            }
+            _ => {
+                request.respond(Err(format!("Unknown local RPC method: {}", request.method)));
+                iced::Task::none()
+            }
+        }
+    }
+
+    fn rpc_worktree(&self, selector: &str) -> Option<WorktreeId> {
+        if matches!(selector, "active" | "current") {
+            return self.selected_worktree.clone();
+        }
+        let selector = selector
+            .strip_prefix("id:")
+            .or_else(|| selector.strip_prefix("path:"))
+            .or_else(|| selector.strip_prefix("name:"))
+            .unwrap_or(selector);
+        self.worktrees_by_repo
+            .values()
+            .flatten()
+            .find(|entry| {
+                worktree_id_for(&entry.path).0 == selector
+                    || entry.path == Path::new(selector)
+                    || entry
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy() == selector)
+                    || entry.branch.as_deref() == Some(selector)
+            })
+            .map(|entry| worktree_id_for(&entry.path))
+    }
+
+    fn rpc_repo(&self, selector: &str) -> Option<&Repo> {
+        let selector = selector
+            .strip_prefix("id:")
+            .or_else(|| selector.strip_prefix("path:"))
+            .or_else(|| selector.strip_prefix("name:"))
+            .unwrap_or(selector);
+        self.repos.iter().find(|repo| {
+            repo.id.0 == selector
+                || repo.display_name == selector
+                || repo.path == Path::new(selector)
+        })
+    }
+
+    fn rpc_project_json(&self, repo: &Repo) -> serde_json::Value {
+        serde_json::json!({
+            "id": repo.id.0,
+            "displayName": repo.display_name,
+            "badgeColor": self.ui_settings.repo_badge_colors
+                .get(&repo.id.0)
+                .map(String::as_str)
+                .unwrap_or("#8b8b8b"),
+            "repoIcon": self.ui_settings.repo_icons.get(&repo.id.0),
+            "kind": if repo.path.join(".git").exists() { "git" } else { "folder" },
+            "sourceRepoIds": [repo.id.0.clone()],
+            "createdAt": 0,
+            "updatedAt": 0,
+        })
+    }
+
+    fn rpc_project_setup_json(
+        project_id: &str,
+        setup: &ProjectHostSetupSetting,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": setup.id,
+            "projectId": project_id,
+            "hostId": setup.host_id,
+            "repoId": project_id,
+            "path": setup.path,
+            "displayName": setup.display_name,
+            "kind": setup.kind,
+            "worktreeBasePath": setup.worktree_base_path,
+            "gitUsername": setup.git_username,
+            "setupState": setup.setup_state,
+            "setupMethod": setup.setup_method,
+            "createdAt": setup.created_at_unix_ms,
+            "updatedAt": setup.updated_at_unix_ms,
+        })
+    }
+
+    fn rpc_worktree_json(&self, worktree: &WorktreeId) -> Option<serde_json::Value> {
+        let (repo_id, entry) = self.find_worktree(worktree)?;
+        let meta = self.worktree_meta.get(worktree);
+        Some(serde_json::json!({
+            "id": worktree.0,
+            "repoId": repo_id.0,
+            "path": entry.path,
+            "branch": entry.branch,
+            "head": entry.head,
+            "main": entry.is_main,
+            "active": self.selected_worktree.as_ref() == Some(worktree),
+            "displayName": self.worktree_display_name(worktree, &entry),
+            "comment": self.worktree_comment(worktree),
+            "workspaceStatus": self.board_status(worktree).persisted(),
+            "parentWorktree": self.ui_settings.worktree_parents.get(&worktree.0),
+            "linkedIssue": meta.and_then(|meta| meta.linked_github_pr),
+            "linearIssue": meta.and_then(|meta| meta.linked_linear_issue.as_deref()),
+            "presence": format!("{:?}", self.worktree_presence(worktree)).to_lowercase(),
+        }))
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
+            Message::LocalRpcRequested(request) => self.handle_local_rpc(request),
             Message::RepoPathInputChanged(value) => {
                 self.repo_path_input = value;
+                iced::Task::none()
+            }
+            Message::RepoBrowseRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|folder| folder.path().to_path_buf())
+                },
+                Message::RepoFolderPicked,
+            ),
+            Message::RepoFolderPicked(Some(path)) => {
+                self.repo_path_input = path.display().to_string();
+                self.update(Message::AddRepoSubmitted)
+            }
+            Message::RepoFolderPicked(None) => iced::Task::none(),
+            Message::RepoAddToggled => {
+                self.adding_repo = !self.adding_repo;
+                iced::Task::none()
+            }
+            Message::IntegrationsToggled => {
+                let opening = !self.integrations_open;
+                self.close_context_panels();
+                self.integrations_open = opening;
+                if opening {
+                    self.settings_section = SettingsSection::General;
+                    self.settings_search_query.clear();
+                    self.onboarding_open = false;
+                    iced::Task::none()
+                } else {
+                    self.selected_worktree
+                        .clone()
+                        .map_or_else(iced::Task::none, |worktree| {
+                            self.ensure_file_explorer(worktree)
+                        })
+                }
+            }
+            Message::SettingsSearchChanged(query) => {
+                self.settings_search_query = query;
+                iced::Task::none()
+            }
+            Message::SettingsOpened(section) => {
+                self.close_context_panels();
+                self.integrations_open = true;
+                self.settings_section = section;
+                self.settings_search_query.clear();
+                match section {
+                    SettingsSection::Integrations => {
+                        self.update(Message::HostedIntegrationsRefreshRequested)
+                    }
+                    SettingsSection::MobileEmulator => {
+                        self.update(Message::EmulatorAvailabilityRequested)
+                    }
+                    SettingsSection::StatsUsage => self.update(Message::UsageRefreshRequested),
+                    SettingsSection::Git => {
+                        self.update(Message::SourceControlAiModelsRefreshRequested)
+                    }
+                    SettingsSection::Advanced => {
+                        self.update(Message::DaemonSessionsRefreshRequested)
+                    }
+                    SettingsSection::ProviderAccounts => {
+                        self.update(Message::RemoteProviderAccountsRefreshRequested)
+                    }
+                    SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
+                    _ => iced::Task::none(),
+                }
+            }
+            Message::SettingsSectionSelected(section) => {
+                self.settings_section = section;
+                match section {
+                    SettingsSection::Integrations => {
+                        self.update(Message::HostedIntegrationsRefreshRequested)
+                    }
+                    SettingsSection::MobileEmulator => {
+                        self.update(Message::EmulatorAvailabilityRequested)
+                    }
+                    SettingsSection::StatsUsage => self.update(Message::UsageRefreshRequested),
+                    SettingsSection::Git => {
+                        self.update(Message::SourceControlAiModelsRefreshRequested)
+                    }
+                    SettingsSection::Advanced => {
+                        self.update(Message::DaemonSessionsRefreshRequested)
+                    }
+                    SettingsSection::ProviderAccounts => {
+                        self.update(Message::RemoteProviderAccountsRefreshRequested)
+                    }
+                    SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
+                    _ => iced::Task::none(),
+                }
+            }
+            Message::SettingsWorkspaceRootChanged(path) => {
+                self.workspace_root = PathBuf::from(path);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::SettingsWorkspaceBrowseRequested => {
+                let directory = self.workspace_root.clone();
+                iced::Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_directory(directory)
+                            .pick_folder()
+                            .await
+                            .map(|folder| folder.path().to_path_buf())
+                    },
+                    Message::SettingsWorkspaceRootPicked,
+                )
+            }
+            Message::SettingsWorkspaceRootPicked(Some(path)) => {
+                self.workspace_root = path;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::SettingsWorkspaceRootPicked(None) => iced::Task::none(),
+            Message::EmulatorAvailabilityRequested => {
+                if self.emulator_refreshing {
+                    return iced::Task::none();
+                }
+                self.emulator_refreshing = true;
+                self.emulator_status = Some("Checking emulator availability…".into());
+                let configured = self.ui_settings.android_sdk_path.clone();
+                iced::Task::perform(
+                    crate::emulator::inspect(configured),
+                    Message::EmulatorAvailabilityFinished,
+                )
+            }
+            Message::EmulatorAvailabilityFinished(availability) => {
+                self.emulator_refreshing = false;
+                self.emulator_status = Some(availability.message.clone());
+                self.emulator_availability = Some(availability);
+                if std::mem::take(&mut self.emulator_launch_after_refresh) {
+                    self.update(Message::EmulatorLaunchDefaultRequested)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EmulatorDefaultDeviceSelected(device_id) => {
+                self.ui_settings.mobile_emulator_default_device_udid = device_id;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::EmulatorLaunchDefaultRequested => {
+                if !self.ui_settings.mobile_emulator_enabled {
+                    self.emulator_launch_after_refresh = false;
+                    self.emulator_status = Some(
+                        "Enable Mobile Emulator in Settings before launching a device.".into(),
+                    );
+                    return iced::Task::none();
+                }
+                let Some(availability) = self.emulator_availability.as_ref() else {
+                    self.emulator_launch_after_refresh = true;
+                    return self.update(Message::EmulatorAvailabilityRequested);
+                };
+                let selected = self
+                    .ui_settings
+                    .mobile_emulator_default_device_udid
+                    .as_ref()
+                    .and_then(|id| availability.devices.iter().find(|device| &device.id == id))
+                    .or_else(|| crate::emulator::pick_default(&availability.devices))
+                    .cloned();
+                let Some(device) = selected else {
+                    self.emulator_status = Some("No emulator device is available.".into());
+                    return iced::Task::none();
+                };
+                self.emulator_status = Some(format!("Launching {}…", device.name));
+                self.emulator_active_device = Some(device.clone());
+                let configured = self.ui_settings.android_sdk_path.clone();
+                iced::Task::perform(
+                    crate::emulator::launch(device, configured),
+                    Message::EmulatorLaunchFinished,
+                )
+            }
+            Message::EmulatorLaunchFinished(result) => match result {
+                Ok(()) => {
+                    self.emulator_status = Some("Emulator attached.".to_string());
+                    self.emulator_panel_open = true;
+                    iced::Task::batch([
+                        self.update(Message::EmulatorFrameTick),
+                        self.update(Message::EmulatorAvailabilityRequested),
+                    ])
+                }
+                Err(error) => {
+                    self.emulator_status = Some(error);
+                    self.emulator_active_device = None;
+                    self.emulator_panel_open = false;
+                    iced::Task::none()
+                }
+            },
+            Message::EmulatorClosed => {
+                self.emulator_panel_open = false;
+                self.emulator_frame = None;
+                self.emulator_frame_loading = false;
+                self.emulator_pointer = None;
+                iced::Task::none()
+            }
+            Message::EmulatorFrameTick => {
+                if !self.emulator_panel_open || self.emulator_frame_loading {
+                    return iced::Task::none();
+                }
+                let Some(device) = self.emulator_active_device.clone() else {
+                    return iced::Task::none();
+                };
+                self.emulator_frame_loading = true;
+                let id = device.id.clone();
+                let configured = self.ui_settings.android_sdk_path.clone();
+                iced::Task::perform(
+                    crate::emulator::screenshot(device, configured),
+                    move |result| Message::EmulatorFrameFinished(id.clone(), result),
+                )
+            }
+            Message::EmulatorFrameFinished(device_id, result) => {
+                if self
+                    .emulator_active_device
+                    .as_ref()
+                    .map(|device| &device.id)
+                    != Some(&device_id)
+                {
+                    return iced::Task::none();
+                }
+                self.emulator_frame_loading = false;
+                match result {
+                    Ok(frame) => {
+                        self.emulator_frame = Some(frame);
+                        self.emulator_status = Some("Live device view".to_string());
+                    }
+                    Err(error) => self.emulator_status = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::EmulatorPointerMoved(point) => {
+                self.emulator_pointer = Some(point);
+                iced::Task::none()
+            }
+            Message::EmulatorTapRequested => {
+                let Some((device, frame, point)) = self
+                    .emulator_active_device
+                    .clone()
+                    .zip(self.emulator_frame.as_deref())
+                    .zip(self.emulator_pointer)
+                    .map(|((device, frame), point)| (device, frame, point))
+                else {
+                    return iced::Task::none();
+                };
+                let Some((x, y)) = crate::emulator::tap_coordinates(frame, point) else {
+                    return iced::Task::none();
+                };
+                self.emulator_status = Some("Sending tap…".to_string());
+                let configured = self.ui_settings.android_sdk_path.clone();
+                iced::Task::perform(
+                    crate::emulator::tap(device, x, y, configured),
+                    Message::EmulatorControlFinished,
+                )
+            }
+            Message::EmulatorControlRequested(action) => {
+                let Some(device) = self.emulator_active_device.clone() else {
+                    return iced::Task::none();
+                };
+                let configured = self.ui_settings.android_sdk_path.clone();
+                self.emulator_status = Some(format!("Sending {action}…"));
+                if action == "rotate-left" {
+                    iced::Task::perform(
+                        crate::emulator::rotate(device, "left".into(), configured),
+                        Message::EmulatorControlFinished,
+                    )
+                } else {
+                    iced::Task::perform(
+                        crate::emulator::button(device, action, configured),
+                        Message::EmulatorControlFinished,
+                    )
+                }
+            }
+            Message::EmulatorControlFinished(result) => {
+                self.emulator_status = Some(match result {
+                    Ok(()) => "Device control sent.".to_string(),
+                    Err(error) => error,
+                });
+                self.update(Message::EmulatorFrameTick)
+            }
+            Message::EmulatorTextChanged(value) => {
+                if value.len() <= 64 * 1024 && !value.contains('\0') {
+                    self.emulator_text_draft = value;
+                }
+                iced::Task::none()
+            }
+            Message::EmulatorTextSubmitted => {
+                let Some(device) = self.emulator_active_device.clone() else {
+                    return iced::Task::none();
+                };
+                if self.emulator_text_draft.is_empty() {
+                    return iced::Task::none();
+                }
+                let value = std::mem::take(&mut self.emulator_text_draft);
+                let configured = self.ui_settings.android_sdk_path.clone();
+                self.emulator_status = Some("Typing on device…".to_string());
+                iced::Task::perform(
+                    crate::emulator::type_text(device, value, configured),
+                    Message::EmulatorControlFinished,
+                )
+            }
+            Message::HostedIntegrationsRefreshRequested => {
+                if self.hosted_integrations_refreshing {
+                    return iced::Task::none();
+                }
+                self.hosted_integrations_refreshing = true;
+                iced::Task::perform(
+                    crate::hosted_integrations::preflight(),
+                    Message::HostedIntegrationsRefreshFinished,
+                )
+            }
+            Message::HostedIntegrationsRefreshFinished(statuses) => {
+                self.hosted_integrations_refreshing = false;
+                self.hosted_integrations = Some(statuses);
+                iced::Task::none()
+            }
+            Message::UsageProviderToggled(provider) => {
+                match provider {
+                    crate::usage::UsageProvider::Claude => {
+                        self.ui_settings.claude_usage_enabled =
+                            !self.ui_settings.claude_usage_enabled;
+                    }
+                    crate::usage::UsageProvider::Codex => {
+                        self.ui_settings.codex_usage_enabled =
+                            !self.ui_settings.codex_usage_enabled;
+                    }
+                    crate::usage::UsageProvider::OpenCode => {
+                        self.ui_settings.opencode_usage_enabled =
+                            !self.ui_settings.opencode_usage_enabled;
+                    }
+                }
+                self.persist();
+                self.update(Message::UsageRefreshRequested)
+            }
+            Message::UsageRefreshRequested => {
+                if self.usage_scanning {
+                    self.usage_refresh_pending = true;
+                    return iced::Task::none();
+                }
+                self.usage_scanning = true;
+                let enabled = [
+                    self.ui_settings.claude_usage_enabled,
+                    self.ui_settings.codex_usage_enabled,
+                    self.ui_settings.opencode_usage_enabled,
+                ];
+                let claude_config_dirs = self
+                    .ui_settings
+                    .claude_managed_accounts
+                    .iter()
+                    .map(|account| PathBuf::from(&account.config_dir))
+                    .collect();
+                let codex_home_dirs = self
+                    .ui_settings
+                    .codex_managed_accounts
+                    .iter()
+                    .map(|account| PathBuf::from(&account.config_dir))
+                    .collect();
+                iced::Task::batch([
+                    iced::Task::perform(
+                        crate::usage::scan(enabled, claude_config_dirs, codex_home_dirs),
+                        Message::UsageRefreshFinished,
+                    ),
+                    self.update(Message::GeminiRateLimitsRefreshRequested),
+                    self.update(Message::ProviderRateLimitsRefreshRequested),
+                ])
+            }
+            Message::UsageRefreshFinished(snapshot) => {
+                self.usage_scanning = false;
+                self.usage_snapshot = Some(snapshot);
+                if std::mem::take(&mut self.usage_refresh_pending) {
+                    self.update(Message::UsageRefreshRequested)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::RateLimitsRefreshRequested => iced::Task::batch([
+                self.update(Message::GeminiRateLimitsRefreshRequested),
+                self.update(Message::ProviderRateLimitsRefreshRequested),
+            ]),
+            Message::GeminiRateLimitsRefreshRequested => {
+                if self.gemini_rate_limits_fetching {
+                    return iced::Task::none();
+                }
+                self.gemini_rate_limits_fetching = true;
+                iced::Task::perform(
+                    crate::rate_limits::fetch_gemini(self.ui_settings.gemini_cli_oauth_enabled),
+                    Message::GeminiRateLimitsRefreshFinished,
+                )
+            }
+            Message::GeminiRateLimitsRefreshFinished(rate_limits) => {
+                self.gemini_rate_limits_fetching = false;
+                let mut antigravity = rate_limits.clone();
+                antigravity.provider = crate::rate_limits::RateLimitProvider::Antigravity;
+                self.provider_rate_limits.insert(
+                    crate::rate_limits::RateLimitProvider::Antigravity,
+                    antigravity,
+                );
+                self.gemini_rate_limits = Some(rate_limits);
+                iced::Task::none()
+            }
+            Message::ProviderSecretDraftChanged(provider, draft) => {
+                self.provider_secret_drafts.insert(provider, draft);
+                self.provider_secret_status.remove(&provider);
+                iced::Task::none()
+            }
+            Message::ProviderSecretSaveRequested(provider) => {
+                let Some(value) = self.provider_secret_drafts.remove(&provider) else {
+                    return iced::Task::none();
+                };
+                self.provider_secret_status
+                    .insert(provider, "Saving securely…".to_string());
+                iced::Task::perform(
+                    async move { crate::provider_credentials::store(provider, value.into_inner()) },
+                    move |result| Message::ProviderSecretSaveFinished(provider, result),
+                )
+            }
+            Message::ProviderSecretSaveFinished(provider, result) => match result {
+                Ok(()) => {
+                    self.provider_secrets_configured.insert(provider);
+                    self.provider_secret_status
+                        .insert(provider, "Saved in the system keychain.".to_string());
+                    self.update(Message::ProviderRateLimitsRefreshRequested)
+                }
+                Err(error) => {
+                    self.provider_secret_status.insert(provider, error);
+                    iced::Task::none()
+                }
+            },
+            Message::ProviderSecretClearRequested(provider) => {
+                self.provider_secret_status
+                    .insert(provider, "Clearing…".to_string());
+                iced::Task::perform(
+                    async move { crate::provider_credentials::clear(provider) },
+                    move |result| Message::ProviderSecretClearFinished(provider, result),
+                )
+            }
+            Message::ProviderSecretClearFinished(provider, result) => {
+                match result {
+                    Ok(()) => {
+                        self.provider_secrets_configured.remove(&provider);
+                        self.provider_secret_drafts.remove(&provider);
+                        self.provider_secret_status
+                            .insert(provider, "Cookie cleared.".to_string());
+                        let rate_provider = match provider {
+                            crate::provider_credentials::ProviderSecret::OpenCodeGo => {
+                                crate::rate_limits::RateLimitProvider::OpenCodeGo
+                            }
+                            crate::provider_credentials::ProviderSecret::MiniMax => {
+                                crate::rate_limits::RateLimitProvider::MiniMax
+                            }
+                        };
+                        self.provider_rate_limits.remove(&rate_provider);
+                    }
+                    Err(error) => {
+                        self.provider_secret_status.insert(provider, error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::GhosttyImportRequested => {
+                if self.ghostty_importing {
+                    return iced::Task::none();
+                }
+                self.ghostty_importing = true;
+                self.ghostty_import_status = Some("Reading Ghostty settings…".to_string());
+                iced::Task::perform(
+                    crate::ghostty_import::import(self.ui_settings.clone()),
+                    |result| Message::GhosttyImportFinished(Box::new(result)),
+                )
+            }
+            Message::GhosttyImportFinished(result) => {
+                self.ghostty_importing = false;
+                match *result {
+                    Ok(imported) => {
+                        #[cfg(not(test))]
+                        let blur_changed = self.ui_settings.window_background_blur
+                            != imported.settings.window_background_blur;
+                        self.ui_settings = imported.settings;
+                        self.terminal_color_drafts =
+                            self.ui_settings.terminal_color_overrides.clone();
+                        crate::terminal::palette::configure_custom_themes(
+                            &self.ui_settings.terminal_custom_themes,
+                        );
+                        crate::terminal::palette::configure_color_overrides(
+                            &self.ui_settings.terminal_color_overrides,
+                        );
+                        suaegi_term::grid::configure_semantic_escape_chars(
+                            self.ui_settings.terminal_word_separator.clone(),
+                        );
+                        self.apply_network_settings();
+                        self.persist();
+                        #[cfg(not(test))]
+                        if blur_changed {
+                            if let Err(error) = crate::appearance::set_background_blur(
+                                self.ui_settings.window_background_blur,
+                            ) {
+                                self.last_error = Some(error);
+                            }
+                        }
+                        self.ghostty_import_status = Some(format!(
+                            "Imported {} settings from {} file(s). {} unsupported.",
+                            imported.applied_fields.len(),
+                            imported.config_paths.len(),
+                            imported.unsupported_keys.len()
+                        ));
+                    }
+                    Err(error) => self.ghostty_import_status = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::WarpThemeImportRequested => {
+                if self.terminal_theme_importing {
+                    return iced::Task::none();
+                }
+                self.terminal_theme_importing = true;
+                self.terminal_theme_import_status =
+                    Some("Scanning Warp theme folders…".to_string());
+                crate::background::blocking(move |mut sender| {
+                    let result = crate::warp_theme_import::discover_and_import();
+                    let _ = sender.try_send(Message::TerminalThemeImportFinished(result));
+                })
+            }
+            Message::YamlThemeImportRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Theme YAML", &["yaml", "yml"])
+                        .pick_files()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|file| file.path().to_path_buf())
+                        .collect()
+                },
+                Message::YamlThemeFilesPicked,
+            ),
+            Message::YamlThemeFilesPicked(paths) => {
+                if paths.is_empty() || self.terminal_theme_importing {
+                    return iced::Task::none();
+                }
+                self.terminal_theme_importing = true;
+                self.terminal_theme_import_status = Some("Reading theme YAML…".to_string());
+                crate::background::blocking(move |mut sender| {
+                    let result = crate::warp_theme_import::import_files(&paths);
+                    let _ = sender.try_send(Message::TerminalThemeImportFinished(result));
+                })
+            }
+            Message::TerminalThemeImportFinished(result) => {
+                self.terminal_theme_importing = false;
+                match result {
+                    Ok(imported) => {
+                        let imported_count = imported.themes.len();
+                        let skipped_count = imported.skipped.len();
+                        let mut themes =
+                            std::mem::take(&mut self.ui_settings.terminal_custom_themes);
+                        themes.extend(imported.themes);
+                        self.ui_settings.terminal_custom_themes =
+                            crate::warp_theme_import::normalize_themes(themes);
+                        crate::terminal::palette::configure_custom_themes(
+                            &self.ui_settings.terminal_custom_themes,
+                        );
+                        self.terminal_theme_import_status = Some(format!(
+                            "Imported {imported_count} theme(s) from {}. {skipped_count} skipped.",
+                            imported.source_label
+                        ));
+                        self.persist();
+                    }
+                    Err(error) => self.terminal_theme_import_status = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::CustomTerminalThemeRemoved(id) => {
+                self.ui_settings
+                    .terminal_custom_themes
+                    .retain(|theme| theme.id != id);
+                let selection = crate::warp_theme_import::custom_selection(&id);
+                if self.ui_settings.terminal_theme_dark == selection {
+                    self.ui_settings.terminal_theme_dark = "Ghostty Default Style Dark".to_string();
+                }
+                if self.ui_settings.terminal_theme_light == selection {
+                    self.ui_settings.terminal_theme_light = "Builtin Tango Light".to_string();
+                }
+                crate::terminal::palette::configure_custom_themes(
+                    &self.ui_settings.terminal_custom_themes,
+                );
+                self.persist();
+                iced::Task::none()
+            }
+            Message::ProviderRateLimitsRefreshRequested => {
+                if self.ui_settings.active_runtime_environment_id.is_some() {
+                    return self.request_remote_provider_accounts();
+                }
+                use crate::rate_limits::RateLimitProvider;
+                let claude_config = self
+                    .ui_settings
+                    .active_claude_managed_account_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.ui_settings
+                            .claude_managed_accounts
+                            .iter()
+                            .find(|account| account.id == id)
+                    })
+                    .map(|account| PathBuf::from(&account.config_dir));
+                let codex_config = self
+                    .ui_settings
+                    .active_codex_managed_account_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.ui_settings
+                            .codex_managed_accounts
+                            .iter()
+                            .find(|account| account.id == id)
+                    })
+                    .map(|account| PathBuf::from(&account.config_dir));
+                let proxy = self.ui_settings.http_proxy_url.clone();
+                let mut tasks = Vec::new();
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::Claude)
+                {
+                    let proxy = proxy.clone();
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_claude(claude_config, proxy),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::Claude,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::Codex)
+                {
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_codex(codex_config, proxy),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::Codex,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::Kimi)
+                {
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_kimi(self.ui_settings.http_proxy_url.clone()),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::Kimi,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::Grok)
+                {
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_grok(self.ui_settings.http_proxy_url.clone()),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::Grok,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::OpenCodeGo)
+                {
+                    let cookie = crate::provider_credentials::load(
+                        crate::provider_credentials::ProviderSecret::OpenCodeGo,
+                    )
+                    .secret;
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_opencode_go(
+                            cookie,
+                            self.ui_settings.opencode_workspace_id.clone(),
+                            self.ui_settings.http_proxy_url.clone(),
+                        ),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::OpenCodeGo,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                if self
+                    .provider_rate_limits_fetching
+                    .insert(RateLimitProvider::MiniMax)
+                {
+                    let cookie = crate::provider_credentials::load(
+                        crate::provider_credentials::ProviderSecret::MiniMax,
+                    )
+                    .secret;
+                    tasks.push(iced::Task::perform(
+                        crate::rate_limits::fetch_minimax(
+                            cookie,
+                            self.ui_settings.minimax_group_id.clone(),
+                            self.ui_settings.minimax_usage_models.clone(),
+                            self.ui_settings.http_proxy_url.clone(),
+                        ),
+                        |limits| {
+                            Message::ProviderRateLimitsRefreshFinished(
+                                RateLimitProvider::MiniMax,
+                                limits,
+                            )
+                        },
+                    ));
+                }
+                iced::Task::batch(tasks)
+            }
+            Message::ProviderRateLimitsRefreshFinished(provider, limits) => {
+                self.provider_rate_limits_fetching.remove(&provider);
+                self.provider_rate_limits.insert(provider, limits);
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeNameChanged(value) => {
+                self.remote_runtime_name_draft = value.chars().take(100).collect();
+                iced::Task::none()
+            }
+            Message::RemoteRuntimePairingCodeChanged(value) => {
+                self.remote_runtime_pairing_draft = value;
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeSaveRequested => {
+                if self.remote_runtime_saving {
+                    return iced::Task::none();
+                }
+                let name = self.remote_runtime_name_draft.trim().to_string();
+                if name.is_empty() || self.remote_runtime_pairing_draft.0.trim().is_empty() {
+                    self.remote_runtime_status.insert(
+                        "__form__".into(),
+                        "Name and pairing code are required.".into(),
+                    );
+                    return iced::Task::none();
+                }
+                if self
+                    .ui_settings
+                    .runtime_environments
+                    .iter()
+                    .any(|environment| environment.name.eq_ignore_ascii_case(&name))
+                {
+                    self.remote_runtime_status.insert(
+                        "__form__".into(),
+                        format!("A server named \"{name}\" already exists."),
+                    );
+                    return iced::Task::none();
+                }
+                self.remote_runtime_saving = true;
+                self.remote_runtime_status
+                    .insert("__form__".into(), "Saving remote server…".into());
+                let pairing = std::mem::replace(
+                    &mut self.remote_runtime_pairing_draft,
+                    SecretDraft::new(String::new()),
+                )
+                .into_inner();
+                iced::Task::perform(
+                    crate::remote_runtime::save_environment(name, pairing),
+                    Message::RemoteRuntimeSaveFinished,
+                )
+            }
+            Message::RemoteRuntimeSaveFinished(result) => {
+                self.remote_runtime_saving = false;
+                match result {
+                    Ok(environment) => {
+                        self.remote_runtime_status
+                            .insert("__form__".into(), format!("Saved {}.", environment.name));
+                        self.remote_runtime_name_draft.clear();
+                        self.ui_settings.runtime_environments.push(environment);
+                        self.persist();
+                    }
+                    Err(error) => {
+                        self.remote_runtime_status.insert("__form__".into(), error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeRpcSaveFinished(request, result) => {
+                match result {
+                    Ok(environment) => {
+                        let response = serde_json::json!({
+                            "environment": {
+                                "id": environment.id,
+                                "name": environment.name,
+                                "endpoint": environment.endpoint,
+                                "credentialsConfigured": environment.credentials_configured,
+                                "createdAtUnixMs": environment.created_at_unix_ms,
+                            }
+                        });
+                        self.ui_settings
+                            .runtime_environments
+                            .push(environment.clone());
+                        self.remote_runtime_status
+                            .insert(environment.id, "Saved from CLI.".into());
+                        self.persist();
+                        request.respond(Ok(response));
+                    }
+                    Err(error) => request.respond(Err(error)),
+                }
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeCheckRequested(index) => {
+                let Some(environment) = self.ui_settings.runtime_environments.get(index).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                if !self.remote_runtime_checking.insert(environment.id.clone()) {
+                    return iced::Task::none();
+                }
+                self.remote_runtime_status
+                    .insert(environment.id.clone(), "Checking…".into());
+                let id = environment.id.clone();
+                iced::Task::perform(
+                    crate::remote_runtime::check_reachability(environment),
+                    move |result| Message::RemoteRuntimeCheckFinished(id.clone(), result),
+                )
+            }
+            Message::RemoteRuntimeCheckFinished(id, result) => {
+                self.remote_runtime_checking.remove(&id);
+                self.remote_runtime_status.insert(id, result.message);
+                iced::Task::none()
+            }
+            Message::RemoteServerUpdateCheckRequested(index) => {
+                let Some(environment) = self.ui_settings.runtime_environments.get(index).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                let id = environment.id.clone();
+                self.remote_server_updates.insert(
+                    id.clone(),
+                    crate::remote_runtime::RemoteServerUpdateState {
+                        phase: crate::remote_runtime::RemoteUpdatePhase::Checking,
+                        current_version: None,
+                        target_version: None,
+                        progress: None,
+                        message: "Checking for updates…".into(),
+                    },
+                );
+                iced::Task::perform(
+                    crate::remote_runtime::inspect_server_update(environment),
+                    move |result| Message::RemoteServerUpdateCheckFinished(id.clone(), result),
+                )
+            }
+            Message::RemoteServerUpdateCheckFinished(id, result) => {
+                self.remote_server_updates.insert(id, result);
+                iced::Task::none()
+            }
+            Message::RemoteServerUpdateRequested(index) => {
+                let Some(environment) = self.ui_settings.runtime_environments.get(index).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                let id = environment.id.clone();
+                let previous = self.remote_server_updates.get(&id).cloned().unwrap_or(
+                    crate::remote_runtime::RemoteServerUpdateState {
+                        phase: crate::remote_runtime::RemoteUpdatePhase::Available,
+                        current_version: None,
+                        target_version: None,
+                        progress: None,
+                        message: "Preparing server update…".into(),
+                    },
+                );
+                self.remote_server_updates.insert(
+                    id.clone(),
+                    crate::remote_runtime::RemoteServerUpdateState {
+                        phase: crate::remote_runtime::RemoteUpdatePhase::Updating,
+                        progress: Some(0.0),
+                        message: "Updating server; live sessions may briefly disconnect…".into(),
+                        ..previous.clone()
+                    },
+                );
+                iced::Task::perform(
+                    crate::remote_runtime::update_server(environment, previous),
+                    move |result| Message::RemoteServerUpdateFinished(id.clone(), result),
+                )
+            }
+            Message::RemoteServerUpdateFinished(id, result) => {
+                self.remote_server_updates.insert(id, result);
+                iced::Task::none()
+            }
+            Message::PluginsRefreshRequested => {
+                if !self.ui_settings.plugin_system_enabled {
+                    self.plugins.clear();
+                    self.plugins_loading = false;
+                    return iced::Task::none();
+                }
+                self.plugins_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugins::discover(
+                        crate::plugins::default_plugins_dir(),
+                        self.ui_settings.dev_plugin_paths.clone(),
+                        self.ui_settings.disabled_plugins.clone(),
+                        self.ui_settings.plugin_consents.clone(),
+                    ),
+                    Message::PluginsRefreshFinished,
+                )
+            }
+            Message::PluginsRefreshFinished(mut plugins) => {
+                self.plugins_loading = false;
+                crate::plugins::apply_kill_list(&mut plugins, self.plugin_kill_list.as_ref());
+                self.plugins = plugins;
+                // A refresh can replace an installed tree without changing its
+                // identity. Revoke the old WebView so stale HTML cannot borrow
+                // the newly approved manifest's capabilities.
+                if self.active_plugin_panel.take().is_some() {
+                    self.plugin_panel_error = None;
+                    crate::plugin_panel::set_visible(false);
+                }
+                crate::keybindings::publish_plugin_shortcuts(&self.plugins);
+                crate::plugin_worker::reconcile(&self.plugins);
+                crate::i18n::set_plugin_language_packs(&self.plugins);
+                iced::Task::batch([
+                    self.update(Message::PluginMarketplaceLoadRequested),
+                    self.update(Message::PluginKillListRefreshRequested),
+                ])
+            }
+            Message::PluginEnabledToggled(plugin_key) => {
+                if self.plugins.iter().any(|plugin| {
+                    plugin.plugin_key == plugin_key && plugin.blocked_by_kill_list.is_some()
+                }) {
+                    return iced::Task::none();
+                }
+                if self
+                    .ui_settings
+                    .disabled_plugins
+                    .iter()
+                    .any(|disabled| disabled == &plugin_key)
+                {
+                    self.ui_settings
+                        .disabled_plugins
+                        .retain(|disabled| disabled != &plugin_key);
+                } else {
+                    self.ui_settings.disabled_plugins.push(plugin_key);
+                    self.ui_settings.disabled_plugins.sort();
+                    self.ui_settings.disabled_plugins.dedup();
+                }
+                self.persist();
+                self.update(Message::PluginsRefreshRequested)
+            }
+            Message::PluginConsentReviewRequested(plugin_key) => {
+                self.plugin_consent_review = self
+                    .plugins
+                    .iter()
+                    .find(|plugin| {
+                        plugin.plugin_key == plugin_key
+                            && plugin.status == crate::plugins::PluginStatus::Pending
+                            && plugin.consent_fingerprint.is_some()
+                            && plugin.blocked_by_kill_list.is_none()
+                    })
+                    .cloned();
+                iced::Task::none()
+            }
+            Message::PluginConsentGranted(plugin_key, fingerprint) => {
+                let reviewed = self.plugin_consent_review.as_ref().is_some_and(|plugin| {
+                    plugin.plugin_key == plugin_key
+                        && plugin.consent_fingerprint.as_deref() == Some(fingerprint.as_str())
+                });
+                if reviewed {
+                    self.ui_settings
+                        .plugin_consents
+                        .insert(plugin_key.clone(), fingerprint);
+                    self.ui_settings
+                        .disabled_plugins
+                        .retain(|disabled| disabled != &plugin_key);
+                    self.persist();
+                }
+                self.plugin_consent_review = None;
+                self.update(Message::PluginsRefreshRequested)
+            }
+            Message::PluginConsentKeptDisabled(plugin_key) => {
+                if self
+                    .plugin_consent_review
+                    .as_ref()
+                    .is_some_and(|plugin| plugin.plugin_key == plugin_key)
+                {
+                    self.ui_settings.plugin_consents.remove(&plugin_key);
+                    if !self
+                        .ui_settings
+                        .disabled_plugins
+                        .iter()
+                        .any(|disabled| disabled == &plugin_key)
+                    {
+                        self.ui_settings.disabled_plugins.push(plugin_key);
+                        self.ui_settings.disabled_plugins.sort();
+                        self.ui_settings.disabled_plugins.dedup();
+                    }
+                    self.persist();
+                }
+                self.plugin_consent_review = None;
+                self.update(Message::PluginsRefreshRequested)
+            }
+            Message::PluginDevPathChanged(value) => {
+                self.plugin_dev_path_draft = value.chars().take(2048).collect();
+                iced::Task::none()
+            }
+            Message::PluginDevPathAdded => {
+                let path = self.plugin_dev_path_draft.trim();
+                if path.is_empty() || !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
+                    self.plugins_error = Some(
+                        "Development plugin path must be an existing absolute directory.".into(),
+                    );
+                    return iced::Task::none();
+                }
+                if !self
+                    .ui_settings
+                    .dev_plugin_paths
+                    .iter()
+                    .any(|existing| existing == path)
+                {
+                    self.ui_settings.dev_plugin_paths.push(path.to_string());
+                    self.persist();
+                }
+                self.plugin_dev_path_draft.clear();
+                self.update(Message::PluginsRefreshRequested)
+            }
+            Message::PluginDevPathRemoved(path) => {
+                self.ui_settings
+                    .dev_plugin_paths
+                    .retain(|existing| existing != &path);
+                self.persist();
+                self.update(Message::PluginsRefreshRequested)
+            }
+            Message::PluginLocalInstallRequested => {
+                if self.plugins_loading {
+                    return iced::Task::none();
+                }
+                self.plugins_loading = true;
+                self.plugins_error = None;
+                let source = self.plugin_dev_path_draft.trim().to_string();
+                iced::Task::perform(
+                    crate::plugins::install_source(source, crate::plugins::default_plugins_dir()),
+                    Message::PluginLocalInstallFinished,
+                )
+            }
+            Message::PluginLocalInstallFinished(result) => {
+                self.plugins_loading = false;
+                match result {
+                    Ok(plugin_key) => {
+                        self.ui_settings.plugin_consents.remove(&plugin_key);
+                        self.plugin_dev_path_draft.clear();
+                        self.plugins_error = Some(format!(
+                            "Installed {plugin_key}. Review its capabilities before activation."
+                        ));
+                        self.persist();
+                        self.update(Message::PluginsRefreshRequested)
+                    }
+                    Err(error) => {
+                        self.plugins_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::PluginRollbackRequested(plugin_key) => {
+                let allowed = self.plugins.iter().any(|plugin| {
+                    plugin.plugin_key == plugin_key && !plugin.is_dev && plugin.rollback_available
+                });
+                if !allowed || self.plugins_loading {
+                    return iced::Task::none();
+                }
+                self.plugins_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugins::rollback(plugin_key, crate::plugins::default_plugins_dir()),
+                    Message::PluginRollbackFinished,
+                )
+            }
+            Message::PluginRollbackFinished(result) => {
+                self.plugins_loading = false;
+                match result {
+                    Ok(plugin_key) => {
+                        self.ui_settings.plugin_consents.remove(&plugin_key);
+                        self.plugins_error = Some(format!(
+                            "Rolled back {plugin_key}. Review the restored version before activation."
+                        ));
+                        self.persist();
+                        self.update(Message::PluginsRefreshRequested)
+                    }
+                    Err(error) => {
+                        self.plugins_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::PluginRemoveRequested(plugin_key) => {
+                if self
+                    .plugins
+                    .iter()
+                    .any(|plugin| plugin.plugin_key == plugin_key && !plugin.is_dev)
+                {
+                    self.plugin_remove_confirmation = Some(plugin_key);
+                }
+                iced::Task::none()
+            }
+            Message::PluginRemoveCancelled => {
+                self.plugin_remove_confirmation = None;
+                iced::Task::none()
+            }
+            Message::PluginRemoveConfirmed(plugin_key) => {
+                if self.plugin_remove_confirmation.as_deref() != Some(plugin_key.as_str())
+                    || self.plugins_loading
+                {
+                    return iced::Task::none();
+                }
+                self.plugin_remove_confirmation = None;
+                self.plugins_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugins::remove(
+                        plugin_key,
+                        crate::plugins::default_plugins_dir(),
+                        crate::plugins::default_plugins_data_dir(),
+                    ),
+                    Message::PluginRemoveFinished,
+                )
+            }
+            Message::PluginRemoveFinished(result) => {
+                self.plugins_loading = false;
+                match result {
+                    Ok(plugin_key) => {
+                        self.ui_settings.plugin_consents.remove(&plugin_key);
+                        self.ui_settings
+                            .disabled_plugins
+                            .retain(|disabled| disabled != &plugin_key);
+                        self.plugins_error = Some(format!("Removed {plugin_key}."));
+                        self.persist();
+                        self.update(Message::PluginsRefreshRequested)
+                    }
+                    Err(error) => {
+                        self.plugins_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::PluginCommandInvoked(plugin_key, command_id) => {
+                let invocation = self
+                    .plugins
+                    .iter()
+                    .find(|plugin| {
+                        plugin.plugin_key == plugin_key
+                            && plugin.status == crate::plugins::PluginStatus::Idle
+                            && plugin.blocked_by_kill_list.is_none()
+                    })
+                    .and_then(|plugin| {
+                        plugin
+                            .commands
+                            .iter()
+                            .find(|command| {
+                                command.id == command_id
+                                    && command.context.as_deref().is_none_or(|context| {
+                                        context == "global"
+                                            || (context == "worktree"
+                                                && self.selected_worktree.is_some())
+                                    })
+                            })
+                            .map(|command| {
+                                (
+                                    command.action.clone(),
+                                    plugin.root.clone(),
+                                    plugin.content_hash.clone(),
+                                    plugin.main_entry.clone(),
+                                    plugin.capabilities.clone(),
+                                )
+                            })
+                    });
+                let Some((action, root, content_hash, main_entry, capabilities)) = invocation
+                else {
+                    return iced::Task::none();
+                };
+                if let Some(action) = action
+                    .as_deref()
+                    .and_then(suaegi_keys::KeybindingActionId::from_id)
+                {
+                    return self.dispatch_keybinding_shortcut(action, None);
+                }
+                let Some(main_entry) = main_entry else {
+                    return iced::Task::none();
+                };
+                iced::Task::perform(
+                    crate::plugin_worker::invoke_command(
+                        plugin_key.clone(),
+                        root,
+                        content_hash,
+                        main_entry,
+                        command_id,
+                        capabilities,
+                        crate::plugins::default_plugins_data_dir(),
+                    ),
+                    move |result| Message::PluginWorkerCommandFinished(plugin_key.clone(), result),
+                )
+            }
+            Message::PluginHostCallRequested(request) => {
+                let result = self.resolve_plugin_host_call(&request);
+                request.respond(result);
+                iced::Task::none()
+            }
+            Message::PluginPanelOpened(plugin_key, panel_id) => {
+                let loaded = self
+                    .plugins
+                    .iter()
+                    .find(|plugin| plugin.plugin_key == plugin_key)
+                    .ok_or_else(|| "plugin is no longer installed".to_string())
+                    .and_then(|plugin| crate::plugin_panel::read_html(plugin, &panel_id));
+                let (title, html) = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        self.plugin_panel_error = Some(error);
+                        crate::plugin_panel::set_visible(false);
+                        return iced::Task::none();
+                    }
+                };
+                self.close_context_panels();
+                self.right_sidebar_open = true;
+                self.active_plugin_panel = Some((plugin_key.clone(), panel_id.clone(), title));
+                self.plugin_panel_error = crate::plugin_panel::ensure(
+                    &plugin_key,
+                    &panel_id,
+                    &html,
+                    crate::theme::mode_is_dark(&self.ui_settings.theme),
+                    self.plugin_panel_bounds(),
+                )
+                .err();
+                iced::Task::none()
+            }
+            Message::PluginPanelClosed => {
+                self.active_plugin_panel = None;
+                self.plugin_panel_error = None;
+                crate::plugin_panel::set_visible(false);
+                iced::Task::none()
+            }
+            Message::PluginPanelCallRequested(call) => {
+                let visible =
+                    self.active_plugin_panel
+                        .as_ref()
+                        .is_some_and(|(plugin_key, panel_id, _)| {
+                            plugin_key == &call.plugin_key && panel_id == &call.panel_id
+                        });
+                if let Some(error) = call
+                    .validation_error
+                    .clone()
+                    .or_else(|| (!visible).then(|| "plugin panel is not active".to_string()))
+                {
+                    let error_code = call
+                        .validation_error_code
+                        .as_deref()
+                        .unwrap_or("unavailable");
+                    if let Err(response_error) = crate::plugin_panel::respond_error(
+                        &call.plugin_key,
+                        &call.panel_id,
+                        &call.request_id,
+                        error_code,
+                        &error,
+                    ) {
+                        self.plugin_panel_error = Some(response_error);
+                    }
+                    return iced::Task::none();
+                }
+                let plugin_key = call.plugin_key;
+                let panel_id = call.panel_id;
+                let request_id = call.request_id;
+                let response_plugin_key = plugin_key.clone();
+                let response_panel_id = panel_id.clone();
+                let response_request_id = request_id.clone();
+                let action = call.action;
+                let params = call.params;
+                iced::Task::perform(
+                    async move {
+                        crate::plugin_worker::invoke_panel_host(&plugin_key, &action, params).await
+                    },
+                    move |result| Message::PluginPanelCallFinished {
+                        plugin_key: response_plugin_key.clone(),
+                        panel_id: response_panel_id.clone(),
+                        request_id: response_request_id.clone(),
+                        result,
+                    },
+                )
+            }
+            Message::PluginPanelCallFinished {
+                plugin_key,
+                panel_id,
+                request_id,
+                result,
+            } => {
+                if let Err(error) =
+                    crate::plugin_panel::respond(&plugin_key, &panel_id, &request_id, result)
+                {
+                    self.plugin_panel_error = Some(error);
+                }
+                iced::Task::none()
+            }
+            Message::PluginPanelWatchdogTick => {
+                if self.active_plugin_panel.is_some() && self.right_sidebar_open {
+                    if let Err(error) = crate::plugin_panel::ping() {
+                        self.plugin_panel_error = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::PluginPanelPongReceived {
+                plugin_key,
+                panel_id,
+                ping_id,
+            } => {
+                if crate::plugin_panel::accept_pong(&plugin_key, &panel_id, ping_id)
+                    && self.plugin_panel_error.as_deref() == Some("plugin panel stopped responding")
+                {
+                    self.plugin_panel_error = None;
+                }
+                iced::Task::none()
+            }
+            Message::PluginEventDeliveryFinished(result) => {
+                if let Err(error) = result {
+                    self.plugins_error = Some(error);
+                }
+                iced::Task::none()
+            }
+            Message::PluginWorkerReapTick => {
+                crate::plugin_worker::reap_idle();
+                iced::Task::none()
+            }
+            Message::EphemeralVmRecipeUseRequested(repo_id, recipe_id) => {
+                if !self
+                    .vm_recipe_choices(&repo_id)
+                    .iter()
+                    .any(|choice| choice.id == recipe_id && !choice.id.is_empty())
+                {
+                    return iced::Task::none();
+                }
+                let suggested = self.fresh_worktree_suggestion();
+                self.worktree_suggested_name
+                    .insert(repo_id.clone(), suggested);
+                self.worktree_vm_recipe_draft
+                    .insert(repo_id.clone(), recipe_id);
+                self.creating_worktree_for = Some(repo_id);
+                self.integrations_open = false;
+                iced::Task::none()
+            }
+            Message::EphemeralVmProvisionFinished {
+                repo_id,
+                created_with_agent,
+                initial_prompt,
+                result,
+            } => match result {
+                Ok(runtime) => {
+                    let worktree_id = ephemeral_worktree_id(&runtime.id);
+                    let entry = ephemeral_worktree_entry(&runtime);
+                    let now = runtime.created_at;
+                    if let Some(environment) = runtime.runtime_environment.clone() {
+                        if !self
+                            .ui_settings
+                            .runtime_environments
+                            .iter()
+                            .any(|existing| existing.id == environment.id)
+                        {
+                            self.ui_settings.runtime_environments.push(environment);
+                        }
+                    }
+                    self.ephemeral_vm_runtimes
+                        .retain(|existing| existing.id != runtime.id);
+                    self.ephemeral_vm_runtimes.push(runtime.clone());
+                    self.ephemeral_vm_runtimes.sort_by(|left, right| {
+                        right
+                            .created_at
+                            .cmp(&left.created_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    let entries = self.worktrees_by_repo.entry(repo_id.clone()).or_default();
+                    if !entries
+                        .iter()
+                        .any(|entry| worktree_id_for(&entry.path) == worktree_id)
+                    {
+                        entries.push(entry);
+                    }
+                    self.worktree_meta.insert(
+                        worktree_id.clone(),
+                        WorktreeMeta {
+                            display_name: runtime.workspace_name.clone(),
+                            created_with_agent,
+                            created_at_unix_ms: now,
+                            ..WorktreeMeta::default()
+                        },
+                    );
+                    if let Some(prompt) = initial_prompt {
+                        self.pending_prompts.insert(worktree_id.clone(), prompt);
+                    }
+                    self.worktree_name_draft.remove(&repo_id);
+                    self.worktree_suggested_name.remove(&repo_id);
+                    self.worktree_agent_draft.remove(&repo_id);
+                    self.worktree_prompt_draft.remove(&repo_id);
+                    self.worktree_setup_run_draft.remove(&repo_id);
+                    self.worktree_sparse_preset_draft.remove(&repo_id);
+                    self.worktree_vm_recipe_draft.remove(&repo_id);
+                    self.creating_worktree_for = None;
+                    self.last_error = runtime
+                        .pairing_error
+                        .as_ref()
+                        .map(|error| format!("VM created, but runtime pairing failed: {error}"));
+                    self.selected_worktree = Some(worktree_id.clone());
+                    let plugin_event = self.deliver_plugin_event(
+                        "worktree.created",
+                        serde_json::json!({
+                            "worktreeId": worktree_id.0,
+                            "path": runtime.recipe_result.connection().project_root(),
+                            "branch": runtime.workspace_name
+                        }),
+                    );
+                    let session = if runtime.pairing_error.is_some() {
+                        iced::Task::none()
+                    } else {
+                        self.start_session_for(&worktree_id)
+                            .map_or_else(iced::Task::none, |(_, task)| task)
+                    };
+                    self.persist();
+                    iced::Task::batch([session, plugin_event])
+                }
+                Err(error) => {
+                    self.last_error = Some(format!("Environment provisioning failed: {error}"));
+                    iced::Task::none()
+                }
+            },
+            Message::EphemeralVmSuspendRequested(runtime_id) => {
+                let Some(record) = self
+                    .ephemeral_vm_runtimes
+                    .iter()
+                    .find(|record| record.id == runtime_id)
+                else {
+                    return iced::Task::none();
+                };
+                let Some(repo_path) = record
+                    .repo_id
+                    .as_deref()
+                    .and_then(|repo_id| self.repos.iter().find(|repo| repo.id.0 == repo_id))
+                    .map(|repo| repo.path.clone())
+                else {
+                    self.last_error =
+                        Some("The runtime's source repository is no longer available.".into());
+                    return iced::Task::none();
+                };
+                if !self.ephemeral_vm_busy.insert(runtime_id.clone()) {
+                    return iced::Task::none();
+                }
+                iced::Task::perform(
+                    crate::ephemeral_vm::suspend(
+                        crate::ephemeral_vm::default_store_path(),
+                        runtime_id.clone(),
+                        repo_path,
+                    ),
+                    move |result| Message::EphemeralVmLifecycleFinished(runtime_id.clone(), result),
+                )
+            }
+            Message::EphemeralVmResumeRequested(runtime_id) => {
+                let Some(record) = self
+                    .ephemeral_vm_runtimes
+                    .iter()
+                    .find(|record| record.id == runtime_id)
+                else {
+                    return iced::Task::none();
+                };
+                let Some(repo_path) = record
+                    .repo_id
+                    .as_deref()
+                    .and_then(|repo_id| self.repos.iter().find(|repo| repo.id.0 == repo_id))
+                    .map(|repo| repo.path.clone())
+                else {
+                    self.last_error =
+                        Some("The runtime's source repository is no longer available.".into());
+                    return iced::Task::none();
+                };
+                if !self.ephemeral_vm_busy.insert(runtime_id.clone()) {
+                    return iced::Task::none();
+                }
+                iced::Task::perform(
+                    crate::ephemeral_vm::resume_and_pair(
+                        crate::ephemeral_vm::default_store_path(),
+                        runtime_id.clone(),
+                        repo_path,
+                    ),
+                    move |result| Message::EphemeralVmLifecycleFinished(runtime_id.clone(), result),
+                )
+            }
+            Message::EphemeralVmCleanupRequested(runtime_id) => {
+                let Some(record) = self
+                    .ephemeral_vm_runtimes
+                    .iter()
+                    .find(|record| record.id == runtime_id)
+                else {
+                    return iced::Task::none();
+                };
+                let Some(repo_path) = record
+                    .repo_id
+                    .as_deref()
+                    .and_then(|repo_id| self.repos.iter().find(|repo| repo.id.0 == repo_id))
+                    .map(|repo| repo.path.clone())
+                else {
+                    self.last_error =
+                        Some("The runtime's source repository is no longer available.".into());
+                    return iced::Task::none();
+                };
+                if !self.ephemeral_vm_busy.insert(runtime_id.clone()) {
+                    return iced::Task::none();
+                }
+                iced::Task::perform(
+                    crate::ephemeral_vm::cleanup(
+                        crate::ephemeral_vm::default_store_path(),
+                        runtime_id.clone(),
+                        repo_path,
+                    ),
+                    move |result| Message::EphemeralVmLifecycleFinished(runtime_id.clone(), result),
+                )
+            }
+            Message::EphemeralVmLifecycleFinished(runtime_id, result) => {
+                self.ephemeral_vm_busy.remove(&runtime_id);
+                match result {
+                    Ok(mut record) => {
+                        let worktree_id = ephemeral_worktree_id(&record.id);
+                        let status = record.status.clone();
+                        let repo_id = record.repo_id.clone().map(RepoId);
+                        let removed_environment =
+                            if status == crate::ephemeral_vm::RuntimeStatus::Cleaned {
+                                let environment = record.runtime_environment.take();
+                                record.pairing_error = None;
+                                if environment.is_some() {
+                                    if let Err(error) = crate::ephemeral_vm::upsert(
+                                        &crate::ephemeral_vm::default_store_path(),
+                                        record.clone(),
+                                    ) {
+                                        self.last_error = Some(error);
+                                    }
+                                }
+                                environment
+                            } else {
+                                None
+                            };
+                        if let Some(environment) = record.runtime_environment.clone() {
+                            if let Some(existing) = self
+                                .ui_settings
+                                .runtime_environments
+                                .iter_mut()
+                                .find(|existing| existing.id == environment.id)
+                            {
+                                *existing = environment;
+                            } else {
+                                self.ui_settings.runtime_environments.push(environment);
+                            }
+                        }
+                        if let Some(environment) = removed_environment.as_ref() {
+                            self.ui_settings
+                                .runtime_environments
+                                .retain(|existing| existing.id != environment.id);
+                            if self.ui_settings.active_runtime_environment_id.as_deref()
+                                == Some(environment.id.as_str())
+                            {
+                                self.ui_settings.active_runtime_environment_id = None;
+                            }
+                        }
+                        if let Some(existing) = self
+                            .ephemeral_vm_runtimes
+                            .iter_mut()
+                            .find(|existing| existing.id == record.id)
+                        {
+                            *existing = record;
+                        } else {
+                            self.ephemeral_vm_runtimes.push(record);
+                        }
+                        self.ephemeral_vm_runtimes.sort_by(|left, right| {
+                            right
+                                .created_at
+                                .cmp(&left.created_at)
+                                .then_with(|| left.id.cmp(&right.id))
+                        });
+                        if matches!(
+                            status,
+                            crate::ephemeral_vm::RuntimeStatus::Suspended
+                                | crate::ephemeral_vm::RuntimeStatus::Cleaned
+                        ) {
+                            if let Some(session) = self.worktree_sessions.get(&worktree_id).copied()
+                            {
+                                self.close_session(session);
+                            }
+                        }
+                        if status == crate::ephemeral_vm::RuntimeStatus::Cleaned {
+                            if let Some(repo_id) = repo_id {
+                                self.remove_worktree_entry(&repo_id, &worktree_id);
+                            }
+                            if self.selected_worktree.as_ref() == Some(&worktree_id) {
+                                self.selected_worktree = None;
+                            }
+                        } else if status == crate::ephemeral_vm::RuntimeStatus::Running
+                            && self.selected_worktree.as_ref() == Some(&worktree_id)
+                            && !self.worktree_sessions.contains_key(&worktree_id)
+                        {
+                            let session = self
+                                .start_session_for(&worktree_id)
+                                .map_or_else(iced::Task::none, |(_, task)| task);
+                            self.persist();
+                            return session;
+                        }
+                        self.last_error = None;
+                        self.persist();
+                        if let Some(environment) = removed_environment {
+                            let id = environment.id;
+                            return iced::Task::perform(
+                                crate::remote_runtime::remove_environment(id.clone()),
+                                move |result| {
+                                    Message::RemoteRuntimeRemoveFinished(id.clone(), result)
+                                },
+                            );
+                        }
+                    }
+                    Err(error) => self.last_error = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::PluginWorkerCommandFinished(plugin_key, result) => {
+                self.plugins_error = Some(match result {
+                    Ok(_) => format!("Plugin command from {plugin_key} completed."),
+                    Err(error) => format!("{plugin_key}: {error}"),
+                });
+                iced::Task::none()
+            }
+            Message::PluginMarketplaceLoadRequested => {
+                if !self.ui_settings.plugin_system_enabled || self.plugin_marketplace_loading {
+                    return iced::Task::none();
+                }
+                self.plugin_marketplace_loading = true;
+                iced::Task::perform(
+                    crate::plugin_marketplace::seed_official_source(
+                        crate::plugin_marketplace::default_marketplaces_dir(),
+                    ),
+                    Message::PluginMarketplaceLoaded,
+                )
+            }
+            Message::PluginMarketplaceLoaded(result) => {
+                self.plugin_marketplace_loading = false;
+                match result {
+                    Ok(states) => self.plugin_marketplaces = states,
+                    Err(error) => self.plugins_error = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::PluginMarketplaceUrlChanged(value) => {
+                self.plugin_marketplace_url_draft = value.chars().take(32 * 1024).collect();
+                iced::Task::none()
+            }
+            Message::PluginMarketplaceRefChanged(value) => {
+                self.plugin_marketplace_ref_draft = value.chars().take(4_096).collect();
+                iced::Task::none()
+            }
+            Message::PluginMarketplaceAddRequested => {
+                if self.plugin_marketplace_loading {
+                    return iced::Task::none();
+                }
+                let source = crate::plugin_marketplace::MarketplaceGitSource {
+                    kind: "git".into(),
+                    url: self.plugin_marketplace_url_draft.trim().to_string(),
+                    git_ref: self.plugin_marketplace_ref_draft.trim().to_string(),
+                };
+                self.plugin_marketplace_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugin_marketplace::add_and_refresh(
+                        crate::plugin_marketplace::default_marketplaces_dir(),
+                        source,
+                    ),
+                    Message::PluginMarketplaceLoaded,
+                )
+            }
+            Message::PluginMarketplaceRefreshRequested(source_id) => {
+                if self.plugin_marketplace_loading {
+                    return iced::Task::none();
+                }
+                self.plugin_marketplace_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugin_marketplace::refresh_catalog(
+                        crate::plugin_marketplace::default_marketplaces_dir(),
+                        source_id,
+                    ),
+                    Message::PluginMarketplaceLoaded,
+                )
+            }
+            Message::PluginMarketplaceRemoveRequested(source_id) => {
+                if self.plugin_marketplace_loading {
+                    return iced::Task::none();
+                }
+                self.plugin_marketplace_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    async move {
+                        let root = crate::plugin_marketplace::default_marketplaces_dir();
+                        crate::plugin_marketplace::remove_source(&root, &source_id)?;
+                        crate::plugin_marketplace::load_catalog(root).await
+                    },
+                    Message::PluginMarketplaceLoaded,
+                )
+            }
+            Message::PluginMarketplaceInstallRequested(
+                source_id,
+                marketplace_commit,
+                plugin_key,
+            ) => {
+                if self.plugin_marketplace_loading || self.plugins_loading {
+                    return iced::Task::none();
+                }
+                if let Some(reason) = self.plugin_kill_list_reason(&plugin_key) {
+                    self.plugins_error =
+                        Some(format!("Blocked by Suaegi's plugin safety list: {reason}"));
+                    return iced::Task::none();
+                }
+                self.plugin_marketplace_loading = true;
+                self.plugins_error = None;
+                iced::Task::perform(
+                    crate::plugin_marketplace::install_listing(
+                        crate::plugin_marketplace::default_marketplaces_dir(),
+                        crate::plugins::default_plugins_dir(),
+                        source_id,
+                        marketplace_commit,
+                        plugin_key,
+                    ),
+                    Message::PluginMarketplaceInstallFinished,
+                )
+            }
+            Message::PluginMarketplaceInstallFinished(result) => {
+                self.plugin_marketplace_loading = false;
+                match result {
+                    Ok(plugin_key) => {
+                        self.ui_settings.plugin_consents.remove(&plugin_key);
+                        self.plugins_error = Some(format!(
+                            "Installed {plugin_key}. Review its exact permissions before activation."
+                        ));
+                        self.persist();
+                        self.update(Message::PluginsRefreshRequested)
+                    }
+                    Err(error) => {
+                        self.plugins_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::PluginKillListRefreshRequested => {
+                if self.plugin_kill_list_loading || !self.ui_settings.plugin_system_enabled {
+                    return iced::Task::none();
+                }
+                self.plugin_kill_list_loading = true;
+                iced::Task::perform(
+                    crate::plugin_kill_list::refresh(crate::plugin_kill_list::default_cache_path()),
+                    Message::PluginKillListRefreshFinished,
+                )
+            }
+            Message::PluginKillListRefreshFinished(result) => {
+                self.plugin_kill_list_loading = false;
+                match result {
+                    Ok(kill_list) => {
+                        self.plugin_kill_list = Some(kill_list);
+                        crate::plugins::apply_kill_list(
+                            &mut self.plugins,
+                            self.plugin_kill_list.as_ref(),
+                        );
+                        if let Some((plugin_key, panel_id, _)) = self.active_plugin_panel.as_ref() {
+                            let still_available = self.plugins.iter().any(|plugin| {
+                                plugin.plugin_key == *plugin_key
+                                    && plugin.status == crate::plugins::PluginStatus::Idle
+                                    && plugin.blocked_by_kill_list.is_none()
+                                    && plugin.panels.iter().any(|panel| panel.id == *panel_id)
+                            });
+                            if !still_available {
+                                self.active_plugin_panel = None;
+                                self.plugin_panel_error = None;
+                                crate::plugin_panel::set_visible(false);
+                            }
+                        }
+                        crate::keybindings::publish_plugin_shortcuts(&self.plugins);
+                        crate::plugin_worker::reconcile(&self.plugins);
+                        crate::i18n::set_plugin_language_packs(&self.plugins);
+                    }
+                    Err(error) => {
+                        if self.plugin_kill_list.is_none() {
+                            self.plugins_error =
+                                Some(format!("Plugin safety list is unavailable: {error}"));
+                        }
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeRemoveRequested(index) => {
+                let Some(environment) = self.ui_settings.runtime_environments.get(index).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                self.remote_runtime_status
+                    .insert(environment.id.clone(), "Removing…".into());
+                let id = environment.id.clone();
+                iced::Task::perform(
+                    crate::remote_runtime::remove_environment(id.clone()),
+                    move |result| Message::RemoteRuntimeRemoveFinished(id.clone(), result),
+                )
+            }
+            Message::RemoteRuntimeRemoveFinished(id, result) => {
+                match result {
+                    Ok(()) => {
+                        self.ui_settings
+                            .runtime_environments
+                            .retain(|environment| environment.id != id);
+                        if self.ui_settings.active_runtime_environment_id.as_deref()
+                            == Some(id.as_str())
+                        {
+                            self.ui_settings.active_runtime_environment_id = None;
+                            self.remote_provider_accounts = None;
+                            self.remote_provider_accounts_error = None;
+                            self.remote_provider_accounts_loading = false;
+                        }
+                        self.remote_runtime_checking.remove(&id);
+                        self.remote_runtime_status.remove(&id);
+                        self.remote_server_updates.remove(&id);
+                        self.persist();
+                    }
+                    Err(error) => {
+                        self.remote_runtime_status.insert(id, error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeRpcRemoveFinished(request, environment, result) => {
+                match result {
+                    Ok(()) => {
+                        self.ui_settings
+                            .runtime_environments
+                            .retain(|candidate| candidate.id != environment.id);
+                        if self.ui_settings.active_runtime_environment_id.as_deref()
+                            == Some(environment.id.as_str())
+                        {
+                            self.ui_settings.active_runtime_environment_id = None;
+                            self.remote_provider_accounts = None;
+                            self.remote_provider_accounts_error = None;
+                            self.remote_provider_accounts_loading = false;
+                        }
+                        self.remote_runtime_checking.remove(&environment.id);
+                        self.remote_runtime_status.remove(&environment.id);
+                        self.remote_server_updates.remove(&environment.id);
+                        self.persist();
+                        request.respond(Ok(serde_json::json!({
+                            "removed": {
+                                "id": environment.id,
+                                "name": environment.name,
+                                "endpoint": environment.endpoint,
+                                "credentialsConfigured": environment.credentials_configured,
+                                "createdAtUnixMs": environment.created_at_unix_ms,
+                            }
+                        })));
+                    }
+                    Err(error) => request.respond(Err(error)),
+                }
+                iced::Task::none()
+            }
+            Message::RemoteRuntimeActiveSelected(id) => {
+                let Some(id) = id else {
+                    self.ui_settings.active_runtime_environment_id = None;
+                    self.remote_provider_accounts = None;
+                    self.remote_provider_accounts_error = None;
+                    self.remote_provider_accounts_loading = false;
+                    self.persist();
+                    return iced::Task::none();
+                };
+                let Some(environment) = self
+                    .ui_settings
+                    .runtime_environments
+                    .iter()
+                    .find(|environment| environment.id == id)
+                    .cloned()
+                else {
+                    return iced::Task::none();
+                };
+                if self.ui_settings.active_runtime_environment_id.as_deref() == Some(id.as_str()) {
+                    return iced::Task::none();
+                }
+                self.remote_runtime_checking.insert(id.clone());
+                self.remote_runtime_status
+                    .insert(id.clone(), "Connecting and verifying E2EE…".into());
+                iced::Task::perform(
+                    crate::remote_runtime::check_reachability(environment),
+                    move |result| Message::RemoteRuntimeActivateFinished(id.clone(), result),
+                )
+            }
+            Message::RemoteRuntimeActivateFinished(id, result) => {
+                self.remote_runtime_checking.remove(&id);
+                self.remote_runtime_status
+                    .insert(id.clone(), result.message);
+                if result.reachable
+                    && self
+                        .ui_settings
+                        .runtime_environments
+                        .iter()
+                        .any(|environment| environment.id == id)
+                {
+                    self.ui_settings.active_runtime_environment_id = Some(id);
+                    self.persist();
+                    return self.update(Message::RemoteProviderAccountsRefreshRequested);
+                }
+                iced::Task::none()
+            }
+            Message::RemoteProviderAccountsRefreshRequested => {
+                self.request_remote_provider_accounts()
+            }
+            Message::RemoteProviderAccountsRefreshFinished(result) => {
+                self.remote_provider_accounts_loading = false;
+                match result {
+                    Ok(snapshot) => self.accept_remote_provider_accounts(snapshot),
+                    Err(error) => {
+                        self.remote_provider_accounts = None;
+                        self.remote_provider_accounts_error = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RemoteProviderAccountMutationFinished(provider, result) => {
+                self.provider_account_importing.remove(&provider);
+                match result {
+                    Ok(snapshot) => {
+                        self.accept_remote_provider_accounts(snapshot);
+                        self.last_error = None;
+                    }
+                    Err(error) => {
+                        self.remote_provider_accounts_error = Some(error.clone());
+                        self.last_error = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::VoiceEnabledToggled => {
+                if self.ui_settings.voice_enabled {
+                    crate::speech::cancel_capture();
+                    self.voice_dictation_state = VoiceDictationState::Idle;
+                    self.ui_settings.voice_enabled = false;
+                    self.voice_status = Some("Voice dictation disabled.".to_string());
+                } else {
+                    match crate::speech::start_capture() {
+                        Ok(()) => {
+                            crate::speech::cancel_capture();
+                            self.ui_settings.voice_enabled = true;
+                            self.voice_status = Some(
+                                "Microphone permission granted. Voice dictation enabled.".into(),
+                            );
+                        }
+                        Err(error) => {
+                            self.voice_status = Some(error);
+                        }
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::VoiceDictationShortcutPressed => {
+                if self.ui_settings.voice_dictation_mode == "hold" {
+                    if self.voice_dictation_state == VoiceDictationState::Idle {
+                        self.update(Message::VoiceDictationToggled)
+                    } else {
+                        iced::Task::none()
+                    }
+                } else {
+                    self.update(Message::VoiceDictationToggled)
+                }
+            }
+            Message::VoiceDictationShortcutReleased => {
+                if self.ui_settings.voice_dictation_mode == "hold"
+                    && self.voice_dictation_state == VoiceDictationState::Recording
+                {
+                    self.update(Message::VoiceDictationToggled)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::VoiceDictationToggled => {
+                if !self.ui_settings.voice_enabled {
+                    self.voice_status = Some(
+                        "Enable Voice Dictation in Settings before using the shortcut.".into(),
+                    );
+                    return iced::Task::none();
+                }
+                match self.voice_dictation_state {
+                    VoiceDictationState::Idle => {
+                        if self.ui_settings.voice_model.is_empty() {
+                            self.voice_status =
+                                Some("Select and prepare a speech model before dictating.".into());
+                            return iced::Task::none();
+                        }
+                        match crate::speech::start_capture() {
+                            Ok(()) => {
+                                self.voice_dictation_state = VoiceDictationState::Recording;
+                                self.voice_status = Some(
+                                    "Listening… Press the dictation shortcut again to stop.".into(),
+                                );
+                            }
+                            Err(error) => {
+                                self.voice_status = Some(error);
+                            }
+                        }
+                        iced::Task::none()
+                    }
+                    VoiceDictationState::Recording => {
+                        let capture = match crate::speech::stop_capture() {
+                            Ok(capture) => capture,
+                            Err(error) => {
+                                self.voice_dictation_state = VoiceDictationState::Idle;
+                                self.voice_status = Some(error);
+                                return iced::Task::none();
+                            }
+                        };
+                        self.voice_dictation_state = VoiceDictationState::Transcribing;
+                        self.voice_status = Some("Transcribing dictation…".into());
+                        let model = self.ui_settings.voice_model.clone();
+                        let models_dir = self.ui_settings.voice_models_dir.clone();
+                        let language = self.ui_settings.voice_language.clone();
+                        iced::Task::perform(
+                            crate::speech::transcribe(capture, model, models_dir, language),
+                            Message::VoiceTranscriptionFinished,
+                        )
+                    }
+                    VoiceDictationState::Transcribing => {
+                        self.voice_status =
+                            Some("Please wait for the current transcription to finish.".into());
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::VoiceApiKeyDraftChanged(value) => {
+                self.voice_api_key_draft = value.into_inner();
+                iced::Task::none()
+            }
+            Message::VoiceApiKeySaveRequested => {
+                match crate::speech::save_openai_key(&self.voice_api_key_draft) {
+                    Ok(()) => {
+                        self.voice_api_key_draft.clear();
+                        self.ui_settings.voice_openai_api_key_configured = true;
+                        self.voice_status =
+                            Some("OpenAI API key saved in the macOS Keychain.".into());
+                    }
+                    Err(error) => self.voice_status = Some(error),
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::VoiceApiKeyClearRequested => {
+                match crate::speech::clear_openai_key() {
+                    Ok(()) => {
+                        self.voice_api_key_draft.clear();
+                        self.ui_settings.voice_openai_api_key_configured = false;
+                        if self.ui_settings.voice_model.starts_with("openai-") {
+                            self.ui_settings.voice_model.clear();
+                        }
+                        self.voice_status = Some("OpenAI API key cleared.".into());
+                    }
+                    Err(error) => self.voice_status = Some(error),
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::VoiceModelDownloadRequested(model_id) => {
+                if self.voice_model_busy.is_some() {
+                    self.voice_status =
+                        Some("Wait for the current speech model operation to finish.".into());
+                    return iced::Task::none();
+                }
+                let Some(manifest) = crate::speech_models::local_model(&model_id) else {
+                    self.voice_status = Some(format!("Unknown local speech model: {model_id}"));
+                    return iced::Task::none();
+                };
+                self.voice_model_busy = Some(model_id.clone());
+                self.voice_status = Some(format!(
+                    "Downloading {} ({} MB)…",
+                    manifest.label,
+                    manifest.size_bytes / 1_000_000
+                ));
+                let models_dir = self.ui_settings.voice_models_dir.clone();
+                iced::Task::perform(
+                    crate::speech_models::download_model(model_id.clone(), models_dir),
+                    move |result| Message::VoiceModelDownloadFinished(model_id, result),
+                )
+            }
+            Message::VoiceModelDownloadFinished(model_id, result) => {
+                self.voice_model_busy = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(manifest) = crate::speech_models::local_model(&model_id) {
+                            self.voice_status = Some(format!(
+                                "{} is ready for offline dictation.",
+                                manifest.label
+                            ));
+                        }
+                    }
+                    Err(error) => self.voice_status = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::VoiceModelDeleteRequested(model_id) => {
+                if self.voice_model_busy.is_some() {
+                    self.voice_status =
+                        Some("Wait for the current speech model operation to finish.".into());
+                    return iced::Task::none();
+                }
+                self.voice_model_busy = Some(model_id.clone());
+                self.voice_status = Some("Deleting local speech model…".into());
+                let models_dir = self.ui_settings.voice_models_dir.clone();
+                iced::Task::perform(
+                    crate::speech_models::delete_model(model_id.clone(), models_dir),
+                    move |result| Message::VoiceModelDeleteFinished(model_id, result),
+                )
+            }
+            Message::VoiceModelDeleteFinished(model_id, result) => {
+                self.voice_model_busy = None;
+                match result {
+                    Ok(()) => {
+                        if self.ui_settings.voice_model == model_id {
+                            self.ui_settings.voice_model.clear();
+                            self.persist();
+                        }
+                        self.voice_status = Some("Local speech model deleted.".into());
+                    }
+                    Err(error) => self.voice_status = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::VoiceTranscriptionFinished(result) => {
+                self.voice_dictation_state = VoiceDictationState::Idle;
+                match result {
+                    Ok(transcript) if transcript.trim().is_empty() => {
+                        self.voice_status = Some("No speech was detected.".into());
+                        iced::Task::none()
+                    }
+                    Ok(transcript) if self.ui_settings.voice_terminal_confirm_before_insert => {
+                        self.pending_voice_transcript = Some(transcript);
+                        self.voice_status =
+                            Some("Review the transcription before inserting it.".into());
+                        iced::Task::none()
+                    }
+                    Ok(transcript) => self.insert_voice_transcript(transcript),
+                    Err(error) => {
+                        self.voice_status = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::VoiceTranscriptInsertConfirmed => self
+                .pending_voice_transcript
+                .take()
+                .map_or_else(iced::Task::none, |transcript| {
+                    self.insert_voice_transcript(transcript)
+                }),
+            Message::VoiceTranscriptInsertCancelled => {
+                self.pending_voice_transcript = None;
+                self.voice_status = Some("Dictation discarded.".into());
+                iced::Task::none()
+            }
+            Message::UiSettingToggled(setting) => {
+                match setting {
+                    UiSetting::ConfirmClosePinnedTabs => {
+                        self.ui_settings.confirm_close_pinned_tabs =
+                            !self.ui_settings.confirm_close_pinned_tabs;
+                    }
+                    UiSetting::ConfirmCloseRunningTerminal => {
+                        self.ui_settings.confirm_close_running_terminal =
+                            !self.ui_settings.confirm_close_running_terminal;
+                    }
+                    UiSetting::ConfirmWorkspaceDelete => {
+                        self.ui_settings.confirm_workspace_delete =
+                            !self.ui_settings.confirm_workspace_delete;
+                    }
+                    UiSetting::ConfirmAutomationDelete => {
+                        self.ui_settings.confirm_automation_delete =
+                            !self.ui_settings.confirm_automation_delete;
+                    }
+                    UiSetting::NestWorkspaces => {
+                        self.ui_settings.nest_workspaces = !self.ui_settings.nest_workspaces;
+                    }
+                    UiSetting::AutoSaveFiles => {
+                        self.ui_settings.auto_save_files = !self.ui_settings.auto_save_files;
+                    }
+                    UiSetting::EditorWordWrap => {
+                        self.ui_settings.editor_word_wrap = !self.ui_settings.editor_word_wrap;
+                    }
+                    UiSetting::EditorMinimap => {
+                        self.ui_settings.editor_minimap = !self.ui_settings.editor_minimap;
+                    }
+                    UiSetting::RichMarkdownSpellcheck => {
+                        self.ui_settings.rich_markdown_spellcheck =
+                            !self.ui_settings.rich_markdown_spellcheck;
+                        self.editor
+                            .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                    }
+                    UiSetting::MarkdownReviewTools => {
+                        self.ui_settings.markdown_review_tools =
+                            !self.ui_settings.markdown_review_tools;
+                    }
+                    UiSetting::PrimarySelectionMiddleClickPaste => {
+                        self.ui_settings.primary_selection_middle_click_paste =
+                            !self.ui_settings.primary_selection_middle_click_paste;
+                    }
+                    UiSetting::DiffWordWrap => {
+                        self.ui_settings.diff_word_wrap = !self.ui_settings.diff_word_wrap;
+                    }
+                    UiSetting::CombinedDiffFileTreeVisibleByDefault => {
+                        self.ui_settings.combined_diff_file_tree_visible_by_default =
+                            !self.ui_settings.combined_diff_file_tree_visible_by_default;
+                    }
+                    UiSetting::RefreshLocalBaseRef => {
+                        self.ui_settings.refresh_local_base_ref =
+                            !self.ui_settings.refresh_local_base_ref;
+                    }
+                    UiSetting::AutoRenameBranchFromWork => {
+                        self.ui_settings.auto_rename_branch_from_work =
+                            !self.ui_settings.auto_rename_branch_from_work;
+                    }
+                    UiSetting::EnableGithubAttribution => {
+                        self.ui_settings.enable_github_attribution =
+                            !self.ui_settings.enable_github_attribution;
+                    }
+                    UiSetting::ShowGitIgnoredFiles => {
+                        self.ui_settings.show_git_ignored_files =
+                            !self.ui_settings.show_git_ignored_files;
+                    }
+                    UiSetting::SourceControlCompareAgainstUpstream => {
+                        self.ui_settings.source_control_compare_against_upstream =
+                            !self.ui_settings.source_control_compare_against_upstream;
+                    }
+                    UiSetting::ShowTitlebarAppName => {
+                        self.ui_settings.show_titlebar_app_name =
+                            !self.ui_settings.show_titlebar_app_name;
+                    }
+                    UiSetting::ShowTasksButton => {
+                        self.ui_settings.show_tasks_button = !self.ui_settings.show_tasks_button;
+                    }
+                    UiSetting::ShowAutomationsButton => {
+                        self.ui_settings.show_automations_button =
+                            !self.ui_settings.show_automations_button;
+                    }
+                    UiSetting::ShowPinnedWorktreesInGroups => {
+                        self.ui_settings.show_pinned_worktrees_in_groups =
+                            !self.ui_settings.show_pinned_worktrees_in_groups;
+                    }
+                    UiSetting::ShowMenuBarIcon => {
+                        self.ui_settings.show_menu_bar_icon = !self.ui_settings.show_menu_bar_icon;
+                        #[cfg(not(test))]
+                        if let Err(error) = crate::appearance::set_menu_bar_item(
+                            self.ui_settings.show_menu_bar_icon,
+                        ) {
+                            self.last_error = Some(error);
+                        }
+                    }
+                    UiSetting::WindowBackgroundBlur => {
+                        self.ui_settings.window_background_blur =
+                            !self.ui_settings.window_background_blur;
+                        #[cfg(not(test))]
+                        if let Err(error) = crate::appearance::set_background_blur(
+                            self.ui_settings.window_background_blur,
+                        ) {
+                            self.last_error = Some(error);
+                        }
+                    }
+                    UiSetting::TerminalCursorBlink => {
+                        self.ui_settings.terminal_cursor_blink =
+                            !self.ui_settings.terminal_cursor_blink;
+                    }
+                    UiSetting::TerminalMouseHideWhileTyping => {
+                        self.ui_settings.terminal_mouse_hide_while_typing =
+                            !self.ui_settings.terminal_mouse_hide_while_typing;
+                    }
+                    UiSetting::TerminalUseSeparateLightTheme => {
+                        self.ui_settings.terminal_use_separate_light_theme =
+                            !self.ui_settings.terminal_use_separate_light_theme;
+                    }
+                    UiSetting::TerminalFocusFollowsMouse => {
+                        self.ui_settings.terminal_focus_follows_mouse =
+                            !self.ui_settings.terminal_focus_follows_mouse;
+                    }
+                    UiSetting::TerminalClipboardOnSelect => {
+                        self.ui_settings.terminal_clipboard_on_select =
+                            !self.ui_settings.terminal_clipboard_on_select;
+                    }
+                    UiSetting::TerminalAllowOsc52Clipboard => {
+                        self.ui_settings.terminal_allow_osc52_clipboard =
+                            !self.ui_settings.terminal_allow_osc52_clipboard;
+                    }
+                    UiSetting::TerminalScopeHistoryByWorktree => {
+                        self.ui_settings.terminal_scope_history_by_worktree =
+                            !self.ui_settings.terminal_scope_history_by_worktree;
+                    }
+                    UiSetting::TerminalRightClickToPaste => {
+                        self.ui_settings.terminal_right_click_to_paste =
+                            !self.ui_settings.terminal_right_click_to_paste;
+                    }
+                    UiSetting::TerminalJisYenToBackslash => {
+                        self.ui_settings.terminal_jis_yen_to_backslash =
+                            !self.ui_settings.terminal_jis_yen_to_backslash;
+                    }
+                    UiSetting::NotificationsEnabled => {
+                        self.ui_settings.notifications_enabled =
+                            !self.ui_settings.notifications_enabled;
+                    }
+                    UiSetting::NotificationAgentTaskComplete => {
+                        self.ui_settings.notification_agent_task_complete =
+                            !self.ui_settings.notification_agent_task_complete;
+                    }
+                    UiSetting::NotificationTerminalBell => {
+                        self.ui_settings.notification_terminal_bell =
+                            !self.ui_settings.notification_terminal_bell;
+                    }
+                    UiSetting::NotificationSuppressWhenFocused => {
+                        self.ui_settings.notification_suppress_when_focused =
+                            !self.ui_settings.notification_suppress_when_focused;
+                    }
+                    UiSetting::AnonymousTelemetry => {
+                        self.ui_settings.anonymous_telemetry =
+                            !self.ui_settings.anonymous_telemetry;
+                    }
+                    UiSetting::ShowUsageStatus => {
+                        self.ui_settings.show_usage_status = !self.ui_settings.show_usage_status;
+                    }
+                    UiSetting::ShowResourceStatus => {
+                        self.ui_settings.show_resource_status =
+                            !self.ui_settings.show_resource_status;
+                    }
+                    UiSetting::ShowPortsStatus => {
+                        self.ui_settings.show_ports_status = !self.ui_settings.show_ports_status;
+                    }
+                    UiSetting::ShowMobileSidebar => {
+                        self.ui_settings.show_mobile_sidebar =
+                            !self.ui_settings.show_mobile_sidebar;
+                    }
+                    UiSetting::FloatingWorkspaceEnabled => {
+                        self.ui_settings.floating_workspace_enabled =
+                            !self.ui_settings.floating_workspace_enabled;
+                        if !self.ui_settings.floating_workspace_enabled {
+                            self.floating_workspace_open = false;
+                            if self.floating_workspace_owns_browser() {
+                                self.browser_open = false;
+                                crate::browser::set_visible(false);
+                            }
+                        }
+                    }
+                    UiSetting::OpenLinksInApp => {
+                        self.ui_settings.open_links_in_app = !self.ui_settings.open_links_in_app;
+                    }
+                    UiSetting::LocalhostWorktreeLabels => {
+                        self.ui_settings.localhost_worktree_labels =
+                            !self.ui_settings.localhost_worktree_labels;
+                    }
+                    UiSetting::MobileEmulatorEnabled => {
+                        self.ui_settings.mobile_emulator_enabled =
+                            !self.ui_settings.mobile_emulator_enabled;
+                        if !self.ui_settings.mobile_emulator_enabled {
+                            self.emulator_launch_after_refresh = false;
+                            self.emulator_status = Some("Mobile Emulator disabled.".into());
+                        }
+                    }
+                    UiSetting::AgentStatusHooksEnabled => {
+                        let enabled = !self.ui_settings.agent_status_hooks_enabled;
+                        if let Err(error) = self.set_agent_hooks_enabled(enabled) {
+                            self.last_error = Some(error);
+                        }
+                    }
+                    UiSetting::TabAutoGenerateTitle => {
+                        self.ui_settings.tab_auto_generate_title =
+                            !self.ui_settings.tab_auto_generate_title;
+                    }
+                    UiSetting::KeepComputerAwakeWhileAgentsRun => {
+                        self.ui_settings.keep_computer_awake_while_agents_run =
+                            !self.ui_settings.keep_computer_awake_while_agents_run;
+                    }
+                    UiSetting::PromptCacheTimerEnabled => {
+                        self.ui_settings.prompt_cache_timer_enabled =
+                            !self.ui_settings.prompt_cache_timer_enabled;
+                        if !self.ui_settings.prompt_cache_timer_enabled {
+                            self.prompt_cache_started.clear();
+                        }
+                    }
+                    UiSetting::GeminiCliOauthEnabled => {
+                        self.ui_settings.gemini_cli_oauth_enabled =
+                            !self.ui_settings.gemini_cli_oauth_enabled;
+                        self.gemini_rate_limits = None;
+                    }
+                    UiSetting::OrchestrationEnabled => {
+                        self.ui_settings.orchestration_enabled =
+                            !self.ui_settings.orchestration_enabled;
+                    }
+                    UiSetting::ComputerUseEnabled => {
+                        self.ui_settings.computer_use_enabled =
+                            !self.ui_settings.computer_use_enabled;
+                    }
+                    UiSetting::VoiceEnabled => {
+                        self.ui_settings.voice_enabled = !self.ui_settings.voice_enabled;
+                    }
+                    UiSetting::VoiceConfirmBeforeInsert => {
+                        self.ui_settings.voice_terminal_confirm_before_insert =
+                            !self.ui_settings.voice_terminal_confirm_before_insert;
+                    }
+                    UiSetting::ShowGithubTasks => {
+                        self.ui_settings.show_github_tasks = !self.ui_settings.show_github_tasks;
+                        if !self.ui_settings.show_github_tasks
+                            && self.task_provider == TaskProvider::Github
+                        {
+                            self.task_provider = if self.ui_settings.show_gitlab_tasks {
+                                TaskProvider::Gitlab
+                            } else if self.ui_settings.show_jira_tasks {
+                                TaskProvider::Jira
+                            } else {
+                                TaskProvider::Linear
+                            };
+                        }
+                    }
+                    UiSetting::ShowGitlabTasks => {
+                        self.ui_settings.show_gitlab_tasks = !self.ui_settings.show_gitlab_tasks;
+                        if !self.ui_settings.show_gitlab_tasks
+                            && self.task_provider == TaskProvider::Gitlab
+                        {
+                            self.task_provider = if self.ui_settings.show_github_tasks {
+                                TaskProvider::Github
+                            } else if self.ui_settings.show_jira_tasks {
+                                TaskProvider::Jira
+                            } else {
+                                TaskProvider::Linear
+                            };
+                        }
+                    }
+                    UiSetting::ShowJiraTasks => {
+                        self.ui_settings.show_jira_tasks = !self.ui_settings.show_jira_tasks;
+                        if !self.ui_settings.show_jira_tasks
+                            && self.task_provider == TaskProvider::Jira
+                        {
+                            self.task_provider = if self.ui_settings.show_github_tasks {
+                                TaskProvider::Github
+                            } else if self.ui_settings.show_gitlab_tasks {
+                                TaskProvider::Gitlab
+                            } else {
+                                TaskProvider::Linear
+                            };
+                        }
+                    }
+                    UiSetting::ShowLinearTasks => {
+                        self.ui_settings.show_linear_tasks = !self.ui_settings.show_linear_tasks;
+                        if !self.ui_settings.show_linear_tasks
+                            && self.task_provider == TaskProvider::Linear
+                        {
+                            self.task_provider = if self.ui_settings.show_github_tasks {
+                                TaskProvider::Github
+                            } else if self.ui_settings.show_gitlab_tasks {
+                                TaskProvider::Gitlab
+                            } else {
+                                TaskProvider::Jira
+                            };
+                        }
+                    }
+                    UiSetting::ElectronHttp1CompatibilityMode => {
+                        self.ui_settings.electron_http1_compatibility_mode =
+                            !self.ui_settings.electron_http1_compatibility_mode;
+                    }
+                    UiSetting::TerminalHiddenViewParking => {
+                        self.ui_settings.terminal_hidden_view_parking =
+                            !self.ui_settings.terminal_hidden_view_parking;
+                    }
+                    UiSetting::TerminalMainSideEffectAuthority => {
+                        self.ui_settings.terminal_main_side_effect_authority =
+                            !self.ui_settings.terminal_main_side_effect_authority;
+                    }
+                    UiSetting::TerminalHiddenDeliveryGate => {
+                        self.ui_settings.terminal_hidden_delivery_gate =
+                            !self.ui_settings.terminal_hidden_delivery_gate;
+                    }
+                    UiSetting::TerminalModelQueryAuthority => {
+                        self.ui_settings.terminal_model_query_authority =
+                            !self.ui_settings.terminal_model_query_authority;
+                    }
+                    UiSetting::ExperimentalNativeChat => {
+                        self.ui_settings.experimental_native_chat =
+                            !self.ui_settings.experimental_native_chat;
+                        if !self.ui_settings.experimental_native_chat {
+                            self.native_chat_sessions.clear();
+                            self.native_chat_drafts.clear();
+                        }
+                    }
+                    UiSetting::ExperimentalPet => {
+                        self.ui_settings.experimental_pet = !self.ui_settings.experimental_pet;
+                    }
+                    UiSetting::ExperimentalActivity => {
+                        self.ui_settings.experimental_activity =
+                            !self.ui_settings.experimental_activity;
+                        if !self.ui_settings.experimental_activity {
+                            self.activity_open = false;
+                        }
+                    }
+                    UiSetting::ExperimentalTerminalAttention => {
+                        self.ui_settings.experimental_terminal_attention =
+                            !self.ui_settings.experimental_terminal_attention;
+                        if !self.ui_settings.experimental_terminal_attention {
+                            self.terminal_attention_sessions.clear();
+                        }
+                    }
+                    UiSetting::ExperimentalAgentHibernation => {
+                        self.ui_settings.experimental_agent_hibernation =
+                            !self.ui_settings.experimental_agent_hibernation;
+                    }
+                    UiSetting::CompactWorktreeCards => {
+                        self.ui_settings.compact_worktree_cards =
+                            !self.ui_settings.compact_worktree_cards;
+                    }
+                    UiSetting::ExperimentalEphemeralVms => {
+                        self.ui_settings.experimental_ephemeral_vms =
+                            !self.ui_settings.experimental_ephemeral_vms;
+                    }
+                    UiSetting::PluginSystemEnabled => {
+                        self.ui_settings.plugin_system_enabled =
+                            !self.ui_settings.plugin_system_enabled;
+                        if !self.ui_settings.plugin_system_enabled {
+                            self.plugins.clear();
+                            self.plugin_consent_review = None;
+                            self.plugin_remove_confirmation = None;
+                        }
+                    }
+                    UiSetting::HideDefaultBranch => {
+                        self.ui_settings.hide_default_branch =
+                            !self.ui_settings.hide_default_branch;
+                    }
+                    UiSetting::HideDetachedHead => {
+                        self.ui_settings.hide_detached_head = !self.ui_settings.hide_detached_head;
+                    }
+                    UiSetting::HideSleeping => {
+                        self.ui_settings.hide_sleeping = !self.ui_settings.hide_sleeping;
+                    }
+                }
+                if matches!(
+                    setting,
+                    UiSetting::ShowGithubTasks
+                        | UiSetting::ShowGitlabTasks
+                        | UiSetting::ShowJiraTasks
+                        | UiSetting::ShowLinearTasks
+                ) {
+                    if !self.ui_settings.show_github_tasks
+                        && !self.ui_settings.show_gitlab_tasks
+                        && !self.ui_settings.show_jira_tasks
+                        && !self.ui_settings.show_linear_tasks
+                    {
+                        match setting {
+                            UiSetting::ShowGithubTasks => {
+                                self.ui_settings.show_github_tasks = true;
+                            }
+                            UiSetting::ShowGitlabTasks => {
+                                self.ui_settings.show_gitlab_tasks = true;
+                            }
+                            UiSetting::ShowJiraTasks => {
+                                self.ui_settings.show_jira_tasks = true;
+                            }
+                            UiSetting::ShowLinearTasks => {
+                                self.ui_settings.show_linear_tasks = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let preferred = match self.ui_settings.default_task_source.as_str() {
+                        "gitlab" => TaskProvider::Gitlab,
+                        "jira" => TaskProvider::Jira,
+                        "linear" => TaskProvider::Linear,
+                        _ => TaskProvider::Github,
+                    };
+                    if !self.task_provider_visible(preferred) {
+                        self.ui_settings.default_task_source =
+                            if self.ui_settings.show_github_tasks {
+                                "github"
+                            } else if self.ui_settings.show_gitlab_tasks {
+                                "gitlab"
+                            } else if self.ui_settings.show_linear_tasks {
+                                "linear"
+                            } else {
+                                "jira"
+                            }
+                            .to_string();
+                    }
+                    self.apply_task_defaults();
+                }
+                self.apply_network_settings();
+                self.sync_keep_awake();
+                self.persist();
+                if setting == UiSetting::GeminiCliOauthEnabled {
+                    self.update(Message::GeminiRateLimitsRefreshRequested)
+                } else if setting == UiSetting::PluginSystemEnabled {
+                    self.update(Message::PluginsRefreshRequested)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::UiChoiceCycled(choice) => {
+                fn next(current: &str, options: &[&str]) -> String {
+                    let index = options
+                        .iter()
+                        .position(|option| *option == current)
+                        .map_or(0, |index| (index + 1) % options.len());
+                    options[index].to_string()
+                }
+                match choice {
+                    UiChoice::TabOrder => {
+                        self.ui_settings.tab_order_mru = !self.ui_settings.tab_order_mru;
+                    }
+                    UiChoice::AutoSaveDelay => {
+                        self.ui_settings.auto_save_delay_ms =
+                            match self.ui_settings.auto_save_delay_ms {
+                                300 => 500,
+                                500 => 800,
+                                800 => 1_500,
+                                1_500 => 3_000,
+                                _ => 300,
+                            };
+                    }
+                    UiChoice::DefaultDiffView => {
+                        self.ui_settings.diff_default_side_by_side =
+                            !self.ui_settings.diff_default_side_by_side;
+                    }
+                    UiChoice::BranchPrefix => {
+                        self.ui_settings.branch_prefix = next(
+                            &self.ui_settings.branch_prefix,
+                            &["git-username", "custom", "none"],
+                        );
+                    }
+                    UiChoice::SourceControlViewMode => {
+                        self.ui_settings.source_control_view_mode = next(
+                            &self.ui_settings.source_control_view_mode,
+                            &["list", "tree"],
+                        );
+                    }
+                    UiChoice::SourceControlGroupOrder => {
+                        self.ui_settings.source_control_group_order = next(
+                            &self.ui_settings.source_control_group_order,
+                            &["changes-first", "staged-first", "untracked-first"],
+                        );
+                    }
+                    UiChoice::Theme => {
+                        self.ui_settings.theme =
+                            next(&self.ui_settings.theme, &["system", "dark", "light"]);
+                    }
+                    UiChoice::Language => {
+                        self.ui_settings.ui_language = next(
+                            &self.ui_settings.ui_language,
+                            &["system", "en", "zh", "ko", "ja", "es"],
+                        );
+                    }
+                    UiChoice::UiZoom => {
+                        self.ui_settings.ui_zoom_percent = match self.ui_settings.ui_zoom_percent {
+                            80 => 90,
+                            90 => 100,
+                            100 => 110,
+                            110 => 125,
+                            125 => 150,
+                            _ => 80,
+                        };
+                    }
+                    UiChoice::AppFontFamily => {
+                        self.ui_settings.app_font_family = next(
+                            &self.ui_settings.app_font_family,
+                            &["system", "Geist", "SF Pro", "Inter"],
+                        );
+                    }
+                    UiChoice::AppIcon => {
+                        self.ui_settings.app_icon =
+                            next(&self.ui_settings.app_icon, &crate::appearance::APP_ICON_IDS);
+                    }
+                    UiChoice::LeftSidebarAppearance => {
+                        self.ui_settings.left_sidebar_appearance = next(
+                            &self.ui_settings.left_sidebar_appearance,
+                            &["default", "match-terminal", "tinted"],
+                        );
+                    }
+                    UiChoice::LeftSidebarTintOpacity => {
+                        self.ui_settings.left_sidebar_tint_opacity_percent =
+                            match self.ui_settings.left_sidebar_tint_opacity_percent {
+                                0 => 4,
+                                4 => 8,
+                                8 => 12,
+                                12 => 20,
+                                20 => 28,
+                                28 => 35,
+                                _ => 0,
+                            };
+                    }
+                    UiChoice::UsagePercentageMode => {
+                        self.ui_settings.usage_percentage_mode = next(
+                            &self.ui_settings.usage_percentage_mode,
+                            &["used", "remaining"],
+                        );
+                    }
+                    UiChoice::TerminalFontSize => {
+                        self.ui_settings.terminal_font_size =
+                            match self.ui_settings.terminal_font_size {
+                                11 => 12,
+                                12 => 13,
+                                13 => 14,
+                                14 => 16,
+                                16 => 18,
+                                18 => 20,
+                                _ => 11,
+                            };
+                    }
+                    UiChoice::TerminalFontFamily => {
+                        self.ui_settings.terminal_font_family = next(
+                            &self.ui_settings.terminal_font_family,
+                            &["SF Mono", "Menlo", "JetBrains Mono", "Fira Code"],
+                        );
+                    }
+                    UiChoice::TerminalFontWeight => {
+                        self.ui_settings.terminal_font_weight =
+                            match self.ui_settings.terminal_font_weight {
+                                300 => 400,
+                                400 => 500,
+                                500 => 600,
+                                _ => 300,
+                            };
+                    }
+                    UiChoice::TerminalLineHeight => {
+                        self.ui_settings.terminal_line_height_percent =
+                            match self.ui_settings.terminal_line_height_percent {
+                                100 => 110,
+                                110 => 120,
+                                120 => 130,
+                                _ => 100,
+                            };
+                    }
+                    UiChoice::TerminalScrollSensitivity => {
+                        self.ui_settings.terminal_scroll_sensitivity_percent =
+                            match self.ui_settings.terminal_scroll_sensitivity_percent {
+                                50 => 100,
+                                100 => 115,
+                                115 => 150,
+                                150 => 200,
+                                200 => 300,
+                                _ => 50,
+                            };
+                    }
+                    UiChoice::TerminalFastScrollSensitivity => {
+                        self.ui_settings.terminal_fast_scroll_sensitivity_percent =
+                            match self.ui_settings.terminal_fast_scroll_sensitivity_percent {
+                                100 => 200,
+                                200 => 500,
+                                500 => 750,
+                                750 => 1_000,
+                                _ => 100,
+                            };
+                    }
+                    UiChoice::TerminalTuiScrollMultiplier => {
+                        self.ui_settings.terminal_tui_scroll_multiplier =
+                            match self.ui_settings.terminal_tui_scroll_multiplier {
+                                1 => 2,
+                                2 => 3,
+                                3 => 5,
+                                5 => 10,
+                                _ => 1,
+                            };
+                    }
+                    UiChoice::TerminalGpuAcceleration => {
+                        self.ui_settings.terminal_gpu_acceleration = next(
+                            &self.ui_settings.terminal_gpu_acceleration,
+                            &["auto", "on", "off"],
+                        );
+                    }
+                    UiChoice::TerminalLigatures => {
+                        self.ui_settings.terminal_ligatures =
+                            next(&self.ui_settings.terminal_ligatures, &["auto", "on", "off"]);
+                    }
+                    UiChoice::TerminalCursorStyle => {
+                        self.ui_settings.terminal_cursor_style = next(
+                            &self.ui_settings.terminal_cursor_style,
+                            &["block", "bar", "underline"],
+                        );
+                    }
+                    UiChoice::TerminalThemeDark => {
+                        self.ui_settings.terminal_theme_dark = next(
+                            &self.ui_settings.terminal_theme_dark,
+                            &[
+                                "Ghostty Default Style Dark",
+                                "Builtin Dracula",
+                                "Builtin Solarized Dark",
+                            ],
+                        );
+                    }
+                    UiChoice::TerminalThemeLight => {
+                        self.ui_settings.terminal_theme_light = next(
+                            &self.ui_settings.terminal_theme_light,
+                            &[
+                                "Builtin Tango Light",
+                                "Builtin Solarized Light",
+                                "Ghostty Default Style Light",
+                            ],
+                        );
+                    }
+                    UiChoice::SetupScriptLaunchMode => {
+                        self.ui_settings.setup_script_launch_mode = next(
+                            &self.ui_settings.setup_script_launch_mode,
+                            &["new-tab", "split-vertical", "split-horizontal"],
+                        );
+                    }
+                    UiChoice::TerminalPaddingX => {
+                        self.ui_settings.terminal_padding_x =
+                            next_terminal_padding(self.ui_settings.terminal_padding_x);
+                    }
+                    UiChoice::TerminalPaddingY => {
+                        self.ui_settings.terminal_padding_y =
+                            next_terminal_padding(self.ui_settings.terminal_padding_y);
+                    }
+                    UiChoice::TerminalCursorOpacity => {
+                        self.ui_settings.terminal_cursor_opacity_percent =
+                            next_opacity(self.ui_settings.terminal_cursor_opacity_percent);
+                    }
+                    UiChoice::TerminalBackgroundOpacity => {
+                        self.ui_settings.terminal_background_opacity_percent =
+                            next_opacity(self.ui_settings.terminal_background_opacity_percent);
+                    }
+                    UiChoice::TerminalInactivePaneOpacity => {
+                        self.ui_settings.terminal_inactive_pane_opacity_percent =
+                            next_opacity(self.ui_settings.terminal_inactive_pane_opacity_percent);
+                    }
+                    UiChoice::TerminalActivePaneOpacity => {
+                        self.ui_settings.terminal_active_pane_opacity_percent =
+                            next_opacity(self.ui_settings.terminal_active_pane_opacity_percent);
+                    }
+                    UiChoice::TerminalPaneOpacityTransition => {
+                        self.ui_settings.terminal_pane_opacity_transition_ms =
+                            match self.ui_settings.terminal_pane_opacity_transition_ms {
+                                0 => 70,
+                                70 => 140,
+                                140 => 250,
+                                250 => 400,
+                                _ => 0,
+                            };
+                    }
+                    UiChoice::TerminalDividerThickness => {
+                        self.ui_settings.terminal_divider_thickness_px =
+                            match self.ui_settings.terminal_divider_thickness_px {
+                                1 => 2,
+                                2 => 3,
+                                3 => 4,
+                                4 => 6,
+                                _ => 1,
+                            };
+                    }
+                    UiChoice::TerminalScrollbackRows => {
+                        self.ui_settings.terminal_scrollback_rows =
+                            match self.ui_settings.terminal_scrollback_rows {
+                                1_000 => 5_000,
+                                5_000 => 10_000,
+                                10_000 => 50_000,
+                                _ => 1_000,
+                            };
+                    }
+                    UiChoice::TerminalShortcutPolicy => {
+                        self.ui_settings.terminal_shortcut_policy = next(
+                            &self.ui_settings.terminal_shortcut_policy,
+                            &["orca-first", "terminal-first"],
+                        );
+                    }
+                    UiChoice::TerminalMacOptionAsAlt => {
+                        self.ui_settings.terminal_mac_option_as_alt = next(
+                            &self.ui_settings.terminal_mac_option_as_alt,
+                            &["auto", "true", "false", "left", "right"],
+                        );
+                    }
+                    UiChoice::NotificationSound => {
+                        self.ui_settings.notification_sound = next(
+                            &self.ui_settings.notification_sound,
+                            &crate::notification_sound::SOUND_IDS,
+                        );
+                    }
+                    UiChoice::NotificationVolume => {
+                        self.ui_settings.notification_volume =
+                            match self.ui_settings.notification_volume {
+                                0 => 25,
+                                25 => 50,
+                                50 => 75,
+                                75 => 100,
+                                _ => 0,
+                            };
+                    }
+                    UiChoice::FloatingWorkspaceTrigger => {
+                        self.ui_settings.floating_workspace_trigger = next(
+                            &self.ui_settings.floating_workspace_trigger,
+                            &["floating-button", "status-bar"],
+                        );
+                    }
+                    UiChoice::BrowserSearchEngine => {
+                        self.ui_settings.browser_search_engine = next(
+                            &self.ui_settings.browser_search_engine,
+                            &["google", "duckduckgo", "kagi", "bing"],
+                        );
+                    }
+                    UiChoice::BrowserDefaultZoom => {
+                        self.ui_settings.browser_default_zoom_percent =
+                            match self.ui_settings.browser_default_zoom_percent {
+                                80 => 90,
+                                90 => 100,
+                                100 => 110,
+                                110 => 125,
+                                _ => 80,
+                            };
+                        if self.browser_open {
+                            self.browser_error = crate::browser::set_zoom(
+                                self.ui_settings.browser_default_zoom_percent as f64 / 100.0,
+                            )
+                            .err();
+                        }
+                    }
+                    UiChoice::DefaultTaskSource => {
+                        self.ui_settings.default_task_source = next(
+                            &self.ui_settings.default_task_source,
+                            &["github", "gitlab", "linear", "jira"],
+                        );
+                        self.apply_task_defaults();
+                    }
+                    UiChoice::DefaultTaskViewPreset => {
+                        self.ui_settings.default_task_view_preset = next(
+                            &self.ui_settings.default_task_view_preset,
+                            &["all", "issues", "review", "my-issues", "my-prs", "prs"],
+                        );
+                        self.apply_task_defaults();
+                    }
+                    UiChoice::DefaultAgent => {
+                        let mut options = vec!["auto", "blank"];
+                        options.extend(self.installed_agents.iter().copied());
+                        self.ui_settings.default_agent =
+                            next(&self.ui_settings.default_agent, &options);
+                    }
+                    UiChoice::PromptCacheTtl => {
+                        self.ui_settings.prompt_cache_ttl_minutes =
+                            if self.ui_settings.prompt_cache_ttl_minutes == 5 {
+                                60
+                            } else {
+                                5
+                            };
+                    }
+                    UiChoice::AgentHibernationIdle => {
+                        self.ui_settings.agent_hibernation_idle_ms =
+                            match self.ui_settings.agent_hibernation_idle_ms / 60_000 {
+                                1 => 5 * 60_000,
+                                5 => 15 * 60_000,
+                                15 => 30 * 60_000,
+                                30 => 60 * 60_000,
+                                60 => 120 * 60_000,
+                                120 => 240 * 60_000,
+                                240 => 24 * 60 * 60_000,
+                                _ => 60_000,
+                            };
+                    }
+                    UiChoice::VoiceModel => {
+                        self.ui_settings.voice_model = next(
+                            &self.ui_settings.voice_model,
+                            &[
+                                "",
+                                "parakeet-tdt-0.6b-v3-int8",
+                                "parakeet-tdt-0.6b-v2-int8",
+                                "zipformer-bilingual-zh-en",
+                                "paraformer-bilingual-zh-en",
+                                "zipformer-streaming-en-20m",
+                                "zipformer-streaming-zh-14m",
+                                "whisper-tiny",
+                                "openai-gpt-4o-mini-transcribe",
+                                "openai-gpt-4o-transcribe",
+                            ],
+                        );
+                    }
+                    UiChoice::VoiceLanguage => {
+                        self.ui_settings.voice_language = next(
+                            &self.ui_settings.voice_language,
+                            &["auto", "en", "ko", "ja"],
+                        );
+                    }
+                    UiChoice::VoiceDictationMode => {
+                        self.ui_settings.voice_dictation_mode =
+                            next(&self.ui_settings.voice_dictation_mode, &["toggle", "hold"]);
+                    }
+                    UiChoice::NativeChatDefaultView => {
+                        self.ui_settings.open_agent_tabs_in_chat_by_default =
+                            !self.ui_settings.open_agent_tabs_in_chat_by_default;
+                    }
+                    UiChoice::ClaudeAgentTeamsMode => {
+                        self.ui_settings.claude_agent_teams_mode = next(
+                            &self.ui_settings.claude_agent_teams_mode,
+                            &["off", "native-panes-shim", "in-process"],
+                        );
+                    }
+                }
+                #[cfg(not(test))]
+                if choice == UiChoice::AppIcon {
+                    if let Err(error) = crate::appearance::set_app_icon(&self.ui_settings.app_icon)
+                    {
+                        self.last_error = Some(error);
+                    }
+                }
+                self.apply_network_settings();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::UiChoiceSelected(choice, value) => {
+                let parse_number = |value: &str| {
+                    value
+                        .chars()
+                        .filter(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse::<u32>()
+                        .ok()
+                };
+                let parse_multiplier_percent = |value: &str| {
+                    value
+                        .trim()
+                        .trim_end_matches('x')
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|value| value.is_finite())
+                        .map(|value| (value * 100.0).round() as u16)
+                };
+                match choice {
+                    UiChoice::TabOrder => self.ui_settings.tab_order_mru = value == "Most recent",
+                    UiChoice::AutoSaveDelay => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.auto_save_delay_ms = value as u64;
+                        }
+                    }
+                    UiChoice::DefaultDiffView => {
+                        self.ui_settings.diff_default_side_by_side = value == "Side by side";
+                    }
+                    UiChoice::BranchPrefix => self.ui_settings.branch_prefix = value,
+                    UiChoice::SourceControlViewMode => {
+                        self.ui_settings.source_control_view_mode = value;
+                    }
+                    UiChoice::SourceControlGroupOrder => {
+                        if ["changes-first", "staged-first", "untracked-first"]
+                            .contains(&value.as_str())
+                        {
+                            self.ui_settings.source_control_group_order = value;
+                        }
+                    }
+                    UiChoice::Theme => self.ui_settings.theme = value,
+                    UiChoice::Language => {
+                        self.ui_settings.ui_language = crate::i18n::language_id_for_label(&value);
+                    }
+                    UiChoice::UiZoom => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.ui_zoom_percent = value as u16;
+                        }
+                    }
+                    UiChoice::AppFontFamily => self.ui_settings.app_font_family = value,
+                    UiChoice::AppIcon => {
+                        self.ui_settings.app_icon =
+                            crate::appearance::normalize_app_icon_id(&value).to_string();
+                    }
+                    UiChoice::LeftSidebarAppearance => {
+                        self.ui_settings.left_sidebar_appearance = match value.as_str() {
+                            "default" | "match-terminal" | "tinted" => value,
+                            _ => "default".to_string(),
+                        };
+                    }
+                    UiChoice::LeftSidebarTintOpacity => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.left_sidebar_tint_opacity_percent =
+                                value.clamp(0, 35) as u8;
+                        }
+                    }
+                    UiChoice::UsagePercentageMode => {
+                        self.ui_settings.usage_percentage_mode = value;
+                    }
+                    UiChoice::TerminalFontSize => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_font_size = value as u16;
+                        }
+                    }
+                    UiChoice::TerminalFontFamily => {
+                        self.ui_settings.terminal_font_family = value;
+                    }
+                    UiChoice::TerminalFontWeight => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_font_weight = value as u16;
+                        }
+                    }
+                    UiChoice::TerminalLineHeight => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_line_height_percent = value as u16;
+                        }
+                    }
+                    UiChoice::TerminalScrollSensitivity => {
+                        if let Some(value) = parse_multiplier_percent(&value) {
+                            self.ui_settings.terminal_scroll_sensitivity_percent =
+                                value.clamp(50, 300);
+                        }
+                    }
+                    UiChoice::TerminalFastScrollSensitivity => {
+                        if let Some(value) = parse_multiplier_percent(&value) {
+                            self.ui_settings.terminal_fast_scroll_sensitivity_percent =
+                                value.clamp(100, 1_000);
+                        }
+                    }
+                    UiChoice::TerminalTuiScrollMultiplier => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_tui_scroll_multiplier =
+                                value.clamp(1, 10) as u8;
+                        }
+                    }
+                    UiChoice::TerminalGpuAcceleration => {
+                        self.ui_settings.terminal_gpu_acceleration = value;
+                    }
+                    UiChoice::TerminalLigatures => self.ui_settings.terminal_ligatures = value,
+                    UiChoice::TerminalCursorStyle => {
+                        self.ui_settings.terminal_cursor_style = value;
+                    }
+                    UiChoice::TerminalThemeDark => self.ui_settings.terminal_theme_dark = value,
+                    UiChoice::TerminalThemeLight => self.ui_settings.terminal_theme_light = value,
+                    UiChoice::SetupScriptLaunchMode => {
+                        if ["new-tab", "split-vertical", "split-horizontal"]
+                            .contains(&value.as_str())
+                        {
+                            self.ui_settings.setup_script_launch_mode = value;
+                        }
+                    }
+                    UiChoice::TerminalPaddingX => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_padding_x = value.min(512) as u16;
+                        }
+                    }
+                    UiChoice::TerminalPaddingY => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_padding_y = value.min(512) as u16;
+                        }
+                    }
+                    UiChoice::TerminalCursorOpacity => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_cursor_opacity_percent = value.min(100) as u8;
+                        }
+                    }
+                    UiChoice::TerminalBackgroundOpacity => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_background_opacity_percent =
+                                value.min(100) as u8;
+                        }
+                    }
+                    UiChoice::TerminalInactivePaneOpacity => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_inactive_pane_opacity_percent =
+                                value.min(100) as u8;
+                        }
+                    }
+                    UiChoice::TerminalActivePaneOpacity => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_active_pane_opacity_percent =
+                                value.min(100) as u8;
+                        }
+                    }
+                    UiChoice::TerminalPaneOpacityTransition => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_pane_opacity_transition_ms =
+                                value.min(5_000) as u16;
+                        }
+                    }
+                    UiChoice::TerminalDividerThickness => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_divider_thickness_px =
+                                value.clamp(1, 16) as u8;
+                        }
+                    }
+                    UiChoice::TerminalScrollbackRows => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.terminal_scrollback_rows = value;
+                        }
+                    }
+                    UiChoice::TerminalShortcutPolicy => {
+                        self.ui_settings.terminal_shortcut_policy = value;
+                    }
+                    UiChoice::TerminalMacOptionAsAlt => {
+                        self.ui_settings.terminal_mac_option_as_alt = value;
+                    }
+                    UiChoice::NotificationSound => {
+                        self.ui_settings.notification_sound =
+                            crate::notification_sound::normalize_sound_id(&value).to_string();
+                    }
+                    UiChoice::NotificationVolume => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.notification_volume = value.min(100) as u8;
+                        }
+                    }
+                    UiChoice::FloatingWorkspaceTrigger => {
+                        self.ui_settings.floating_workspace_trigger = value;
+                    }
+                    UiChoice::BrowserSearchEngine => {
+                        self.ui_settings.browser_search_engine = value;
+                    }
+                    UiChoice::BrowserDefaultZoom => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.browser_default_zoom_percent = value as u16;
+                            if self.browser_open {
+                                self.browser_error =
+                                    crate::browser::set_zoom(value as f64 / 100.0).err();
+                            }
+                        }
+                    }
+                    UiChoice::DefaultTaskSource => {
+                        if ["github", "gitlab", "linear", "jira"].contains(&value.as_str()) {
+                            self.ui_settings.default_task_source = value;
+                            self.apply_task_defaults();
+                        }
+                    }
+                    UiChoice::DefaultTaskViewPreset => {
+                        if ["all", "issues", "review", "my-issues", "my-prs", "prs"]
+                            .contains(&value.as_str())
+                        {
+                            self.ui_settings.default_task_view_preset = value;
+                            self.apply_task_defaults();
+                        }
+                    }
+                    UiChoice::DefaultAgent => self.ui_settings.default_agent = value,
+                    UiChoice::PromptCacheTtl => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.prompt_cache_ttl_minutes = value as u16;
+                        }
+                    }
+                    UiChoice::AgentHibernationIdle => {
+                        if let Some(value) = parse_number(&value) {
+                            self.ui_settings.agent_hibernation_idle_ms =
+                                u64::from(value.clamp(1, 1_440)) * 60_000;
+                        }
+                    }
+                    UiChoice::VoiceModel => {
+                        self.ui_settings.voice_model = match value.as_str() {
+                            "Parakeet TDT v3" => "parakeet-tdt-0.6b-v3-int8",
+                            "Parakeet TDT v2" => "parakeet-tdt-0.6b-v2-int8",
+                            "Zipformer Bilingual" => "zipformer-bilingual-zh-en",
+                            "Paraformer Bilingual" => "paraformer-bilingual-zh-en",
+                            "Zipformer Streaming EN" => "zipformer-streaming-en-20m",
+                            "Zipformer Streaming ZH" => "zipformer-streaming-zh-14m",
+                            "Whisper Tiny" => "whisper-tiny",
+                            "GPT-4o mini Transcribe" => "openai-gpt-4o-mini-transcribe",
+                            "GPT-4o Transcribe" => "openai-gpt-4o-transcribe",
+                            "Select Model" => "",
+                            _ => value.as_str(),
+                        }
+                        .to_string();
+                    }
+                    UiChoice::VoiceLanguage => self.ui_settings.voice_language = value,
+                    UiChoice::VoiceDictationMode => {
+                        self.ui_settings.voice_dictation_mode = value;
+                    }
+                    UiChoice::NativeChatDefaultView => {
+                        self.ui_settings.open_agent_tabs_in_chat_by_default = value == "Chat UI";
+                    }
+                    UiChoice::ClaudeAgentTeamsMode => {
+                        self.ui_settings.claude_agent_teams_mode = match value.as_str() {
+                            "In process" | "in-process" => "in-process",
+                            "Native panes" | "native-panes-shim" => "native-panes-shim",
+                            _ => "off",
+                        }
+                        .to_string();
+                    }
+                }
+                #[cfg(not(test))]
+                if choice == UiChoice::AppIcon {
+                    if let Err(error) = crate::appearance::set_app_icon(&self.ui_settings.app_icon)
+                    {
+                        self.last_error = Some(error);
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::UiTextSettingChanged(setting, value) => {
+                if let Some(key) = setting.terminal_color_key() {
+                    if value.len() <= 7 && value.is_ascii() && !value.contains('\0') {
+                        self.terminal_color_drafts
+                            .insert(key.to_string(), value.clone());
+                        if value.trim().is_empty() {
+                            self.ui_settings.terminal_color_overrides.remove(key);
+                        } else if let Some(color) =
+                            crate::terminal::palette::normalize_hex_color(&value)
+                        {
+                            self.ui_settings
+                                .terminal_color_overrides
+                                .insert(key.to_string(), color);
+                        }
+                        crate::terminal::palette::configure_color_overrides(
+                            &self.ui_settings.terminal_color_overrides,
+                        );
+                        self.persist();
+                    }
+                    return iced::Task::none();
+                }
+                match setting {
+                    UiTextSetting::BranchPrefixCustom => {
+                        self.ui_settings.branch_prefix_custom = value;
+                    }
+                    UiTextSetting::EditorFontFamily => {
+                        if value.len() <= 128 && !value.contains('\0') {
+                            self.ui_settings.editor_font_family = value;
+                        }
+                    }
+                    UiTextSetting::LeftSidebarTintColor => {
+                        if let Some(color) = crate::terminal::palette::normalize_hex_color(&value) {
+                            self.ui_settings.left_sidebar_tint_color = color;
+                        }
+                    }
+                    UiTextSetting::TerminalFontFamily => {
+                        self.ui_settings.terminal_font_family = value;
+                    }
+                    UiTextSetting::TerminalWordSeparator => {
+                        if value.len() <= 256 && !value.contains('\0') {
+                            self.ui_settings.terminal_word_separator = value.clone();
+                            suaegi_term::grid::configure_semantic_escape_chars(value);
+                        }
+                    }
+                    UiTextSetting::TerminalDividerColorDark => {
+                        if value.len() <= 9 && value.is_ascii() && !value.contains('\0') {
+                            self.ui_settings.terminal_divider_color_dark = value;
+                        }
+                    }
+                    UiTextSetting::TerminalDividerColorLight => {
+                        if value.len() <= 9 && value.is_ascii() && !value.contains('\0') {
+                            self.ui_settings.terminal_divider_color_light = value;
+                        }
+                    }
+                    UiTextSetting::FloatingWorkspaceCwd => {
+                        self.ui_settings.floating_workspace_cwd = value;
+                    }
+                    UiTextSetting::BrowserHomePage => {
+                        self.ui_settings.browser_home_page = value;
+                    }
+                    UiTextSetting::AndroidSdkPath => {
+                        self.ui_settings.android_sdk_path = value;
+                    }
+                    UiTextSetting::OpenCodeWorkspaceId => {
+                        self.ui_settings.opencode_workspace_id = value;
+                    }
+                    UiTextSetting::MiniMaxGroupId => {
+                        self.ui_settings.minimax_group_id = value;
+                    }
+                    UiTextSetting::MiniMaxUsageModels => {
+                        self.ui_settings.minimax_usage_models = value;
+                    }
+                    UiTextSetting::HttpProxyUrl => {
+                        self.ui_settings.http_proxy_url = value;
+                    }
+                    UiTextSetting::HttpProxyBypassRules => {
+                        self.ui_settings.http_proxy_bypass_rules = value;
+                    }
+                    _ => unreachable!("terminal color settings are handled before this match"),
+                }
+                self.apply_network_settings();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::AgentAvailabilityToggled(agent) => {
+                if agent_def_by_id(&agent).is_none() {
+                    return iced::Task::none();
+                }
+                if let Some(index) = self
+                    .ui_settings
+                    .disabled_agents
+                    .iter()
+                    .position(|disabled| disabled == &agent)
+                {
+                    self.ui_settings.disabled_agents.remove(index);
+                } else {
+                    self.ui_settings.disabled_agents.push(agent.clone());
+                    self.ui_settings.disabled_agents.sort();
+                    self.ui_settings.disabled_agents.dedup();
+                    self.worktree_agent_draft
+                        .retain(|_, choice| choice.0 != Some(agent.as_str()));
+                    if self.ui_settings.default_agent == agent {
+                        self.ui_settings.default_agent = "auto".to_string();
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::AgentCommandOverrideChanged(agent, value) => {
+                if agent_def_by_id(&agent).is_some() && value.len() <= 4_096 {
+                    if value.is_empty() {
+                        self.ui_settings.agent_command_overrides.remove(&agent);
+                    } else {
+                        self.ui_settings
+                            .agent_command_overrides
+                            .insert(agent, value);
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::AgentDefaultArgsChanged(agent, value) => {
+                if agent_def_by_id(&agent).is_some() && value.len() <= 4_096 {
+                    self.ui_settings.agent_default_args.insert(agent, value);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::AgentDefaultEnvChanged(agent, value) => {
+                if agent_def_by_id(&agent).is_some() && value.len() <= 64 * 1_024 {
+                    self.agent_env_drafts.insert(agent.clone(), value.clone());
+                    if let Some(env) = parse_agent_env_draft(&value) {
+                        self.ui_settings.agent_default_env.insert(agent, env);
+                        self.persist();
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::AgentPermissionModeSelected(yolo) => {
+                let yolo_args = suaegi_core::domain::orca_yolo_agent_args();
+                for (agent, default) in yolo_args {
+                    let current = self
+                        .ui_settings
+                        .agent_default_args
+                        .get(&agent)
+                        .map(|args| args.trim())
+                        .unwrap_or("");
+                    if current.is_empty() || current == default {
+                        self.ui_settings
+                            .agent_default_args
+                            .insert(agent, if yolo { default } else { String::new() });
+                    }
+                }
+                let yolo_env = suaegi_core::domain::orca_yolo_agent_env();
+                for (agent, default) in yolo_env {
+                    let current = self.ui_settings.agent_default_env.get(&agent);
+                    if current.is_none_or(HashMap::is_empty) || current == Some(&default) {
+                        let next = if yolo { default } else { HashMap::new() };
+                        self.agent_env_drafts
+                            .insert(agent.clone(), format_agent_env(&next));
+                        self.ui_settings.agent_default_env.insert(agent, next);
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::AgentSettingsExpansionToggled(agent) => {
+                if agent_def_by_id(&agent).is_some() && !self.expanded_agent_settings.remove(&agent)
+                {
+                    self.expanded_agent_settings.insert(agent);
+                }
+                iced::Task::none()
+            }
+            Message::AgentDetectionRefreshRequested => {
+                self.installed_agents = detect_installed_agents();
+                self.worktree_agent_draft.retain(|_, choice| {
+                    choice
+                        .0
+                        .is_none_or(|agent| self.installed_agents.contains(&agent))
+                });
+                iced::Task::none()
+            }
+            Message::ProviderManagedAccountImportRequested(provider) => {
+                if !self.provider_account_importing.insert(provider) {
+                    return iced::Task::none();
+                }
+                crate::background::blocking(move |mut sender| {
+                    let result = crate::managed_accounts::import_system_account(provider);
+                    let _ = sender.try_send(Message::ProviderManagedAccountImportFinished(
+                        provider, result,
+                    ));
+                })
+            }
+            Message::ProviderManagedAccountAddRequested(provider) => {
+                if !self.provider_account_importing.insert(provider) {
+                    return iced::Task::none();
+                }
+                crate::background::blocking(move |mut sender| {
+                    let result = crate::managed_accounts::add_account(provider);
+                    let _ = sender
+                        .try_send(Message::ProviderManagedAccountAddFinished(provider, result));
+                })
+            }
+            Message::ProviderManagedAccountAddFinished(provider, result) => {
+                self.provider_account_importing.remove(&provider);
+                match result {
+                    Ok(account) => {
+                        let (accounts, active) = match provider {
+                            crate::managed_accounts::Provider::Claude => (
+                                &mut self.ui_settings.claude_managed_accounts,
+                                &mut self.ui_settings.active_claude_managed_account_id,
+                            ),
+                            crate::managed_accounts::Provider::Codex => (
+                                &mut self.ui_settings.codex_managed_accounts,
+                                &mut self.ui_settings.active_codex_managed_account_id,
+                            ),
+                        };
+                        if let Some(existing) =
+                            accounts.iter().find(|item| item.email == account.email)
+                        {
+                            let existing_id = existing.id.clone();
+                            crate::managed_accounts::discard_imported_account(provider, &account);
+                            *active = Some(existing_id);
+                            self.last_error =
+                                Some("This provider account is already added.".to_string());
+                        } else {
+                            *active = Some(account.id.clone());
+                            accounts.push(account);
+                            self.last_error = None;
+                        }
+                        self.persist();
+                        self.update(Message::ProviderRateLimitsRefreshRequested)
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::ProviderManagedAccountImportFinished(provider, result) => {
+                self.provider_account_importing.remove(&provider);
+                let imported = result.is_ok();
+                match result {
+                    Ok(account) => {
+                        let (accounts, active) = match provider {
+                            crate::managed_accounts::Provider::Claude => (
+                                &mut self.ui_settings.claude_managed_accounts,
+                                &mut self.ui_settings.active_claude_managed_account_id,
+                            ),
+                            crate::managed_accounts::Provider::Codex => (
+                                &mut self.ui_settings.codex_managed_accounts,
+                                &mut self.ui_settings.active_codex_managed_account_id,
+                            ),
+                        };
+                        if let Some(existing) =
+                            accounts.iter_mut().find(|item| item.email == account.email)
+                        {
+                            crate::managed_accounts::discard_imported_account(provider, &account);
+                            *active = Some(existing.id.clone());
+                        } else {
+                            *active = Some(account.id.clone());
+                            accounts.push(account);
+                        }
+                        self.last_error = None;
+                        self.persist();
+                    }
+                    Err(error) => self.last_error = Some(error),
+                }
+                if imported {
+                    self.update(Message::ProviderRateLimitsRefreshRequested)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::ProviderManagedAccountReauthenticateRequested(provider, account_id) => {
+                if !self.provider_account_importing.insert(provider) {
+                    return iced::Task::none();
+                }
+                let account = match provider {
+                    crate::managed_accounts::Provider::Claude => {
+                        &self.ui_settings.claude_managed_accounts
+                    }
+                    crate::managed_accounts::Provider::Codex => {
+                        &self.ui_settings.codex_managed_accounts
+                    }
+                }
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned();
+                let Some(account) = account else {
+                    self.provider_account_importing.remove(&provider);
+                    return iced::Task::none();
+                };
+                crate::background::blocking(move |mut sender| {
+                    let result =
+                        crate::managed_accounts::reauthenticate_account(provider, &account);
+                    let _ = sender.try_send(Message::ProviderManagedAccountReauthenticateFinished(
+                        provider, result,
+                    ));
+                })
+            }
+            Message::ProviderManagedAccountReauthenticateFinished(provider, result) => {
+                self.provider_account_importing.remove(&provider);
+                match result {
+                    Ok(account) => {
+                        let accounts = match provider {
+                            crate::managed_accounts::Provider::Claude => {
+                                &mut self.ui_settings.claude_managed_accounts
+                            }
+                            crate::managed_accounts::Provider::Codex => {
+                                &mut self.ui_settings.codex_managed_accounts
+                            }
+                        };
+                        if let Some(existing) =
+                            accounts.iter_mut().find(|item| item.id == account.id)
+                        {
+                            *existing = account;
+                            self.last_error = None;
+                            self.persist();
+                            self.update(Message::ProviderRateLimitsRefreshRequested)
+                        } else {
+                            iced::Task::none()
+                        }
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::ProviderManagedAccountSelected(provider, account_id) => {
+                if let Some(environment) = self
+                    .ui_settings
+                    .active_runtime_environment_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.ui_settings
+                            .runtime_environments
+                            .iter()
+                            .find(|environment| environment.id == id)
+                    })
+                    .cloned()
+                {
+                    let selected = account_id.filter(|id| {
+                        self.provider_accounts(provider)
+                            .0
+                            .iter()
+                            .any(|account| account.id == *id)
+                    });
+                    if !self.provider_account_importing.insert(provider) {
+                        return iced::Task::none();
+                    }
+                    return iced::Task::perform(
+                        crate::remote_runtime::mutate_provider_account(
+                            environment,
+                            provider,
+                            selected,
+                            false,
+                        ),
+                        move |result| {
+                            Message::RemoteProviderAccountMutationFinished(provider, result)
+                        },
+                    );
+                }
+                let accounts = match provider {
+                    crate::managed_accounts::Provider::Claude => {
+                        &self.ui_settings.claude_managed_accounts
+                    }
+                    crate::managed_accounts::Provider::Codex => {
+                        &self.ui_settings.codex_managed_accounts
+                    }
+                };
+                let selected =
+                    account_id.filter(|id| accounts.iter().any(|account| account.id == *id));
+                match provider {
+                    crate::managed_accounts::Provider::Claude => {
+                        self.ui_settings.active_claude_managed_account_id = selected;
+                    }
+                    crate::managed_accounts::Provider::Codex => {
+                        self.ui_settings.active_codex_managed_account_id = selected;
+                    }
+                }
+                self.persist();
+                self.update(Message::ProviderRateLimitsRefreshRequested)
+            }
+            Message::ProviderManagedAccountRemoveRequested(provider, account_id) => {
+                let exists = self
+                    .provider_accounts(provider)
+                    .0
+                    .iter()
+                    .any(|account| account.id == account_id);
+                self.provider_account_remove_confirm = exists.then_some((provider, account_id));
+                iced::Task::none()
+            }
+            Message::ProviderManagedAccountRemoveCancelled => {
+                self.provider_account_remove_confirm = None;
+                iced::Task::none()
+            }
+            Message::ProviderManagedAccountRemoveConfirmed => {
+                let Some((provider, account_id)) = self.provider_account_remove_confirm.take()
+                else {
+                    return iced::Task::none();
+                };
+                if let Some(environment) = self
+                    .ui_settings
+                    .active_runtime_environment_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.ui_settings
+                            .runtime_environments
+                            .iter()
+                            .find(|environment| environment.id == id)
+                    })
+                    .cloned()
+                {
+                    if !self
+                        .provider_accounts(provider)
+                        .0
+                        .iter()
+                        .any(|account| account.id == account_id)
+                        || !self.provider_account_importing.insert(provider)
+                    {
+                        return iced::Task::none();
+                    }
+                    return iced::Task::perform(
+                        crate::remote_runtime::mutate_provider_account(
+                            environment,
+                            provider,
+                            Some(account_id),
+                            true,
+                        ),
+                        move |result| {
+                            Message::RemoteProviderAccountMutationFinished(provider, result)
+                        },
+                    );
+                }
+                let account = match provider {
+                    crate::managed_accounts::Provider::Claude => self
+                        .ui_settings
+                        .claude_managed_accounts
+                        .iter()
+                        .find(|account| account.id == account_id),
+                    crate::managed_accounts::Provider::Codex => self
+                        .ui_settings
+                        .codex_managed_accounts
+                        .iter()
+                        .find(|account| account.id == account_id),
+                }
+                .cloned();
+                let Some(account) = account else {
+                    return iced::Task::none();
+                };
+                if let Err(error) = crate::managed_accounts::remove_account(provider, &account) {
+                    self.last_error = Some(error);
+                    return iced::Task::none();
+                }
+                match provider {
+                    crate::managed_accounts::Provider::Claude => {
+                        self.ui_settings
+                            .claude_managed_accounts
+                            .retain(|entry| entry.id != account_id);
+                        if self.ui_settings.active_claude_managed_account_id.as_deref()
+                            == Some(account_id.as_str())
+                        {
+                            self.ui_settings.active_claude_managed_account_id = None;
+                        }
+                    }
+                    crate::managed_accounts::Provider::Codex => {
+                        self.ui_settings
+                            .codex_managed_accounts
+                            .retain(|entry| entry.id != account_id);
+                        if self.ui_settings.active_codex_managed_account_id.as_deref()
+                            == Some(account_id.as_str())
+                        {
+                            self.ui_settings.active_codex_managed_account_id = None;
+                        }
+                    }
+                }
+                self.last_error = None;
+                self.persist();
+                self.update(Message::ProviderRateLimitsRefreshRequested)
+            }
+            Message::KeybindingDraftChanged(action, value) => {
+                self.keybinding_drafts.insert(action, value);
+                iced::Task::none()
+            }
+            Message::KeybindingApplyRequested(action) => {
+                let bindings = self
+                    .keybinding_drafts
+                    .get(&action)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|binding| !binding.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                match suaegi_keys::write_keybinding_override(
+                    &crate::keybindings::path(),
+                    action,
+                    Some(&bindings),
+                    crate::keybindings::host_platform(),
+                ) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.reload_keybindings();
+                    }
+                    Err(error) => self.last_error = Some(error.to_string()),
+                }
+                iced::Task::none()
+            }
+            Message::KeybindingResetRequested(action) => {
+                match suaegi_keys::write_keybinding_override(
+                    &crate::keybindings::path(),
+                    action,
+                    None,
+                    crate::keybindings::host_platform(),
+                ) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.reload_keybindings();
+                    }
+                    Err(error) => self.last_error = Some(error.to_string()),
+                }
+                iced::Task::none()
+            }
+            Message::KeybindingsFileOpenRequested => {
+                let path = crate::keybindings::path();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if !path.exists() {
+                    let _ = std::fs::write(
+                        &path,
+                        "{\n  \"version\": 1,\n  \"keybindings\": {},\n  \"platforms\": {}\n}\n",
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&path).spawn();
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(&path)
+                    .spawn();
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                self.reload_keybindings();
+                iced::Task::none()
+            }
+            Message::KeybindingShortcut(action, index) => {
+                self.dispatch_keybinding_shortcut(action, index)
+            }
+            Message::TerminalCursorBlinkTick => {
+                self.terminal_cursor_phase_visible = !self.terminal_cursor_phase_visible;
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceToggled => {
+                if !self.ui_settings.floating_workspace_enabled {
+                    return iced::Task::none();
+                }
+                self.floating_workspace_open = !self.floating_workspace_open;
+                if self.floating_workspace_open {
+                    match self.floating_workspace_content {
+                        FloatingWorkspaceContent::Terminal => self
+                            .floating_workspace_session
+                            .map_or_else(iced::Task::none, |id| {
+                                self.dispatch_term_command(id, TermCommand::FocusRequested)
+                            }),
+                        FloatingWorkspaceContent::Browser => {
+                            self.update(Message::BrowserOpenRequested)
+                        }
+                        _ => iced::Task::none(),
+                    }
+                } else {
+                    if self.floating_workspace_owns_browser() {
+                        self.browser_open = false;
+                        crate::browser::set_visible(false);
+                    }
+                    iced::Task::none()
+                }
+            }
+            Message::FloatingWorkspaceMinimized => {
+                self.floating_workspace_open = false;
+                if self.floating_workspace_owns_browser() {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceMaximizedToggled => {
+                self.floating_workspace_open = true;
+                self.floating_workspace_maximized = !self.floating_workspace_maximized;
+                if self.floating_workspace_owns_browser() && self.browser_open {
+                    let (left, top, width, height) = self.browser_bounds();
+                    self.browser_error = crate::browser::resize(left, top, width, height).err();
+                }
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceLauncherRequested => {
+                if self.floating_workspace_owns_browser() {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceContentClosed => match self.floating_workspace_content {
+                FloatingWorkspaceContent::Empty => iced::Task::none(),
+                FloatingWorkspaceContent::Terminal => self
+                    .floating_workspace_session
+                    .map_or_else(iced::Task::none, |id| {
+                        self.update(Message::FloatingWorkspaceTerminalClosed(id))
+                    }),
+                FloatingWorkspaceContent::Browser => self.update(Message::BrowserClosed),
+                FloatingWorkspaceContent::Markdown => {
+                    if self.editor.request_close() {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                    iced::Task::none()
+                }
+            },
+            Message::FloatingWorkspaceContentSelected(content) => {
+                if self.floating_workspace_owns_browser()
+                    && content != FloatingWorkspaceContent::Browser
+                {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                self.floating_workspace_content = content;
+                self.floating_workspace_open = true;
+                match content {
+                    FloatingWorkspaceContent::Terminal => self
+                        .floating_workspace_session
+                        .map_or_else(iced::Task::none, |id| {
+                            self.dispatch_term_command(id, TermCommand::FocusRequested)
+                        }),
+                    FloatingWorkspaceContent::Browser => self.update(Message::BrowserOpenRequested),
+                    FloatingWorkspaceContent::Empty | FloatingWorkspaceContent::Markdown => {
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::FloatingWorkspaceTerminalSelected(id) => {
+                if !self.floating_workspace_sessions.contains(&id) {
+                    return iced::Task::none();
+                }
+                if self.floating_workspace_owns_browser() {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                self.floating_workspace_session = Some(id);
+                self.floating_workspace_content = FloatingWorkspaceContent::Terminal;
+                self.floating_workspace_open = true;
+                self.terminal_attention_sessions.remove(&id);
+                self.dispatch_term_command(id, TermCommand::FocusRequested)
+            }
+            Message::FloatingWorkspaceTerminalClosed(id) => {
+                if !self.floating_workspace_sessions.contains(&id) {
+                    return iced::Task::none();
+                }
+                self.floating_workspace_sessions
+                    .retain(|candidate| *candidate != id);
+                self.close_session(id);
+                if self.floating_workspace_session == Some(id) {
+                    self.floating_workspace_session =
+                        self.floating_workspace_sessions.last().copied();
+                }
+                match self.floating_workspace_session {
+                    Some(active) => {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Terminal;
+                        self.dispatch_term_command(active, TermCommand::FocusRequested)
+                    }
+                    None => {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::FloatingWorkspaceDragStarted(target) => {
+                if self.floating_workspace_maximized
+                    && target != FloatingWorkspaceDragTarget::Trigger
+                {
+                    return iced::Task::none();
+                }
+                let (start_x, start_y, start_width, start_height) =
+                    if target == FloatingWorkspaceDragTarget::Trigger {
+                        let (x, y) = self.floating_workspace_trigger_position();
+                        (x as i32, y as i32, 40, 40)
+                    } else {
+                        let (x, y, width, height) = self.floating_workspace_panel_geometry();
+                        (x as i32, y as i32, width as u16, height as u16)
+                    };
+                self.floating_workspace_drag = Some(FloatingWorkspaceDrag {
+                    target,
+                    start_pointer: self.floating_workspace_pointer,
+                    start_x,
+                    start_y,
+                    start_width,
+                    start_height,
+                    moved: false,
+                });
+                iced::Task::none()
+            }
+            Message::FloatingWorkspacePointerMoved(position) => {
+                self.floating_workspace_pointer = position;
+                let Some(mut drag) = self.floating_workspace_drag else {
+                    return iced::Task::none();
+                };
+                let dx = position.x - drag.start_pointer.x;
+                let dy = position.y - drag.start_pointer.y;
+                if !drag.moved && dx.hypot(dy) >= 4.0 {
+                    drag.moved = true;
+                }
+                match drag.target {
+                    FloatingWorkspaceDragTarget::Panel => {
+                        let width = f32::from(drag.start_width);
+                        let height = f32::from(drag.start_height);
+                        self.ui_settings.floating_workspace_panel_x = ((drag.start_x as f32 + dx)
+                            .clamp(0.0, (self.app_window_size.width - width).max(0.0)))
+                            as i32;
+                        self.ui_settings.floating_workspace_panel_y = ((drag.start_y as f32 + dy)
+                            .clamp(0.0, (self.app_window_size.height - height).max(0.0)))
+                            as i32;
+                    }
+                    FloatingWorkspaceDragTarget::Resize => {
+                        let max_width = (self.app_window_size.width - drag.start_x as f32).max(1.0);
+                        let max_height =
+                            (self.app_window_size.height - drag.start_y as f32).max(1.0);
+                        self.ui_settings.floating_workspace_panel_width =
+                            (f32::from(drag.start_width) + dx)
+                                .clamp(420.0_f32.min(max_width), max_width)
+                                as u16;
+                        self.ui_settings.floating_workspace_panel_height =
+                            (f32::from(drag.start_height) + dy)
+                                .clamp(280.0_f32.min(max_height), max_height)
+                                as u16;
+                    }
+                    FloatingWorkspaceDragTarget::Trigger => {
+                        self.ui_settings.floating_workspace_trigger_x = ((drag.start_x as f32 + dx)
+                            .clamp(0.0, (self.app_window_size.width - 40.0).max(0.0)))
+                            as i32;
+                        self.ui_settings.floating_workspace_trigger_y = ((drag.start_y as f32 + dy)
+                            .clamp(0.0, (self.app_window_size.height - 40.0).max(0.0)))
+                            as i32;
+                    }
+                }
+                self.floating_workspace_drag = Some(drag);
+                if self.browser_open && self.floating_workspace_owns_browser() {
+                    let (left, top, width, height) = self.browser_bounds();
+                    self.browser_error = crate::browser::resize(left, top, width, height).err();
+                }
+                iced::Task::none()
+            }
+            Message::FloatingWorkspacePointerReleased => {
+                let Some(drag) = self.floating_workspace_drag.take() else {
+                    return iced::Task::none();
+                };
+                if drag.target == FloatingWorkspaceDragTarget::Trigger && !drag.moved {
+                    return self.update(Message::FloatingWorkspaceToggled);
+                }
+                if drag.moved {
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceTerminalRequested => {
+                if self.floating_workspace_owns_browser() {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                self.floating_workspace_content = FloatingWorkspaceContent::Terminal;
+                self.floating_workspace_open = true;
+                self.start_floating_workspace(None)
+            }
+            Message::FloatingWorkspaceClaudeRequested => {
+                if self.floating_workspace_owns_browser() {
+                    self.browser_open = false;
+                    crate::browser::set_visible(false);
+                }
+                self.floating_workspace_content = FloatingWorkspaceContent::Terminal;
+                self.floating_workspace_open = true;
+                self.start_floating_workspace(Some("claude"))
+            }
+            Message::FloatingWorkspaceBrowserRequested => {
+                self.floating_workspace_content = FloatingWorkspaceContent::Browser;
+                self.floating_workspace_open = true;
+                self.update(Message::BrowserOpenRequested)
+            }
+            Message::FloatingWorkspaceNewMarkdownRequested => iced::Task::perform(
+                async move {
+                    let root = dirs::data_local_dir()
+                        .or_else(dirs::home_dir)
+                        .ok_or_else(|| "Could not resolve the app data directory.".to_string())?
+                        .join("suaegi")
+                        .join("floating-workspace");
+                    std::fs::create_dir_all(&root)
+                        .map_err(|error| format!("Could not create Markdown directory: {error}"))?;
+                    let stem = format!("Untitled-{}", current_unix_ms());
+                    let path = root.join(format!("{stem}.md"));
+                    std::fs::write(&path, b"# Untitled\n\n")
+                        .map_err(|error| format!("Could not create the Markdown note: {error}"))?;
+                    Ok(path)
+                },
+                Message::FloatingWorkspaceMarkdownReady,
+            ),
+            Message::FloatingWorkspaceOpenMarkdownRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::FloatingWorkspaceMarkdownPicked,
+            ),
+            Message::FloatingWorkspaceMarkdownPicked(Some(path)) => {
+                self.open_floating_markdown(path)
+            }
+            Message::FloatingWorkspaceMarkdownPicked(None) => iced::Task::none(),
+            Message::FloatingWorkspaceMarkdownReady(Ok(path)) => self.open_floating_markdown(path),
+            Message::FloatingWorkspaceMarkdownReady(Err(error)) => {
+                self.last_error = Some(error);
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceBrowseRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|folder| folder.path().to_path_buf())
+                },
+                Message::FloatingWorkspaceDirectoryPicked,
+            ),
+            Message::FloatingWorkspaceDirectoryPicked(Some(path)) => {
+                self.ui_settings.floating_workspace_cwd = path.display().to_string();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::FloatingWorkspaceDirectoryPicked(None) => iced::Task::none(),
+            Message::NotificationCustomSoundBrowseRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Audio", &["ogg", "mp3", "wav", "m4a", "aac", "flac"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::NotificationCustomSoundPicked,
+            ),
+            Message::NotificationCustomSoundPicked(Some(path)) => {
+                if crate::notification_sound::is_supported_custom_sound(&path) {
+                    self.ui_settings.notification_custom_sound_path = Some(path);
+                    self.ui_settings.notification_sound = "custom".to_string();
+                    self.last_error = None;
+                    self.persist();
+                } else {
+                    self.last_error =
+                        Some("Choose an OGG, MP3, WAV, M4A, AAC, or FLAC audio file.".to_string());
+                }
+                iced::Task::none()
+            }
+            Message::NotificationCustomSoundPicked(None) => iced::Task::none(),
+            Message::NotificationCustomSoundCleared => {
+                self.ui_settings.notification_custom_sound_path = None;
+                if self.ui_settings.notification_sound == "custom" {
+                    self.ui_settings.notification_sound = "system".to_string();
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::DiagnosticsReviewRequested => {
+                let blocked = std::env::var_os("DO_NOT_TRACK").is_some()
+                    || std::env::var_os("SUAEGI_DIAGNOSTICS_DISABLED").is_some()
+                    || std::env::var_os("CI").is_some();
+                if blocked {
+                    self.diagnostics_status =
+                        Some("Diagnostics are disabled by an environment variable.".to_string());
+                    return iced::Task::none();
+                }
+                let Some(root) = dirs::cache_dir() else {
+                    self.diagnostics_status =
+                        Some("Could not resolve the diagnostics directory.".to_string());
+                    return iced::Task::none();
+                };
+                let directory = root.join("suaegi").join("diagnostics");
+                let stamp = current_unix_ms();
+                let path = directory.join(format!("suaegi-diagnostics-{stamp}.txt"));
+                let body = format!(
+                    "Suaegi diagnostics review\n\
+                     generated_unix_ms: {stamp}\n\
+                     version: {}\n\
+                     platform: {} {}\n\
+                     projects: {}\n\
+                     workspaces: {}\n\
+                     terminal_sessions: {}\n\
+                     settings_load: {:?}\n\
+                     settings_save: {:?}\n\
+                     last_error: {}\n\n\
+                     Privacy: terminal output, file contents, prompts, environment variables, \
+                     credentials, tokens, proxy URLs, and repository paths are intentionally excluded.\n",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    self.repos.len(),
+                    self.worktrees_by_repo.values().map(Vec::len).sum::<usize>(),
+                    self.session_store.sessions().count(),
+                    self.load_origin,
+                    self.last_save_status,
+                    self.last_error.as_deref().unwrap_or("none"),
+                );
+                match std::fs::create_dir_all(&directory).and_then(|()| std::fs::write(&path, body))
+                {
+                    Ok(()) => {
+                        let _ = std::process::Command::new("open").arg(&path).spawn();
+                        self.diagnostics_status =
+                            Some(format!("Review file created: {}", path.display()));
+                    }
+                    Err(error) => {
+                        self.diagnostics_status =
+                            Some(format!("Could not create diagnostics: {error}"));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::AndroidSdkBrowseRequested => iced::Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|folder| folder.path().to_path_buf())
+                },
+                Message::AndroidSdkDirectoryPicked,
+            ),
+            Message::AndroidSdkDirectoryPicked(Some(path)) => {
+                self.ui_settings.android_sdk_path = path.display().to_string();
+                self.persist();
+                self.update(Message::EmulatorAvailabilityRequested)
+            }
+            Message::AndroidSdkDirectoryPicked(None) => iced::Task::none(),
+            Message::QuickCommandAdded => {
+                if self.ui_settings.quick_commands.len() >= 40 {
+                    return iced::Task::none();
+                }
+                let mut suffix = self.ui_settings.quick_commands.len() + 1;
+                let id = loop {
+                    let candidate = format!("command-{suffix}");
+                    if self
+                        .ui_settings
+                        .quick_commands
+                        .iter()
+                        .all(|command| command.id != candidate)
+                    {
+                        break candidate;
+                    }
+                    suffix += 1;
+                };
+                self.ui_settings.quick_commands.push(QuickCommandSetting {
+                    id,
+                    label: "New command".to_string(),
+                    command: String::new(),
+                    append_enter: true,
+                });
+                self.persist();
+                iced::Task::none()
+            }
+            Message::QuickCommandLabelChanged(index, value) => {
+                if let Some(command) = self.ui_settings.quick_commands.get_mut(index) {
+                    command.label = value.chars().take(80).collect();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::QuickCommandBodyChanged(index, value) => {
+                if let Some(command) = self.ui_settings.quick_commands.get_mut(index) {
+                    command.command = value.chars().take(4_000).collect();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::QuickCommandAppendEnterToggled(index) => {
+                if let Some(command) = self.ui_settings.quick_commands.get_mut(index) {
+                    command.append_enter = !command.append_enter;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::QuickCommandRemoved(index) => {
+                if index < self.ui_settings.quick_commands.len() {
+                    self.ui_settings.quick_commands.remove(index);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::QuickCommandRun(index) => {
+                let Some(command) = self.ui_settings.quick_commands.get(index) else {
+                    return iced::Task::none();
+                };
+                let mut input = command.command.clone();
+                if command.append_enter {
+                    input.push('\r');
+                }
+                self.integrations_open = false;
+                self.run_in_available_terminal(input)
+            }
+            Message::OpenInApplicationAdded => {
+                if self.ui_settings.open_in_applications.len() < 20 {
+                    let suffix = self.ui_settings.open_in_applications.len() + 1;
+                    self.ui_settings
+                        .open_in_applications
+                        .push(OpenInApplicationSetting {
+                            id: format!("application-{suffix}"),
+                            label: "New app".to_string(),
+                            command: String::new(),
+                        });
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::OpenInApplicationLabelChanged(index, value) => {
+                if let Some(application) = self.ui_settings.open_in_applications.get_mut(index) {
+                    application.label = value.chars().take(80).collect();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::OpenInApplicationCommandChanged(index, value) => {
+                if let Some(application) = self.ui_settings.open_in_applications.get_mut(index) {
+                    application.command = value.chars().take(1_000).collect();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::OpenInApplicationRemoved(index) => {
+                if index < self.ui_settings.open_in_applications.len() {
+                    self.ui_settings.open_in_applications.remove(index);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostAdded => {
+                if self.ui_settings.ssh_hosts.len() < 50 {
+                    let suffix = self.ui_settings.ssh_hosts.len() + 1;
+                    self.ui_settings.ssh_hosts.push(SshHostSetting {
+                        id: format!("ssh-host-{suffix}"),
+                        label: "New SSH host".to_string(),
+                        config_host: String::new(),
+                        hostname: String::new(),
+                        user: String::new(),
+                        port: 22,
+                        identity_file: String::new(),
+                        proxy_command: String::new(),
+                        jump_host: String::new(),
+                        system_ssh_connection_reuse: true,
+                        relay_grace_period_seconds: 0,
+                        source: "manual".to_string(),
+                    });
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostLabelChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.label = value.chars().take(80).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostHostnameChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.hostname = value.chars().take(255).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostUserChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.user = value.chars().take(80).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostPortChanged(index, value) => {
+                if let (Some(host), Ok(port)) = (
+                    self.ui_settings.ssh_hosts.get_mut(index),
+                    value.trim().parse::<u16>(),
+                ) {
+                    host.port = port;
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostIdentityFileChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.identity_file = value.chars().take(1_000).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostProxyCommandChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.proxy_command = value.chars().take(2_000).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostJumpHostChanged(index, value) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.jump_host = value.chars().take(255).collect();
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostConnectionReuseToggled(index) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.system_ssh_connection_reuse = !host.system_ssh_connection_reuse;
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostRelayKeepAliveToggled(index) => {
+                if let Some(host) = self.ui_settings.ssh_hosts.get_mut(index) {
+                    host.relay_grace_period_seconds = if host.relay_grace_period_seconds == 0 {
+                        86_400
+                    } else {
+                        0
+                    };
+                    host.source = "manual".to_string();
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostRelayGracePeriodChanged(index, value) => {
+                if let (Some(host), Ok(seconds)) = (
+                    self.ui_settings.ssh_hosts.get_mut(index),
+                    value.trim().parse::<u32>(),
+                ) {
+                    if (60..=604_800).contains(&seconds) {
+                        host.relay_grace_period_seconds = seconds;
+                        host.source = "manual".to_string();
+                        self.persist();
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::SshConfigImportRequested => {
+                if self.ssh_importing {
+                    return iced::Task::none();
+                }
+                self.ssh_importing = true;
+                iced::Task::perform(
+                    crate::ssh::import_config(),
+                    Message::SshConfigImportFinished,
+                )
+            }
+            Message::SshConfigImportFinished(result) => {
+                self.ssh_importing = false;
+                match result {
+                    Ok(imported) => {
+                        let count = imported.len();
+                        for target in imported {
+                            if let Some(existing) =
+                                self.ui_settings.ssh_hosts.iter_mut().find(|existing| {
+                                    existing.source == "ssh-config"
+                                        && existing.config_host == target.config_host
+                                })
+                            {
+                                *existing = target;
+                            } else if !self.ui_settings.ssh_hosts.iter().any(|existing| {
+                                existing.source == "manual"
+                                    && existing.config_host == target.config_host
+                            }) {
+                                self.ui_settings.ssh_hosts.push(target);
+                            }
+                        }
+                        self.last_error = None;
+                        self.ssh_status.insert(
+                            "__import__".to_string(),
+                            if count == 0 {
+                                "~/.ssh/config already in sync.".to_string()
+                            } else {
+                                format!("Synced {count} SSH target(s).")
+                            },
+                        );
+                        self.persist();
+                    }
+                    Err(error) => {
+                        self.ssh_status
+                            .insert("__import__".to_string(), format!("Import failed: {error}"));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::SshHostTestRequested(index) => {
+                let Some(host) = self.ui_settings.ssh_hosts.get(index).cloned() else {
+                    return iced::Task::none();
+                };
+                if self.ssh_testing.contains(&host.id) {
+                    return iced::Task::none();
+                }
+                self.ssh_testing.insert(host.id.clone());
+                self.ssh_status
+                    .insert(host.id.clone(), "Testing connection…".to_string());
+                let id = host.id.clone();
+                iced::Task::perform(crate::ssh::test_connection(host), move |result| {
+                    Message::SshHostTestFinished(id.clone(), result)
+                })
+            }
+            Message::SshHostTestFinished(id, result) => {
+                self.ssh_testing.remove(&id);
+                self.ssh_status.insert(id, result.message);
+                iced::Task::none()
+            }
+            Message::SshHostRemoved(index) => {
+                if index < self.ui_settings.ssh_hosts.len() {
+                    let removed = self.ui_settings.ssh_hosts.remove(index);
+                    self.ssh_testing.remove(&removed.id);
+                    self.ssh_status.remove(&removed.id);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SshHostConnect(index) => {
+                let Some(host) = self.ui_settings.ssh_hosts.get(index) else {
+                    return iced::Task::none();
+                };
+                if host.hostname.trim().is_empty() && host.config_host.trim().is_empty() {
+                    self.last_error = Some("Host or SSH config alias is required.".to_string());
+                    return iced::Task::none();
+                }
+                let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+                let mut command = "ssh".to_string();
+                for arg in crate::ssh::command_args(host, false) {
+                    command.push(' ');
+                    command.push_str(&quote(&arg));
+                }
+                command.push('\r');
+                self.integrations_open = false;
+                self.run_in_available_terminal(command)
+            }
+            Message::SettingsTerminalCommandRequested(mut command) => {
+                if !command.ends_with('\r') {
+                    command.push('\r');
+                }
+                self.integrations_open = false;
+                self.run_in_available_terminal(command)
+            }
+            Message::OpenSystemSettings(url) => {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+                iced::Task::none()
+            }
+            Message::LaunchApplication(application) => {
+                if let Err(error) = std::process::Command::new("open")
+                    .args(["-a", &application])
+                    .spawn()
+                {
+                    self.last_error = Some(format!("Could not open {application}: {error}"));
+                }
+                iced::Task::none()
+            }
+            Message::HelpToggled => {
+                self.workspace_options_open = false;
+                self.project_actions_open = None;
+                self.worktree_actions_open = None;
+                self.help_open = !self.help_open;
+                iced::Task::none()
+            }
+            Message::HelpActionSelected(action) => {
+                self.help_open = false;
+                match action {
+                    HelpAction::KeyboardShortcuts => {
+                        self.close_context_panels();
+                        self.integrations_open = true;
+                        self.settings_section = SettingsSection::Shortcuts;
+                    }
+                    HelpAction::Feedback => {
+                        let _ = std::process::Command::new("open")
+                            .arg("mailto:feedback@onorca.dev?subject=Suaegi%20feedback")
+                            .spawn();
+                    }
+                    HelpAction::Docs => return self.route_web_url("https://www.onorca.dev/docs"),
+                    HelpAction::Changelog => {
+                        return self.route_web_url("https://onorca.dev/changelog");
+                    }
+                    HelpAction::Github => {
+                        return self.route_web_url("https://github.com/stablyai/orca");
+                    }
+                    HelpAction::Discord => {
+                        return self.route_web_url("https://discord.gg/fzjDKHxv8Q");
+                    }
+                    HelpAction::X => return self.route_web_url("https://x.com/orca_build"),
+                    HelpAction::CheckForUpdates => {
+                        return self
+                            .route_web_url("https://github.com/stablyai/orca/releases/latest");
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::ExternalUrlRequested(url) => self.route_web_url(&url),
+            Message::WorkspaceOptionsToggled => {
+                self.help_open = false;
+                self.project_actions_open = None;
+                self.worktree_actions_open = None;
+                self.workspace_options_open = !self.workspace_options_open;
+                iced::Task::none()
+            }
+            Message::ProjectActionsToggled(repo) => {
+                self.help_open = false;
+                self.workspace_options_open = false;
+                self.worktree_actions_open = None;
+                if self.project_actions_open.as_ref() == Some(&repo) {
+                    self.project_actions_open = None;
+                } else {
+                    self.project_actions_open = Some(repo);
+                }
+                iced::Task::none()
+            }
+            Message::ProjectRemoveRequested(repo) => {
+                self.project_actions_open = None;
+                self.project_remove_confirm = Some(repo);
+                iced::Task::none()
+            }
+            Message::ProjectRemoveCancelled => {
+                self.project_remove_confirm = None;
+                iced::Task::none()
+            }
+            Message::ProjectRemoveConfirmed => {
+                let Some(repo_id) = self.project_remove_confirm.take() else {
+                    return iced::Task::none();
+                };
+                let worktrees: Vec<WorktreeId> = self
+                    .worktrees_for(&repo_id)
+                    .iter()
+                    .map(|entry| worktree_id_for(&entry.path))
+                    .collect();
+                for worktree in &worktrees {
+                    if let Some(session) = self.worktree_sessions.get(worktree).copied() {
+                        self.close_session(session);
+                    }
+                    if let Some(session) = self.worktree_setup_sessions.get(worktree).copied() {
+                        self.close_session(session);
+                    }
+                    self.worktree_meta.remove(worktree);
+                }
+                if self
+                    .selected_worktree
+                    .as_ref()
+                    .is_some_and(|selected| worktrees.contains(selected))
+                {
+                    self.selected_worktree = None;
+                    self.tasks_open = true;
+                }
+                self.worktrees_by_repo.remove(&repo_id);
+                self.ui_settings.repo_hook_settings.remove(&repo_id.0);
+                self.ui_settings.repo_worktree_base_paths.remove(&repo_id.0);
+                self.ui_settings.repo_symlink_paths.remove(&repo_id.0);
+                self.ui_settings.repo_sparse_presets.remove(&repo_id.0);
+                self.ui_settings.repo_badge_colors.remove(&repo_id.0);
+                self.ui_settings.repo_icons.remove(&repo_id.0);
+                self.ui_settings.repo_github_upstreams.remove(&repo_id.0);
+                self.ui_settings.repo_fork_sync_modes.remove(&repo_id.0);
+                self.ui_settings
+                    .repo_external_worktree_visibility
+                    .remove(&repo_id.0);
+                self.ui_settings
+                    .repo_external_worktree_inbox_baseline_paths
+                    .remove(&repo_id.0);
+                self.ui_settings
+                    .repo_imported_external_worktree_paths
+                    .remove(&repo_id.0);
+                self.ui_settings
+                    .repo_external_worktree_discovery_suppressed_at
+                    .remove(&repo_id.0);
+                self.ui_settings.repo_host_setups.remove(&repo_id.0);
+                self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                self.repo_shared_path_drafts.remove(&repo_id);
+                self.repo_sparse_preset_name_drafts.remove(&repo_id);
+                self.repo_sparse_preset_directory_drafts.remove(&repo_id);
+                self.repo_host_setup_drafts.remove(&repo_id);
+                self.repo_host_setup_busy.remove(&repo_id);
+                self.repo_host_setup_status.remove(&repo_id);
+                self.worktree_sparse_preset_draft.remove(&repo_id);
+                self.worktree_vm_recipe_draft.remove(&repo_id);
+                self.fork_syncing.remove(&repo_id);
+                self.fork_sync_status.remove(&repo_id);
+                self.task_repo_selection.remove(&repo_id);
+                self.task_items_by_repo.remove(&repo_id);
+                self.task_items_pending.remove(&repo_id);
+                self.task_item_errors.remove(&repo_id);
+                self.repos.retain(|repo| repo.id != repo_id);
+                if let Some(selected) = self.ui_settings.default_repo_selection.as_mut() {
+                    selected.retain(|id| id != &repo_id.0);
+                    if selected.is_empty() {
+                        self.ui_settings.default_repo_selection = None;
+                    }
+                }
+                self.reconcile_task_repo_selection();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::WorktreeActionsToggled(worktree) => {
+                self.help_open = false;
+                self.workspace_options_open = false;
+                self.project_actions_open = None;
+                if self.worktree_actions_open.as_ref() == Some(&worktree) {
+                    self.worktree_actions_open = None;
+                } else {
+                    self.worktree_actions_open = Some(worktree);
+                }
+                iced::Task::none()
+            }
+            Message::WorktreeOpenInFinder(worktree) => {
+                self.worktree_actions_open = None;
+                if let Some((_repo, entry)) = self.find_worktree(&worktree) {
+                    let _ = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(&entry.path)
+                        .spawn();
+                }
+                iced::Task::none()
+            }
+            Message::WorktreeOpenInEditor(worktree) => {
+                self.worktree_actions_open = None;
+                if let Some((_repo, entry)) = self.find_worktree(&worktree) {
+                    let path = entry.path.display().to_string();
+                    let spec = crate::external_editor::resolve_external_editor_launch_spec(
+                        None,
+                        &path,
+                        crate::external_editor::Platform::current(),
+                        |candidate| std::path::Path::new(candidate).exists(),
+                    );
+                    if let Err(error) = crate::external_editor::spawn_external_editor(&spec) {
+                        self.last_error = Some(format!("Could not open VS Code: {error}"));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::WorktreeOpenInApplication(worktree, index) => {
+                self.worktree_actions_open = None;
+                let application = self.ui_settings.open_in_applications.get(index).cloned();
+                let entry = self.find_worktree(&worktree).map(|(_, entry)| entry);
+                if let (Some(application), Some(entry)) = (application, entry) {
+                    let path = entry.path.display().to_string();
+                    let spec = crate::external_editor::resolve_external_editor_launch_spec(
+                        Some(&application.command),
+                        &path,
+                        crate::external_editor::Platform::current(),
+                        |candidate| std::path::Path::new(candidate).exists(),
+                    );
+                    if let Err(error) = crate::external_editor::spawn_external_editor(&spec) {
+                        self.last_error =
+                            Some(format!("Could not open {}: {error}", application.label));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::WorktreeCopyPath(worktree) => {
+                self.worktree_actions_open = None;
+                let path = self
+                    .find_worktree(&worktree)
+                    .map(|(_, entry)| entry.path.to_string_lossy().into_owned());
+                path.map_or_else(iced::Task::none, iced::clipboard::write)
+            }
+            Message::WorktreeRefreshRequested(worktree) => {
+                self.worktree_actions_open = None;
+                let repo = self.find_worktree(&worktree).map(|(repo, _)| repo);
+                repo.map_or_else(iced::Task::none, |repo| self.refresh_worktrees(repo))
+            }
+            Message::WorktreeBoardStatusSet(worktree, status) => {
+                self.worktree_actions_open = None;
+                self.ui_settings
+                    .board_statuses
+                    .insert(worktree.0, status.persisted().to_string());
+                self.persist();
+                iced::Task::none()
+            }
+            Message::WorktreePinToggled(worktree) => {
+                self.worktree_actions_open = None;
+                toggle_worktree_preference(&mut self.ui_settings.pinned_worktrees, worktree.0);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::WorktreeSleepToggled(worktree) => {
+                self.worktree_actions_open = None;
+                if let Some(runtime) = self.ephemeral_runtime_for_worktree(&worktree) {
+                    return match runtime.status {
+                        crate::ephemeral_vm::RuntimeStatus::Running => {
+                            self.update(Message::EphemeralVmSuspendRequested(runtime.id.clone()))
+                        }
+                        crate::ephemeral_vm::RuntimeStatus::Suspended
+                        | crate::ephemeral_vm::RuntimeStatus::ResumeFailed => {
+                            self.update(Message::EphemeralVmResumeRequested(runtime.id.clone()))
+                        }
+                        _ => iced::Task::none(),
+                    };
+                }
+                toggle_worktree_preference(&mut self.ui_settings.sleeping_worktrees, worktree.0);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::WorktreeUnreadToggled(worktree) => {
+                self.worktree_actions_open = None;
+                toggle_worktree_preference(&mut self.ui_settings.unread_worktrees, worktree.0);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::WorkspaceBoardToggled => {
+                self.help_open = false;
+                self.workspace_options_open = false;
+                self.project_actions_open = None;
+                self.worktree_actions_open = None;
+                self.workspace_board_open = !self.workspace_board_open;
+                iced::Task::none()
+            }
+            Message::StatusPopoverToggled(popover) => {
+                self.help_open = false;
+                self.workspace_options_open = false;
+                self.project_actions_open = None;
+                self.worktree_actions_open = None;
+                let opening = self.status_popover != Some(popover);
+                self.status_popover = if !opening { None } else { Some(popover) };
+                if opening {
+                    match popover {
+                        StatusPopover::Ports => self.update(Message::PortsRefreshRequested),
+                        StatusPopover::Resources => {
+                            self.update(Message::MemorySnapshotRefreshRequested)
+                        }
+                        StatusPopover::Usage => iced::Task::none(),
+                    }
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::MemorySnapshotRefreshRequested => {
+                if self.memory_snapshot_loading {
+                    return iced::Task::none();
+                }
+                self.memory_snapshot_loading = true;
+                crate::background::blocking(move |mut sender| {
+                    let persisted = suaegi_core::persistence::Store::new(
+                        crate::persistence_thread::default_data_file(),
+                    )
+                    .load()
+                    .state;
+                    let snapshot = crate::memory::collect(&persisted, Some(std::process::id()));
+                    let _ = sender.try_send(Message::MemorySnapshotLoaded(Box::new(snapshot)));
+                })
+            }
+            Message::MemorySnapshotLoaded(snapshot) => {
+                self.memory_snapshot_loading = false;
+                self.memory_snapshot = Some(*snapshot);
+                iced::Task::none()
+            }
+            Message::PortsRefreshRequested => {
+                let op = self.next_op();
+                self.ports_loading = true;
+                self.ports_error = None;
+                self.ports_op = Some(op);
+                let mut workspace_roots = self
+                    .repos
+                    .iter()
+                    .map(|repo| repo.path.clone())
+                    .chain(
+                        self.worktrees_by_repo
+                            .values()
+                            .flatten()
+                            .map(|entry| entry.path.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                workspace_roots.sort();
+                workspace_roots.dedup();
+                crate::ports::scan(op, workspace_roots)
+            }
+            Message::PortsLoaded { op, result } => {
+                if self.ports_op != Some(op) {
+                    return iced::Task::none();
+                }
+                self.ports_loading = false;
+                self.ports_op = None;
+                match result {
+                    Ok(listeners) => {
+                        self.port_listeners = listeners;
+                        self.ports_error = None;
+                    }
+                    Err(error) => {
+                        self.port_listeners.clear();
+                        self.ports_error = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::PortOpenRequested(address) => {
+                let Some(target_url) = crate::localhost_labels::listener_url(&address) else {
+                    self.ports_error = Some(format!("Could not open listener {address}."));
+                    return iced::Task::none();
+                };
+                if !self.ui_settings.localhost_worktree_labels {
+                    return self.route_web_url(&target_url);
+                }
+                let Some(worktree_id) = self.selected_worktree.clone() else {
+                    return self.route_web_url(&target_url);
+                };
+                let Some((repo_id, entry)) = self.find_worktree(&worktree_id) else {
+                    return self.route_web_url(&target_url);
+                };
+                let project_name = self
+                    .repo_by_id(&repo_id)
+                    .map(|repo| repo.display_name.clone())
+                    .unwrap_or_else(|| "workspace".to_string());
+                let worktree_name = self.worktree_display_name(&worktree_id, &entry);
+                iced::Task::perform(
+                    crate::localhost_labels::register(target_url, project_name, worktree_name),
+                    Message::LocalhostLabelReady,
+                )
+            }
+            Message::LocalhostLabelReady(result) => match result {
+                Ok(url) => self.route_web_url(&url),
+                Err(error) => {
+                    self.ports_error = Some(error);
+                    iced::Task::none()
+                }
+            },
+            Message::RevealActiveWorkspace => {
+                if let Some(worktree) = self.selected_worktree.clone() {
+                    if let Some((_repo, entry)) = self.find_worktree(&worktree) {
+                        let _ = std::process::Command::new("open")
+                            .arg("-R")
+                            .arg(&entry.path)
+                            .spawn();
+                    }
+                }
                 iced::Task::none()
             }
             Message::AddRepoSubmitted => {
@@ -2502,22 +16912,51 @@ impl AppState {
                 let op = self.next_op();
                 crate::git_tasks::add_repo(op, PathBuf::from(path))
             }
-            Message::RepoProbed { result, .. } => match result {
-                Ok((mut repo, head_branch)) => {
-                    self.last_error = None;
-                    if repo.worktree_base_ref.is_none() {
-                        repo.worktree_base_ref = head_branch;
+            Message::RepoProbed {
+                request, result, ..
+            } => {
+                let rpc = self.pending_repo_add_rpcs.remove(&request);
+                match result {
+                    Ok((mut repo, head_branch)) => {
+                        self.last_error = None;
+                        self.adding_repo = false;
+                        if repo.worktree_base_ref.is_none() {
+                            repo.worktree_base_ref = head_branch;
+                        }
+                        let repo_id = repo.id.clone();
+                        let repo_path = repo.path.clone();
+                        self.ui_settings
+                            .repo_external_worktree_visibility
+                            .entry(repo_id.0.clone())
+                            .or_insert_with(|| "hide".to_string());
+                        self.upsert_repo(repo);
+                        self.reconcile_task_repo_selection();
+                        self.persist();
+                        if let Some(rpc) = rpc {
+                            let repo = self
+                                .repo_by_id(&repo_id)
+                                .expect("the successfully probed repository was just inserted");
+                            rpc.respond(Ok(serde_json::json!({
+                                "id": repo.id.0,
+                                "name": repo.display_name,
+                                "path": repo.path,
+                                "baseRef": repo.worktree_base_ref,
+                            })));
+                        }
+                        iced::Task::batch([
+                            self.refresh_worktrees(repo_id.clone()),
+                            crate::fork_sync::discover(repo_id, repo_path),
+                        ])
                     }
-                    let repo_id = repo.id.clone();
-                    self.upsert_repo(repo);
-                    self.persist();
-                    self.refresh_worktrees(repo_id)
+                    Err(err) => {
+                        if let Some(rpc) = rpc {
+                            rpc.respond(Err(err.clone()));
+                        }
+                        self.last_error = Some(err);
+                        iced::Task::none()
+                    }
                 }
-                Err(err) => {
-                    self.last_error = Some(err);
-                    iced::Task::none()
-                }
-            },
+            }
             Message::WorktreesListed {
                 request,
                 repo_id,
@@ -2546,9 +16985,29 @@ impl AppState {
                     }
                 }
                 if is_current {
-                    self.note_hydration(HydrationStep::ReposListed(repo_id));
+                    self.note_hydration(HydrationStep::ReposListed(repo_id.clone()));
                 }
-                iced::Task::none()
+                let ready = self
+                    .worktrees_by_repo
+                    .get(&repo_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| worktree_id_for(&entry.path))
+                    .filter(|worktree| {
+                        self.deferred_setup_agent_starts.contains(worktree)
+                            && !self.setup_waiting_worktrees.contains(worktree)
+                    })
+                    .collect::<Vec<_>>();
+                let mut tasks = Vec::new();
+                for worktree in ready {
+                    self.deferred_setup_agent_starts.remove(&worktree);
+                    if let Some((_, task)) = self.start_session_for(&worktree) {
+                        tasks.push(task);
+                    } else {
+                        self.deferred_setup_agent_starts.insert(worktree);
+                    }
+                }
+                iced::Task::batch(tasks)
             }
             Message::WorktreeNameInputChanged { repo_id, value } => {
                 // **사이드바 입력에 포커스를 잡아 터미널을 unfocus한다.** 이게 없으면
@@ -2558,6 +17017,18 @@ impl AppState {
                 let focus = iced::widget::operation::focus(crate::sidebar::name_input_id(&repo_id));
                 self.worktree_name_draft.insert(repo_id, value);
                 focus
+            }
+            Message::WorktreeCreateToggled(repo_id) => {
+                if self.creating_worktree_for.as_ref() == Some(&repo_id) {
+                    self.creating_worktree_for = None;
+                    self.worktree_suggested_name.remove(&repo_id);
+                } else {
+                    let suggested = self.fresh_worktree_suggestion();
+                    self.worktree_suggested_name
+                        .insert(repo_id.clone(), suggested);
+                    self.creating_worktree_for = Some(repo_id);
+                }
+                iced::Task::none()
             }
             Message::WorktreeAgentSelected { repo_id, choice } => {
                 // 로그인 셸(기본)을 고르면 엔트리를 지운다 — "없음"과 같은 의미라
@@ -2582,27 +17053,1171 @@ impl AppState {
                 }
                 focus
             }
+            Message::WorktreeSetupRunToggled(repo_id) => {
+                let next = !self.worktree_setup_run_selection(&repo_id);
+                self.worktree_setup_run_draft.insert(repo_id, next);
+                iced::Task::none()
+            }
+            Message::WorktreeSparsePresetSelected(repo_id, preset_id) => {
+                if preset_id.is_empty() {
+                    self.worktree_sparse_preset_draft.remove(&repo_id);
+                    self.worktree_vm_recipe_draft.remove(&repo_id);
+                } else if self
+                    .ui_settings
+                    .repo_sparse_presets
+                    .get(&repo_id.0)
+                    .is_some_and(|presets| presets.iter().any(|preset| preset.id == preset_id))
+                {
+                    self.worktree_sparse_preset_draft.insert(repo_id, preset_id);
+                }
+                iced::Task::none()
+            }
+            Message::WorktreeVmRecipeSelected(repo_id, recipe_id) => {
+                if recipe_id.is_empty() {
+                    self.worktree_vm_recipe_draft.remove(&repo_id);
+                } else if self
+                    .vm_recipe_choices(&repo_id)
+                    .iter()
+                    .any(|choice| choice.id == recipe_id)
+                {
+                    self.worktree_vm_recipe_draft.insert(repo_id, recipe_id);
+                }
+                iced::Task::none()
+            }
+            Message::RepoSetupScriptChanged(repo_id, value) => {
+                self.ui_settings
+                    .repo_hook_settings
+                    .entry(repo_id.0)
+                    .or_default()
+                    .setup_script = value;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoArchiveScriptChanged(repo_id, value) => {
+                self.ui_settings
+                    .repo_hook_settings
+                    .entry(repo_id.0)
+                    .or_default()
+                    .archive_script = value;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSetupRunPolicySelected(repo_id, value) => {
+                if matches!(value.as_str(), "ask" | "run-by-default" | "skip-by-default") {
+                    self.ui_settings
+                        .repo_hook_settings
+                        .entry(repo_id.0)
+                        .or_default()
+                        .setup_run_policy = value;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSetupAgentWaitToggled(repo_id) => {
+                let setting = self
+                    .ui_settings
+                    .repo_hook_settings
+                    .entry(repo_id.0)
+                    .or_default();
+                setting.setup_agent_startup_policy =
+                    if setting.setup_agent_startup_policy == "wait-for-setup" {
+                        "start-immediately"
+                    } else {
+                        "wait-for-setup"
+                    }
+                    .to_string();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoHookSourcePolicySelected(repo_id, value) => {
+                if matches!(value.as_str(), "shared-only" | "local-only" | "run-both") {
+                    self.ui_settings
+                        .repo_hook_settings
+                        .entry(repo_id.0)
+                        .or_default()
+                        .command_source_policy = Some(value);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoDisplayNameChanged(repo_id, value) => {
+                let value = value.chars().take(100).collect::<String>();
+                if !value.trim().is_empty() {
+                    if let Some(repo) = self.repos.iter_mut().find(|repo| repo.id == repo_id) {
+                        repo.display_name = value;
+                        self.persist();
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RepoBadgeColorChanged(repo_id, value) => {
+                if value.trim().is_empty() {
+                    self.ui_settings.repo_badge_colors.remove(&repo_id.0);
+                } else {
+                    self.ui_settings
+                        .repo_badge_colors
+                        .insert(repo_id.0, value.chars().take(7).collect());
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoIconChanged(repo_id, value) => {
+                let value = value.trim().chars().take(8).collect::<String>();
+                if value.is_empty() {
+                    self.ui_settings.repo_icons.remove(&repo_id.0);
+                } else {
+                    self.ui_settings.repo_icons.insert(repo_id.0, value);
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoBaseRefChanged(repo_id, value) => {
+                let value = value.trim().to_string();
+                if let Some(repo) = self.repos.iter_mut().find(|repo| repo.id == repo_id) {
+                    repo.worktree_base_ref = (!value.is_empty()).then_some(value);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoWorktreeBasePathChanged(repo_id, value) => {
+                if value.trim().is_empty() {
+                    self.ui_settings.repo_worktree_base_paths.remove(&repo_id.0);
+                } else {
+                    self.ui_settings
+                        .repo_worktree_base_paths
+                        .insert(repo_id.0, value);
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSharedPathsChanged(repo_id, value) => {
+                self.repo_shared_path_drafts.insert(repo_id, value);
+                iced::Task::none()
+            }
+            Message::RepoSharedPathAdded(repo_id) => {
+                let raw = self
+                    .repo_shared_path_drafts
+                    .get(&repo_id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let Some(path) = crate::worktree_linked_paths::normalize_relative_path(raw) else {
+                    return iced::Task::none();
+                };
+                let path = path.to_string_lossy().to_string();
+                let paths = self
+                    .ui_settings
+                    .repo_symlink_paths
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                if paths.len() < 64 && !paths.contains(&path) {
+                    paths.push(path);
+                    self.persist();
+                }
+                self.repo_shared_path_drafts.remove(&repo_id);
+                iced::Task::none()
+            }
+            Message::RepoSharedPathRemoved(repo_id, path) => {
+                if let Some(paths) = self.ui_settings.repo_symlink_paths.get_mut(&repo_id.0) {
+                    paths.retain(|candidate| candidate != &path);
+                    if paths.is_empty() {
+                        self.ui_settings.repo_symlink_paths.remove(&repo_id.0);
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSparsePresetNameChanged(repo_id, value) => {
+                self.repo_sparse_preset_name_drafts.insert(repo_id, value);
+                iced::Task::none()
+            }
+            Message::RepoSparsePresetDirectoriesChanged(repo_id, value) => {
+                self.repo_sparse_preset_directory_drafts
+                    .insert(repo_id, value);
+                iced::Task::none()
+            }
+            Message::RepoSparsePresetSaved(repo_id) => {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NEXT_PRESET: AtomicU64 = AtomicU64::new(0);
+
+                let name = self
+                    .repo_sparse_preset_name_drafts
+                    .get(&repo_id)
+                    .map(|value| value.trim())
+                    .unwrap_or("");
+                if name.is_empty() || name.chars().count() > 80 {
+                    self.last_error =
+                        Some("Sparse preset name must be between 1 and 80 characters.".to_string());
+                    return iced::Task::none();
+                }
+                let raw_directories = self
+                    .repo_sparse_preset_directory_drafts
+                    .get(&repo_id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let directories =
+                    match crate::sparse_checkout::normalize_directories(raw_directories) {
+                        Ok(directories) => directories,
+                        Err(error) => {
+                            self.last_error = Some(error);
+                            return iced::Task::none();
+                        }
+                    };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                let presets = self
+                    .ui_settings
+                    .repo_sparse_presets
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                if let Some(existing) = presets
+                    .iter_mut()
+                    .find(|preset| preset.name.eq_ignore_ascii_case(name))
+                {
+                    existing.name = name.to_string();
+                    existing.directories = directories;
+                    existing.updated_at_unix_ms = now;
+                } else {
+                    presets.push(suaegi_core::domain::SparsePresetSetting {
+                        id: format!(
+                            "sparse-{now}-{}",
+                            NEXT_PRESET.fetch_add(1, Ordering::Relaxed)
+                        ),
+                        name: name.to_string(),
+                        directories,
+                        created_at_unix_ms: now,
+                        updated_at_unix_ms: now,
+                    });
+                    presets.sort_by_key(|preset| preset.name.to_lowercase());
+                }
+                self.repo_sparse_preset_name_drafts.remove(&repo_id);
+                self.repo_sparse_preset_directory_drafts.remove(&repo_id);
+                self.last_error = None;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSparsePresetRemoved(repo_id, preset_id) => {
+                if let Some(presets) = self.ui_settings.repo_sparse_presets.get_mut(&repo_id.0) {
+                    presets.retain(|preset| preset.id != preset_id);
+                    if presets.is_empty() {
+                        self.ui_settings.repo_sparse_presets.remove(&repo_id.0);
+                    }
+                    if self.worktree_sparse_preset_draft.get(&repo_id) == Some(&preset_id) {
+                        self.worktree_sparse_preset_draft.remove(&repo_id);
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoUpstreamDiscovered(repo_id, upstream) => {
+                let changed = match upstream.clone() {
+                    Some(upstream) => {
+                        self.ui_settings
+                            .repo_github_upstreams
+                            .insert(repo_id.0.clone(), upstream)
+                            .as_ref()
+                            != self.ui_settings.repo_github_upstreams.get(&repo_id.0)
+                    }
+                    None => self
+                        .ui_settings
+                        .repo_github_upstreams
+                        .remove(&repo_id.0)
+                        .is_some(),
+                };
+                if changed {
+                    self.persist();
+                }
+                let safe_auto = self
+                    .ui_settings
+                    .repo_fork_sync_modes
+                    .get(&repo_id.0)
+                    .is_some_and(|mode| mode == "safe-auto");
+                if safe_auto && upstream.is_some() && !self.fork_syncing.contains(&repo_id) {
+                    return iced::Task::done(Message::RepoForkSyncRequested(repo_id));
+                }
+                iced::Task::none()
+            }
+            Message::RepoForkSyncModeSelected(repo_id, mode) => {
+                if !matches!(mode.as_str(), "ask" | "safe-auto" | "off") {
+                    return iced::Task::none();
+                }
+                self.ui_settings
+                    .repo_fork_sync_modes
+                    .insert(repo_id.0.clone(), mode.clone());
+                self.persist();
+                if mode == "safe-auto" {
+                    iced::Task::done(Message::RepoForkSyncRequested(repo_id))
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::RepoForkSyncRequested(repo_id) => {
+                if !self.fork_syncing.insert(repo_id.clone()) {
+                    return iced::Task::none();
+                }
+                let Some(repo) = self.repos.iter().find(|repo| repo.id == repo_id) else {
+                    self.fork_syncing.remove(&repo_id);
+                    return iced::Task::none();
+                };
+                let Some(upstream) = self
+                    .ui_settings
+                    .repo_github_upstreams
+                    .get(&repo_id.0)
+                    .cloned()
+                else {
+                    self.fork_syncing.remove(&repo_id);
+                    return iced::Task::none();
+                };
+                let repo_path = repo.path.clone();
+                self.fork_sync_status
+                    .insert(repo_id.clone(), "Syncing fork…".to_string());
+                crate::fork_sync::sync(repo_id, repo_path, upstream)
+            }
+            Message::RepoForkSyncFinished(repo_id, result) => {
+                self.fork_syncing.remove(&repo_id);
+                let text = match result {
+                    Ok(result) => fork_sync_result_text(&result),
+                    Err(error) => format!("Fork sync failed — {error}"),
+                };
+                self.fork_sync_status.insert(repo_id, text);
+                iced::Task::none()
+            }
+            Message::RepoExternalWorktreeVisibilitySelected(repo_id, visibility) => {
+                if !matches!(visibility.as_str(), "hide" | "show") {
+                    return iced::Task::none();
+                }
+                self.ui_settings
+                    .repo_external_worktree_visibility
+                    .insert(repo_id.0.clone(), visibility.clone());
+                if visibility == "show" {
+                    self.ui_settings
+                        .repo_external_worktree_discovery_suppressed_at
+                        .remove(&repo_id.0);
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoExternalWorktreeImported(repo_id, worktree_id) => {
+                let Some(path) = self
+                    .worktrees_for(&repo_id)
+                    .iter()
+                    .find(|entry| worktree_id_for(&entry.path) == worktree_id)
+                    .map(|entry| entry.path.to_string_lossy().into_owned())
+                else {
+                    return iced::Task::none();
+                };
+                for paths in [
+                    self.ui_settings
+                        .repo_imported_external_worktree_paths
+                        .entry(repo_id.0.clone())
+                        .or_default(),
+                    self.ui_settings
+                        .repo_external_worktree_inbox_baseline_paths
+                        .entry(repo_id.0.clone())
+                        .or_default(),
+                ] {
+                    if !paths.contains(&path) {
+                        paths.push(path.clone());
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoExternalWorktreesImportedAll(repo_id) => {
+                let paths = self
+                    .external_worktree_inbox(&repo_id)
+                    .into_iter()
+                    .map(|entry| entry.path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    for target in [
+                        self.ui_settings
+                            .repo_imported_external_worktree_paths
+                            .entry(repo_id.0.clone())
+                            .or_default(),
+                        self.ui_settings
+                            .repo_external_worktree_inbox_baseline_paths
+                            .entry(repo_id.0.clone())
+                            .or_default(),
+                    ] {
+                        if !target.contains(&path) {
+                            target.push(path.clone());
+                        }
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoExternalWorktreesKeptHidden(repo_id) => {
+                let paths = self
+                    .external_worktree_inbox(&repo_id)
+                    .into_iter()
+                    .map(|entry| entry.path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let baseline = self
+                    .ui_settings
+                    .repo_external_worktree_inbox_baseline_paths
+                    .entry(repo_id.0)
+                    .or_default();
+                for path in paths {
+                    if !baseline.contains(&path) {
+                        baseline.push(path);
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoExternalWorktreeDiscoverySuppressed(repo_id) => {
+                let paths = self
+                    .external_worktree_inbox(&repo_id)
+                    .into_iter()
+                    .map(|entry| entry.path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let baseline = self
+                    .ui_settings
+                    .repo_external_worktree_inbox_baseline_paths
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                for path in paths {
+                    if !baseline.contains(&path) {
+                        baseline.push(path);
+                    }
+                }
+                self.ui_settings
+                    .repo_external_worktree_discovery_suppressed_at
+                    .insert(repo_id.0, current_unix_ms().min(u64::MAX as u128) as u64);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoHostSetupHostSelected(repo_id, host_id) => {
+                if self
+                    .ui_settings
+                    .ssh_hosts
+                    .iter()
+                    .any(|host| host.id == host_id)
+                {
+                    self.repo_host_setup_drafts
+                        .entry(repo_id)
+                        .or_default()
+                        .host_id = host_id;
+                }
+                iced::Task::none()
+            }
+            Message::RepoHostSetupPathChanged(repo_id, path) => {
+                self.repo_host_setup_drafts.entry(repo_id).or_default().path =
+                    path.chars().take(4_096).collect();
+                iced::Task::none()
+            }
+            Message::RepoHostSetupKindSelected(repo_id, kind) => {
+                if matches!(kind.as_str(), "git" | "folder") {
+                    self.repo_host_setup_drafts.entry(repo_id).or_default().kind = kind;
+                }
+                iced::Task::none()
+            }
+            Message::RepoHostSetupCloneUrlChanged(repo_id, url) => {
+                self.repo_host_setup_drafts
+                    .entry(repo_id)
+                    .or_default()
+                    .clone_url = url.chars().take(4_096).collect();
+                iced::Task::none()
+            }
+            Message::RepoHostSetupCloneDestinationChanged(repo_id, destination) => {
+                self.repo_host_setup_drafts
+                    .entry(repo_id)
+                    .or_default()
+                    .clone_destination = destination.chars().take(4_096).collect();
+                iced::Task::none()
+            }
+            Message::RepoHostSetupExistingRequested(repo_id) => {
+                if !self.repo_host_setup_busy.insert(repo_id.clone()) {
+                    return iced::Task::none();
+                }
+                let draft = self.repo_host_setup_draft(&repo_id);
+                let Some(host) = self
+                    .ui_settings
+                    .ssh_hosts
+                    .iter()
+                    .find(|host| host.id == draft.host_id)
+                    .cloned()
+                else {
+                    self.repo_host_setup_busy.remove(&repo_id);
+                    self.repo_host_setup_status
+                        .insert(repo_id, "Choose an available SSH host first.".to_string());
+                    return iced::Task::none();
+                };
+                if draft.path.trim().is_empty() {
+                    self.repo_host_setup_busy.remove(&repo_id);
+                    self.repo_host_setup_status
+                        .insert(repo_id, "Remote project path is required.".to_string());
+                    return iced::Task::none();
+                }
+                self.repo_host_setup_status
+                    .insert(repo_id.clone(), "Validating remote project…".to_string());
+                let host_id = draft.host_id;
+                let kind = draft.kind;
+                iced::Task::perform(
+                    crate::ssh::validate_project_folder(host, draft.path, kind.clone()),
+                    move |result| {
+                        Message::RepoHostSetupExistingFinished(
+                            repo_id.clone(),
+                            host_id.clone(),
+                            kind.clone(),
+                            result,
+                        )
+                    },
+                )
+            }
+            Message::RepoHostSetupExistingFinished(repo_id, host_id, kind, result) => {
+                self.repo_host_setup_busy.remove(&repo_id);
+                match result {
+                    Ok(path) => {
+                        self.finish_repo_host_setup(
+                            &repo_id,
+                            host_id,
+                            path,
+                            kind,
+                            "imported-existing-folder",
+                        );
+                        self.repo_host_setup_drafts.remove(&repo_id);
+                        self.repo_host_setup_status
+                            .insert(repo_id, "Remote project is ready.".to_string());
+                        self.persist();
+                    }
+                    Err(error) => {
+                        self.repo_host_setup_status
+                            .insert(repo_id, format!("Setup failed: {error}"));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RepoHostSetupCloneRequested(repo_id) => {
+                if !self.repo_host_setup_busy.insert(repo_id.clone()) {
+                    return iced::Task::none();
+                }
+                let draft = self.repo_host_setup_draft(&repo_id);
+                let Some(host) = self
+                    .ui_settings
+                    .ssh_hosts
+                    .iter()
+                    .find(|host| host.id == draft.host_id)
+                    .cloned()
+                else {
+                    self.repo_host_setup_busy.remove(&repo_id);
+                    self.repo_host_setup_status
+                        .insert(repo_id, "Choose an available SSH host first.".to_string());
+                    return iced::Task::none();
+                };
+                if draft.clone_url.trim().is_empty() || draft.clone_destination.trim().is_empty() {
+                    self.repo_host_setup_busy.remove(&repo_id);
+                    self.repo_host_setup_status.insert(
+                        repo_id,
+                        "Clone URL and absolute destination are required.".to_string(),
+                    );
+                    return iced::Task::none();
+                }
+                self.repo_host_setup_status
+                    .insert(repo_id.clone(), "Cloning on remote host…".to_string());
+                let host_id = draft.host_id;
+                iced::Task::perform(
+                    crate::ssh::clone_project(host, draft.clone_url, draft.clone_destination),
+                    move |result| {
+                        Message::RepoHostSetupCloneFinished(
+                            repo_id.clone(),
+                            host_id.clone(),
+                            result,
+                        )
+                    },
+                )
+            }
+            Message::RepoHostSetupCloneFinished(repo_id, host_id, result) => {
+                self.repo_host_setup_busy.remove(&repo_id);
+                match result {
+                    Ok(path) => {
+                        self.finish_repo_host_setup(
+                            &repo_id,
+                            host_id,
+                            path,
+                            "git".to_string(),
+                            "cloned",
+                        );
+                        self.repo_host_setup_drafts.remove(&repo_id);
+                        self.repo_host_setup_status
+                            .insert(repo_id, "Remote clone is ready.".to_string());
+                        self.persist();
+                    }
+                    Err(error) => {
+                        self.repo_host_setup_status
+                            .insert(repo_id, format!("Clone failed: {error}"));
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::RepoHostSetupPlannedRequested(repo_id) => {
+                let draft = self.repo_host_setup_draft(&repo_id);
+                if draft.host_id.is_empty()
+                    || !self
+                        .ui_settings
+                        .ssh_hosts
+                        .iter()
+                        .any(|host| host.id == draft.host_id)
+                {
+                    self.repo_host_setup_status
+                        .insert(repo_id, "Choose an available SSH host first.".to_string());
+                    return iced::Task::none();
+                }
+                let now = current_unix_ms().min(u64::MAX as u128) as u64;
+                let display_name = self
+                    .repo_by_id(&repo_id)
+                    .map(|repo| repo.display_name.clone())
+                    .unwrap_or_else(|| "Project".to_string());
+                let setups = self
+                    .ui_settings
+                    .repo_host_setups
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                if setups.iter().any(|setup| setup.host_id == draft.host_id) {
+                    self.repo_host_setup_status.insert(
+                        repo_id,
+                        "This project already has a setup for that host.".to_string(),
+                    );
+                    return iced::Task::none();
+                }
+                setups.push(ProjectHostSetupSetting {
+                    id: format!("{}::{}", repo_id.0, draft.host_id),
+                    host_id: draft.host_id,
+                    path: String::new(),
+                    display_name,
+                    worktree_base_path: String::new(),
+                    git_username: String::new(),
+                    kind: "git".to_string(),
+                    setup_state: "not-set-up".to_string(),
+                    setup_method: "provisioned".to_string(),
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                });
+                self.repo_host_setup_status
+                    .insert(repo_id, "Planned host setup saved.".to_string());
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoHostSetupOpenTerminal(repo_id, setup_id) => {
+                let Some(setup) = self
+                    .ui_settings
+                    .repo_host_setups
+                    .get(&repo_id.0)
+                    .and_then(|setups| setups.iter().find(|setup| setup.id == setup_id))
+                    .cloned()
+                else {
+                    return iced::Task::none();
+                };
+                if setup.setup_state != "ready" || setup.path.trim().is_empty() {
+                    self.repo_host_setup_status
+                        .insert(repo_id, "This host setup is not ready yet.".to_string());
+                    return iced::Task::none();
+                }
+                let Some(host) = self
+                    .ui_settings
+                    .ssh_hosts
+                    .iter()
+                    .find(|host| host.id == setup.host_id)
+                else {
+                    self.repo_host_setup_status
+                        .insert(repo_id, "The SSH host is no longer configured.".to_string());
+                    return iced::Task::none();
+                };
+                match crate::ssh::interactive_project_command(host, &setup.path) {
+                    Ok(command) => {
+                        self.integrations_open = false;
+                        self.run_in_available_terminal(command)
+                    }
+                    Err(error) => {
+                        self.repo_host_setup_status.insert(repo_id, error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::RepoHostSetupRemoved(repo_id, setup_id) => {
+                if let Some(setups) = self.ui_settings.repo_host_setups.get_mut(&repo_id.0) {
+                    setups.retain(|setup| setup.id != setup_id);
+                    if setups.is_empty() {
+                        self.ui_settings.repo_host_setups.remove(&repo_id.0);
+                    }
+                    self.repo_host_setup_status.insert(
+                        repo_id,
+                        "Host setup unregistered; remote files were not deleted.".to_string(),
+                    );
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiEnabledToggled => {
+                self.ui_settings.source_control_ai.enabled =
+                    !self.ui_settings.source_control_ai.enabled;
+                self.persist();
+                iced::Task::none()
+            }
+            Message::SourceControlAiAgentSelected(agent_id) => {
+                if crate::source_control_ai::AGENT_IDS.contains(&agent_id.as_str()) {
+                    self.ui_settings.source_control_ai.agent_id = agent_id.clone();
+                    self.ui_settings.source_control_ai.model =
+                        crate::source_control_ai::default_model_for(&agent_id).to_string();
+                    self.ui_settings.source_control_ai.thinking_level =
+                        crate::source_control_ai::thinking_levels_for(
+                            &agent_id,
+                            &self.ui_settings.source_control_ai.model,
+                        )
+                        .first()
+                        .copied()
+                        .unwrap_or("")
+                        .to_string();
+                    self.persist();
+                    if crate::source_control_ai::has_dynamic_models(&agent_id) {
+                        return iced::Task::done(Message::SourceControlAiModelsRefreshRequested);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiModelChanged(model) => {
+                if model.chars().count() <= 160 && !model.contains('\0') {
+                    self.ui_settings.source_control_ai.model = model;
+                    let levels = crate::source_control_ai::thinking_levels_for(
+                        &self.ui_settings.source_control_ai.agent_id,
+                        &self.ui_settings.source_control_ai.model,
+                    );
+                    if !levels.contains(&self.ui_settings.source_control_ai.thinking_level.as_str())
+                    {
+                        self.ui_settings.source_control_ai.thinking_level =
+                            levels.first().copied().unwrap_or("").to_string();
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiThinkingSelected(level) => {
+                if crate::source_control_ai::thinking_levels_for(
+                    &self.ui_settings.source_control_ai.agent_id,
+                    &self.ui_settings.source_control_ai.model,
+                )
+                .contains(&level.as_str())
+                {
+                    self.ui_settings.source_control_ai.thinking_level = level;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiCustomCommandChanged(command) => {
+                if command.chars().count() <= 4_096 && !command.contains('\0') {
+                    self.ui_settings.source_control_ai.custom_agent_command = command;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiModelsRefreshRequested => {
+                let agent_id = self.ui_settings.source_control_ai.agent_id.clone();
+                if !crate::source_control_ai::has_dynamic_models(&agent_id)
+                    || !self
+                        .source_control_ai_models_loading
+                        .insert(agent_id.clone())
+                {
+                    return iced::Task::none();
+                }
+                self.source_control_ai_models_status =
+                    Some(format!("Discovering {agent_id} models…"));
+                let command_override = self
+                    .ui_settings
+                    .agent_command_overrides
+                    .get(&agent_id)
+                    .cloned();
+                iced::Task::perform(
+                    crate::source_control_ai::discover_models(agent_id.clone(), command_override),
+                    move |result| {
+                        Message::SourceControlAiModelsRefreshFinished(agent_id.clone(), result)
+                    },
+                )
+            }
+            Message::SourceControlAiModelsRefreshFinished(agent_id, result) => {
+                self.source_control_ai_models_loading.remove(&agent_id);
+                match result {
+                    Ok(models) => {
+                        let count = models.len();
+                        self.source_control_ai_discovered_models
+                            .insert(agent_id.clone(), models);
+                        self.source_control_ai_models_status =
+                            Some(format!("Discovered {count} {agent_id} model(s)."));
+                    }
+                    Err(error) => {
+                        self.source_control_ai_models_status = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::DaemonSessionsRefreshRequested => {
+                if self.daemon_sessions_loading {
+                    return iced::Task::none();
+                }
+                self.daemon_sessions_loading = true;
+                iced::Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(suaegi_term::daemon::list_sessions)
+                            .await
+                            .map_err(|_| "Could not query the terminal daemon.".to_string())?
+                            .map_err(|error| error.to_string())
+                    },
+                    Message::DaemonSessionsRefreshFinished,
+                )
+            }
+            Message::DaemonSessionsRefreshFinished(result) => {
+                self.daemon_sessions_loading = false;
+                match result {
+                    Ok(sessions) => {
+                        self.daemon_sessions = sessions;
+                        self.daemon_sessions_status = None;
+                    }
+                    Err(error) => {
+                        self.daemon_sessions_status = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::DaemonSessionKillRequested(session_id) => {
+                if self
+                    .daemon_sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+                {
+                    self.daemon_action_confirm = Some(session_id);
+                }
+                iced::Task::none()
+            }
+            Message::DaemonKillAllRequested => {
+                if !self.daemon_sessions.is_empty() {
+                    self.daemon_action_confirm = Some("*".to_string());
+                }
+                iced::Task::none()
+            }
+            Message::DaemonRestartRequested => {
+                self.daemon_action_confirm = Some("!restart".to_string());
+                iced::Task::none()
+            }
+            Message::DaemonActionCancelled => {
+                self.daemon_action_confirm = None;
+                iced::Task::none()
+            }
+            Message::DaemonActionConfirmed => {
+                let Some(action) = self.daemon_action_confirm.take() else {
+                    return iced::Task::none();
+                };
+                self.daemon_sessions_loading = true;
+                iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            if action == "*" {
+                                suaegi_term::daemon::kill_all_sessions()
+                                    .map(|count| format!("Killed {count} terminal session(s)."))
+                            } else if action == "!restart" {
+                                suaegi_term::daemon::restart()
+                                    .map(|()| "Terminal daemon restarted.".to_string())
+                            } else {
+                                suaegi_term::daemon::kill_session(&action)
+                                    .map(|()| "Terminal session killed.".to_string())
+                            }
+                            .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|_| "The terminal daemon action failed.".to_string())?
+                    },
+                    Message::DaemonActionFinished,
+                )
+            }
+            Message::DaemonActionFinished(result) => {
+                self.daemon_sessions_loading = false;
+                self.daemon_sessions_status = Some(match result {
+                    Ok(status) => status,
+                    Err(error) => error,
+                });
+                iced::Task::done(Message::DaemonSessionsRefreshRequested)
+            }
+            Message::SourceControlAiActionAgentSelected(action_id, agent_id) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && (agent_id == "inherit"
+                        || crate::source_control_ai::AGENT_IDS.contains(&agent_id.as_str()))
+                {
+                    self.ui_settings
+                        .source_control_ai
+                        .actions
+                        .entry(action_id)
+                        .or_default()
+                        .agent_id = (agent_id != "inherit").then_some(agent_id);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiActionTemplateChanged(action_id, template) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && template.chars().count() <= 65_536
+                    && !template.contains('\0')
+                {
+                    self.ui_settings
+                        .source_control_ai
+                        .actions
+                        .entry(action_id)
+                        .or_default()
+                        .command_input_template = template;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiActionArgsChanged(action_id, args) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && args.chars().count() <= 4_096
+                    && !args.contains('\0')
+                {
+                    self.ui_settings
+                        .source_control_ai
+                        .actions
+                        .entry(action_id)
+                        .or_default()
+                        .agent_args = args;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiPrDefaultToggled(setting) => {
+                let defaults = &mut self.ui_settings.source_control_ai.pr_creation_defaults;
+                match setting {
+                    SourceControlAiPrDefault::Draft => defaults.draft = !defaults.draft,
+                    SourceControlAiPrDefault::UseTemplate => {
+                        defaults.use_template = !defaults.use_template;
+                    }
+                    SourceControlAiPrDefault::GenerateDetailsOnOpen => {
+                        defaults.generate_details_on_open = !defaults.generate_details_on_open;
+                    }
+                    SourceControlAiPrDefault::OpenAfterCreate => {
+                        defaults.open_after_create = !defaults.open_after_create;
+                    }
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiVisibilitySelected(repo_id, value) => {
+                let overrides = self
+                    .ui_settings
+                    .repo_source_control_ai
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                overrides.enabled = match value.as_str() {
+                    "enabled" => Some(true),
+                    "disabled" => Some(false),
+                    _ => None,
+                };
+                if overrides == &suaegi_core::domain::RepoSourceControlAiSetting::default() {
+                    self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiCustomCommandChanged(repo_id, command) => {
+                if command.chars().count() <= 4_096 && !command.contains('\0') {
+                    let overrides = self
+                        .ui_settings
+                        .repo_source_control_ai
+                        .entry(repo_id.0.clone())
+                        .or_default();
+                    overrides.custom_agent_command =
+                        (!command.trim().is_empty()).then_some(command);
+                    if overrides == &suaegi_core::domain::RepoSourceControlAiSetting::default() {
+                        self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiActionAgentSelected(repo_id, action_id, agent_id) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && (agent_id == "inherit"
+                        || crate::source_control_ai::AGENT_IDS.contains(&agent_id.as_str()))
+                {
+                    let global = self
+                        .ui_settings
+                        .source_control_ai
+                        .actions
+                        .get(&action_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let recipe = self
+                        .ui_settings
+                        .repo_source_control_ai
+                        .entry(repo_id.0)
+                        .or_default()
+                        .action_overrides
+                        .entry(action_id)
+                        .or_insert(global);
+                    recipe.agent_id = (agent_id != "inherit").then_some(agent_id);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiActionTemplateChanged(repo_id, action_id, template) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && template.chars().count() <= 65_536
+                    && !template.contains('\0')
+                {
+                    let global = self
+                        .ui_settings
+                        .source_control_ai
+                        .actions
+                        .get(&action_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.ui_settings
+                        .repo_source_control_ai
+                        .entry(repo_id.0)
+                        .or_default()
+                        .action_overrides
+                        .entry(action_id)
+                        .or_insert(global)
+                        .command_input_template = template;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiActionArgsChanged(repo_id, action_id, args) => {
+                if SOURCE_CONTROL_AI_ACTION_IDS.contains(&action_id.as_str())
+                    && args.chars().count() <= 4_096
+                    && !args.contains('\0')
+                {
+                    let global = self
+                        .ui_settings
+                        .source_control_ai
+                        .actions
+                        .get(&action_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.ui_settings
+                        .repo_source_control_ai
+                        .entry(repo_id.0)
+                        .or_default()
+                        .action_overrides
+                        .entry(action_id)
+                        .or_insert(global)
+                        .agent_args = args;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiActionReset(repo_id, action_id) => {
+                if let Some(overrides) = self.ui_settings.repo_source_control_ai.get_mut(&repo_id.0)
+                {
+                    overrides.action_overrides.remove(&action_id);
+                    if overrides == &suaegi_core::domain::RepoSourceControlAiSetting::default() {
+                        self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                    }
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiPrDefaultSelected(repo_id, setting, value) => {
+                let value = match value.as_str() {
+                    "enabled" => Some(true),
+                    "disabled" => Some(false),
+                    _ => None,
+                };
+                let overrides = self
+                    .ui_settings
+                    .repo_source_control_ai
+                    .entry(repo_id.0.clone())
+                    .or_default();
+                match setting {
+                    SourceControlAiPrDefault::Draft => {
+                        overrides.pr_creation_defaults.draft = value;
+                    }
+                    SourceControlAiPrDefault::UseTemplate => {
+                        overrides.pr_creation_defaults.use_template = value;
+                    }
+                    SourceControlAiPrDefault::GenerateDetailsOnOpen => {
+                        overrides.pr_creation_defaults.generate_details_on_open = value;
+                    }
+                    SourceControlAiPrDefault::OpenAfterCreate => {
+                        overrides.pr_creation_defaults.open_after_create = value;
+                    }
+                }
+                if overrides == &suaegi_core::domain::RepoSourceControlAiSetting::default() {
+                    self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                }
+                self.persist();
+                iced::Task::none()
+            }
+            Message::RepoSourceControlAiReset(repo_id) => {
+                self.ui_settings.repo_source_control_ai.remove(&repo_id.0);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::McpStarterCreateRequested(repo_id) => {
+                if self.mcp_create_confirm.as_ref() != Some(&repo_id) {
+                    self.mcp_create_confirm = Some(repo_id);
+                    return iced::Task::none();
+                }
+                self.mcp_create_confirm = None;
+                let Some((worktree, root)) = self.mcp_target_for_repo(&repo_id) else {
+                    self.last_error =
+                        Some("No local workspace is available for this repository.".to_string());
+                    return iced::Task::none();
+                };
+                match crate::mcp_config::create_starter(&root) {
+                    Ok(_) => {
+                        self.selected_worktree = Some(worktree.clone());
+                        self.integrations_open = false;
+                        self.open_editor_file(worktree, ".mcp.json".to_string())
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::McpConfigOpenRequested(repo_id, relative_path) => {
+                if !suaegi_mcp::MCP_CONFIG_CANDIDATES
+                    .iter()
+                    .any(|candidate| candidate.relative_path == relative_path)
+                {
+                    self.last_error = Some("Unsupported MCP config path.".to_string());
+                    return iced::Task::none();
+                }
+                let Some((worktree, _root)) = self.mcp_target_for_repo(&repo_id) else {
+                    self.last_error =
+                        Some("No local workspace is available for this repository.".to_string());
+                    return iced::Task::none();
+                };
+                self.selected_worktree = Some(worktree.clone());
+                self.integrations_open = false;
+                self.open_editor_file(worktree, relative_path)
+            }
             Message::CreateWorktreeSubmitted { repo_id } => {
                 let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
                     return iced::Task::none();
                 };
-                let name = self.worktree_name_draft(&repo_id).trim().to_string();
-                if name.is_empty() {
-                    return iced::Task::none();
-                }
+                // Snapshot the prompt before choosing the workspace seed. Orca
+                // accepts a blank explicit name: a useful prompt becomes the
+                // seed, otherwise the stable creature suggestion is used.
+                let initial_prompt = self
+                    .worktree_prompt_draft
+                    .get(&repo_id)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let name = workspace_seed_name(
+                    self.worktree_name_draft(&repo_id),
+                    initial_prompt.as_deref(),
+                    self.worktree_suggested_name(&repo_id),
+                );
                 // 제출 시점의 피커 선택을 create op에 실어 보낸다(응답을 기다리는
                 // 사이 피커가 바뀌어도 이 worktree엔 영향 없다).
                 let selected_agent = self
                     .worktree_agent_selection(&repo_id)
                     .0
                     .map(|id| id.to_string());
-                // 제출 시점의 초기 프롬프트도 함께 스냅샷한다(빈 값은 `None`) —
-                // 응답을 기다리는 사이 입력창이 바뀌어도 이 worktree엔 영향 없다.
-                let initial_prompt = self
-                    .worktree_prompt_draft
-                    .get(&repo_id)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
+                let run_setup = self.repo_has_setup_script(&repo_id)
+                    && self.worktree_setup_run_selection(&repo_id);
                 // repo 등록 시 감지한 HEAD 브랜치를 기본 base ref로 쓴다. probe가
                 // 실패했거나 HEAD를 못 읽었으면 "main"으로 최선을 다해 추정한다 —
                 // 정확한 기본 브랜치 선택 UI는 이 태스크 범위 밖이다.
@@ -2610,30 +18225,139 @@ impl AppState {
                     .worktree_base_ref
                     .clone()
                     .unwrap_or_else(|| "main".to_string());
+                if let Some(recipe_id) = self
+                    .worktree_vm_recipe_draft
+                    .get(&repo_id)
+                    .cloned()
+                    .filter(|recipe_id| !recipe_id.is_empty())
+                {
+                    let Some(recipe) = self.vm_recipe_for(&repo_id, &recipe_id) else {
+                        self.last_error = Some(format!(
+                            "Environment recipe {recipe_id} is no longer available."
+                        ));
+                        return iced::Task::none();
+                    };
+                    let context = crate::ephemeral_vm::RecipeContext {
+                        recipe_id: recipe.id.clone(),
+                        project_id: Some(repo_id.0.clone()),
+                        workspace_id: Some(format!(
+                            "{}-{}",
+                            repo_id.0,
+                            name.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+                        )),
+                        workspace_name: Some(name),
+                        repo_path: repo.path.clone(),
+                        branch: Some(base_ref),
+                        orca_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        ..crate::ephemeral_vm::RecipeContext::default()
+                    };
+                    self.last_error = Some(format!("Provisioning {}…", recipe.name));
+                    return iced::Task::perform(
+                        crate::ephemeral_vm::provision_and_pair(
+                            crate::ephemeral_vm::default_store_path(),
+                            recipe,
+                            repo.path,
+                            context,
+                            Some(repo_id.0.clone()),
+                        ),
+                        move |result| Message::EphemeralVmProvisionFinished {
+                            repo_id: repo_id.clone(),
+                            created_with_agent: selected_agent.clone(),
+                            initial_prompt: initial_prompt.clone(),
+                            result,
+                        },
+                    );
+                }
                 let op = self.next_op();
+                let branch_prefix = match self.ui_settings.branch_prefix.as_str() {
+                    "custom" => Some(self.ui_settings.branch_prefix_custom.trim().to_string())
+                        .filter(|prefix| !prefix.is_empty()),
+                    "git-username" => std::env::var("GIT_AUTHOR_NAME")
+                        .ok()
+                        .or_else(|| std::env::var("USER").ok())
+                        .filter(|prefix| !prefix.trim().is_empty()),
+                    _ => None,
+                };
+                let configured_root = self
+                    .ui_settings
+                    .repo_worktree_base_paths
+                    .get(&repo_id.0)
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty());
+                let workspace_root = configured_root.map_or_else(
+                    || self.workspace_root.clone(),
+                    |value| {
+                        let path = PathBuf::from(value);
+                        if path.is_absolute() {
+                            path
+                        } else {
+                            repo.path.join(path)
+                        }
+                    },
+                );
+                let nest_workspaces = configured_root
+                    .map(|_| false)
+                    .unwrap_or(self.ui_settings.nest_workspaces);
+                let linked_paths = self
+                    .ui_settings
+                    .repo_symlink_paths
+                    .get(&repo_id.0)
+                    .cloned()
+                    .unwrap_or_default();
+                let sparse_directories = self
+                    .worktree_sparse_preset_draft
+                    .get(&repo_id)
+                    .and_then(|selected| {
+                        self.ui_settings
+                            .repo_sparse_presets
+                            .get(&repo_id.0)?
+                            .iter()
+                            .find(|preset| &preset.id == selected)
+                    })
+                    .map(|preset| preset.directories.clone())
+                    .unwrap_or_default();
                 crate::git_tasks::create_worktree(
                     op,
                     repo,
                     name,
                     base_ref,
-                    self.workspace_root.clone(),
+                    workspace_root,
+                    nest_workspaces,
+                    branch_prefix,
+                    self.ui_settings.refresh_local_base_ref,
                     selected_agent,
                     initial_prompt,
+                    run_setup,
+                    linked_paths,
+                    sparse_directories,
                 )
             }
             Message::WorktreeCreated {
+                request,
                 repo_id,
                 created_with_agent,
                 initial_prompt,
+                run_setup,
                 result,
-                ..
             } => match result {
                 // **Task 6: 생성 시점이 메타데이터의 유일한 진짜 출처다.**
                 // 여기서 `Ok(_created)`를 통째로 버리면 그 시각은 영영 없다 —
                 // `persisted_snapshot`이 매 저장마다 0을 합성하게 된다.
                 Ok(created) => {
+                    if let Some(rpc) = self.pending_worktree_create_rpcs.remove(&request) {
+                        rpc.respond(Ok(serde_json::json!({
+                            "repoId": &repo_id.0,
+                            "path": &created.path,
+                            "branch": &created.branch,
+                            "displayName": &created.display_name,
+                        })));
+                    }
                     self.last_error = None;
                     self.worktree_name_draft.remove(&repo_id);
+                    self.worktree_suggested_name.remove(&repo_id);
+                    if self.creating_worktree_for.as_ref() == Some(&repo_id) {
+                        self.creating_worktree_for = None;
+                    }
                     // 이 create가 소비했으니 피커 선택도 초기화(다음 worktree는 다시
                     // 로그인 셸 기본에서 시작). 성공 경로에서만 지운다 — 실패하면
                     // 사용자가 재시도할 때 고른 에이전트가 유지된다.
@@ -2641,6 +18365,8 @@ impl AppState {
                     // 초기-프롬프트 입력창도 초기화(같은 이유). 스냅샷된 값은 이미
                     // `initial_prompt`에 실려 있으므로 여기서 지워도 잃지 않는다.
                     self.worktree_prompt_draft.remove(&repo_id);
+                    self.worktree_setup_run_draft.remove(&repo_id);
+                    self.worktree_sparse_preset_draft.remove(&repo_id);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -2651,9 +18377,15 @@ impl AppState {
                     // 실행하지 않으므로 `--settings`를 넘길 argv가 없다.
                     self.inject_into_worktree(&created.path);
                     let created_id = worktree_id_for(&created.path);
+                    let should_start_agent = created_with_agent.is_some();
                     self.worktree_meta.insert(
                         created_id.clone(),
                         WorktreeMeta {
+                            display_name: created
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_string),
                             // 6c: 생성 시점에 고른 에이전트를 여기 굳힌다. `None`이면
                             // (피커를 안 건드림) 로그인 셸로 뜬다 — 예전과 동일.
                             // 세션 시작(`start_session_for`)이 이 값을 레지스트리로
@@ -2673,15 +18405,42 @@ impl AppState {
                             linked_jira_site: None,
                         },
                     );
+                    // Agent-first creation starts the requested agent after the
+                    // authoritative worktree refresh. The same queue allows a
+                    // wait-for-setup repository policy to gate that launch
+                    // without creating an extra fallback shell.
+                    if should_start_agent {
+                        self.deferred_setup_agent_starts.insert(created_id.clone());
+                    }
                     // **일회성 프롬프트를 메모리에만 담는다**(`WorktreeMeta`가 아니라).
                     // 이 worktree의 첫 세션 시작이 소비한다. 영속화되지 않으므로
                     // 재시작 후 복원된 세션은 낡은 프롬프트를 다시 주입하지 않는다.
                     if let Some(prompt) = initial_prompt {
-                        self.pending_prompts.insert(created_id, prompt);
+                        self.pending_prompts.insert(created_id.clone(), prompt);
                     }
-                    self.refresh_worktrees(repo_id)
+                    let plugin_event = self.deliver_plugin_event(
+                        "worktree.created",
+                        serde_json::json!({
+                            "worktreeId": created_id.0,
+                            "path": created.path.to_string_lossy(),
+                            "branch": created.branch
+                        }),
+                    );
+                    let setup = if run_setup {
+                        self.start_setup_session(
+                            &repo_id,
+                            worktree_id_for(&created.path),
+                            &created.path,
+                        )
+                    } else {
+                        iced::Task::none()
+                    };
+                    iced::Task::batch([self.refresh_worktrees(repo_id), setup, plugin_event])
                 }
                 Err(err) => {
+                    if let Some(rpc) = self.pending_worktree_create_rpcs.remove(&request) {
+                        rpc.respond(Err(err.clone()));
+                    }
                     self.last_error = Some(err);
                     iced::Task::none()
                 }
@@ -2692,40 +18451,94 @@ impl AppState {
                 worktree_path,
                 branch,
             } => {
+                self.worktree_actions_open = None;
+                self.worktree_remove_confirm = Some(PendingWorktreeRemoval {
+                    repo_id,
+                    worktree_id,
+                    worktree_path,
+                    branch,
+                });
+                if self.ui_settings.confirm_workspace_delete {
+                    iced::Task::none()
+                } else {
+                    self.update(Message::RemoveWorktreeConfirmed)
+                }
+            }
+            Message::RemoveWorktreeCancelled => {
+                self.worktree_remove_confirm = None;
+                iced::Task::none()
+            }
+            Message::RemoveWorktreeConfirmed => {
+                let Some(PendingWorktreeRemoval {
+                    repo_id,
+                    worktree_id,
+                    worktree_path,
+                    branch,
+                }) = self.worktree_remove_confirm.take()
+                else {
+                    return iced::Task::none();
+                };
+                if let Some(runtime) = self.ephemeral_runtime_for_worktree(&worktree_id) {
+                    return self.update(Message::EphemeralVmCleanupRequested(runtime.id.clone()));
+                }
                 let Some(repo) = self.repo_by_id(&repo_id).cloned() else {
                     return iced::Task::none();
                 };
-                if self.selected_worktree.as_ref() == Some(&worktree_id) {
-                    self.selected_worktree = None;
+                let setting = self.repo_hook_setting(&repo_id);
+                match crate::repo_hooks::effective_archive_script(&setting, &worktree_path) {
+                    Ok(Some(script)) => iced::Task::perform(
+                        crate::repo_hooks::run_archive_script(repo, worktree_path.clone(), script),
+                        move |result| Message::ArchiveScriptFinished {
+                            repo_id: repo_id.clone(),
+                            worktree_id: worktree_id.clone(),
+                            worktree_path: worktree_path.clone(),
+                            branch: branch.clone(),
+                            result,
+                        },
+                    ),
+                    Ok(None) => {
+                        self.begin_worktree_removal(repo_id, worktree_id, worktree_path, branch)
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        self.begin_worktree_removal(repo_id, worktree_id, worktree_path, branch)
+                    }
                 }
-                // 세션을 여기서 곧바로 닫으면 안 된다 — git이 삭제를 실제로
-                // 허용할지 아직 모른다. non-forced `git worktree remove`는
-                // dirty한 worktree에서 흔히 실패하고(에이전트가 파일을 바꾸는
-                // 게 이 앱의 존재 이유이니 그게 오히려 정상 상태다), 그때
-                // worktree는 살아남는다. 여기서 세션을 먼저 닫으면 삭제가
-                // 실패해도 방금 돌던(어쩌면 작업 중이던) 세션은 이미 reaper로
-                // 갔고 pane은 빈 화면으로 남는다 — `close_session`은
-                // `WorktreeRemoved`의 성공 경로로 미룬다. 아래
-                // `pending_worktree_removals` 가드가 그 사이 새 세션이 끼어드는
-                // 걸 막아주므로 순서를 미뤄도 안전하다.
-                self.pending_worktree_removals.insert(worktree_id.clone());
-                let op = self.next_op();
-                crate::git_tasks::remove_worktree(
-                    op,
-                    repo,
-                    worktree_id,
-                    worktree_path,
-                    false,
-                    branch,
-                )
+            }
+            Message::ArchiveScriptFinished {
+                repo_id,
+                worktree_id,
+                worktree_path,
+                branch,
+                result,
+            } => {
+                if !result.success {
+                    self.last_error = Some(format!(
+                        "Archive hook failed; continuing removal like Orca: {}",
+                        result.output
+                    ));
+                }
+                self.begin_worktree_removal(repo_id, worktree_id, worktree_path, branch)
             }
             Message::WorktreeRemoved {
+                request,
                 repo_id,
                 worktree_id,
                 result,
-                ..
             } => {
+                if let Some(rpc) = self.pending_worktree_remove_rpcs.remove(&request) {
+                    match &result {
+                        Ok(outcome) => rpc.respond(Ok(serde_json::json!({
+                            "removed": &worktree_id.0,
+                            "branchDeletion": format!("{:?}", outcome.branch_deletion),
+                        }))),
+                        Err(error) => rpc.respond(Err(error.clone())),
+                    }
+                }
                 self.pending_worktree_removals.remove(&worktree_id);
+                let removed_path = self
+                    .find_worktree(&worktree_id)
+                    .map(|(_, entry)| entry.path);
                 match result {
                     Ok(outcome) => {
                         // worktree 체크아웃 자체는 지워졌지만 브랜치 삭제가
@@ -2746,12 +18559,26 @@ impl AppState {
                         if let Some(&session_id) = self.worktree_sessions.get(&worktree_id) {
                             self.close_session(session_id);
                         }
+                        if let Some(setup_id) =
+                            self.worktree_setup_sessions.get(&worktree_id).copied()
+                        {
+                            self.close_session(setup_id);
+                        }
                         // 재조회 응답을 기다리지 않고 곧바로 지운다 — 그 사이
                         // 도착하는 `worktree_still_exists` 판단이 새 목록이
                         // 반영되기 전 낡은 목록으로 "아직 있다"고 답하지 않게 한다.
                         self.remove_worktree_entry(&repo_id, &worktree_id);
                         self.persist();
-                        self.refresh_worktrees(repo_id)
+                        let plugin_event = removed_path.map_or_else(iced::Task::none, |path| {
+                            self.deliver_plugin_event(
+                                "worktree.removed",
+                                serde_json::json!({
+                                    "worktreeId": worktree_id.0,
+                                    "path": path.to_string_lossy()
+                                }),
+                            )
+                        });
+                        iced::Task::batch([self.refresh_worktrees(repo_id), plugin_event])
                     }
                     Err(err) => {
                         self.last_error = Some(err);
@@ -2760,21 +18587,65 @@ impl AppState {
                 }
             }
             Message::WorktreeSelected(id) => {
+                self.automation_ui.close();
+                self.mobile_open = false;
+                self.activity_open = false;
+                if !self.navigation_replay
+                    && self
+                        .selected_worktree
+                        .as_ref()
+                        .is_some_and(|current| current != &id)
+                {
+                    if let Some(current) = self.selected_worktree.clone() {
+                        self.navigation_back.push(current);
+                    }
+                    self.navigation_forward.clear();
+                }
                 self.selected_worktree = Some(id.clone());
+                if let Some(session) = self.worktree_sessions.get(&id) {
+                    self.terminal_attention_sessions.remove(session);
+                }
+                self.tasks_open = false;
                 self.persist();
+                if let Some(runtime) = self.ephemeral_runtime_for_worktree(&id) {
+                    if matches!(
+                        runtime.status,
+                        crate::ephemeral_vm::RuntimeStatus::Suspended
+                            | crate::ephemeral_vm::RuntimeStatus::ResumeFailed
+                    ) {
+                        return self
+                            .update(Message::EphemeralVmResumeRequested(runtime.id.clone()));
+                    }
+                }
                 // **worktree가 활성화되면 PR 상태를 1회 조회한다**(§3.7). 세션이 이미
                 // 열려 있든 새로 뜨든 활성화는 선택이다 — 그래서 세션 태스크와 별개로
                 // 여기서 발급하고 batch한다. `force=false`라 캐시가 있으면 건너뛴다
                 // (재조회는 명시적 새로고침의 몫, `PresenceTick`이 아니다).
                 let status_task = self.request_github_status(id.clone(), false);
                 // 세션 쪽 태스크. 조기 return을 없애 status_task와 항상 함께 실린다.
-                let session_task = if let Some(&session_id) = self.worktree_sessions.get(&id) {
+                let session_task = if self.sleeping_agent_sessions.contains_key(&id) {
+                    if self.pending_session_starts.contains_key(&id)
+                        || self.waking_agent_sessions.contains(&id)
+                    {
+                        iced::Task::none()
+                    } else {
+                        self.start_session_for(&id)
+                            .map_or_else(iced::Task::none, |(_, task)| task)
+                    }
+                } else if let Some(&session_id) = self.worktree_sessions.get(&id) {
                     // 이미 열려 있다 — 새 세션을 띄우지 않고 그 pane에 포커스만
                     // 옮긴다. pane_grid는 pane → 값 매핑만 들고 있으므로 여기서
                     // 직접 훑어야 한다(양방향 인덱스가 없다).
-                    if let Some(panes) = &self.panes {
-                        if let Some((pane, _)) = panes.iter().find(|(_, sid)| **sid == session_id) {
-                            self.focused_pane = Some(*pane);
+                    let pane = self.panes.as_ref().and_then(|panes| {
+                        panes
+                            .iter()
+                            .find(|(_, sid)| **sid == session_id)
+                            .map(|(pane, _)| *pane)
+                    });
+                    if let Some(pane) = pane {
+                        self.focused_pane = Some(pane);
+                        if let Some(panes) = &mut self.panes {
+                            panes.maximize(pane);
                         }
                     }
                     iced::Task::none()
@@ -2789,8 +18660,1525 @@ impl AppState {
                         None => iced::Task::none(),
                     }
                 };
-                iced::Task::batch([status_task, session_task])
+                let explorer_task = self.ensure_file_explorer(id);
+                iced::Task::batch([status_task, session_task, explorer_task])
             }
+            Message::FileExplorerToggled { worktree } => self.open_file_explorer(worktree),
+            Message::FileExplorerClosed => {
+                self.file_explorer.close();
+                iced::Task::none()
+            }
+            Message::FileExplorerRefreshRequested { worktree } => {
+                self.refresh_file_explorer(worktree)
+            }
+            Message::FileExplorerWatchTick => iced::Task::batch([
+                self.refresh_file_explorer_preserving(),
+                self.watch_editor_file(),
+            ]),
+            Message::FileExplorerFilterChanged(query) => {
+                self.file_explorer.set_filter_query(query);
+                iced::Task::none()
+            }
+            Message::FileExplorerCollapseAll => {
+                self.file_explorer.collapse_all();
+                iced::Task::none()
+            }
+            Message::FileExplorerDirectoryToggled { path } => {
+                self.toggle_file_explorer_directory(path)
+            }
+            Message::FileExplorerDirectoryLoaded {
+                worktree,
+                path,
+                op,
+                result,
+            } => {
+                self.file_explorer
+                    .accept_directory(&worktree, &path, op, result);
+                iced::Task::none()
+            }
+            Message::FileExplorerStatusLoaded {
+                worktree,
+                op,
+                result,
+            } => {
+                self.file_explorer.accept_status(&worktree, op, result);
+                iced::Task::none()
+            }
+            Message::EditorFileRequested { worktree, path } => {
+                self.open_editor_file(worktree, path)
+            }
+            Message::EditorFileLoaded {
+                worktree,
+                path,
+                op,
+                result,
+            } => {
+                self.editor.accept_load(&worktree, &path, op, result);
+                self.editor
+                    .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                iced::Task::none()
+            }
+            Message::EditorExternalSignatureChecked {
+                worktree,
+                path,
+                expected,
+                result,
+            } => {
+                if !self.editor.is_clean_version(&worktree, &path, &expected) {
+                    return iced::Task::none();
+                }
+                match result {
+                    Ok(current) if current == expected => iced::Task::none(),
+                    Ok(_) | Err(_) => self.load_editor_document(worktree, path),
+                }
+            }
+            Message::EditorAction(action) => {
+                let is_edit = action.is_edit();
+                self.editor.perform(action);
+                if is_edit {
+                    self.editor
+                        .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                }
+                if is_edit && self.ui_settings.auto_save_files {
+                    self.schedule_editor_auto_save()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EditorFindOpened(replace) => {
+                self.editor.open_find(replace);
+                iced::widget::operation::focus(crate::editor::find_input_id())
+            }
+            Message::EditorFindQueryChanged(query) => {
+                self.editor.set_find_query(query);
+                iced::Task::none()
+            }
+            Message::EditorReplacementChanged(replacement) => {
+                self.editor.set_replacement(replacement);
+                iced::Task::none()
+            }
+            Message::EditorFindNext(backwards) => {
+                self.editor.find_next(backwards);
+                iced::Task::none()
+            }
+            Message::EditorReplaceCurrent => {
+                let changed = self.editor.replace_current();
+                if changed {
+                    self.editor
+                        .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                }
+                if changed && self.ui_settings.auto_save_files {
+                    self.schedule_editor_auto_save()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EditorReplaceAll => {
+                let changed = self.editor.replace_all() > 0;
+                if changed {
+                    self.editor
+                        .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                }
+                if changed && self.ui_settings.auto_save_files {
+                    self.schedule_editor_auto_save()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EditorFindClosed => {
+                self.editor.close_find();
+                iced::Task::none()
+            }
+            Message::EditorMarkdownPreviewToggled => {
+                self.editor.toggle_markdown_preview();
+                iced::Task::none()
+            }
+            Message::EditorMarkdownLinkClicked(url) => self.route_web_url(&url),
+            Message::EditorAutoSave(generation) => {
+                if generation == self.editor_auto_save_generation
+                    && self.ui_settings.auto_save_files
+                    && self.editor.has_unsaved_changes()
+                {
+                    self.save_editor_file()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EditorSaveRequested => self.save_editor_file(),
+            Message::EditorFileSaved {
+                worktree,
+                path,
+                op,
+                result,
+            } => {
+                let accepted = self.editor.accept_save(&worktree, &path, op, result);
+                if accepted && self.ui_settings.auto_save_files && self.editor.has_unsaved_changes()
+                {
+                    self.schedule_editor_auto_save()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::EditorTabSelected { worktree, path } => {
+                self.editor.activate(&worktree, &path);
+                self.editor
+                    .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                iced::Task::none()
+            }
+            Message::EditorTabCloseRequested { worktree, path } => {
+                if self.editor.activate(&worktree, &path) {
+                    let closed = self.editor.request_close();
+                    if closed && worktree.0 == "__suaegi_floating_workspace__" {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::FileOpenChangedLoaded {
+                request,
+                worktree,
+                mode,
+                result,
+            } => {
+                let entries = match result {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        request.respond(Err(error));
+                        return iced::Task::none();
+                    }
+                };
+                let total_changed = entries.len();
+                let mut opened = Vec::new();
+                let mut skipped = Vec::new();
+                let mut tasks = Vec::new();
+                let opens_edit = matches!(mode.as_str(), "edit" | "both");
+                let opens_diff = matches!(mode.as_str(), "diff" | "both");
+
+                for entry in &entries {
+                    if opens_edit {
+                        let reason = match &entry.status {
+                            suaegi_git::status::FileStatus::Deleted => {
+                                Some("deleted file has no edit target")
+                            }
+                            suaegi_git::status::FileStatus::Conflicted(_) => {
+                                Some("unresolved conflict may not have a single editable file")
+                            }
+                            _ => None,
+                        };
+                        if let Some(reason) = reason {
+                            skipped.push(serde_json::json!({
+                                "path": entry.path,
+                                "mode": "edit",
+                                "opened": false,
+                                "skipped": true,
+                                "reason": reason,
+                            }));
+                        } else {
+                            tasks.push(self.open_editor_file(worktree.clone(), entry.path.clone()));
+                            opened.push(serde_json::json!({
+                                "path": entry.path,
+                                "mode": "edit",
+                                "opened": true,
+                                "kind": "text",
+                            }));
+                        }
+                    }
+                    if opens_diff {
+                        if matches!(&entry.status, suaegi_git::status::FileStatus::Conflicted(_)) {
+                            skipped.push(serde_json::json!({
+                                "path": entry.path,
+                                "mode": "diff",
+                                "opened": false,
+                                "skipped": true,
+                                "reason": "unresolved conflict may not have a single diff target",
+                            }));
+                            continue;
+                        }
+                        for staged in [true, false] {
+                            if (staged && !entry.staged) || (!staged && !entry.unstaged) {
+                                continue;
+                            }
+                            opened.push(serde_json::json!({
+                                "path": entry.path,
+                                "mode": "diff",
+                                "staged": staged,
+                                "opened": true,
+                                "kind": "diff",
+                            }));
+                        }
+                    }
+                }
+                if opens_diff && !entries.is_empty() {
+                    // Suaegi's native combined-diff surface exposes every
+                    // changed path in one file tree; refresh it even when it
+                    // was already showing this worktree.
+                    self.diff.close();
+                    tasks.push(self.request_diff(worktree.clone()));
+                }
+                request.respond(Ok(serde_json::json!({
+                    "worktree": worktree.0,
+                    "mode": mode,
+                    "opened": opened,
+                    "skipped": skipped,
+                    "totalChanged": total_changed,
+                })));
+                iced::Task::batch(tasks)
+            }
+            Message::EditorCloseRequested => {
+                let floating = self.floating_workspace_owns_editor();
+                if self.editor.request_close() && floating {
+                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                }
+                iced::Task::none()
+            }
+            Message::EditorCloseCancelled => {
+                self.editor.cancel_close();
+                iced::Task::none()
+            }
+            Message::EditorDiscardConfirmed => {
+                let floating = self.floating_workspace_owns_editor();
+                self.editor.discard_and_close();
+                if floating {
+                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                }
+                iced::Task::none()
+            }
+            Message::QuickOpenRequested { worktree } => self.open_quick_open(worktree),
+            Message::WorkspaceSearchRequested => {
+                let mut items = Vec::new();
+                for repo in &self.repos {
+                    if let Some(entries) = self.worktrees_by_repo.get(&repo.id) {
+                        for entry in entries {
+                            let id = worktree_id_for(&entry.path);
+                            if self.selected_worktree.as_ref() == Some(&id) {
+                                continue;
+                            }
+                            let title = entry
+                                .branch
+                                .clone()
+                                .unwrap_or_else(|| "(detached)".to_string());
+                            let kind = if entry.is_main { "primary" } else { "worktree" };
+                            items.push(crate::quick_open::WorkspaceItem {
+                                id,
+                                title,
+                                subtitle: format!("{} · {kind}", repo.display_name),
+                            });
+                        }
+                    }
+                }
+                self.quick_open.begin_workspaces(items);
+                iced::widget::operation::focus(crate::quick_open::input_id())
+            }
+            Message::WorkspaceSearchSelected(worktree) => {
+                self.quick_open.close();
+                self.update(Message::WorktreeSelected(worktree))
+            }
+            Message::QuickOpenShortcutPressed => {
+                if self.quick_open.is_open() {
+                    self.quick_open.close();
+                    iced::Task::none()
+                } else if let Some(worktree) = self.selected_worktree.clone() {
+                    self.open_quick_open(worktree)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::QuickOpenLoaded {
+                worktree,
+                op,
+                result,
+            } => {
+                if self.quick_open.accept(&worktree, op, result) {
+                    iced::widget::operation::focus(crate::quick_open::input_id())
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::QuickOpenQueryChanged(query) => {
+                self.quick_open.set_query(query);
+                iced::Task::none()
+            }
+            Message::QuickOpenSelectionMoved(offset) => {
+                self.quick_open.move_selection(offset);
+                iced::Task::none()
+            }
+            Message::QuickOpenSelected => {
+                if let Some(worktree) = self.quick_open.selected_workspace() {
+                    self.quick_open.close();
+                    self.update(Message::WorktreeSelected(worktree))
+                } else {
+                    self.open_selected_quick_open_file()
+                }
+            }
+            Message::QuickOpenPathSelected(path) => {
+                let Some(worktree) = self.quick_open.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                self.quick_open.close();
+                self.open_editor_file(worktree, path)
+            }
+            Message::QuickOpenClosed => {
+                self.quick_open.close();
+                iced::Task::none()
+            }
+            Message::ContentSearchRequested { worktree } => self.open_content_search(worktree),
+            Message::ContentSearchQueryChanged(query) => {
+                self.content_search.set_query(query);
+                iced::Task::none()
+            }
+            Message::ContentSearchCaseToggled(value) => {
+                self.content_search.set_case_sensitive(value);
+                iced::Task::none()
+            }
+            Message::ContentSearchWordToggled(value) => {
+                self.content_search.set_whole_word(value);
+                iced::Task::none()
+            }
+            Message::ContentSearchRegexToggled(value) => {
+                self.content_search.set_use_regex(value);
+                iced::Task::none()
+            }
+            Message::ContentSearchSubmitted => self.run_content_search(),
+            Message::ContentSearchFinished {
+                worktree,
+                op,
+                result,
+            } => {
+                self.content_search.accept(&worktree, op, result);
+                iced::Task::none()
+            }
+            Message::ContentSearchPathSelected(path) => {
+                let Some(worktree) = self.content_search.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                self.open_editor_file(worktree, path)
+            }
+            Message::ContentSearchClosed => {
+                self.content_search.close();
+                iced::Task::none()
+            }
+            Message::ActivityOpened => {
+                if !self.ui_settings.experimental_activity {
+                    return iced::Task::none();
+                }
+                self.close_context_panels();
+                self.mobile_open = false;
+                self.tasks_open = false;
+                self.activity_open = true;
+                iced::Task::none()
+            }
+            Message::ActivityClosed => {
+                self.activity_open = false;
+                iced::Task::none()
+            }
+            Message::ActivityCleared => {
+                self.activity_events.clear();
+                iced::Task::none()
+            }
+            Message::NativeChatToggled(session) => {
+                if !self.ui_settings.experimental_native_chat
+                    || self.session_store.session(session).is_none()
+                {
+                    return iced::Task::none();
+                }
+                if !self.native_chat_sessions.remove(&session) {
+                    self.native_chat_sessions.insert(session);
+                }
+                iced::Task::none()
+            }
+            Message::NativeChatDraftChanged(session, value) => {
+                if self.native_chat_open(session) {
+                    self.native_chat_drafts
+                        .insert(session, value.chars().take(16_384).collect());
+                }
+                iced::Task::none()
+            }
+            Message::NativeChatSubmitted(session) => {
+                let Some(prompt) = self
+                    .native_chat_drafts
+                    .remove(&session)
+                    .filter(|prompt| !prompt.trim().is_empty())
+                else {
+                    return iced::Task::none();
+                };
+                let paste = self.dispatch_term_command(session, TermCommand::Paste(prompt));
+                use suaegi_term::input_types::{KeyInput, KeyLocation, Mods, NamedKey, TermKey};
+                let enter = self.dispatch_term_command(
+                    session,
+                    TermCommand::Key(KeyInput {
+                        key: TermKey::Named(NamedKey::Enter),
+                        physical_latin: None,
+                        location: KeyLocation::Standard,
+                        mods: Mods::default(),
+                        text: None,
+                        repeat: false,
+                    }),
+                );
+                iced::Task::batch([paste, enter])
+            }
+            Message::TasksOpened => {
+                self.close_context_panels();
+                self.mobile_open = false;
+                self.activity_open = false;
+                self.tasks_open = true;
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TasksClosed => {
+                self.tasks_open = false;
+                self.selected_worktree
+                    .clone()
+                    .map_or_else(iced::Task::none, |worktree| {
+                        self.ensure_file_explorer(worktree)
+                    })
+            }
+            Message::TaskKindSelected(kind) => {
+                self.task_kind = kind;
+                self.task_preset = match kind {
+                    TaskKind::Issues | TaskKind::PullRequests => TaskPreset::Open,
+                    TaskKind::Projects => TaskPreset::Open,
+                };
+                self.task_query =
+                    if kind == TaskKind::Projects || self.task_provider != TaskProvider::Github {
+                        String::new()
+                    } else {
+                        self.task_preset.query(kind).to_string()
+                    };
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskPresetSelected(preset) => {
+                self.task_preset = preset;
+                self.task_query = if self.task_provider == TaskProvider::Github {
+                    preset.query(self.task_kind).to_string()
+                } else {
+                    String::new()
+                };
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskProviderSelected(provider) => {
+                self.task_provider = provider;
+                self.task_kind = TaskKind::Issues;
+                self.task_preset = TaskPreset::Open;
+                self.task_query = if provider == TaskProvider::Github {
+                    "is:issue is:open".to_string()
+                } else {
+                    String::new()
+                };
+                match provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskRepoSelectionToggled(repo_id) => {
+                if !self.repos.iter().any(|repo| repo.id == repo_id) {
+                    return iced::Task::none();
+                }
+                if self.task_repo_selection_is_all() {
+                    if self.repos.len() > 1 {
+                        self.task_repo_selection.remove(&repo_id);
+                    }
+                } else if self.task_repo_selection.contains(&repo_id) {
+                    if self.task_repo_selection.len() > 1 {
+                        self.task_repo_selection.remove(&repo_id);
+                    }
+                } else {
+                    self.task_repo_selection.insert(repo_id);
+                }
+                self.ui_settings.default_repo_selection = Some(
+                    self.repos
+                        .iter()
+                        .filter(|repo| self.task_repo_selection.contains(&repo.id))
+                        .map(|repo| repo.id.0.clone())
+                        .collect(),
+                );
+                self.persist();
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskRepoSelectionAll => {
+                self.task_repo_selection = self.repos.iter().map(|repo| repo.id.clone()).collect();
+                self.ui_settings.default_repo_selection = None;
+                self.persist();
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskQueryChanged(query) => {
+                self.task_query = query;
+                iced::Task::none()
+            }
+            Message::TaskQueryCleared => {
+                self.task_query.clear();
+                match self.task_provider {
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Jira => self.request_jira_issues(),
+                    TaskProvider::Linear => self.request_linear_issues(),
+                }
+            }
+            Message::TaskCreateRequested => {
+                match self.task_provider {
+                    TaskProvider::Github => {
+                        let Some(repo) = self
+                            .repos
+                            .iter()
+                            .find(|repo| self.task_repo_selection.contains(&repo.id))
+                        else {
+                            return iced::Task::none();
+                        };
+                        let args: &[&str] = match self.task_kind {
+                            TaskKind::Issues => &["issue", "create", "--web"],
+                            TaskKind::PullRequests => &["pr", "create", "--web"],
+                            TaskKind::Projects => &["project", "list", "--web"],
+                        };
+                        let _ = std::process::Command::new("gh")
+                            .current_dir(&repo.path)
+                            .args(args)
+                            .spawn();
+                    }
+                    TaskProvider::Gitlab => {
+                        if self.task_kind == TaskKind::Projects {
+                            return self.route_web_url("https://gitlab.com/dashboard/todos");
+                        }
+                        let repo_path = self
+                            .selected_worktree
+                            .as_ref()
+                            .and_then(|worktree| self.find_worktree(worktree))
+                            .map(|(_, entry)| entry.path)
+                            .or_else(|| {
+                                self.repos
+                                    .iter()
+                                    .find(|repo| self.task_repo_selection.contains(&repo.id))
+                                    .map(|repo| repo.path.clone())
+                            });
+                        let Some(repo_path) = repo_path else {
+                            return iced::Task::none();
+                        };
+                        let args: &[&str] = match self.task_kind {
+                            TaskKind::Issues => &["issue", "create", "--web"],
+                            TaskKind::PullRequests => &["mr", "create", "--web"],
+                            TaskKind::Projects => unreachable!("handled above"),
+                        };
+                        let _ = std::process::Command::new("glab")
+                            .current_dir(repo_path)
+                            .args(args)
+                            .spawn();
+                    }
+                    TaskProvider::Jira => {
+                        if let Some(connection) = &self.jira.connection {
+                            return self.route_web_url(&format!(
+                                "{}/secure/CreateIssue!default.jspa",
+                                connection.site_url.trim_end_matches('/')
+                            ));
+                        } else {
+                            self.last_error =
+                                Some("Connect Jira in Settings before creating an issue.".into());
+                        }
+                    }
+                    TaskProvider::Linear => {
+                        if let Some(workspace) = &self.linear.workspace {
+                            return self.route_web_url(&format!(
+                                "https://linear.app/{}/new",
+                                workspace.url_key
+                            ));
+                        } else {
+                            self.last_error =
+                                Some("Connect Linear in Settings before creating an issue.".into());
+                        }
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::TaskProjectsOpenRequested => {
+                if self.task_provider == TaskProvider::Gitlab {
+                    return self.route_web_url("https://gitlab.com/dashboard/todos");
+                }
+                let _ = std::process::Command::new("gh")
+                    .args(["project", "list", "--web"])
+                    .spawn();
+                iced::Task::none()
+            }
+            Message::TaskRefreshRequested => match self.task_provider {
+                TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                TaskProvider::Jira => self.request_jira_issues(),
+                TaskProvider::Linear => self.request_linear_issues(),
+            },
+            Message::TaskItemsLoaded {
+                op,
+                repo_id,
+                kind,
+                result,
+            } => {
+                if self.task_items_op == Some(op) && self.task_kind == kind {
+                    self.task_items_pending.remove(&repo_id);
+                    match result {
+                        Ok(items) => {
+                            self.task_items_by_repo.insert(repo_id.clone(), items);
+                            self.task_item_errors.remove(&repo_id);
+                        }
+                        Err(error) => {
+                            self.task_items_by_repo.remove(&repo_id);
+                            self.task_item_errors.insert(repo_id, error);
+                        }
+                    }
+                    if self.task_items_pending.is_empty() {
+                        self.finish_task_item_batch();
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::TaskItemOpen(url) => self.route_web_url(&url),
+            Message::SourceControlToggled { worktree } => self.open_source_control(worktree),
+            Message::SourceControlClosed => {
+                self.source_control.close();
+                iced::Task::none()
+            }
+            Message::SourceControlFilterChanged(filter) => {
+                self.source_control.set_filter(filter);
+                iced::Task::none()
+            }
+            Message::SourceControlRefreshRequested => self.refresh_source_control(),
+            Message::SourceControlStatusLoaded {
+                worktree,
+                op,
+                result,
+            } => {
+                self.source_control.accept_status(&worktree, op, result);
+                iced::Task::none()
+            }
+            Message::SourceControlStageRequested(path) => {
+                self.run_source_control_operation(SourceControlOperation::Stage(path))
+            }
+            Message::SourceControlUnstageRequested(path) => {
+                self.run_source_control_operation(SourceControlOperation::Unstage(path))
+            }
+            Message::SourceControlDiscardRequested(path) => {
+                self.source_control.request_discard(path);
+                iced::Task::none()
+            }
+            Message::SourceControlDiscardCancelled => {
+                self.source_control.cancel_discard();
+                iced::Task::none()
+            }
+            Message::SourceControlDiscardConfirmed => {
+                let Some(path) = self.source_control.take_confirmed_discard() else {
+                    return iced::Task::none();
+                };
+                self.run_source_control_operation(SourceControlOperation::Discard(path))
+            }
+            Message::SourceControlCommitMessageChanged(message) => {
+                self.source_control.set_commit_message(message);
+                iced::Task::none()
+            }
+            Message::SourceControlAiCommitMessageRequested => {
+                let Some(worktree) = self.source_control.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                let Some((repo, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let request = self.source_control_ai_request(
+                    &repo,
+                    crate::source_control_ai::TextOperation::CommitMessage,
+                );
+                let op = self.next_op();
+                if !self.source_control.begin_generation(op) {
+                    return iced::Task::none();
+                }
+                iced::Task::perform(
+                    async move {
+                        crate::source_control_ai::generate_commit_message(&entry.path, request)
+                            .await
+                    },
+                    move |result| Message::SourceControlAiCommitMessageGenerated {
+                        worktree,
+                        op,
+                        result,
+                    },
+                )
+            }
+            Message::SourceControlAiCommitMessageGenerated {
+                worktree,
+                op,
+                result,
+            } => {
+                if self.source_control.worktree() == Some(&worktree) {
+                    self.source_control.finish_generation(op, result);
+                }
+                iced::Task::none()
+            }
+            Message::SourceControlAiLaunchActionRequested(action_id) => {
+                let Some(worktree) = self.source_control.worktree().cloned() else {
+                    return iced::Task::none();
+                };
+                let detail = match self.source_control.launch_action() {
+                    Some((expected_action, detail)) if expected_action == action_id => {
+                        detail.to_string()
+                    }
+                    _ if action_id == "resolveConflicts" && self.source_control.has_conflicts() => {
+                        "The working tree contains unresolved merge conflicts.".to_string()
+                    }
+                    _ => return iced::Task::none(),
+                };
+                let Some((repo_id, _entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let prompt = crate::source_control_ai::render_launch_action_prompt(
+                    &self.ui_settings.source_control_ai,
+                    self.ui_settings.repo_source_control_ai.get(&repo_id.0),
+                    &action_id,
+                    &detail,
+                );
+                match prompt {
+                    Ok(prompt) => self.dispatch_source_control_prompt(worktree, prompt),
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::HostedReviewAiActionRequested {
+                worktree,
+                action,
+                detail,
+            } => {
+                let Some((repo_id, _entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                match crate::source_control_ai::render_launch_action_prompt(
+                    &self.ui_settings.source_control_ai,
+                    self.ui_settings.repo_source_control_ai.get(&repo_id.0),
+                    &action,
+                    &detail,
+                ) {
+                    Ok(prompt) => self.dispatch_source_control_prompt(worktree, prompt),
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        iced::Task::none()
+                    }
+                }
+            }
+            Message::SourceControlCommitRequested => {
+                let mut message = self.source_control.commit_message().trim().to_string();
+                if message.is_empty() {
+                    iced::Task::none()
+                } else {
+                    if self.ui_settings.enable_github_attribution
+                        && !message.contains("Co-authored-by: Orca <help@stably.ai>")
+                    {
+                        message.push_str("\n\nCo-authored-by: Orca <help@stably.ai>");
+                    }
+                    self.run_source_control_operation(SourceControlOperation::Commit(message))
+                }
+            }
+            Message::SourceControlFetchRequested => {
+                self.run_source_control_operation(SourceControlOperation::Fetch)
+            }
+            Message::SourceControlPullRequested => {
+                self.run_source_control_operation(SourceControlOperation::Pull)
+            }
+            Message::SourceControlPushRequested => {
+                let branch = self
+                    .source_control
+                    .worktree()
+                    .and_then(|worktree| self.find_worktree(worktree))
+                    .and_then(|(_repo, entry)| entry.branch)
+                    .unwrap_or_default();
+                if branch.is_empty() {
+                    iced::Task::none()
+                } else {
+                    self.run_source_control_operation(SourceControlOperation::Push { branch })
+                }
+            }
+            Message::SourceControlOperationFinished {
+                worktree,
+                op,
+                operation,
+                result,
+            } => {
+                if self
+                    .source_control
+                    .accept_operation(&worktree, op, &operation, result)
+                {
+                    self.refresh_source_control()
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::AutomationOpened => {
+                self.close_context_panels();
+                self.mobile_open = false;
+                self.activity_open = false;
+                self.tasks_open = false;
+                self.automation_ui.open(self.selected_worktree.clone());
+                iced::Task::none()
+            }
+            Message::WindowClose => iced::window::latest()
+                .then(|id| id.map_or_else(iced::Task::none, iced::window::close)),
+            Message::WindowMinimize => iced::window::latest()
+                .then(|id| id.map_or_else(iced::Task::none, |id| iced::window::minimize(id, true))),
+            Message::WindowMaximize => iced::window::latest()
+                .then(|id| id.map_or_else(iced::Task::none, iced::window::toggle_maximize)),
+            Message::WindowDrag => iced::window::latest()
+                .then(|id| id.map_or_else(iced::Task::none, iced::window::drag)),
+            Message::WindowOpened(id) => {
+                #[cfg(not(test))]
+                {
+                    if let Err(error) = crate::appearance::set_background_blur(
+                        self.ui_settings.window_background_blur,
+                    ) {
+                        self.last_error = Some(error);
+                    }
+                    if let Err(error) =
+                        crate::appearance::set_menu_bar_item(self.ui_settings.show_menu_bar_icon)
+                    {
+                        self.last_error = Some(error);
+                    }
+                    if let Err(error) = crate::appearance::set_app_icon(&self.ui_settings.app_icon)
+                    {
+                        self.last_error = Some(error);
+                    }
+                }
+                iced::window::gain_focus(id)
+            }
+            Message::AppWindowFocusChanged(focused) => {
+                self.app_window_focused = focused;
+                iced::Task::none()
+            }
+            Message::AppWindowResized(size) => {
+                self.app_window_size = size;
+                if self.browser_open {
+                    let (left, top, width, height) = self.browser_bounds();
+                    self.browser_error = crate::browser::resize(left, top, width, height).err();
+                }
+                if self.active_plugin_panel.is_some() && self.right_sidebar_open {
+                    self.plugin_panel_error =
+                        crate::plugin_panel::resize(self.plugin_panel_bounds()).err();
+                }
+                iced::Task::none()
+            }
+            Message::BrowserOpenRequested => {
+                if self.floating_workspace_owns_browser() && !self.floating_workspace_open {
+                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                }
+                let home = self.ui_settings.browser_home_page.clone();
+                let initial = if self.browser_current_url.is_empty() {
+                    self.normalized_browser_url(&home)
+                        .unwrap_or_else(|| suaegi_browser_url::ORCA_BROWSER_BLANK_URL.to_string())
+                } else {
+                    self.browser_current_url.clone()
+                };
+                if self
+                    .active_browser_tab_id
+                    .as_ref()
+                    .is_none_or(|active| !self.browser_tabs.iter().any(|tab| &tab.id == active))
+                {
+                    let id = self.create_browser_tab(
+                        initial.clone(),
+                        self.ui_settings.browser_default_profile_id.clone(),
+                    );
+                    self.active_browser_tab_id = Some(id);
+                }
+                let profile_id = self
+                    .active_browser_tab_id
+                    .as_ref()
+                    .and_then(|id| self.browser_tabs.iter().find(|tab| &tab.id == id))
+                    .map(|tab| tab.profile_id.clone())
+                    .unwrap_or_else(|| self.ui_settings.browser_default_profile_id.clone());
+                self.close_context_panels();
+                self.mobile_open = false;
+                self.tasks_open = false;
+                self.browser_open = true;
+                self.browser_current_url = initial.clone();
+                self.browser_address_draft =
+                    if initial == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                        String::new()
+                    } else {
+                        initial.clone()
+                    };
+                let (left, top, width, height) = self.browser_bounds();
+                self.browser_error = crate::browser::ensure(
+                    self.active_browser_tab_id
+                        .as_deref()
+                        .expect("browser tab is created before its native view"),
+                    Self::webview_url(&initial),
+                    &profile_id,
+                    crate::browser::BrowserBounds {
+                        left,
+                        top,
+                        width,
+                        height,
+                    },
+                    self.ui_settings.browser_default_zoom_percent as f64 / 100.0,
+                )
+                .err();
+                iced::Task::none()
+            }
+            Message::BrowserClosed => {
+                self.browser_open = false;
+                crate::browser::set_visible(false);
+                if self.floating_workspace_owns_browser() {
+                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    return iced::Task::none();
+                }
+                self.selected_worktree
+                    .clone()
+                    .map_or_else(iced::Task::none, |worktree| {
+                        self.ensure_file_explorer(worktree)
+                    })
+            }
+            Message::BrowserTabCreated => {
+                self.remember_active_browser_tab();
+                let home = self
+                    .normalized_browser_url(&self.ui_settings.browser_home_page.clone())
+                    .unwrap_or_else(|| suaegi_browser_url::ORCA_BROWSER_BLANK_URL.to_string());
+                let id = self.create_browser_tab(
+                    home.clone(),
+                    self.ui_settings.browser_default_profile_id.clone(),
+                );
+                self.active_browser_tab_id = Some(id);
+                self.browser_current_url = home.clone();
+                self.browser_address_draft = if home == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                    String::new()
+                } else {
+                    home
+                };
+                self.persist();
+                self.update(Message::BrowserOpenRequested)
+            }
+            Message::BrowserTabSelected(id) => {
+                if let Err(error) = self.activate_browser_tab(&id) {
+                    self.browser_error = Some(error);
+                    return iced::Task::none();
+                }
+                self.persist();
+                self.update(Message::BrowserOpenRequested)
+            }
+            Message::BrowserTabClosed(id) => {
+                self.remember_active_browser_tab();
+                let Some(index) = self.browser_tabs.iter().position(|tab| tab.id == id) else {
+                    return iced::Task::none();
+                };
+                let was_active = self.active_browser_tab_id.as_deref() == Some(id.as_str());
+                self.browser_tabs.remove(index);
+                crate::browser::remove_tab(&id);
+                if !was_active {
+                    self.persist();
+                    return iced::Task::none();
+                }
+                let next = index.min(self.browser_tabs.len().saturating_sub(1));
+                if let Some(tab) = self.browser_tabs.get(next).cloned() {
+                    self.active_browser_tab_id = Some(tab.id);
+                    self.browser_current_url = tab.url;
+                    self.browser_address_draft =
+                        if self.browser_current_url == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                            String::new()
+                        } else {
+                            self.browser_current_url.clone()
+                        };
+                    self.persist();
+                    self.update(Message::BrowserOpenRequested)
+                } else {
+                    self.active_browser_tab_id = None;
+                    self.persist();
+                    self.update(Message::BrowserClosed)
+                }
+            }
+            Message::BrowserAddressChanged(value) => {
+                self.browser_address_draft = value;
+                self.browser_error = None;
+                iced::Task::none()
+            }
+            Message::BrowserNavigateRequested => {
+                let raw = self.browser_address_draft.clone();
+                self.open_browser_url(&raw);
+                iced::Task::none()
+            }
+            Message::BrowserBack => {
+                self.browser_error = crate::browser::back().err();
+                iced::Task::none()
+            }
+            Message::BrowserForward => {
+                self.browser_error = crate::browser::forward().err();
+                iced::Task::none()
+            }
+            Message::BrowserReload => {
+                self.browser_error = crate::browser::reload().err();
+                iced::Task::none()
+            }
+            Message::BrowserZoomReset => {
+                self.browser_error = crate::browser::set_zoom(
+                    self.ui_settings.browser_default_zoom_percent as f64 / 100.0,
+                )
+                .err();
+                iced::Task::none()
+            }
+            Message::BrowserOpenExternal => {
+                let raw = if self.browser_current_url.is_empty() {
+                    self.browser_address_draft.as_str()
+                } else {
+                    self.browser_current_url.as_str()
+                };
+                if let Some(url) = suaegi_browser_url::normalize_external_browser_url(raw) {
+                    open_external_url(&url);
+                }
+                iced::Task::none()
+            }
+            Message::BrowserLocationTick => {
+                if let Some(url) = crate::browser::current_url() {
+                    let normalized = if url == "about:blank" {
+                        suaegi_browser_url::ORCA_BROWSER_BLANK_URL.to_string()
+                    } else {
+                        url
+                    };
+                    if normalized != self.browser_current_url {
+                        if self.browser_address_draft == self.browser_current_url
+                            || self.browser_address_draft.is_empty()
+                        {
+                            self.browser_address_draft =
+                                if normalized == suaegi_browser_url::ORCA_BROWSER_BLANK_URL {
+                                    String::new()
+                                } else {
+                                    normalized.clone()
+                                };
+                        }
+                        self.browser_current_url = normalized;
+                        self.remember_active_browser_tab();
+                    }
+                }
+                if let (Some(id), Some(title)) = (
+                    self.active_browser_tab_id.as_deref(),
+                    crate::browser::current_title(),
+                ) {
+                    if let Some(tab) = self.browser_tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.title = title;
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::BrowserProfileNameChanged(value) => {
+                self.browser_profile_name_draft = value.chars().take(50).collect();
+                iced::Task::none()
+            }
+            Message::BrowserProfileAdded => {
+                let label = self.browser_profile_name_draft.trim();
+                if label.is_empty() {
+                    return iced::Task::none();
+                }
+                let id = format!("profile-{}", current_unix_ms());
+                self.ui_settings.browser_profiles.push(
+                    suaegi_core::domain::BrowserProfileSetting {
+                        id: id.clone(),
+                        label: label.to_string(),
+                    },
+                );
+                self.ui_settings.browser_default_profile_id = id;
+                self.browser_profile_name_draft.clear();
+                self.persist();
+                iced::Task::none()
+            }
+            Message::BrowserProfileSelected(id) => {
+                let valid = id == "default"
+                    || self
+                        .ui_settings
+                        .browser_profiles
+                        .iter()
+                        .any(|profile| profile.id == id);
+                if !valid {
+                    return iced::Task::none();
+                }
+                self.ui_settings.browser_default_profile_id = id;
+                self.persist();
+                if self.browser_open {
+                    self.update(Message::BrowserOpenRequested)
+                } else {
+                    iced::Task::none()
+                }
+            }
+            Message::BrowserProfileRemoved(id) => {
+                if self.browser_tabs.iter().any(|tab| tab.profile_id == id) {
+                    self.browser_cookie_status = Some(format!(
+                        "Close every tab using browser profile {id} before removing it."
+                    ));
+                    return iced::Task::none();
+                }
+                let before = self.ui_settings.browser_profiles.len();
+                self.ui_settings
+                    .browser_profiles
+                    .retain(|profile| profile.id != id);
+                if self.ui_settings.browser_profiles.len() == before {
+                    return iced::Task::none();
+                }
+                if self.ui_settings.browser_default_profile_id == id {
+                    self.ui_settings.browser_default_profile_id = "default".into();
+                }
+                self.persist();
+                self.browser_cookie_status =
+                    Some(format!("Removing browser profile {id} and its site data…"));
+                let removal = crate::browser::begin_remove_profile_data(&id);
+                iced::Task::perform(
+                    async move {
+                        removal.await.unwrap_or_else(|_| {
+                            Err("Browser profile deletion was cancelled.".into())
+                        })
+                    },
+                    move |result| Message::BrowserProfileRemovalFinished(id.clone(), result, None),
+                )
+            }
+            Message::BrowserProfileRemovalFinished(id, result, request) => {
+                match result {
+                    Ok(()) => {
+                        self.browser_cookie_status =
+                            Some(format!("Removed browser profile {id} and its site data."));
+                        if let Some(request) = request {
+                            request.respond(Ok(serde_json::json!({"deleted": id})));
+                        }
+                    }
+                    Err(error) => {
+                        self.browser_cookie_status = Some(format!(
+                            "Browser profile {id} was removed, but its site data could not be deleted: {error}"
+                        ));
+                        if let Some(request) = request {
+                            request.respond(Err(error));
+                        }
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::BrowserCookiesClearRequested => {
+                self.browser_cookie_status = match crate::browser::clear_browsing_data() {
+                    Ok(()) => Some("Active browser profile cookies and site data cleared.".into()),
+                    Err(error) => Some(format!("Could not clear browser data: {error}")),
+                };
+                iced::Task::none()
+            }
+            Message::BrowserCookiesImportRequested => {
+                if self.browser_cookie_importing {
+                    return iced::Task::none();
+                }
+                self.browser_cookie_importing = true;
+                self.browser_cookie_status =
+                    Some("Choose a Netscape-format cookies.txt file…".into());
+                let open = if self.browser_open {
+                    iced::Task::none()
+                } else {
+                    self.update(Message::BrowserOpenRequested)
+                };
+                iced::Task::batch([
+                    open,
+                    iced::Task::perform(
+                        crate::browser::pick_cookie_file(),
+                        Message::BrowserCookiesImportFinished,
+                    ),
+                ])
+            }
+            Message::BrowserDetectedCookiesImportRequested(profile) => {
+                if self.browser_cookie_importing {
+                    return iced::Task::none();
+                }
+                self.browser_cookie_importing = true;
+                self.browser_cookie_status =
+                    Some(format!("Importing cookies from {}…", profile.label()));
+                let open = if self.browser_open {
+                    iced::Task::none()
+                } else {
+                    self.update(Message::BrowserOpenRequested)
+                };
+                iced::Task::batch([
+                    open,
+                    iced::Task::perform(
+                        crate::browser::import_detected_browser_profile(profile),
+                        Message::BrowserCookiesImportFinished,
+                    ),
+                ])
+            }
+            Message::BrowserCookiesImportFinished(result) => {
+                self.browser_cookie_importing = false;
+                self.browser_cookie_status = match result {
+                    Ok(Some(bundle)) => match crate::browser::import_cookies(bundle) {
+                        Ok(count) => Some(format!(
+                            "Imported {count} cookie(s) into the active browser profile."
+                        )),
+                        Err(error) => Some(format!("Could not import browser cookies: {error}")),
+                    },
+                    Ok(None) => Some("Cookie import cancelled.".into()),
+                    Err(error) => Some(error),
+                };
+                iced::Task::none()
+            }
+            Message::NavigationBack => {
+                let Some(target) = self.navigation_back.pop() else {
+                    return iced::Task::none();
+                };
+                if let Some(current) = self.selected_worktree.clone() {
+                    self.navigation_forward.push(current);
+                }
+                self.navigation_replay = true;
+                let task = self.update(Message::WorktreeSelected(target));
+                self.navigation_replay = false;
+                task
+            }
+            Message::NavigationForward => {
+                let Some(target) = self.navigation_forward.pop() else {
+                    return iced::Task::none();
+                };
+                if let Some(current) = self.selected_worktree.clone() {
+                    self.navigation_back.push(current);
+                }
+                self.navigation_replay = true;
+                let task = self.update(Message::WorktreeSelected(target));
+                self.navigation_replay = false;
+                task
+            }
+            Message::LeftSidebarToggled => {
+                self.left_sidebar_open = !self.left_sidebar_open;
+                if self.browser_open {
+                    let (left, top, width, height) = self.browser_bounds();
+                    self.browser_error = crate::browser::resize(left, top, width, height).err();
+                }
+                iced::Task::none()
+            }
+            Message::OnboardingOpened => {
+                self.help_open = false;
+                self.onboarding_open = true;
+                iced::Task::none()
+            }
+            Message::OnboardingClosed => {
+                self.onboarding_open = false;
+                iced::Task::none()
+            }
+            Message::OnboardingOpenFullDiskAccess => {
+                open_external_url(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+                );
+                iced::Task::none()
+            }
+            Message::OnboardingInstallCli => {
+                match install_cli_link() {
+                    Ok(_) => self.last_error = None,
+                    Err(error) => self.last_error = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::MobileOpened => {
+                self.close_context_panels();
+                self.integrations_open = false;
+                self.tasks_open = false;
+                self.mobile_open = true;
+                self.mobile_stage = MobileStage::Intro;
+                iced::Task::none()
+            }
+            Message::MobileClosed => {
+                self.mobile_open = false;
+                self.selected_worktree
+                    .clone()
+                    .map_or_else(iced::Task::none, |worktree| {
+                        self.ensure_file_explorer(worktree)
+                    })
+            }
+            Message::MobileGetStarted => {
+                self.mobile_pairing_error = None;
+                self.mobile_stage = MobileStage::Install;
+                iced::Task::none()
+            }
+            Message::MobileBack => {
+                self.mobile_stage = match self.mobile_stage {
+                    MobileStage::Intro | MobileStage::Install => MobileStage::Intro,
+                    MobileStage::Pair => MobileStage::Install,
+                };
+                iced::Task::none()
+            }
+            Message::MobileContinue => {
+                if self.mobile_stage == MobileStage::Install {
+                    self.mobile_stage = MobileStage::Pair;
+                }
+                iced::Task::none()
+            }
+            Message::MobilePlatformSelected(platform) => {
+                self.mobile_platform = platform;
+                iced::Task::none()
+            }
+            Message::MobileIosChannelSelected(channel) => {
+                self.mobile_ios_channel = channel;
+                iced::Task::none()
+            }
+            Message::MobileConnectionModeSelected(mode) => {
+                self.mobile_connection_mode = mode;
+                self.mobile_pairing_error = None;
+                iced::Task::none()
+            }
+            Message::MobileGeneratePairingRequested => {
+                self.mobile_pairing_error = Some(
+                    "Pairing requires Orca's hosted mobile relay, which is not available to this clone."
+                        .to_string(),
+                );
+                iced::Task::none()
+            }
+            Message::MobileOpenInstallLink => {
+                let _ = std::process::Command::new("open")
+                    .arg(mobile_install_url(
+                        self.mobile_platform,
+                        self.mobile_ios_channel,
+                    ))
+                    .spawn();
+                iced::Task::none()
+            }
+            Message::MobileCopyInstallLink => {
+                let url =
+                    mobile_install_url(self.mobile_platform, self.mobile_ios_channel).to_string();
+                iced::clipboard::write(url)
+            }
+            Message::RightSidebarTabSelected(tab) => self.select_right_sidebar_tab(tab),
+            Message::AgentHistoryQueryChanged(query) => {
+                self.agent_history_query = query;
+                iced::Task::none()
+            }
+            Message::AgentScopeSelected(scope) => {
+                self.agent_scope = scope;
+                iced::Task::none()
+            }
+            Message::RightSidebarToggled => {
+                self.right_sidebar_open = !self.right_sidebar_open;
+                if self.right_sidebar_open {
+                    if self.active_plugin_panel.is_some() {
+                        crate::plugin_panel::set_visible(true);
+                        self.plugin_panel_error =
+                            crate::plugin_panel::resize(self.plugin_panel_bounds()).err();
+                        iced::Task::none()
+                    } else {
+                        self.select_right_sidebar_tab(self.right_sidebar_tab)
+                    }
+                } else {
+                    crate::plugin_panel::set_visible(false);
+                    iced::Task::none()
+                }
+            }
+            Message::AutomationClosed => {
+                self.automation_ui.close();
+                iced::Task::none()
+            }
+            Message::AutomationNewRequested => {
+                self.automation_ui.begin_new();
+                iced::Task::none()
+            }
+            Message::AutomationTemplateSelected(template) => {
+                self.automation_ui.apply_template(template);
+                iced::Task::none()
+            }
+            Message::AutomationNameChanged(value) => {
+                self.automation_ui.name = value;
+                self.automation_ui.error = None;
+                iced::Task::none()
+            }
+            Message::AutomationScheduleChanged(value) => {
+                self.automation_ui.schedule = value;
+                self.automation_ui.error = None;
+                iced::Task::none()
+            }
+            Message::AutomationPromptChanged(value) => {
+                self.automation_ui.prompt = value;
+                self.automation_ui.error = None;
+                iced::Task::none()
+            }
+            Message::AutomationTimezoneChanged(value) => {
+                self.automation_ui.timezone = value;
+                self.automation_ui.error = None;
+                iced::Task::none()
+            }
+            Message::AutomationWorktreeSelected(value) => {
+                self.automation_ui.worktree = Some(WorktreeId(value));
+                self.automation_ui.error = None;
+                iced::Task::none()
+            }
+            Message::AutomationCreated => {
+                let now = crate::automation::now_ms();
+                match crate::automation::validate_draft(&self.automation_ui, now) {
+                    Ok((worktree_id, _tz)) => {
+                        let id = format!("automation-{}", self.next_op().0);
+                        self.automations.push(AutomationConfig {
+                            id,
+                            name: self.automation_ui.name.trim().to_string(),
+                            worktree_id,
+                            schedule: self.automation_ui.schedule.trim().to_string(),
+                            prompt: self.automation_ui.prompt.trim().to_string(),
+                            timezone: self.automation_ui.timezone.trim().to_string(),
+                            provider: "claude".to_string(),
+                            dtstart_unix_ms: now,
+                            enabled: true,
+                            last_dispatched_unix_ms: None,
+                        });
+                        self.automation_ui.notice = Some("Automation added".to_string());
+                        self.automation_ui.reset_form();
+                        self.persist();
+                    }
+                    Err(error) => self.automation_ui.error = Some(error),
+                }
+                iced::Task::none()
+            }
+            Message::AutomationToggled(id) => {
+                if let Some(config) = self.automations.iter_mut().find(|item| item.id == id) {
+                    config.enabled = !config.enabled;
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::AutomationDeleteRequested(id) => {
+                if self.ui_settings.confirm_automation_delete {
+                    self.automation_ui.delete_confirm = Some(id);
+                    iced::Task::none()
+                } else {
+                    self.update(Message::AutomationDeleted(id))
+                }
+            }
+            Message::AutomationDeleteCancelled => {
+                self.automation_ui.delete_confirm = None;
+                iced::Task::none()
+            }
+            Message::AutomationDeleted(id) => {
+                self.automation_ui.delete_confirm = None;
+                self.automations.retain(|item| item.id != id);
+                self.persist();
+                iced::Task::none()
+            }
+            Message::AutomationRunNow(id) => {
+                let Some(config) = self.automations.iter().find(|item| item.id == id).cloned()
+                else {
+                    return iced::Task::none();
+                };
+                self.automation_ui.error = None;
+                let task = self.dispatch_automation_prompt(&config);
+                let error = self.automation_ui.error.clone();
+                self.record_automation_run(
+                    &config,
+                    "manual",
+                    crate::automation::now_ms(),
+                    if error.is_some() {
+                        "failed"
+                    } else {
+                        "dispatched"
+                    },
+                    error,
+                );
+                self.persist();
+                task
+            }
+            Message::AutomationTick(now) => self.run_due_automations(now),
             Message::Saved(report) => {
                 self.last_save_status = Some(report.status);
                 iced::Task::none()
@@ -2802,7 +20190,198 @@ impl AppState {
                 worktree_id,
                 result,
             } => {
+                if let Some(pending) = self.pending_cli_terminals.remove(&id) {
+                    match result {
+                        Ok(started) => {
+                            let Some(session) = started.take() else {
+                                self.session_titles.remove(&id);
+                                self.manual_session_titles.remove(&id);
+                                pending.request.respond(Err(
+                                    "Terminal start result was already consumed.".into(),
+                                ));
+                                return iced::Task::none();
+                            };
+                            match self.session_store.accept_started(
+                                id,
+                                pending.worktree_id.clone(),
+                                session,
+                                self.worktree_still_exists(&pending.worktree_id),
+                            ) {
+                                Ok(()) => {
+                                    self.session_worktrees
+                                        .insert(id, pending.worktree_id.clone());
+                                    self.note_user_layout_edit();
+                                    let previous = self.focused_pane;
+                                    if let Some(target) = pending.split_target {
+                                        self.open_split_pane_for_session(
+                                            id,
+                                            target,
+                                            pending.direction,
+                                            pending.focus,
+                                        );
+                                    } else {
+                                        self.open_pane_for_session(id);
+                                        if !pending.focus {
+                                            if let (Some(previous), Some(panes)) =
+                                                (previous, &mut self.panes)
+                                            {
+                                                if panes.get(previous).is_some() {
+                                                    self.focused_pane = Some(previous);
+                                                    panes.maximize(previous);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    self.persist();
+                                    pending.request.respond(Ok(serde_json::json!({
+                                        "terminal": self.rpc_terminal_json(id)
+                                    })));
+                                    if pending.focus {
+                                        if let Some(pane) = self.panes.as_ref().and_then(|panes| {
+                                            panes.iter().find_map(|(pane, session)| {
+                                                (*session == id).then_some(*pane)
+                                            })
+                                        }) {
+                                            return self.focus_pane(pane);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    self.session_titles.remove(&id);
+                                    self.manual_session_titles.remove(&id);
+                                    pending.request.respond(Err(format!(
+                                        "Worktree disappeared while starting terminal: {}",
+                                        pending.worktree_id.0
+                                    )));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.session_titles.remove(&id);
+                            self.manual_session_titles.remove(&id);
+                            pending.request.respond(Err(error));
+                        }
+                    }
+                    return iced::Task::none();
+                }
+                if let Some(pending) = self.pending_setup_sessions.remove(&id) {
+                    match result {
+                        Ok(started) => {
+                            let Some(session) = started.take() else {
+                                self.setup_waiting_worktrees.remove(&pending.worktree_id);
+                                self.session_titles.remove(&id);
+                                return iced::Task::none();
+                            };
+                            match self.session_store.accept_started(
+                                id,
+                                pending.worktree_id.clone(),
+                                session,
+                                pending.worktree_path.is_dir(),
+                            ) {
+                                Ok(()) => {
+                                    self.setup_sessions.insert(
+                                        id,
+                                        ActiveSetupSession {
+                                            worktree_id: pending.worktree_id.clone(),
+                                            mode: pending.mode,
+                                            pane_open: false,
+                                            completed: false,
+                                        },
+                                    );
+                                    self.worktree_setup_sessions
+                                        .insert(pending.worktree_id.clone(), id);
+                                    self.open_setup_pane_if_requested(&pending.worktree_id);
+                                    return self.dispatch_term_command(
+                                        id,
+                                        TermCommand::Paste(pending.command),
+                                    );
+                                }
+                                Err(_) => {
+                                    self.setup_waiting_worktrees.remove(&pending.worktree_id);
+                                    self.session_titles.remove(&id);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.setup_waiting_worktrees.remove(&pending.worktree_id);
+                            self.session_titles.remove(&id);
+                            self.last_error = Some(format!(
+                                "Could not start the workspace setup terminal: {error}"
+                            ));
+                        }
+                    }
+                    if pending.wait_for_agent
+                        && self
+                            .deferred_setup_agent_starts
+                            .remove(&pending.worktree_id)
+                    {
+                        if let Some((_, task)) = self.start_session_for(&pending.worktree_id) {
+                            return task;
+                        }
+                        self.deferred_setup_agent_starts.insert(pending.worktree_id);
+                    }
+                    return iced::Task::none();
+                }
                 self.pending_session_starts.remove(&worktree_id);
+                if worktree_id.0.starts_with(FLOATING_WORKSPACE_ID_PREFIX) {
+                    match result {
+                        Ok(started) => {
+                            let Some(session) = started.take() else {
+                                self.session_titles.remove(&id);
+                                self.generated_session_titles.remove(&id);
+                                return iced::Task::none();
+                            };
+                            match self.session_store.accept_started(
+                                id,
+                                worktree_id,
+                                session,
+                                self.ui_settings.floating_workspace_enabled,
+                            ) {
+                                Ok(()) => {
+                                    self.last_error = None;
+                                    if !self.floating_workspace_sessions.contains(&id) {
+                                        self.floating_workspace_sessions.push(id);
+                                    }
+                                    self.floating_workspace_session = Some(id);
+                                    let commands =
+                                        std::mem::take(&mut self.floating_pending_commands);
+                                    let mut tasks = Vec::with_capacity(commands.len() + 1);
+                                    if self.floating_workspace_open
+                                        && self.floating_workspace_content
+                                            == FloatingWorkspaceContent::Terminal
+                                    {
+                                        tasks.push(self.dispatch_term_command(
+                                            id,
+                                            TermCommand::FocusRequested,
+                                        ));
+                                    }
+                                    tasks.extend(commands.into_iter().map(|command| {
+                                        self.dispatch_term_command(id, TermCommand::Paste(command))
+                                    }));
+                                    return iced::Task::batch(tasks);
+                                }
+                                Err(_) => {
+                                    self.session_titles.remove(&id);
+                                    self.generated_session_titles.remove(&id);
+                                    if self.floating_workspace_sessions.is_empty() {
+                                        self.floating_workspace_content =
+                                            FloatingWorkspaceContent::Empty;
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.session_titles.remove(&id);
+                            self.generated_session_titles.remove(&id);
+                            if self.floating_workspace_sessions.is_empty() {
+                                self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                            }
+                            self.last_error = Some(error);
+                        }
+                    }
+                    return iced::Task::none();
+                }
+                let waking = self.waking_agent_sessions.remove(&worktree_id);
                 // 복원 중인 잎인가. **복원 중에는 pane을 열지 않는다** — 트리는
                 // 모든 잎이 결정된 뒤 한 번에 짓는다.
                 let restoring = self
@@ -2817,13 +20396,17 @@ impl AppState {
                             // 않지만(봉투는 한 번만 만들어진다), 방어적으로
                             // 무시한다.
                             self.pending_injections.remove(&id);
-                            self.session_titles.remove(&id);
+                            if !waking {
+                                self.session_titles.remove(&id);
+                                self.generated_session_titles.remove(&id);
+                            }
                             // **그래도 잎은 결정해야 한다** — 여기서 빠져나가면
                             // 그 잎이 `pending`에 남아 게이트가 영원히 닫힌다.
                             self.note_restore_outcome(&worktree_id, LeafOutcome::Failed);
                             return iced::Task::none();
                         };
                         let still_exists = self.worktree_still_exists(&worktree_id);
+                        let was_reattached = session.was_reattached();
                         match self.session_store.accept_started(
                             id,
                             worktree_id.clone(),
@@ -2831,8 +20414,24 @@ impl AppState {
                             still_exists,
                         ) {
                             Ok(()) => {
+                                if was_reattached {
+                                    if let Some(badge) = self.badges.get_mut(&worktree_id) {
+                                        badge.allow_reattach_nonce_bind = true;
+                                    }
+                                }
                                 self.worktree_sessions.insert(worktree_id.clone(), id);
                                 self.session_worktrees.insert(id, worktree_id.clone());
+                                if !restoring
+                                    && !waking
+                                    && self.ui_settings.experimental_native_chat
+                                    && self.ui_settings.open_agent_tabs_in_chat_by_default
+                                    && native_chat_supported_agent(self.session_store.agent(id))
+                                {
+                                    self.native_chat_sessions.insert(id);
+                                }
+                                if waking {
+                                    self.sleeping_agent_sessions.remove(&worktree_id);
+                                }
                                 // **세션이 실제로 살아났다 — 이제 주입 게이트를
                                 // 무장한다.** 슬롯이 이 시점에 생기므로(`accept_started`)
                                 // 다음 `PresenceTick`부터 poll이 세션을 찾을 수 있다.
@@ -2845,10 +20444,19 @@ impl AppState {
                                         &worktree_id,
                                         LeafOutcome::Started(id),
                                     );
+                                } else if waking
+                                    && self.panes.as_ref().is_some_and(|panes| {
+                                        panes.iter().any(|(_, session)| *session == id)
+                                    })
+                                {
+                                    // The sleeping pane stayed in the layout;
+                                    // the new PTY reuses its SessionId.
+                                    self.persist();
                                 } else {
                                     // 복원 밖에서 열린 pane = 사용자의 편집이다.
                                     self.note_user_layout_edit();
                                     self.open_pane_for_session(id);
+                                    self.open_setup_pane_if_requested(&worktree_id);
                                     self.persist();
                                 }
                             }
@@ -2856,17 +20464,20 @@ impl AppState {
                                 // worktree가 그새 삭제됐다 — 세션은 이미 reaper로
                                 // 갔다(`accept_started`). 타이틀·주입 대기를 정리한다.
                                 self.pending_injections.remove(&id);
-                                self.session_titles.remove(&id);
-                                self.note_restore_outcome(
-                                    &worktree_id,
-                                    LeafOutcome::WorktreeGone,
-                                );
+                                if !waking {
+                                    self.session_titles.remove(&id);
+                                    self.generated_session_titles.remove(&id);
+                                }
+                                self.note_restore_outcome(&worktree_id, LeafOutcome::WorktreeGone);
                             }
                         }
                     }
                     Err(err) => {
                         self.pending_injections.remove(&id);
-                        self.session_titles.remove(&id);
+                        if !waking {
+                            self.session_titles.remove(&id);
+                            self.generated_session_titles.remove(&id);
+                        }
                         self.last_error = Some(err);
                         self.note_restore_outcome(&worktree_id, LeafOutcome::Failed);
                     }
@@ -2874,8 +20485,45 @@ impl AppState {
                 iced::Task::none()
             }
             Message::SessionDirty { id, generation } => {
-                let (_, task) = self.session_store.request_snapshot(id, generation);
-                task
+                let rang = self.session_store.take_bell(id);
+                if rang
+                    && self.ui_settings.experimental_terminal_attention
+                    && self.focused_session() != Some(id)
+                {
+                    self.terminal_attention_sessions.insert(id);
+                }
+                let osc52_writes = self.session_store.take_osc52_writes(id);
+                if rang
+                    && self.ui_settings.notifications_enabled
+                    && self.ui_settings.notification_terminal_bell
+                    && !(self.ui_settings.notification_suppress_when_focused
+                        && self.app_window_focused)
+                {
+                    crate::notification_sound::show(
+                        "Terminal bell",
+                        &self.ui_settings.notification_sound,
+                        self.ui_settings.notification_custom_sound_path.as_deref(),
+                        self.ui_settings.notification_volume,
+                    );
+                }
+                let (_, snapshot) = self.session_store.request_snapshot(id, generation);
+                let clipboard = if self.ui_settings.terminal_allow_osc52_clipboard {
+                    osc52_writes
+                        .into_iter()
+                        .last()
+                        .map_or_else(iced::Task::none, |text| {
+                            clipboard_writes(
+                                CopyTargets {
+                                    standard: true,
+                                    primary: false,
+                                },
+                                text,
+                            )
+                        })
+                } else {
+                    iced::Task::none()
+                };
+                iced::Task::batch([snapshot, clipboard])
             }
             Message::SnapshotReady {
                 id,
@@ -2888,6 +20536,15 @@ impl AppState {
             Message::PaneClicked(pane) => self.focus_pane(pane),
 
             Message::Terminal { id, command } => self.dispatch_term_command(id, command),
+            Message::TerminalPasteRead { id, text } => text.map_or_else(iced::Task::none, |text| {
+                self.dispatch_term_command(id, TermCommand::Paste(text))
+            }),
+            Message::TerminalClipboardWriteFinished(result) => {
+                if let Err(error) = result {
+                    self.last_error = Some(error);
+                }
+                iced::Task::none()
+            }
 
             Message::ResizeApplied { id, seq, result } => {
                 if let Err(e) = result {
@@ -2939,14 +20596,79 @@ impl AppState {
                 self.schedule_layout_save()
             }
             Message::PaneCloseRequested(pane) => {
+                let pinned = self
+                    .panes
+                    .as_ref()
+                    .and_then(|panes| panes.get(pane))
+                    .and_then(|session| self.session_worktrees.get(session))
+                    .is_some_and(|worktree| self.worktree_is_pinned(worktree));
+                if pinned && self.ui_settings.confirm_close_pinned_tabs {
+                    self.pinned_pane_close_confirm = Some(pane);
+                    return iced::Task::none();
+                }
+                let running_agent = self
+                    .panes
+                    .as_ref()
+                    .and_then(|panes| panes.get(pane))
+                    .is_some_and(|session| {
+                        matches!(
+                            self.session_store.presence(*session),
+                            AgentPresence::Agent(_)
+                        )
+                    });
+                if running_agent && self.ui_settings.confirm_close_running_terminal {
+                    self.running_pane_close_confirm = Some(pane);
+                    return iced::Task::none();
+                }
                 // pane 자체를 지우는 것도 `close_session`이 한다 — 대화형/비대화형
                 // 경로가 갈라져서 pane이 새던 것이 이 수렴의 이유다.
                 if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
                     // 사용자가 직접 닫았다 — 이제 화면이 진실이다.
                     self.note_user_layout_edit();
+                    let setup_worktree = self
+                        .setup_sessions
+                        .get(&session_id)
+                        .map(|setup| setup.worktree_id.clone());
+                    self.close_session(session_id);
+                    self.persist();
+                    if let Some(worktree) = setup_worktree {
+                        if self.deferred_setup_agent_starts.remove(&worktree) {
+                            return self
+                                .start_session_for(&worktree)
+                                .map_or_else(iced::Task::none, |(_, task)| task);
+                        }
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::PinnedPaneCloseConfirmed => {
+                let Some(pane) = self.pinned_pane_close_confirm.take() else {
+                    return iced::Task::none();
+                };
+                if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
+                    self.note_user_layout_edit();
                     self.close_session(session_id);
                     self.persist();
                 }
+                iced::Task::none()
+            }
+            Message::PinnedPaneCloseCancelled => {
+                self.pinned_pane_close_confirm = None;
+                iced::Task::none()
+            }
+            Message::RunningPaneCloseConfirmed => {
+                let Some(pane) = self.running_pane_close_confirm.take() else {
+                    return iced::Task::none();
+                };
+                if let Some(&session_id) = self.panes.as_ref().and_then(|panes| panes.get(pane)) {
+                    self.note_user_layout_edit();
+                    self.close_session(session_id);
+                    self.persist();
+                }
+                iced::Task::none()
+            }
+            Message::RunningPaneCloseCancelled => {
+                self.running_pane_close_confirm = None;
                 iced::Task::none()
             }
 
@@ -2956,20 +20678,91 @@ impl AppState {
                 presence,
             } => {
                 self.session_store.apply_presence(id, generation, presence);
+                if let Some(setup) = self.setup_sessions.get(&id).cloned() {
+                    if !setup.completed {
+                        if let AgentPresence::Exited { code } = presence {
+                            self.setup_waiting_worktrees.remove(&setup.worktree_id);
+                            if setup.mode == "new-tab" {
+                                self.close_session(id);
+                            } else if let Some(active) = self.setup_sessions.get_mut(&id) {
+                                active.completed = true;
+                            }
+                            if code != 0 {
+                                self.last_error = Some(format!(
+                                    "Workspace setup exited with status {code}. See the Setup terminal output."
+                                ));
+                            }
+                            if self.deferred_setup_agent_starts.remove(&setup.worktree_id) {
+                                if let Some((_, task)) = self.start_session_for(&setup.worktree_id)
+                                {
+                                    return task;
+                                }
+                                self.deferred_setup_agent_starts.insert(setup.worktree_id);
+                            }
+                        }
+                    }
+                    return iced::Task::none();
+                }
                 self.note_presence_for_badge(id, presence);
                 iced::Task::none()
             }
             Message::PresenceTick => {
                 // 이 틱이 앱에서 가장 규칙적으로 도는 지점이라 여기서 확인한다.
                 self.note_hook_drops();
+                let prompt_cache_ttl = Duration::from_secs(
+                    u64::from(self.ui_settings.prompt_cache_ttl_minutes).saturating_mul(60),
+                );
+                self.prompt_cache_started
+                    .retain(|_, started| started.elapsed() < prompt_cache_ttl);
                 // 비-Claude(OscTitle) 세션의 상태는 터미널 타이틀에서 온다. presence와
                 // 같은 티어로 폴링한다 — 나이 기반 배지 규칙과 결이 맞는다.
                 self.poll_title_status();
                 // 무장된 stdin-after-start 주입 게이트를 같은 틱에 전진시킨다 —
                 // 앱에서 가장 규칙적으로 도는 지점이다.
                 self.poll_prompt_injections();
-                let (_dispatched, task) = crate::presence_poll::dispatch_tick(self);
-                task
+                let hibernation = self.poll_agent_hibernation();
+                let (_dispatched, presence) = crate::presence_poll::dispatch_tick(self);
+                iced::Task::batch([hibernation, presence])
+            }
+            Message::AgentHibernationStopped {
+                id,
+                worktree_id,
+                result,
+            } => {
+                let Some(record) = self.pending_agent_hibernations.remove(&id) else {
+                    return iced::Task::none();
+                };
+                if record.worktree_id != worktree_id
+                    || self.worktree_sessions.get(&worktree_id) != Some(&id)
+                {
+                    return iced::Task::none();
+                }
+                match result {
+                    Ok(()) => {
+                        self.session_store.close(id);
+                        self.terminal_attention_sessions.remove(&id);
+                        self.native_chat_sessions.remove(&id);
+                        self.native_chat_drafts.remove(&id);
+                        self.prompt_gates.remove(&id);
+                        self.pending_injections.remove(&id);
+                        self.terminal_last_input_at.remove(&id);
+                        self.sleeping_agent_sessions
+                            .insert(worktree_id.clone(), record);
+                        self.persist();
+                        if self.selected_worktree.as_ref() == Some(&worktree_id)
+                            || !self.ui_settings.experimental_agent_hibernation
+                        {
+                            return self
+                                .start_session_for(&worktree_id)
+                                .map_or_else(iced::Task::none, |(_, task)| task);
+                        }
+                    }
+                    Err(error) => {
+                        self.last_error =
+                            Some(format!("Could not hibernate the completed agent: {error}"));
+                    }
+                }
+                iced::Task::none()
             }
 
             // ---- Plan 5: 변형만 먼저 만들어 두고 처리는 소유 태스크가 채운다.
@@ -2977,8 +20770,74 @@ impl AppState {
             // 컴파일러가 배선 누락을 잡아주지 못한다. 여기 이름을 늘어놓는 비용이
             // 그 안전망의 값이다. ----
             Message::HookArrived(event) => {
-                self.apply_hook(&event);
-                iced::Task::none()
+                let accepted = self.apply_hook(&event);
+                let rename = self.maybe_auto_rename_branch(&event);
+                let plugin_event = if accepted {
+                    let worktree_id = event.pane_key.0.clone();
+                    let state = format!("{:?}", self.worktree_badge(&worktree_id)).to_lowercase();
+                    let received_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or(1)
+                        .max(1);
+                    self.deliver_plugin_event(
+                        "agent.status.changed",
+                        serde_json::json!({
+                            "worktreeId": worktree_id.0,
+                            "paneKey": event.pane_key.0.0,
+                            "state": state,
+                            "receivedAt": received_at
+                        }),
+                    )
+                } else {
+                    iced::Task::none()
+                };
+                iced::Task::batch([rename, plugin_event])
+            }
+            Message::AutoBranchRenameFinished {
+                repo_id,
+                worktree_id,
+                outcome,
+            } => {
+                self.auto_branch_rename_in_flight.remove(&worktree_id);
+                match outcome {
+                    crate::branch_rename::BranchRenameOutcome::Renamed {
+                        new_branch,
+                        display_name,
+                        ..
+                    } => {
+                        self.remember_auto_branch_rename_settled(worktree_id.clone());
+                        self.worktree_meta
+                            .entry(worktree_id.clone())
+                            .or_default()
+                            .display_name = Some(display_name);
+                        if let Some(entries) = self.worktrees_by_repo.get_mut(&repo_id) {
+                            if let Some(entry) = entries
+                                .iter_mut()
+                                .find(|entry| worktree_id_for(&entry.path) == worktree_id)
+                            {
+                                entry.branch = Some(new_branch.clone());
+                            }
+                        }
+                        if let Some(session_id) = self.worktree_sessions.get(&worktree_id).copied()
+                        {
+                            self.session_titles.insert(session_id, new_branch);
+                        }
+                        self.last_error = None;
+                        self.persist();
+                        self.refresh_worktrees(repo_id)
+                    }
+                    crate::branch_rename::BranchRenameOutcome::Settled(_) => {
+                        self.remember_auto_branch_rename_settled(worktree_id);
+                        iced::Task::none()
+                    }
+                    crate::branch_rename::BranchRenameOutcome::Retry(error) => {
+                        self.last_error = Some(format!(
+                            "Could not automatically rename the branch: {error}"
+                        ));
+                        iced::Task::none()
+                    }
+                }
             }
             // **아무도 이 메시지를 발행하지 않는다 — 의도된 것이다.**
             //
@@ -2995,6 +20854,10 @@ impl AppState {
             // 오해하지 않게 한다.
             // ---- Plan 5 Task 4: diff 패널 ----
             Message::DiffRequested { worktree } => self.request_diff(worktree),
+            Message::DiffFileTreeToggled => {
+                self.diff.toggle_file_tree();
+                iced::Task::none()
+            }
             Message::DiffCancelled { .. } => {
                 // 취소는 조용하다. 배너도, 오류도, `last_error`도 없다.
                 self.diff.close();
@@ -3068,7 +20931,10 @@ impl AppState {
                 // 지우지 않는다** — 조회 실패가 알려진 PR 링크를 날리면 안 된다.
                 if let GithubFetch::Resolved(ReviewLookup::Found(review)) = &fetch {
                     let number = review.number;
-                    if self.worktree_meta.get(&worktree).and_then(|m| m.linked_github_pr)
+                    if self
+                        .worktree_meta
+                        .get(&worktree)
+                        .and_then(|m| m.linked_github_pr)
                         != Some(number)
                     {
                         self.link_pr(&worktree, number);
@@ -3081,26 +20947,37 @@ impl AppState {
             }
             Message::CreatePrOpened { worktree } => {
                 // 제목·base 초안을 채운다. base는 repo 기본 브랜치, 제목은 브랜치명.
-                let (branch, base) = match self.find_worktree(&worktree) {
+                let (repo_id, branch, base) = match self.find_worktree(&worktree) {
                     Some((repo_id, entry)) => {
                         let base = self
                             .repo_by_id(&repo_id)
                             .and_then(|r| r.worktree_base_ref.clone())
                             .unwrap_or_else(|| "main".to_string());
-                        (entry.branch.clone().unwrap_or_default(), base)
+                        (repo_id, entry.branch.clone().unwrap_or_default(), base)
                     }
-                    None => (String::new(), "main".to_string()),
+                    None => return iced::Task::none(),
                 };
+                let defaults = self.source_control_ai_pr_defaults(&repo_id);
+                let generate_on_open =
+                    self.ui_settings.source_control_ai.enabled && defaults.generate_details_on_open;
+                self.close_context_panels();
                 self.create_pr = Some(CreatePrDraft {
                     worktree,
                     title: branch,
                     body: String::new(),
                     base,
-                    draft: false,
+                    draft: defaults.draft,
+                    use_template: defaults.use_template,
+                    generating: false,
+                    generation_op: None,
                     submitting: false,
                     error: None,
                 });
-                iced::Task::none()
+                if generate_on_open {
+                    self.update(Message::CreatePrGenerateDetailsRequested)
+                } else {
+                    iced::Task::none()
+                }
             }
             Message::CreatePrTitleChanged(value) => {
                 if let Some(dialog) = &mut self.create_pr {
@@ -3126,6 +21003,81 @@ impl AppState {
                 }
                 iced::Task::none()
             }
+            Message::CreatePrUseTemplateToggled(value) => {
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.use_template = value;
+                }
+                iced::Task::none()
+            }
+            Message::CreatePrGenerateDetailsRequested => {
+                let Some(dialog) = &self.create_pr else {
+                    return iced::Task::none();
+                };
+                if dialog.submitting || dialog.generating {
+                    return iced::Task::none();
+                }
+                let worktree = dialog.worktree.clone();
+                let base = dialog.base.clone();
+                let title = dialog.title.clone();
+                let body = dialog.body.clone();
+                let draft = dialog.draft;
+                let Some((repo_id, entry)) = self.find_worktree(&worktree) else {
+                    return iced::Task::none();
+                };
+                let request = self.source_control_ai_request(
+                    &repo_id,
+                    crate::source_control_ai::TextOperation::PullRequest,
+                );
+                let op = self.next_op();
+                if let Some(dialog) = &mut self.create_pr {
+                    dialog.generating = true;
+                    dialog.generation_op = Some(op);
+                    dialog.error = None;
+                }
+                iced::Task::perform(
+                    async move {
+                        crate::source_control_ai::generate_pull_request_fields(
+                            &entry.path,
+                            &base,
+                            &title,
+                            &body,
+                            draft,
+                            request,
+                        )
+                        .await
+                    },
+                    move |result| Message::CreatePrDetailsGenerated {
+                        worktree,
+                        op,
+                        result,
+                    },
+                )
+            }
+            Message::CreatePrDetailsGenerated {
+                worktree,
+                op,
+                result,
+            } => {
+                let Some(dialog) = &mut self.create_pr else {
+                    return iced::Task::none();
+                };
+                if dialog.worktree != worktree || dialog.generation_op != Some(op) {
+                    return iced::Task::none();
+                }
+                dialog.generating = false;
+                dialog.generation_op = None;
+                match result {
+                    Ok(fields) => {
+                        dialog.base = fields.base;
+                        dialog.title = fields.title;
+                        dialog.body = fields.body;
+                        dialog.draft = fields.draft;
+                        dialog.error = None;
+                    }
+                    Err(error) => dialog.error = Some(error),
+                }
+                iced::Task::none()
+            }
             Message::CreatePrCancelled => {
                 self.create_pr = None;
                 iced::Task::none()
@@ -3135,7 +21087,7 @@ impl AppState {
                     return iced::Task::none();
                 };
                 // 중복 제출 방지 — 이미 진행 중이면 무시한다.
-                if dialog.submitting {
+                if dialog.submitting || dialog.generating {
                     return iced::Task::none();
                 }
                 // 제목이 비면 UI에서 미리 막는다(백엔드도 거부하지만 왕복이 아깝다).
@@ -3160,7 +21112,7 @@ impl AppState {
                     head: entry.branch.clone(),
                     title: dialog.title.trim().to_string(),
                     // body가 비면 repo PR 템플릿을 쓴다(백엔드가 채운다).
-                    use_template: body.trim().is_empty(),
+                    use_template: dialog.use_template,
                     body,
                     draft: dialog.draft,
                 };
@@ -3177,6 +21129,11 @@ impl AppState {
                 result,
             } => match result {
                 Ok(review) => {
+                    let open_after_create = self
+                        .find_worktree(&worktree)
+                        .map(|(repo_id, _)| self.source_control_ai_pr_defaults(&repo_id))
+                        .is_some_and(|defaults| defaults.open_after_create);
+                    let review_url = review.url.clone();
                     // **생성 성공은 링크를 굳힌다**(§5 mutation (c)). 저장을 거쳐도
                     // 남도록 `WorktreeMeta`에 씨딩하고 persist한다.
                     self.link_pr(&worktree, review.number);
@@ -3186,7 +21143,13 @@ impl AppState {
                         self.create_pr = None;
                     }
                     // 상태를 강제 재조회해 표시자가 새 PR(Found)로 바뀌게 한다.
-                    self.request_github_status(worktree, true)
+                    let refresh = self.request_github_status(worktree, true);
+                    if open_after_create {
+                        let open = self.route_web_url(&review_url);
+                        iced::Task::batch([refresh, open])
+                    } else {
+                        refresh
+                    }
                 }
                 Err(err) => {
                     // **분류된 문구**를 다이얼로그에 표시한다(raw stderr 아님).
@@ -3218,6 +21181,7 @@ impl AppState {
                 let path = entry.path;
                 let number = review.number;
                 let op = self.next_op();
+                self.close_context_panels();
                 self.pr_panel
                     .open(worktree.clone(), number, review.title, review.state, op);
                 crate::forge_tasks::fetch_pr_details(op, worktree, path, number)
@@ -3328,7 +21292,7 @@ impl AppState {
 
             // ---- N1: Linear 트래커 UI ----
             Message::LinearApiKeyChanged(value) => {
-                self.linear.api_key_input = value;
+                self.linear.api_key_input = value.into_inner();
                 iced::Task::none()
             }
             Message::LinearConnectSubmitted => {
@@ -3406,7 +21370,7 @@ impl AppState {
                 iced::Task::none()
             }
             Message::JiraTokenChanged(value) => {
-                self.jira.token_input = value;
+                self.jira.token_input = value.into_inner();
                 iced::Task::none()
             }
             Message::JiraCloudToggled(is_cloud) => {
@@ -3568,10 +21532,10 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_status::contract::{HookEventName, HOOK_STALE_AFTER, NO_AGENT_CONFIRMATIONS};
     use std::time::{Duration, Instant};
     use suaegi_core::domain::PersistedAxis;
     use suaegi_forge::{ChecksSummary, CreationBlockedReason, ForgeUnavailable, ReviewState};
-    use crate::agent_status::contract::{HookEventName, HOOK_STALE_AFTER, NO_AGENT_CONFIRMATIONS};
 
     fn entry(name: &str) -> WorktreeEntry {
         WorktreeEntry {
@@ -3580,6 +21544,404 @@ mod tests {
             head: None,
             is_main: false,
         }
+    }
+
+    #[test]
+    fn local_rpc_updates_worktree_metadata_in_the_live_state() {
+        let mut state = AppState::default();
+        let repo = some_repo("rpc-meta");
+        let repo_id = repo.id.clone();
+        let worktree = entry("rpc-meta-worktree");
+        let worktree_id = worktree_id_for(&worktree.path);
+        state.repos.push(repo);
+        state.worktrees_by_repo.insert(repo_id, vec![worktree]);
+        state.selected_worktree = Some(worktree_id.clone());
+        let (request, response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "worktree.set",
+            serde_json::json!({
+                "worktree": "active",
+                "displayName": "RPC workspace",
+                "comment": "tests passing",
+                "workspaceStatus": "in-review",
+                "linkedIssue": 42,
+            }),
+        );
+
+        let _ = state.update(Message::LocalRpcRequested(request));
+
+        let response = response.recv().expect("RPC response").expect("success");
+        assert_eq!(response["worktree"]["displayName"], "RPC workspace");
+        assert_eq!(state.worktree_comment(&worktree_id), Some("tests passing"));
+        assert_eq!(state.board_status(&worktree_id), BoardStatus::InReview);
+        assert_eq!(state.worktree_meta[&worktree_id].linked_github_pr, Some(42));
+    }
+
+    #[test]
+    fn local_rpc_repository_add_responds_only_after_live_state_is_updated() {
+        let mut state = AppState::default();
+        let (request, response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "repo.add",
+            serde_json::json!({"path": "/tmp/rpc-repository"}),
+        );
+        let _ = state.update(Message::LocalRpcRequested(request));
+        assert!(response.try_recv().is_err());
+        let op = *state.pending_repo_add_rpcs.keys().next().unwrap();
+        let repo = some_repo("rpc-repository");
+        let repo_id = repo.id.clone();
+
+        let _ = state.update(Message::RepoProbed {
+            request: op,
+            requested_path: repo.path.clone(),
+            result: Ok((repo, Some("main".into()))),
+        });
+
+        let result = response.recv().expect("RPC response").expect("success");
+        assert_eq!(result["id"].as_str(), Some(repo_id.0.as_str()));
+        assert!(state.repo_by_id(&repo_id).is_some());
+    }
+
+    #[test]
+    fn browser_upload_preparation_is_bounded_and_uses_only_file_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let payload = prepare_browser_upload(&serde_json::json!({
+            "element": "@e1",
+            "files": [path],
+        }))
+        .unwrap();
+        assert_eq!(payload["element"], "@e1");
+        assert_eq!(payload["uploads"][0]["name"], "note.txt");
+        assert_eq!(payload["uploads"][0]["type"], "text/plain");
+        assert_eq!(payload["uploads"][0]["data"], "aGVsbG8=");
+        assert!(!payload
+            .to_string()
+            .contains(directory.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn local_rpc_project_host_setup_crud_updates_the_persisted_ui_model() {
+        let mut state = AppState::default();
+        let repo = some_repo("rpc-project");
+        let project_id = repo.id.0.clone();
+        state.repos.push(repo);
+        let (create, create_response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "projectHostSetup.create",
+            serde_json::json!({
+                "projectId": project_id,
+                "hostId": "runtime:gpu",
+                "setupId": "setup-gpu",
+                "path": "/srv/project",
+                "kind": "git",
+                "displayName": "GPU checkout",
+                "worktreeBasePath": "/srv/worktrees",
+                "gitUsername": "buildbot",
+                "setupState": "setting-up",
+                "setupMethod": "provisioned",
+            }),
+        );
+        let _ = state.update(Message::LocalRpcRequested(create));
+        let created = create_response.recv().unwrap().unwrap();
+        assert_eq!(created["result"]["setup"]["id"], "setup-gpu");
+        assert_eq!(
+            state.ui_settings.repo_host_setups[&project_id][0].git_username,
+            "buildbot"
+        );
+
+        let (update, update_response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "projectHostSetup.update",
+            serde_json::json!({
+                "setupId": "setup-gpu",
+                "updates": {
+                    "path": "/srv/project-ready",
+                    "setupState": "ready",
+                }
+            }),
+        );
+        let _ = state.update(Message::LocalRpcRequested(update));
+        let updated = update_response.recv().unwrap().unwrap();
+        assert_eq!(updated["result"]["setup"]["setupState"], "ready");
+        assert_eq!(
+            state.ui_settings.repo_host_setups[&project_id][0].path,
+            "/srv/project-ready"
+        );
+
+        let (delete, delete_response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "projectHostSetup.delete",
+            serde_json::json!({"setupId": "setup-gpu"}),
+        );
+        let _ = state.update(Message::LocalRpcRequested(delete));
+        assert_eq!(
+            delete_response.recv().unwrap().unwrap()["result"]["setup"]["id"],
+            "setup-gpu"
+        );
+        assert!(!state.ui_settings.repo_host_setups.contains_key(&project_id));
+    }
+
+    #[test]
+    fn local_rpc_worktree_create_uses_the_app_owned_async_completion() {
+        let mut state = AppState::default();
+        let repo = some_repo("rpc-create");
+        let repo_id = repo.id.clone();
+        state.repos.push(repo);
+        let (request, response) = crate::local_rpc::LocalRpcRequest::for_test(
+            "worktree.create",
+            serde_json::json!({"repo": &repo_id.0, "name": "rpc-feature"}),
+        );
+        let _ = state.update(Message::LocalRpcRequested(request));
+        assert!(response.try_recv().is_err());
+        let op = *state.pending_worktree_create_rpcs.keys().next().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rpc-feature");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let _ = state.update(Message::WorktreeCreated {
+            request: op,
+            repo_id: repo_id.clone(),
+            created_with_agent: None,
+            initial_prompt: None,
+            run_setup: false,
+            result: Ok(CreatedWorktree {
+                path: path.clone(),
+                branch: "rpc-feature".into(),
+                display_name: "rpc-feature".into(),
+            }),
+        });
+
+        let result = response.recv().expect("RPC response").expect("success");
+        assert_eq!(result["repoId"].as_str(), Some(repo_id.0.as_str()));
+        assert_eq!(result["path"], path.to_string_lossy().as_ref());
+        assert!(state
+            .worktree_meta
+            .contains_key(&worktree_id_for(path.as_path())));
+    }
+
+    fn approved_worker_plugin(capabilities: &[&str]) -> crate::plugins::PluginEntry {
+        crate::plugins::PluginEntry {
+            plugin_key: "acme.worker".into(),
+            root: PathBuf::from("/tmp/acme-worker"),
+            content_hash: None,
+            name: "Worker".into(),
+            version: "1.0.0".into(),
+            publisher: "acme".into(),
+            description: String::new(),
+            status: crate::plugins::PluginStatus::Idle,
+            error: None,
+            is_dev: true,
+            consent_fingerprint: Some("approved".into()),
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            panels: Vec::new(),
+            commands: Vec::new(),
+            events: Vec::new(),
+            language_packs: Vec::new(),
+            language_pack_catalogs: Vec::new(),
+            keybindings: Vec::new(),
+            vm_recipes: Vec::new(),
+            vm_recipe_specs: Vec::new(),
+            agents: Vec::new(),
+            has_worker: true,
+            main_entry: Some("main.mjs".into()),
+            rollback_available: false,
+            blocked_by_kill_list: None,
+        }
+    }
+
+    #[test]
+    fn plugin_app_context_is_bounded_capability_gated_and_focus_safe() {
+        let (mut state, session, active, _) = state_with_one_open_session();
+        state.selected_worktree = Some(active.clone());
+        state.plugins.push(approved_worker_plugin(&[
+            "workspace:read",
+            "terminal:send",
+            "notifications:show",
+            "events:subscribe",
+        ]));
+
+        let read = crate::plugin_worker::PluginHostRequest::for_test(
+            "acme.worker",
+            "workspace.readContext",
+            serde_json::json!({}),
+        );
+        let value = state.resolve_plugin_host_call(&read).unwrap();
+        assert_eq!(value["branch"], "accepted");
+        assert_eq!(value["displayName"], "accepted");
+        assert_eq!(
+            value["terminals"],
+            serde_json::json!([{"id": format!("terminal:local:{}", session.0)}])
+        );
+        assert!(value.get("path").is_none());
+        assert!(value.get("worktreeId").is_none());
+
+        let other = WorktreeId("/tmp/other".into());
+        state.selected_worktree = Some(other);
+        let delayed_write = crate::plugin_worker::PluginHostRequest::for_test(
+            "acme.worker",
+            "terminal.sendText",
+            serde_json::json!({
+                "terminalId": format!("terminal:local:{}", session.0),
+                "text": "must not reach the old worktree",
+                "enter": true
+            }),
+        );
+        assert_eq!(
+            state.resolve_plugin_host_call(&delayed_write).unwrap_err(),
+            "terminal is outside the active worktree"
+        );
+
+        state.selected_worktree = Some(active);
+        state.plugins[0].capabilities.clear();
+        assert!(state
+            .resolve_plugin_host_call(&read)
+            .unwrap_err()
+            .contains("was not granted"));
+    }
+
+    #[test]
+    fn external_worktree_visibility_import_and_baseline_are_runtime_wired() {
+        let repo_id = RepoId("/tmp/external-root".to_string());
+        let main = WorktreeEntry {
+            path: PathBuf::from("/tmp/external-root"),
+            branch: Some("main".to_string()),
+            head: None,
+            is_main: true,
+        };
+        let external = entry("external-one");
+        let managed = entry("managed-one");
+        let managed_id = worktree_id_for(&managed.path);
+        let external_id = worktree_id_for(&external.path);
+        let mut state = AppState::default();
+        state.repos.push(Repo {
+            id: repo_id.clone(),
+            path: PathBuf::from("/tmp/external-root"),
+            display_name: "external-root".to_string(),
+            worktree_base_ref: Some("main".to_string()),
+        });
+        state.worktrees_by_repo.insert(
+            repo_id.clone(),
+            vec![main.clone(), external.clone(), managed.clone()],
+        );
+        state.worktree_meta.insert(
+            managed_id,
+            WorktreeMeta {
+                created_at_unix_ms: 1,
+                ..WorktreeMeta::default()
+            },
+        );
+        state
+            .ui_settings
+            .repo_external_worktree_visibility
+            .insert(repo_id.0.clone(), "hide".to_string());
+
+        assert!(state.worktree_is_visible(&main));
+        assert!(state.worktree_is_visible(&managed));
+        assert!(!state.worktree_is_visible(&external));
+        assert_eq!(state.external_worktree_inbox(&repo_id).len(), 1);
+
+        let _ = state.update(Message::RepoExternalWorktreeImported(
+            repo_id.clone(),
+            external_id,
+        ));
+        assert!(state.worktree_is_visible(&external));
+        assert!(state.external_worktree_inbox(&repo_id).is_empty());
+
+        let second = entry("external-two");
+        state
+            .worktrees_by_repo
+            .get_mut(&repo_id)
+            .unwrap()
+            .push(second.clone());
+        assert_eq!(state.external_worktree_inbox(&repo_id).len(), 1);
+        let _ = state.update(Message::RepoExternalWorktreesKeptHidden(repo_id.clone()));
+        assert!(state.external_worktree_inbox(&repo_id).is_empty());
+        assert!(!state.worktree_is_visible(&second));
+
+        let _ = state.update(Message::RepoExternalWorktreeVisibilitySelected(
+            repo_id,
+            "show".to_string(),
+        ));
+        assert!(state.worktree_is_visible(&second));
+    }
+
+    #[test]
+    fn browser_navigation_uses_the_configured_search_engine_and_localhost_rules() {
+        let mut state = AppState::default();
+        state.ui_settings.browser_search_engine = "duckduckgo".into();
+
+        assert_eq!(
+            state.normalized_browser_url("orca rust clone"),
+            Some("https://duckduckgo.com/?q=orca%20rust%20clone".into())
+        );
+        assert_eq!(
+            state.normalized_browser_url("localhost:5173"),
+            Some("http://localhost:5173/".into()),
+            "local development addresses stay on HTTP like Orca"
+        );
+    }
+
+    #[test]
+    fn browser_child_bounds_track_sidebar_and_window_size() {
+        let mut state = AppState {
+            app_window_size: iced::Size::new(1200.0, 800.0),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.browser_bounds(),
+            (
+                207.0,
+                crate::browser::TOOLBAR_HEIGHT,
+                993.0,
+                800.0 - crate::browser::TOOLBAR_HEIGHT - crate::browser::STATUS_BAR_HEIGHT,
+            )
+        );
+        state.left_sidebar_open = false;
+        assert_eq!(
+            state.browser_bounds(),
+            (
+                32.0,
+                crate::browser::TOOLBAR_HEIGHT,
+                1168.0,
+                800.0 - crate::browser::TOOLBAR_HEIGHT - crate::browser::STATUS_BAR_HEIGHT,
+            )
+        );
+    }
+
+    #[test]
+    fn browser_profiles_create_select_remove_and_persist() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::BrowserProfileNameChanged("Work login".into()));
+        let _ = state.update(Message::BrowserProfileAdded);
+
+        let profile = state.ui_settings.browser_profiles[0].clone();
+        assert_eq!(profile.label, "Work login");
+        assert_eq!(state.ui_settings.browser_default_profile_id, profile.id);
+        assert_eq!(
+            state.persisted_snapshot().settings.ui.browser_profiles,
+            vec![profile.clone()]
+        );
+
+        let _ = state.update(Message::BrowserProfileRemoved(profile.id));
+        assert!(state.ui_settings.browser_profiles.is_empty());
+        assert_eq!(state.ui_settings.browser_default_profile_id, "default");
+    }
+
+    #[test]
+    fn blank_worktree_display_names_fall_back_to_branch_then_folder() {
+        let mut state = AppState::default();
+        let mut entry = entry_at("/tmp/folder-name", "feature/name");
+        let id = worktree_id_for(&entry.path);
+        state
+            .worktree_meta
+            .entry(id.clone())
+            .or_default()
+            .display_name = Some("   ".into());
+        assert_eq!(state.worktree_display_name(&id, &entry), "feature/name");
+
+        entry.branch = None;
+        assert_eq!(state.worktree_display_name(&id, &entry), "folder-name");
     }
 
     #[test]
@@ -3709,6 +22071,46 @@ mod tests {
             !state.session_store().is_running(id),
             "the underlying session must actually be closed, not merely detached from the pane"
         );
+        assert!(!state.worktree_sessions.contains_key(&worktree_id));
+    }
+
+    #[test]
+    fn closing_a_terminal_with_an_active_agent_requires_confirmation() {
+        let (mut state, id, worktree_id, pane) = state_with_one_open_session();
+        state
+            .session_store
+            .apply_presence(id, 1, AgentPresence::Agent("claude"));
+
+        let _ = state.update(Message::PaneCloseRequested(pane));
+
+        assert_eq!(state.running_pane_close_confirm, Some(pane));
+        assert!(state.session_store().is_running(id));
+        assert!(state.worktree_sessions.contains_key(&worktree_id));
+
+        let _ = state.update(Message::RunningPaneCloseCancelled);
+        assert_eq!(state.running_pane_close_confirm, None);
+        assert!(state.session_store().is_running(id));
+
+        let _ = state.update(Message::PaneCloseRequested(pane));
+        let _ = state.update(Message::RunningPaneCloseConfirmed);
+        assert!(state.panes().is_none());
+        assert!(!state.session_store().is_running(id));
+        assert!(!state.worktree_sessions.contains_key(&worktree_id));
+    }
+
+    #[test]
+    fn running_terminal_close_confirmation_can_be_disabled() {
+        let (mut state, id, worktree_id, pane) = state_with_one_open_session();
+        state.ui_settings.confirm_close_running_terminal = false;
+        state
+            .session_store
+            .apply_presence(id, 1, AgentPresence::Agent("codex"));
+
+        let _ = state.update(Message::PaneCloseRequested(pane));
+
+        assert_eq!(state.running_pane_close_confirm, None);
+        assert!(state.panes().is_none());
+        assert!(!state.session_store().is_running(id));
         assert!(!state.worktree_sessions.contains_key(&worktree_id));
     }
 
@@ -4023,6 +22425,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_clipboard_write_requires_an_exact_read_back() {
+        assert_eq!(
+            verify_clipboard_write("line 1\nline 2", None, true),
+            Err("Clipboard write verification failed.".to_string())
+        );
+        assert_eq!(
+            verify_clipboard_write("line 1\nline 2", Some("line 1\r\nline 2"), true),
+            Err("Clipboard write verification failed.".to_string())
+        );
+        assert_eq!(
+            verify_clipboard_write("line 1\nline 2", Some("line 1\nline 2"), false),
+            Err("Clipboard write verification failed.".to_string())
+        );
+        assert!(verify_clipboard_write("line 1\nline 2", Some("line 1\nline 2"), true).is_ok());
+    }
+
     /// 추출은 세션당 **직렬**이다(`selection_to_string()`이 선택 범위 전체를
     /// 훑는다). 도는 동안 온 요청은 최신 하나로 대기했다가 완료 후에 나간다.
     #[test]
@@ -4234,6 +22653,7 @@ mod tests {
             repo_id: RepoId("/tmp/r".into()),
             created_with_agent: None,
             initial_prompt: None,
+            run_setup: false,
             result: Err("branch already exists".to_string()),
         });
         assert_eq!(state.last_error(), Some("branch already exists"));
@@ -4263,7 +22683,11 @@ mod tests {
         let repo_id = RepoId("/tmp/r".into());
         let worktree_id = WorktreeId("/tmp/r/wt".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
-        state.apply_authoritative_listing(repo_id.clone(), OpId(1), vec![entry_at("/tmp/r/wt", "wt")]);
+        state.apply_authoritative_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/r/wt", "wt")],
+        );
 
         let _ = state.update(Message::WorktreeRemoved {
             request: OpId(2),
@@ -4299,7 +22723,11 @@ mod tests {
         let repo_id = RepoId("/tmp/r".into());
         let worktree_id = WorktreeId("/tmp/r/wt".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
-        state.apply_authoritative_listing(repo_id.clone(), OpId(1), vec![entry_at("/tmp/r/wt", "wt")]);
+        state.apply_authoritative_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/r/wt", "wt")],
+        );
 
         let _ = state.update(Message::WorktreeRemoved {
             request: OpId(2),
@@ -4339,6 +22767,7 @@ mod tests {
             worktree_path: PathBuf::from("/tmp/accepted"),
             branch: Some("accepted".to_string()),
         });
+        let _ = state.update(Message::RemoveWorktreeConfirmed);
 
         // 제거 요청을 보낸 직후(git 응답은 아직 안 옴) — 세션은 여전히 살아
         // 있어야 하고 pane도 여전히 그걸 가리켜야 한다.
@@ -4422,6 +22851,7 @@ mod tests {
             worktree_path: e.path.clone(),
             branch: e.branch.clone(),
         });
+        let _ = state.update(Message::RemoveWorktreeConfirmed);
 
         // git 삭제는 실제로 돌지 않았다(테스트 스레드엔 iced executor가 없다) —
         // `worktrees_by_repo`는 아직 그대로다. 이 상태에서도 새는지가 이 버그의
@@ -4711,7 +23141,11 @@ mod tests {
         deliver_start(&mut state, "/tmp/wt-a", false);
         deliver_start(&mut state, "/tmp/wt-b", false);
 
-        assert_eq!(restored_shape(&state), "-", "no survivor means no workbench");
+        assert_eq!(
+            restored_shape(&state),
+            "-",
+            "no survivor means no workbench"
+        );
         assert!(
             state.hydration.is_open(),
             "a restore in which EVERYTHING failed is still a completed restore — if the \
@@ -4775,8 +23209,10 @@ mod tests {
     /// 복원할 트리가 아예 없는 첫 실행. 게이트는 즉시 열려야 한다.
     #[test]
     fn a_first_run_with_no_saved_layout_opens_the_gate_immediately() {
-        let mut state = AppState::default();
-        state.hydration = Hydration::new([]);
+        let mut state = AppState {
+            hydration: Hydration::new([]),
+            ..Default::default()
+        };
         assert!(!state.hydration.is_open(), "precondition: closed");
 
         let _ = state.begin_layout_restore();
@@ -4855,16 +23291,14 @@ mod tests {
 
     /// 저장된 레이아웃을 디스크에 심고 복원을 시작한다. `restoring_state`와 달리
     /// **영속화가 배선돼 있어** 게이트가 열릴 때 실제로 저장이 일어난다.
-    fn restoring_state_with_disk(
-        file: &Path,
-        tree: PersistedPane,
-        listed: &[&str],
-    ) -> AppState {
+    fn restoring_state_with_disk(file: &Path, tree: PersistedPane, listed: &[&str]) -> AppState {
         let mut disk = PersistedState::default();
         disk.session.panes = Some(tree.clone());
         {
             let mut store = suaegi_core::persistence::Store::new(file.to_path_buf());
-            store.save(&disk).expect("seeding the good file must succeed");
+            store
+                .save(&disk)
+                .expect("seeding the good file must succeed");
         }
 
         let mut state = restoring_state(tree, listed);
@@ -4931,7 +23365,10 @@ mod tests {
         deliver_start(&mut state, "/tmp/wt-b", false);
 
         assert_eq!(restored_shape(&state), "-", "precondition: nothing came up");
-        assert!(state.hydration.is_open(), "precondition: the gate still opens");
+        assert!(
+            state.hydration.is_open(),
+            "precondition: the gate still opens"
+        );
 
         assert_eq!(
             flush_and_reload(state, &file).session.panes,
@@ -5040,8 +23477,7 @@ mod tests {
             leaf("/tmp/wt-a"),
             leaf("/tmp/wt-b"),
         );
-        let mut state =
-            restoring_state_with_disk(&file, saved, &["/tmp/wt-a", "/tmp/wt-b"]);
+        let mut state = restoring_state_with_disk(&file, saved, &["/tmp/wt-a", "/tmp/wt-b"]);
         deliver_start(&mut state, "/tmp/wt-a", true);
         deliver_start(&mut state, "/tmp/wt-b", true);
 
@@ -5084,7 +23520,7 @@ mod tests {
         // iced가 높이 0인 분할 영역에서 실제로 만들어내는 값이다.
         let _ = state.update(Message::PaneResized(pane_grid::ResizeEvent {
             split: split_id,
-            ratio: 0.0 / 0.0,
+            ratio: f32::NAN,
         }));
         let _ = state.update(Message::LayoutPersistDue { generation: 1 });
 
@@ -5233,10 +23669,15 @@ mod tests {
     #[test]
     fn a_failed_repo_listing_still_resolves_its_hydration_step() {
         let repo_id = RepoId("/tmp/degraded-repo".into());
-        let mut state = AppState::default();
-        state.hydration = gate_waiting_only_on(repo_id.clone());
+        let mut state = AppState {
+            hydration: gate_waiting_only_on(repo_id.clone()),
+            ..Default::default()
+        };
         state.note_list_issued(repo_id.clone(), OpId(7));
-        assert!(!state.hydration.is_open(), "precondition: waiting on the repo");
+        assert!(
+            !state.hydration.is_open(),
+            "precondition: waiting on the repo"
+        );
 
         let _ = state.update(Message::WorktreesListed {
             request: OpId(7),
@@ -5261,8 +23702,10 @@ mod tests {
     #[test]
     fn a_stale_listing_response_does_not_resolve_the_hydration_step() {
         let repo_id = RepoId("/tmp/racy-repo".into());
-        let mut state = AppState::default();
-        state.hydration = gate_waiting_only_on(repo_id.clone());
+        let mut state = AppState {
+            hydration: gate_waiting_only_on(repo_id.clone()),
+            ..Default::default()
+        };
         // 조회를 두 번 냈다. 지금 유효한 것은 OpId(2)다.
         state.note_list_issued(repo_id.clone(), OpId(1));
         state.note_list_issued(repo_id.clone(), OpId(2));
@@ -5634,40 +24077,42 @@ mod tests {
     /// (mutation으로 확인했다).
     #[test]
     fn a_saved_layout_is_read_off_disk_and_starts_its_sessions() {
-        let mut disk = PersistedState::default();
-        disk.repos = vec![some_repo("booted")];
-        disk.worktrees = vec![
-            Worktree {
-                id: wt("/tmp/wt-a"),
-                repo_id: RepoId("/tmp/booted".into()),
-                path: PathBuf::from("/tmp/wt-a"),
-                branch: "a".into(),
-                display_name: "a".into(),
-                created_with_agent: None,
-                created_at_unix_ms: 1,
-                linked_github_pr: None,
-                linked_linear_issue: None,
-                linked_linear_issue_workspace_id: None,
-                linked_linear_issue_organization_url_key: None,
-                linked_jira_issue: None,
-                linked_jira_site: None,
-            },
-            Worktree {
-                id: wt("/tmp/wt-b"),
-                repo_id: RepoId("/tmp/booted".into()),
-                path: PathBuf::from("/tmp/wt-b"),
-                branch: "b".into(),
-                display_name: "b".into(),
-                created_with_agent: None,
-                created_at_unix_ms: 2,
-                linked_github_pr: None,
-                linked_linear_issue: None,
-                linked_linear_issue_workspace_id: None,
-                linked_linear_issue_organization_url_key: None,
-                linked_jira_issue: None,
-                linked_jira_site: None,
-            },
-        ];
+        let mut disk = PersistedState {
+            repos: vec![some_repo("booted")],
+            worktrees: vec![
+                Worktree {
+                    id: wt("/tmp/wt-a"),
+                    repo_id: RepoId("/tmp/booted".into()),
+                    path: PathBuf::from("/tmp/wt-a"),
+                    branch: "a".into(),
+                    display_name: "a".into(),
+                    created_with_agent: None,
+                    created_at_unix_ms: 1,
+                    linked_github_pr: None,
+                    linked_linear_issue: None,
+                    linked_linear_issue_workspace_id: None,
+                    linked_linear_issue_organization_url_key: None,
+                    linked_jira_issue: None,
+                    linked_jira_site: None,
+                },
+                Worktree {
+                    id: wt("/tmp/wt-b"),
+                    repo_id: RepoId("/tmp/booted".into()),
+                    path: PathBuf::from("/tmp/wt-b"),
+                    branch: "b".into(),
+                    display_name: "b".into(),
+                    created_with_agent: None,
+                    created_at_unix_ms: 2,
+                    linked_github_pr: None,
+                    linked_linear_issue: None,
+                    linked_linear_issue_workspace_id: None,
+                    linked_linear_issue_organization_url_key: None,
+                    linked_jira_issue: None,
+                    linked_jira_site: None,
+                },
+            ],
+            ..Default::default()
+        };
         disk.session.panes = Some(split(
             PersistedAxis::Horizontal,
             0.4,
@@ -5770,6 +24215,7 @@ mod tests {
             event: name,
             tool_name: None,
             agent_id: None,
+            prompt: None,
             background_tasks_empty: Some(true),
         }
     }
@@ -5830,6 +24276,35 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_daemon_reattach_binds_its_original_nonce_once() {
+        let worktree = wt("/tmp/wt-a");
+        let mut state = state_with_badge("/tmp/wt-a", 9);
+        state
+            .badges
+            .get_mut(&worktree)
+            .unwrap()
+            .allow_reattach_nonce_bind = true;
+
+        assert!(state.apply_hook(&hook("/tmp/wt-a", 3, HookEventName::UserPromptSubmit,)));
+        let rebound = &state.badges[&worktree];
+        assert_eq!(rebound.expected, SpawnNonce(3));
+        assert!(!rebound.allow_reattach_nonce_bind);
+        assert_eq!(
+            rebound.hook.map(|(value, _)| value),
+            Some(HookState::Working)
+        );
+
+        assert!(
+            !state.apply_hook(&hook("/tmp/wt-a", 2, HookEventName::Stop)),
+            "after the one-time daemon rebind, another stale generation must be rejected"
+        );
+        assert_eq!(
+            state.badges[&worktree].hook.map(|(value, _)| value),
+            Some(HookState::Working)
+        );
+    }
+
+    #[test]
     fn a_hook_for_a_pane_we_never_spawned_is_dropped() {
         let mut state = state_with_badge("/tmp/wt-a", 1);
         let _ = state.update(Message::HookArrived(hook(
@@ -5854,7 +24329,10 @@ mod tests {
             1,
             HookEventName::PreToolUse,
         )));
-        assert!(state.badges[&wt("/tmp/wt-a")].hook.is_some(), "precondition");
+        assert!(
+            state.badges[&wt("/tmp/wt-a")].hook.is_some(),
+            "precondition"
+        );
 
         let _ = state.update(Message::HookArrived(hook(
             "/tmp/wt-a",
@@ -5865,6 +24343,246 @@ mod tests {
             state.badges[&wt("/tmp/wt-a")].hook.is_none(),
             "a fresh session starts from Unknown, not from whatever the last one was doing"
         );
+    }
+
+    #[test]
+    fn prompt_cache_timer_tracks_claude_completion_and_clears_on_resume_reset_and_disable() {
+        let id = wt("/tmp/wt-a");
+        let mut state = state_with_badge("/tmp/wt-a", 1);
+        state.ui_settings.prompt_cache_timer_enabled = true;
+        state.ui_settings.prompt_cache_ttl_minutes = 5;
+
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PreToolUse,
+        )));
+        assert_eq!(
+            state.prompt_cache_remaining_seconds(&id),
+            None,
+            "working starts a request, but the reusable prompt cache window begins only when it finishes"
+        );
+
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::Stop,
+        )));
+        assert!(matches!(
+            state.prompt_cache_remaining_seconds(&id),
+            Some(1..=300)
+        ));
+
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PreToolUse,
+        )));
+        assert_eq!(
+            state.prompt_cache_remaining_seconds(&id),
+            None,
+            "resuming work consumes the previous completion window"
+        );
+
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::Stop,
+        )));
+        assert!(state.prompt_cache_remaining_seconds(&id).is_some());
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::SessionStart,
+        )));
+        assert_eq!(
+            state.prompt_cache_remaining_seconds(&id),
+            None,
+            "a new Claude session cannot inherit the old session's cache timer"
+        );
+
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PreToolUse,
+        )));
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::Stop,
+        )));
+        let _ = state.update(Message::UiSettingToggled(
+            UiSetting::PromptCacheTimerEnabled,
+        ));
+        assert!(state.prompt_cache_started.is_empty());
+        assert_eq!(state.prompt_cache_remaining_seconds(&id), None);
+    }
+
+    #[test]
+    fn terminal_attention_persists_for_background_completion_and_clears_on_focus() {
+        let (mut state, session, worktree, pane) = state_with_one_open_session();
+        state.ui_settings.experimental_terminal_attention = true;
+        state.focused_pane = None;
+        state
+            .badges
+            .insert(worktree.clone(), PaneBadge::new(SpawnNonce(1)));
+
+        let _ = state.update(Message::HookArrived(hook(
+            &worktree.0,
+            1,
+            HookEventName::PreToolUse,
+        )));
+        let _ = state.update(Message::HookArrived(hook(
+            &worktree.0,
+            1,
+            HookEventName::Stop,
+        )));
+        assert!(state.session_needs_attention(session));
+
+        let _ = state.update(Message::PaneClicked(pane));
+        assert!(!state.session_needs_attention(session));
+    }
+
+    #[test]
+    fn experimental_activity_records_agent_lifecycle_and_clear_is_explicit() {
+        let mut state = state_with_badge("/tmp/wt-a", 1);
+        state.ui_settings.experimental_activity = true;
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::PreToolUse,
+        )));
+        let _ = state.update(Message::HookArrived(hook(
+            "/tmp/wt-a",
+            1,
+            HookEventName::Stop,
+        )));
+        assert_eq!(state.activity_events.len(), 2);
+        assert_eq!(state.activity_events[0].status, "Completed");
+        let _ = state.update(Message::ActivityOpened);
+        assert!(state.activity_open());
+        let _ = state.update(Message::ActivityCleared);
+        assert!(state.activity_events.is_empty());
+    }
+
+    #[test]
+    fn native_chat_toggle_and_composer_are_scoped_to_a_live_session() {
+        let (mut state, session, _worktree, _pane) = state_with_one_open_session();
+        state.ui_settings.experimental_native_chat = true;
+        let _ = state.update(Message::NativeChatToggled(session));
+        assert!(state.native_chat_open(session));
+        let _ = state.update(Message::NativeChatDraftChanged(session, "hello".into()));
+        assert_eq!(state.native_chat_draft(session), "hello");
+        let _ = state.update(Message::UiSettingToggled(UiSetting::ExperimentalNativeChat));
+        assert!(!state.native_chat_open(session));
+        assert_eq!(state.native_chat_draft(session), "");
+    }
+
+    #[test]
+    fn native_chat_default_view_matches_orca_supported_agents() {
+        assert!(native_chat_supported_agent(Some("claude")));
+        assert!(native_chat_supported_agent(Some("openclaude")));
+        assert!(native_chat_supported_agent(Some("codex")));
+        assert!(native_chat_supported_agent(Some("grok")));
+        assert!(!native_chat_supported_agent(Some("cursor")));
+        assert!(!native_chat_supported_agent(None));
+
+        let mut state = AppState::default();
+        let _ = state.update(Message::UiChoiceSelected(
+            UiChoice::NativeChatDefaultView,
+            "Chat UI".to_string(),
+        ));
+        assert!(state.ui_settings.open_agent_tabs_in_chat_by_default);
+        let _ = state.update(Message::UiChoiceSelected(
+            UiChoice::NativeChatDefaultView,
+            "Terminal chat".to_string(),
+        ));
+        assert!(!state.ui_settings.open_agent_tabs_in_chat_by_default);
+    }
+
+    #[test]
+    fn claude_agent_teams_in_process_adds_the_flag_once() {
+        assert_eq!(
+            claude_agent_teams_args(Some("--dangerously-skip-permissions".into()), "in-process")
+                .as_deref(),
+            Some("--dangerously-skip-permissions --teammate-mode in-process")
+        );
+        assert_eq!(
+            claude_agent_teams_args(Some("--teammate-mode=auto --verbose".into()), "in-process")
+                .as_deref(),
+            Some("--teammate-mode=auto --verbose")
+        );
+        assert_eq!(
+            claude_agent_teams_args(Some("--verbose".into()), "off").as_deref(),
+            Some("--verbose")
+        );
+    }
+
+    #[test]
+    fn plugin_consent_requires_the_exact_reviewed_fingerprint() {
+        let mut state = AppState::default();
+        state.ui_settings.plugin_system_enabled = true;
+        state.plugins.push(crate::plugins::PluginEntry {
+            plugin_key: "acme.notes".into(),
+            root: PathBuf::from("/tmp/acme-notes"),
+            content_hash: None,
+            name: "Notes".into(),
+            version: "1.0.0".into(),
+            publisher: "acme".into(),
+            description: String::new(),
+            status: crate::plugins::PluginStatus::Pending,
+            error: None,
+            is_dev: true,
+            consent_fingerprint: Some("reviewed".into()),
+            capabilities: vec!["storage".into()],
+            panels: Vec::new(),
+            commands: vec![crate::plugins::PluginCommand {
+                id: "open-tasks".into(),
+                title: "Open tasks".into(),
+                context: Some("global".into()),
+                action: Some("view.tasks".into()),
+            }],
+            events: Vec::new(),
+            language_packs: Vec::new(),
+            language_pack_catalogs: Vec::new(),
+            keybindings: Vec::new(),
+            vm_recipes: Vec::new(),
+            vm_recipe_specs: Vec::new(),
+            agents: Vec::new(),
+            has_worker: true,
+            main_entry: Some("main.mjs".into()),
+            rollback_available: false,
+            blocked_by_kill_list: None,
+        });
+
+        let _ = state.update(Message::PluginConsentGranted(
+            "acme.notes".into(),
+            "reviewed".into(),
+        ));
+        assert!(!state.ui_settings.plugin_consents.contains_key("acme.notes"));
+
+        let _ = state.update(Message::PluginConsentReviewRequested("acme.notes".into()));
+        let _ = state.update(Message::PluginConsentGranted(
+            "acme.notes".into(),
+            "different".into(),
+        ));
+        assert!(!state.ui_settings.plugin_consents.contains_key("acme.notes"));
+
+        let _ = state.update(Message::PluginConsentReviewRequested("acme.notes".into()));
+        let _ = state.update(Message::PluginConsentGranted(
+            "acme.notes".into(),
+            "reviewed".into(),
+        ));
+        assert_eq!(
+            state.ui_settings.plugin_consents.get("acme.notes"),
+            Some(&"reviewed".to_string())
+        );
+        state.plugins[0].status = crate::plugins::PluginStatus::Idle;
+        let _ = state.update(Message::PluginCommandInvoked(
+            "acme.notes".into(),
+            "open-tasks".into(),
+        ));
+        assert!(state.tasks_open);
     }
 
     /// **precedence: 훅 > 타이틀.** 로그인 셸(`Custom`→`OscTitle`) 안에서 claude를
@@ -5938,6 +24656,7 @@ mod tests {
             event: HookEventName::PermissionRequest,
             tool_name: Some("Bash".into()),
             agent_id: None,
+            prompt: None,
             background_tasks_empty: None,
         }));
 
@@ -5947,6 +24666,103 @@ mod tests {
             "a PermissionRequest with the agent present must surface as Waiting — this is \
              the state the whole plan exists to show"
         );
+    }
+
+    #[test]
+    fn first_valid_prompt_generates_a_stable_optional_tab_title() {
+        let (mut state, id, worktree_id, _pane) = state_with_one_open_session();
+        state.ui_settings.tab_auto_generate_title = true;
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(7)));
+
+        let _ = state.update(Message::HookArrived(HookEvent {
+            pane_key: PaneKey(worktree_id.clone()),
+            spawn_nonce: SpawnNonce(7),
+            claude_session_id: "s".into(),
+            event: HookEventName::UserPromptSubmit,
+            tool_name: None,
+            agent_id: None,
+            prompt: Some("Review community PR https://github.com/acme/app/pull/1094".into()),
+            background_tasks_empty: None,
+        }));
+        assert_eq!(state.session_tab_title(id), "PR 1094 - Review community");
+
+        let _ = state.update(Message::HookArrived(HookEvent {
+            pane_key: PaneKey(worktree_id),
+            spawn_nonce: SpawnNonce(7),
+            claude_session_id: "s".into(),
+            event: HookEventName::UserPromptSubmit,
+            tool_name: None,
+            agent_id: None,
+            prompt: Some("Please replace the first title".into()),
+            background_tasks_empty: None,
+        }));
+        assert_eq!(
+            state.session_tab_title(id),
+            "PR 1094 - Review community",
+            "later prompts must not make an open tab jump between titles"
+        );
+
+        state.ui_settings.tab_auto_generate_title = false;
+        assert_ne!(
+            state.session_tab_title(id),
+            "PR 1094 - Review community",
+            "disabling the setting must restore the ordinary worktree title immediately"
+        );
+    }
+
+    #[test]
+    fn first_work_rename_is_scheduled_only_for_owned_creature_branches() {
+        let (mut state, _id, worktree_id, _pane) = state_with_one_open_session();
+        let repo_id = RepoId("/tmp/r2".into());
+        state.worktrees_by_repo.get_mut(&repo_id).unwrap()[0].branch =
+            Some("you/Nautilus".to_string());
+        state.worktree_meta.insert(
+            worktree_id.clone(),
+            WorktreeMeta {
+                created_at_unix_ms: 1,
+                ..Default::default()
+            },
+        );
+        state
+            .badges
+            .insert(worktree_id.clone(), PaneBadge::new(SpawnNonce(7)));
+
+        let _task = state.update(Message::HookArrived(HookEvent {
+            pane_key: PaneKey(worktree_id.clone()),
+            spawn_nonce: SpawnNonce(7),
+            claude_session_id: "s".into(),
+            event: HookEventName::UserPromptSubmit,
+            tool_name: None,
+            agent_id: None,
+            prompt: Some("Please fix the auth bug".into()),
+            background_tasks_empty: None,
+        }));
+        assert!(state.auto_branch_rename_in_flight.contains(&worktree_id));
+
+        let (mut imported, _id, imported_id, _pane) = state_with_one_open_session();
+        let imported_repo = RepoId("/tmp/r2".into());
+        imported.worktrees_by_repo.get_mut(&imported_repo).unwrap()[0].branch =
+            Some("Nautilus".to_string());
+        imported
+            .badges
+            .insert(imported_id.clone(), PaneBadge::new(SpawnNonce(7)));
+        let _task = imported.update(Message::HookArrived(HookEvent {
+            pane_key: PaneKey(imported_id.clone()),
+            spawn_nonce: SpawnNonce(7),
+            claude_session_id: "s".into(),
+            event: HookEventName::UserPromptSubmit,
+            tool_name: None,
+            agent_id: None,
+            prompt: Some("Please fix the auth bug".into()),
+            background_tasks_empty: None,
+        }));
+        assert!(
+            !imported.auto_branch_rename_in_flight.contains(&imported_id),
+            "an imported worktree may coincidentally use a creature name and must never be renamed"
+        );
+        assert!(imported.auto_branch_rename_settled.contains(&imported_id));
     }
 
     /// `NoAgent` streak는 폴링이 도는 곳에서 유지돼야 한다. 안 그러면 `reduce`의
@@ -6112,6 +24928,7 @@ mod tests {
             event: HookEventName::PermissionRequest,
             tool_name: None,
             agent_id: None,
+            prompt: None,
             background_tasks_empty: None,
         }));
         assert_eq!(
@@ -6236,10 +25053,11 @@ mod tests {
         assert!(!state.hydration.is_open(), "so the gate stays shut");
 
         // 대조군: 맞는 세대는 실제로 끝낸다.
-        let _ = state.update(Message::RestoreWatchdog {
-            generation: first,
-        });
-        assert!(state.hydration.is_open(), "control: the matching generation completes it");
+        let _ = state.update(Message::RestoreWatchdog { generation: first });
+        assert!(
+            state.hydration.is_open(),
+            "control: the matching generation completes it"
+        );
     }
 
     // ---- presence → 배지 장부 ----
@@ -6360,8 +25178,7 @@ mod tests {
         }
 
         assert_eq!(
-            state.badges[&worktree_id].no_agent_streak,
-            NO_AGENT_CONFIRMATIONS,
+            state.badges[&worktree_id].no_agent_streak, NO_AGENT_CONFIRMATIONS,
             "an Unknown observation means 'we could not tell', not 'the agent is back' — \
              resetting on it lets a flaky ps starve the streak forever"
         );
@@ -6379,9 +25196,11 @@ mod tests {
     /// 것**이었다. 그래서 여기서는 세션에 실제로 심긴 env를 본다.
     #[test]
     fn a_restored_session_is_spawned_with_the_hook_environment() {
-        let mut state = AppState::default();
         // 서버가 세션 시작 **전에** 붙어 있어야 한다 — `boot()`이 강제하는 순서다.
-        state.hook_endpoint = Some((51234, "tok-abc".to_string()));
+        let mut state = AppState {
+            hook_endpoint: Some((51234, "tok-abc".to_string())),
+            ..Default::default()
+        };
 
         let repo_id = RepoId("/tmp/r-env".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
@@ -6413,7 +25232,7 @@ mod tests {
              no hook environment and its badge is Unknown forever"
         );
         assert_eq!(get("SUAEGI_HOOK_TOKEN"), Some("tok-abc".to_string()));
-        assert_eq!(get("SUAEGI_SPAWN_NONCE").is_some(), true);
+        assert!(get("SUAEGI_SPAWN_NONCE").is_some());
         assert!(
             get("SUAEGI_PANE_KEY").is_some_and(|k| !k.contains('/')),
             "and the pane key must be planted already base64url-encoded"
@@ -6426,9 +25245,12 @@ mod tests {
     /// (실제 훅 POST가 뜨는지는 실 claude가 필요해 human-eyes 항목 — 보고서 참고.)
     #[test]
     fn a_claude_worktree_launches_claude_directly_with_the_hook_environment() {
-        let mut state = AppState::default();
         // 세션 시작 전에 엔드포인트가 붙어 있어야 env가 심긴다(boot 순서와 동일).
-        state.hook_endpoint = Some((51999, "tok-claude".to_string()));
+        let mut state = AppState {
+            hook_endpoint: Some((51999, "tok-claude".to_string())),
+            ..Default::default()
+        };
+        state.ui_settings.claude_agent_teams_mode = "in-process".into();
 
         let path = "/nonexistent-suaegi-claude-launch";
         let repo_id = RepoId("/tmp/r-claude".into());
@@ -6477,6 +25299,14 @@ mod tests {
         );
         assert_eq!(get("SUAEGI_HOOK_TOKEN"), Some("tok-claude".to_string()));
         assert!(get("SUAEGI_PANE_KEY").is_some());
+        assert_eq!(
+            get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"),
+            Some("1".to_string())
+        );
+        assert!(spawn
+            .args
+            .windows(2)
+            .any(|args| args == ["--teammate-mode", "in-process"]));
     }
 
     /// 대조군: 에이전트를 안 고른 worktree는 예전 그대로 **로그인 셸**로 뜬다
@@ -6558,6 +25388,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn active_managed_provider_account_scopes_new_agent_processes() {
+        let mut state = AppState::default();
+        let path = "/nonexistent-suaegi-managed-codex";
+        let repo_id = RepoId("/tmp/r-managed-codex".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id, OpId(1), vec![entry_at(path, "feat")]);
+        state.worktree_meta.insert(
+            wt(path),
+            WorktreeMeta {
+                created_with_agent: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
+        state.ui_settings.codex_managed_accounts.push(
+            suaegi_core::domain::ManagedProviderAccountSetting {
+                id: "codex-account-1".into(),
+                email: "ada@example.com".into(),
+                config_dir: "/tmp/suaegi-codex-account".into(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                last_authenticated_at_unix_ms: 1,
+            },
+        );
+        state.ui_settings.active_codex_managed_account_id = Some("codex-account-1".into());
+
+        let _ = state.update(Message::WorktreeSelected(wt(path)));
+        let spawn = state.session_store().last_spawn().unwrap();
+        assert!(spawn
+            .env
+            .iter()
+            .any(|(name, value)| name == "CODEX_HOME" && value == "/tmp/suaegi-codex-account"));
+    }
+
     /// stdin-after-start 에이전트(aider)는 프롬프트를 argv로 받지 않는다 —
     /// bare로 뜨고 대신 주입이 **대기**한다(`pending_injections`). 세션이 실제로
     /// 살아난 뒤에야 게이트로 옮겨진다(`SessionStarted`).
@@ -6620,6 +25484,7 @@ mod tests {
             repo_id,
             created_with_agent: Some("aider".to_string()),
             initial_prompt: Some("SECRET-PROMPT-TOKEN".to_string()),
+            run_setup: false,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-persist"),
                 branch: "feat".into(),
@@ -6678,7 +25543,8 @@ mod tests {
             text: Some("h".to_string()),
             repeat: false,
         };
-        let _ = state.dispatch_term_command(session_id, crate::terminal::contract::TermCommand::Key(key));
+        let _ = state
+            .dispatch_term_command(session_id, crate::terminal::contract::TermCommand::Key(key));
         assert!(
             !state.pending_injections.contains_key(&session_id)
                 && !state.prompt_gates.contains_key(&session_id),
@@ -6708,12 +25574,15 @@ mod tests {
             .start_for_test_with_agent(cmd, Some("aider"));
 
         // 시계가 이미 타임아웃을 넘긴 게이트를 무장한다(과거 `started`).
-        let past =
-            Instant::now() - crate::prompt_inject::HARD_TIMEOUT - Duration::from_secs(1);
-        state
-            .prompt_gates
-            .insert(session_id, PromptGate::armed_at("the prompt".to_string(), past));
-        assert!(state.has_armed_prompt_gates(), "precondition: a gate is armed");
+        let past = Instant::now() - crate::prompt_inject::HARD_TIMEOUT - Duration::from_secs(1);
+        state.prompt_gates.insert(
+            session_id,
+            PromptGate::armed_at("the prompt".to_string(), past),
+        );
+        assert!(
+            state.has_armed_prompt_gates(),
+            "precondition: a gate is armed"
+        );
         assert_eq!(
             crate::presence_poll::tier(&state),
             crate::presence_poll::ACTIVE_TIER,
@@ -6743,9 +25612,11 @@ mod tests {
         let worktree = workspace.join("repo").join("wt-old");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        let mut state = AppState::default();
-        state.workspace_root = workspace;
-        state.hook_script = Some(dir.path().join("hook.sh"));
+        let mut state = AppState {
+            workspace_root: workspace,
+            hook_script: Some(dir.path().join("hook.sh")),
+            ..Default::default()
+        };
         let repo_id = RepoId("/tmp/r-old".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
         state.apply_authoritative_listing(
@@ -6775,9 +25646,11 @@ mod tests {
         let foreign = dir.path().join("someone-elses-repo");
         std::fs::create_dir_all(&foreign).unwrap();
 
-        let mut state = AppState::default();
-        state.workspace_root = dir.path().join("our-workspace");
-        state.hook_script = Some(dir.path().join("hook.sh"));
+        let mut state = AppState {
+            workspace_root: dir.path().join("our-workspace"),
+            hook_script: Some(dir.path().join("hook.sh")),
+            ..Default::default()
+        };
         let repo_id = RepoId("/tmp/r-foreign".into());
         state.note_list_issued(repo_id.clone(), OpId(1));
         state.apply_authoritative_listing(
@@ -6804,30 +25677,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("data.json");
 
-        let mut disk = PersistedState::default();
-        disk.repos = vec![some_repo("meta-repo")];
-        disk.worktrees = vec![Worktree {
-            id: wt("/tmp/wt-meta"),
-            repo_id: RepoId("/tmp/meta-repo".into()),
-            path: PathBuf::from("/tmp/wt-meta"),
-            branch: "meta".into(),
-            display_name: "meta".into(),
-            created_with_agent: None,
-            created_at_unix_ms: 1_700_000_000_000,
-            // Plan 7a: 연결된 PR도 `created_at_unix_ms`와 같은 경로로 보존돼야 한다 —
-            // `persisted_snapshot`이 매 저장마다 Worktree를 새로 합성하므로, 이 값이
-            // `WorktreeMeta`로 씨딩·재주입되지 않으면 한 번 저장에 사라진다.
-            linked_github_pr: Some(1234),
-            // N1 §1.3: Linear 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입이
-            // 없으면 한 번 저장에 사라진다(forge #14 클래스). 세 조각(식별자 + 좌표)을 다 심는다.
-            linked_linear_issue: Some("ENG-42".into()),
-            linked_linear_issue_workspace_id: Some("org-77".into()),
-            linked_linear_issue_organization_url_key: Some("acme".into()),
-            // N2 §2: Jira 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입 중 하나라도
-            // 지우는 뮤턴트는 아래 두 단언에서 죽는다. 두 조각(키 + 사이트)을 다 심는다.
-            linked_jira_issue: Some("PROJ-99".into()),
-            linked_jira_site: Some("https://acme.atlassian.net".into()),
-        }];
+        let disk = PersistedState {
+            repos: vec![some_repo("meta-repo")],
+            worktrees: vec![Worktree {
+                id: wt("/tmp/wt-meta"),
+                repo_id: RepoId("/tmp/meta-repo".into()),
+                path: PathBuf::from("/tmp/wt-meta"),
+                branch: "meta".into(),
+                display_name: "meta".into(),
+                created_with_agent: None,
+                created_at_unix_ms: 1_700_000_000_000,
+                // Plan 7a: 연결된 PR도 `created_at_unix_ms`와 같은 경로로 보존돼야 한다 —
+                // `persisted_snapshot`이 매 저장마다 Worktree를 새로 합성하므로, 이 값이
+                // `WorktreeMeta`로 씨딩·재주입되지 않으면 한 번 저장에 사라진다.
+                linked_github_pr: Some(1234),
+                // N1 §1.3: Linear 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입이
+                // 없으면 한 번 저장에 사라진다(forge #14 클래스). 세 조각(식별자 + 좌표)을 다 심는다.
+                linked_linear_issue: Some("ENG-42".into()),
+                linked_linear_issue_workspace_id: Some("org-77".into()),
+                linked_linear_issue_organization_url_key: Some("acme".into()),
+                // N2 §2: Jira 링크도 **정확히 같은 데이터-손실 계약**을 받는다 — 씨딩·재주입 중 하나라도
+                // 지우는 뮤턴트는 아래 두 단언에서 죽는다. 두 조각(키 + 사이트)을 다 심는다.
+                linked_jira_issue: Some("PROJ-99".into()),
+                linked_jira_site: Some("https://acme.atlassian.net".into()),
+            }],
+            ..Default::default()
+        };
 
         let mut state = AppState::from_load(LoadDiagnostics {
             state: disk,
@@ -6864,7 +25739,9 @@ mod tests {
              WorktreeMeta and re-injected, exactly like linked_github_pr (forge #14 class)"
         );
         assert_eq!(
-            saved.worktrees[0].linked_linear_issue_workspace_id.as_deref(),
+            saved.worktrees[0]
+                .linked_linear_issue_workspace_id
+                .as_deref(),
             Some("org-77"),
             "the Linear workspace coordinate must survive too (deep-link/reconnect)"
         );
@@ -6917,6 +25794,7 @@ mod tests {
             url: None,
             state: Some("In Progress".into()),
             assignee: None,
+            ..Default::default()
         };
         let _ = state.update(Message::LinearIssueLinked {
             worktree: worktree_id.clone(),
@@ -6946,7 +25824,9 @@ mod tests {
             "the link must survive a save — WorktreeMeta seeded + re-injected (forge #14 class)"
         );
         assert_eq!(
-            saved.worktrees[0].linked_linear_issue_workspace_id.as_deref(),
+            saved.worktrees[0]
+                .linked_linear_issue_workspace_id
+                .as_deref(),
             Some("org-77"),
             "the workspace coordinate captured from the connected workspace must survive too"
         );
@@ -7228,7 +26108,10 @@ mod tests {
             .create_pr_dialog()
             .expect("a failed create must keep the dialog open so the user can retry");
         assert_eq!(dialog.error.as_deref(), Some("run gh auth login"));
-        assert!(!dialog.submitting, "a failed create must unlock the submit button");
+        assert!(
+            !dialog.submitting,
+            "a failed create must unlock the submit button"
+        );
         assert_eq!(
             state
                 .worktree_meta
@@ -7380,7 +26263,10 @@ mod tests {
         state.github_status.insert(
             worktree_id.clone(),
             GithubStatus::Fetched {
-                fetch: GithubFetch::Resolved(ReviewLookup::Found(review(number, ReviewState::Open))),
+                fetch: GithubFetch::Resolved(ReviewLookup::Found(review(
+                    number,
+                    ReviewState::Open,
+                ))),
                 eligibility: CreationEligibility::Blocked(CreationBlockedReason::AlreadyExists),
             },
         );
@@ -7406,7 +26292,10 @@ mod tests {
         let _ = state.update(Message::PrPanelOpened {
             worktree: worktree_id.clone(),
         });
-        assert!(state.pr_panel().is_open(), "the panel opened for the linked PR");
+        assert!(
+            state.pr_panel().is_open(),
+            "the panel opened for the linked PR"
+        );
         assert_eq!(state.pr_panel().number(), Some(42));
 
         // 머지가능성만 테스트 seam으로 세운다(on-open 조회 op를 흉내내지 않는다).
@@ -7484,7 +26373,10 @@ mod tests {
             display: MergeResultDisplay::Merged,
         });
 
-        assert_eq!(state.pr_panel().outcome(), Some(&MergeResultDisplay::Merged));
+        assert_eq!(
+            state.pr_panel().outcome(),
+            Some(&MergeResultDisplay::Merged)
+        );
         assert!(!state.pr_panel().is_merging());
         assert!(
             matches!(
@@ -7533,6 +26425,36 @@ mod tests {
     /// 생성 시점이 메타데이터의 유일한 진짜 출처다 — `Ok(_created)`를 버리면
     /// 그 시각은 영영 없다. 에이전트를 안 고르면(피커 미조작) agent는 `None`.
     #[test]
+    fn blank_workspace_names_follow_orcas_prompt_then_creature_fallback_order() {
+        assert_eq!(
+            workspace_seed_name(" manual-name ", Some("ignored prompt"), "cunner"),
+            "manual-name"
+        );
+        assert_eq!(
+            workspace_seed_name("", Some("Add a dark mode toggle"), "cunner"),
+            "add-a-dark-mode-toggle"
+        );
+        assert_eq!(workspace_seed_name("", None, "cunner"), "cunner");
+        assert_eq!(workspace_seed_name("", Some("🔥🔥"), ""), "workspace");
+    }
+
+    #[test]
+    fn opening_workspace_creation_picks_a_global_unused_creature() {
+        let mut state = AppState::default();
+        let repo = RepoId("/tmp/repo".into());
+        state.worktrees_by_repo.insert(
+            repo.clone(),
+            vec![entry_at("/tmp/workspaces/nautilus", "nautilus")],
+        );
+        let _ = state.update(Message::WorktreeCreateToggled(repo.clone()));
+        let suggestion = state.worktree_suggested_name(&repo);
+        assert!(suaegi_workname::is_auto_generated_creature_branch_name(
+            suggestion
+        ));
+        assert_ne!(suggestion, "nautilus");
+    }
+
+    #[test]
     fn creating_a_worktree_records_a_real_timestamp_but_no_agent() {
         let mut state = AppState::default();
         let repo_id = RepoId("/tmp/creator".into());
@@ -7547,6 +26469,7 @@ mod tests {
             repo_id,
             created_with_agent: None,
             initial_prompt: None,
+            run_setup: false,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-new"),
                 branch: "new".into(),
@@ -7581,6 +26504,7 @@ mod tests {
             repo_id,
             created_with_agent: Some("claude".to_string()),
             initial_prompt: None,
+            run_setup: false,
             result: Ok(CreatedWorktree {
                 path: PathBuf::from("/tmp/wt-claude"),
                 branch: "new".into(),
@@ -7596,6 +26520,12 @@ mod tests {
             meta.created_with_agent.as_deref(),
             Some("claude"),
             "the chosen agent id must be baked into the worktree metadata"
+        );
+        assert!(
+            state
+                .deferred_setup_agent_starts
+                .contains(&wt("/tmp/wt-claude")),
+            "agent-first creation must queue the requested agent for launch after listing refresh"
         );
     }
 
@@ -7614,6 +26544,808 @@ mod tests {
         );
         // 아무것도 설치 안 됐어도 로그인 셸은 늘 고를 수 있다.
         assert_eq!(agent_choices(&[]), vec![AgentChoice::LOGIN_SHELL]);
+    }
+
+    #[test]
+    fn sidebar_creation_and_integration_surfaces_are_closed_by_default_and_toggle_explicitly() {
+        let mut state = AppState::default();
+        assert!(!state.is_adding_repo());
+        assert!(!state.integrations_open());
+
+        let _ = state.update(Message::RepoAddToggled);
+        let _ = state.update(Message::IntegrationsToggled);
+        assert!(state.is_adding_repo());
+        assert!(state.integrations_open());
+
+        let _ = state.update(Message::RepoAddToggled);
+        let _ = state.update(Message::IntegrationsToggled);
+        assert!(!state.is_adding_repo());
+        assert!(!state.integrations_open());
+    }
+
+    #[test]
+    fn settings_navigation_search_and_help_have_independent_state() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::IntegrationsToggled);
+        let _ = state.update(Message::SettingsSearchChanged("terminal".into()));
+        let _ = state.update(Message::SettingsSectionSelected(SettingsSection::Terminal));
+        assert!(state.integrations_open());
+        assert_eq!(state.settings_search_query(), "terminal");
+        assert_eq!(state.settings_section(), SettingsSection::Terminal);
+
+        let _ = state.update(Message::IntegrationsToggled);
+        let _ = state.update(Message::HelpToggled);
+        assert!(!state.integrations_open());
+        assert!(state.help_open());
+        let _ = state.update(Message::HelpToggled);
+        assert!(!state.help_open());
+    }
+
+    #[test]
+    fn interface_setting_toggles_are_included_in_the_persisted_snapshot() {
+        let mut state = AppState::default();
+        assert!(!state.ui_settings().auto_save_files);
+        assert!(!state.ui_settings().anonymous_telemetry);
+
+        let _ = state.update(Message::UiSettingToggled(UiSetting::AutoSaveFiles));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::AnonymousTelemetry));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::OrchestrationEnabled));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::ComputerUseEnabled));
+
+        let snapshot = state.persisted_snapshot();
+        assert!(snapshot.settings.ui.auto_save_files);
+        assert!(snapshot.settings.ui.anonymous_telemetry);
+        assert!(snapshot.settings.ui.orchestration_enabled);
+        assert!(snapshot.settings.ui.computer_use_enabled);
+    }
+
+    #[test]
+    fn settings_dropdown_values_and_editable_collections_persist() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::UiChoiceSelected(
+            UiChoice::Theme,
+            "dark".to_string(),
+        ));
+        let _ = state.update(Message::UiChoiceSelected(
+            UiChoice::TerminalScrollbackRows,
+            "50000 rows".to_string(),
+        ));
+        let _ = state.update(Message::OpenInApplicationAdded);
+        let app_index = state.ui_settings.open_in_applications.len() - 1;
+        let _ = state.update(Message::OpenInApplicationCommandChanged(
+            app_index,
+            "zed".to_string(),
+        ));
+        let _ = state.update(Message::SshHostAdded);
+        let _ = state.update(Message::SshHostHostnameChanged(
+            0,
+            "build.example.com".to_string(),
+        ));
+
+        let ui = state.persisted_snapshot().settings.ui;
+        assert_eq!(ui.theme, "dark");
+        assert_eq!(ui.terminal_scrollback_rows, 50_000);
+        assert_eq!(ui.open_in_applications[app_index].command, "zed");
+        assert_eq!(ui.ssh_hosts[0].hostname, "build.example.com");
+    }
+
+    #[test]
+    fn extended_terminal_controls_persist_the_orca_values() {
+        let mut state = AppState::default();
+        for (choice, value) in [
+            (UiChoice::TerminalScrollSensitivity, "1.5x"),
+            (UiChoice::TerminalFastScrollSensitivity, "7.5x"),
+            (UiChoice::TerminalTuiScrollMultiplier, "5x"),
+            (UiChoice::TerminalPaddingX, "12 px"),
+            (UiChoice::TerminalPaddingY, "8 px"),
+            (UiChoice::TerminalCursorOpacity, "75%"),
+            (UiChoice::TerminalBackgroundOpacity, "90%"),
+            (UiChoice::TerminalInactivePaneOpacity, "50%"),
+            (UiChoice::TerminalActivePaneOpacity, "100%"),
+            (UiChoice::TerminalPaneOpacityTransition, "250 ms"),
+            (UiChoice::TerminalDividerThickness, "6 px"),
+        ] {
+            let _ = state.update(Message::UiChoiceSelected(choice, value.to_string()));
+        }
+        let _ = state.update(Message::UiSettingToggled(
+            UiSetting::TerminalMouseHideWhileTyping,
+        ));
+        let _ = state.update(Message::UiTextSettingChanged(
+            UiTextSetting::TerminalWordSeparator,
+            " /".to_string(),
+        ));
+
+        let ui = state.persisted_snapshot().settings.ui;
+        assert_eq!(ui.terminal_scroll_sensitivity_percent, 150);
+        assert_eq!(ui.terminal_fast_scroll_sensitivity_percent, 750);
+        assert_eq!(ui.terminal_tui_scroll_multiplier, 5);
+        assert_eq!((ui.terminal_padding_x, ui.terminal_padding_y), (12, 8));
+        assert_eq!(ui.terminal_cursor_opacity_percent, 75);
+        assert_eq!(ui.terminal_background_opacity_percent, 90);
+        assert_eq!(ui.terminal_inactive_pane_opacity_percent, 50);
+        assert_eq!(ui.terminal_active_pane_opacity_percent, 100);
+        assert_eq!(ui.terminal_pane_opacity_transition_ms, 250);
+        assert_eq!(ui.terminal_divider_thickness_px, 6);
+        assert!(ui.terminal_mouse_hide_while_typing);
+        assert_eq!(ui.terminal_word_separator, " /");
+    }
+
+    #[test]
+    fn agent_availability_profiles_and_environment_persist() {
+        let mut state = AppState {
+            installed_agents: vec!["claude", "codex"],
+            ..Default::default()
+        };
+        state.ui_settings.default_agent = "codex".to_string();
+
+        let _ = state.update(Message::AgentAvailabilityToggled("codex".to_string()));
+        let _ = state.update(Message::AgentCommandOverrideChanged(
+            "claude".to_string(),
+            "npx claude".to_string(),
+        ));
+        let _ = state.update(Message::AgentDefaultArgsChanged(
+            "claude".to_string(),
+            "--model opus".to_string(),
+        ));
+        let _ = state.update(Message::AgentDefaultEnvChanged(
+            "claude".to_string(),
+            "ANTHROPIC_BASE_URL=https://example.test\nPROFILE=test".to_string(),
+        ));
+
+        let ui = state.persisted_snapshot().settings.ui;
+        assert_eq!(ui.default_agent, "auto");
+        assert_eq!(ui.disabled_agents, vec!["codex"]);
+        assert_eq!(
+            ui.agent_command_overrides.get("claude").map(String::as_str),
+            Some("npx claude")
+        );
+        assert_eq!(
+            ui.agent_default_args.get("claude").map(String::as_str),
+            Some("--model opus")
+        );
+        assert_eq!(
+            ui.agent_default_env["claude"]["ANTHROPIC_BASE_URL"],
+            "https://example.test"
+        );
+        assert!(!state
+            .agent_picker_choices()
+            .contains(&AgentChoice(Some("codex"))));
+    }
+
+    #[test]
+    fn invalid_or_reserved_agent_environment_never_replaces_the_last_valid_profile() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::AgentDefaultEnvChanged(
+            "codex".to_string(),
+            "OPENAI_BASE_URL=https://example.test".to_string(),
+        ));
+        let valid = state.ui_settings.agent_default_env["codex"].clone();
+
+        let _ = state.update(Message::AgentDefaultEnvChanged(
+            "codex".to_string(),
+            "SUAEGI_HOOK_TOKEN=steal".to_string(),
+        ));
+        assert_eq!(state.ui_settings.agent_default_env["codex"], valid);
+        assert_eq!(state.agent_env_draft("codex"), "SUAEGI_HOOK_TOKEN=steal");
+    }
+
+    #[test]
+    fn permission_mode_switch_preserves_custom_agent_arguments() {
+        let mut state = AppState::default();
+        state
+            .ui_settings
+            .agent_default_args
+            .insert("codex".to_string(), "--model custom".to_string());
+
+        let _ = state.update(Message::AgentPermissionModeSelected(false));
+        assert_eq!(
+            state.ui_settings.agent_default_args["codex"],
+            "--model custom"
+        );
+        assert!(state.ui_settings.agent_default_args["claude"].is_empty());
+        // Orca renders a mixed custom/manual profile as Yolo so the custom
+        // entry is never silently classified as globally manual.
+        assert!(state.agent_permission_yolo());
+
+        let _ = state.update(Message::AgentPermissionModeSelected(true));
+        assert_eq!(
+            state.ui_settings.agent_default_args["codex"],
+            "--model custom"
+        );
+        assert_eq!(
+            state.ui_settings.agent_default_args["claude"],
+            "--dangerously-skip-permissions"
+        );
+        assert!(state.agent_permission_yolo());
+    }
+
+    #[test]
+    fn emulator_default_device_selection_persists() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::EmulatorDefaultDeviceSelected(Some(
+            "iPhone-16-Pro-UDID".to_string(),
+        )));
+
+        assert_eq!(
+            state
+                .persisted_snapshot()
+                .settings
+                .ui
+                .mobile_emulator_default_device_udid
+                .as_deref(),
+            Some("iPhone-16-Pro-UDID")
+        );
+        let _ = state.update(Message::EmulatorDefaultDeviceSelected(None));
+        assert!(state
+            .persisted_snapshot()
+            .settings
+            .ui
+            .mobile_emulator_default_device_udid
+            .is_none());
+    }
+
+    #[test]
+    fn emulator_launch_without_inventory_requests_discovery_once() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::EmulatorLaunchDefaultRequested);
+
+        assert!(state.emulator_launch_after_refresh);
+        assert!(state.emulator_refreshing());
+        assert_eq!(
+            state.emulator_status(),
+            Some("Checking emulator availability…")
+        );
+        let _ = state.update(Message::EmulatorLaunchDefaultRequested);
+        assert!(state.emulator_launch_after_refresh);
+        assert!(state.emulator_refreshing());
+    }
+
+    #[test]
+    fn disabled_mobile_emulator_rejects_shortcut_launches() {
+        let mut state = AppState::default();
+        state.ui_settings.mobile_emulator_enabled = false;
+
+        let _ = state.update(Message::EmulatorLaunchDefaultRequested);
+
+        assert!(!state.emulator_launch_after_refresh);
+        assert!(!state.emulator_refreshing());
+        assert_eq!(
+            state.emulator_status(),
+            Some("Enable Mobile Emulator in Settings before launching a device.")
+        );
+    }
+
+    #[test]
+    fn ssh_advanced_connection_and_terminal_persistence_settings_persist() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::SshHostAdded);
+        let _ = state.update(Message::SshHostProxyCommandChanged(
+            0,
+            "cloudflared access ssh --hostname %h".into(),
+        ));
+        let _ = state.update(Message::SshHostJumpHostChanged(
+            0,
+            "bastion.example.com".into(),
+        ));
+        let _ = state.update(Message::SshHostConnectionReuseToggled(0));
+        let _ = state.update(Message::SshHostRelayKeepAliveToggled(0));
+
+        let target = &state.persisted_snapshot().settings.ui.ssh_hosts[0];
+        assert_eq!(target.proxy_command, "cloudflared access ssh --hostname %h");
+        assert_eq!(target.jump_host, "bastion.example.com");
+        assert!(!target.system_ssh_connection_reuse);
+        assert_eq!(target.relay_grace_period_seconds, 86_400);
+        assert_eq!(target.source, "manual");
+    }
+
+    #[test]
+    fn ssh_config_import_refreshes_config_targets_without_overwriting_manual_targets() {
+        let mut state = AppState::default();
+        let manual = SshHostSetting {
+            id: "manual".into(),
+            label: "Manual build".into(),
+            config_host: "build".into(),
+            hostname: "manual.example.com".into(),
+            user: "james".into(),
+            port: 22,
+            identity_file: String::new(),
+            proxy_command: String::new(),
+            jump_host: String::new(),
+            system_ssh_connection_reuse: true,
+            relay_grace_period_seconds: 0,
+            source: "manual".into(),
+        };
+        state.ui_settings.ssh_hosts.push(manual.clone());
+        let imported = SshHostSetting {
+            id: "ssh-config-build".into(),
+            label: "build".into(),
+            config_host: "build".into(),
+            hostname: "config.example.com".into(),
+            user: "deploy".into(),
+            port: 2222,
+            identity_file: "~/.ssh/id_ed25519".into(),
+            proxy_command: String::new(),
+            jump_host: String::new(),
+            system_ssh_connection_reuse: true,
+            relay_grace_period_seconds: 0,
+            source: "ssh-config".into(),
+        };
+
+        let _ = state.update(Message::SshConfigImportFinished(Ok(vec![imported])));
+
+        assert_eq!(state.ui_settings.ssh_hosts, vec![manual]);
+        assert_eq!(
+            state.ssh_status("__import__"),
+            Some("Synced 1 SSH target(s).")
+        );
+    }
+
+    #[test]
+    fn usage_provider_opt_in_is_independent_and_persisted() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::UsageProviderToggled(
+            crate::usage::UsageProvider::Claude,
+        ));
+        let _ = state.update(Message::UsageProviderToggled(
+            crate::usage::UsageProvider::OpenCode,
+        ));
+
+        let ui = state.persisted_snapshot().settings.ui;
+        assert!(ui.claude_usage_enabled);
+        assert!(!ui.codex_usage_enabled);
+        assert!(ui.opencode_usage_enabled);
+        assert!(state.usage_scanning());
+    }
+
+    #[test]
+    fn remote_runtime_metadata_and_active_host_persist_without_pairing_secrets() {
+        let mut state = AppState::default();
+        let secret = "orca://pair?code=super-secret";
+        let message =
+            Message::RemoteRuntimePairingCodeChanged(SecretDraft::new(secret.to_string()));
+        assert!(!format!("{message:?}").contains(secret));
+        let _ = state.update(message);
+        let environment = RuntimeEnvironmentSetting {
+            id: "runtime-one".into(),
+            name: "Build server".into(),
+            endpoint: "wss://runtime.example.com".into(),
+            credentials_configured: true,
+            created_at_unix_ms: 1,
+        };
+        let _ = state.update(Message::RemoteRuntimeSaveFinished(Ok(environment.clone())));
+        let _ = state.update(Message::RemoteRuntimeActiveSelected(Some(
+            environment.id.clone(),
+        )));
+        let _ = state.update(Message::RemoteRuntimeActivateFinished(
+            environment.id.clone(),
+            crate::remote_runtime::RuntimeReachability {
+                reachable: true,
+                message: "Connected".into(),
+            },
+        ));
+
+        let snapshot = state.persisted_snapshot();
+        assert_eq!(snapshot.settings.ui.runtime_environments, vec![environment]);
+        assert_eq!(
+            snapshot
+                .settings
+                .ui
+                .active_runtime_environment_id
+                .as_deref(),
+            Some("runtime-one")
+        );
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains(secret));
+    }
+
+    #[test]
+    fn remote_provider_accounts_replace_the_view_without_overwriting_local_accounts() {
+        let mut state = AppState::default();
+        let local = suaegi_core::domain::ManagedProviderAccountSetting {
+            id: "local-claude".into(),
+            email: "local@example.com".into(),
+            config_dir: "/tmp/local".into(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            last_authenticated_at_unix_ms: 1,
+        };
+        state
+            .ui_settings
+            .claude_managed_accounts
+            .push(local.clone());
+        state
+            .ui_settings
+            .runtime_environments
+            .push(RuntimeEnvironmentSetting {
+                id: "runtime-accounts".into(),
+                name: "Accounts host".into(),
+                endpoint: "wss://runtime.example.com".into(),
+                credentials_configured: true,
+                created_at_unix_ms: 1,
+            });
+        state.ui_settings.active_runtime_environment_id = Some("runtime-accounts".into());
+        let remote = suaegi_core::domain::ManagedProviderAccountSetting {
+            id: "remote-claude".into(),
+            email: "remote@example.com".into(),
+            config_dir: String::new(),
+            created_at_unix_ms: 2,
+            updated_at_unix_ms: 2,
+            last_authenticated_at_unix_ms: 2,
+        };
+        let limits = crate::rate_limits::ProviderRateLimits::from_runtime_value(
+            crate::rate_limits::RateLimitProvider::Claude,
+            &serde_json::json!({
+                "session": {"usedPercent": 35},
+                "updatedAt": 2,
+                "status": "ok",
+                "error": null
+            }),
+        );
+        let _ = state.update(Message::RemoteProviderAccountsRefreshFinished(Ok(
+            crate::remote_runtime::RemoteProviderAccounts {
+                claude: vec![remote.clone()],
+                active_claude: Some(remote.id.clone()),
+                claude_limits: Some(limits),
+                ..Default::default()
+            },
+        )));
+
+        let (visible, active) = state.provider_accounts(crate::managed_accounts::Provider::Claude);
+        assert_eq!(visible, [remote]);
+        assert_eq!(active, Some("remote-claude"));
+        assert_eq!(state.ui_settings.claude_managed_accounts, [local]);
+        assert_eq!(
+            state
+                .provider_rate_limits(crate::rate_limits::RateLimitProvider::Claude)
+                .unwrap()
+                .buckets[0]
+                .used_percent,
+            35
+        );
+    }
+
+    #[test]
+    fn workspace_visibility_filters_apply_to_default_and_detached_worktrees() {
+        let mut state = AppState::default();
+        let mut main = entry_at("/tmp/main", "main");
+        main.is_main = true;
+        let mut detached = entry_at("/tmp/detached", "detached");
+        detached.branch = None;
+
+        assert!(state.worktree_is_visible(&main));
+        assert!(state.worktree_is_visible(&detached));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::HideDefaultBranch));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::HideDetachedHead));
+        assert!(!state.worktree_is_visible(&main));
+        assert!(!state.worktree_is_visible(&detached));
+    }
+
+    #[test]
+    fn pin_sleep_and_unread_workspace_actions_toggle_persisted_preferences() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/preferences");
+        let _ = state.update(Message::WorktreePinToggled(worktree.clone()));
+        let _ = state.update(Message::WorktreeSleepToggled(worktree.clone()));
+        let _ = state.update(Message::WorktreeUnreadToggled(worktree.clone()));
+
+        assert!(state.worktree_is_pinned(&worktree));
+        assert!(state.worktree_is_sleeping(&worktree));
+        assert!(state.worktree_is_unread(&worktree));
+        let snapshot = state.persisted_snapshot();
+        assert!(snapshot.settings.ui.pinned_worktrees.contains(&worktree.0));
+    }
+
+    #[test]
+    fn task_project_selection_persists_explicit_subset_and_all_as_null() {
+        let mut state = AppState::default();
+        let first = some_repo("tasks-one");
+        let second = some_repo("tasks-two");
+        state.upsert_repo(first.clone());
+        state.upsert_repo(second.clone());
+        state.reconcile_task_repo_selection();
+
+        assert!(state.task_repo_selection_is_all());
+        let _ = state.update(Message::TaskRepoSelectionToggled(second.id.clone()));
+        assert!(state.task_repo_selected(&first.id));
+        assert!(!state.task_repo_selected(&second.id));
+        assert_eq!(
+            state.ui_settings.default_repo_selection,
+            Some(vec![first.id.0.clone()])
+        );
+
+        let _ = state.update(Message::TaskRepoSelectionAll);
+        assert!(state.task_repo_selection_is_all());
+        assert_eq!(state.ui_settings.default_repo_selection, None);
+    }
+
+    #[test]
+    fn task_results_from_selected_projects_are_aggregated_and_deduplicated() {
+        let mut state = AppState::default();
+        let first = some_repo("tasks-aggregate-one");
+        let second = some_repo("tasks-aggregate-two");
+        state.upsert_repo(first.clone());
+        state.upsert_repo(second.clone());
+        state.task_kind = TaskKind::Issues;
+        state.task_items_op = Some(OpId(77));
+        state.task_items_loading = true;
+        state.task_items_pending = [first.id.clone(), second.id.clone()].into_iter().collect();
+
+        let duplicate = crate::tasks::TaskWorkItem {
+            number: 1,
+            title: "Shared".into(),
+            state: "OPEN".into(),
+            updated_at: "2026-07-20T10:00:00Z".into(),
+            url: "https://example.test/shared".into(),
+        };
+        let newer = crate::tasks::TaskWorkItem {
+            number: 2,
+            title: "Newer".into(),
+            state: "OPEN".into(),
+            updated_at: "2026-07-21T10:00:00Z".into(),
+            url: "https://example.test/newer".into(),
+        };
+        let _ = state.update(Message::TaskItemsLoaded {
+            op: OpId(77),
+            repo_id: first.id.clone(),
+            kind: TaskKind::Issues,
+            result: Ok(vec![duplicate.clone()]),
+        });
+        assert!(state.task_items_loading);
+        let _ = state.update(Message::TaskItemsLoaded {
+            op: OpId(77),
+            repo_id: second.id,
+            kind: TaskKind::Issues,
+            result: Ok(vec![duplicate, newer.clone()]),
+        });
+
+        assert!(!state.task_items_loading);
+        assert_eq!(state.task_items.len(), 2);
+        assert_eq!(state.task_items[0].url, newer.url);
+        assert_eq!(state.task_items_op, None);
+    }
+
+    #[test]
+    fn closing_settings_restores_the_active_workspace_explorer() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/settings-repo".into());
+        let worktree = wt("/tmp/settings-wt");
+        state.upsert_repo(some_repo("settings-repo"));
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id,
+            OpId(1),
+            vec![entry_at("/tmp/settings-wt", "settings-wt")],
+        );
+        state.selected_worktree = Some(worktree.clone());
+        state
+            .file_explorer
+            .begin(worktree.clone(), OpId(2), OpId(3));
+
+        let _ = state.update(Message::IntegrationsToggled);
+        assert!(state.file_explorer.worktree().is_none());
+        let _ = state.update(Message::IntegrationsToggled);
+        assert_eq!(state.file_explorer.worktree(), Some(&worktree));
+    }
+
+    #[test]
+    fn mobile_hero_runs_the_same_two_step_install_and_pairing_flow_as_orca() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::MobileOpened);
+        assert!(state.mobile_open());
+        assert_eq!(state.mobile_stage(), MobileStage::Intro);
+        let _ = state.update(Message::MobileGetStarted);
+        assert!(state.mobile_open());
+        assert_eq!(state.mobile_stage(), MobileStage::Install);
+        let _ = state.update(Message::MobileContinue);
+        assert_eq!(state.mobile_stage(), MobileStage::Pair);
+        let _ = state.update(Message::MobileBack);
+        assert_eq!(state.mobile_stage(), MobileStage::Install);
+        let _ = state.update(Message::MobileBack);
+        assert_eq!(state.mobile_stage(), MobileStage::Intro);
+        let _ = state.update(Message::MobileClosed);
+        assert!(!state.mobile_open());
+    }
+
+    #[test]
+    fn mobile_controls_update_mode_visibility_and_surface_missing_relay() {
+        let mut state = AppState::default();
+
+        assert!(state.ui_settings().show_mobile_sidebar);
+        let _ = state.update(Message::UiSettingToggled(UiSetting::ShowMobileSidebar));
+        assert!(!state.ui_settings().show_mobile_sidebar);
+        assert!(!state.persisted_snapshot().settings.ui.show_mobile_sidebar);
+
+        let _ = state.update(Message::MobileConnectionModeSelected(
+            MobileConnectionMode::LocalNetwork,
+        ));
+        assert_eq!(
+            state.mobile_connection_mode(),
+            MobileConnectionMode::LocalNetwork
+        );
+        assert!(state.mobile_pairing_error().is_none());
+
+        let _ = state.update(Message::MobileGeneratePairingRequested);
+        assert!(state
+            .mobile_pairing_error()
+            .is_some_and(|error| error.contains("hosted mobile relay")));
+    }
+
+    #[test]
+    fn tasks_switch_kind_and_presets_with_orca_query_defaults() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::TaskKindSelected(TaskKind::PullRequests));
+        assert_eq!(state.task_kind(), TaskKind::PullRequests);
+        assert_eq!(state.task_query(), "is:pr is:open");
+
+        let _ = state.update(Message::TaskPresetSelected(TaskPreset::NeedsReview));
+        assert_eq!(state.task_query(), "review-requested:@me is:pr is:open");
+        let _ = state.update(Message::TaskPresetSelected(TaskPreset::Mine));
+        assert_eq!(state.task_query(), "author:@me is:pr is:open");
+
+        let _ = state.update(Message::TaskKindSelected(TaskKind::Issues));
+        let _ = state.update(Message::TaskPresetSelected(TaskPreset::AssignedToMe));
+        assert_eq!(state.task_query(), "assignee:@me is:issue is:open");
+    }
+
+    #[test]
+    fn workspace_board_is_an_overlay_route_that_toggles_without_losing_mobile() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::MobileOpened);
+        let _ = state.update(Message::WorkspaceBoardToggled);
+        assert!(state.workspace_board_open());
+        assert!(state.mobile_open());
+
+        let _ = state.update(Message::WorkspaceBoardToggled);
+        assert!(!state.workspace_board_open());
+        assert!(state.mobile_open());
+    }
+
+    #[test]
+    fn workspace_board_status_changes_survive_the_settings_snapshot() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/board-review");
+        assert_eq!(state.board_status(&worktree), BoardStatus::InProgress);
+
+        let _ = state.update(Message::WorktreeBoardStatusSet(
+            worktree.clone(),
+            BoardStatus::InReview,
+        ));
+        assert_eq!(state.board_status(&worktree), BoardStatus::InReview);
+        assert_eq!(
+            state
+                .persisted_snapshot()
+                .settings
+                .ui
+                .board_statuses
+                .get(&worktree.0)
+                .map(String::as_str),
+            Some("in_review")
+        );
+    }
+
+    #[test]
+    fn picked_workspace_directory_updates_the_persisted_setting() {
+        let mut state = AppState::default();
+        let picked = PathBuf::from("/tmp/suaegi-picked-workspaces");
+
+        let _ = state.update(Message::SettingsWorkspaceRootPicked(Some(picked.clone())));
+
+        assert_eq!(state.workspace_root(), picked.as_path());
+        assert_eq!(
+            state.persisted_snapshot().settings.workspace_root,
+            picked,
+            "the native folder picker result must survive restart"
+        );
+    }
+
+    #[test]
+    fn status_bar_visibility_controls_are_persisted_independently() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::UiSettingToggled(UiSetting::ShowResourceStatus));
+        let _ = state.update(Message::UiSettingToggled(UiSetting::ShowPortsStatus));
+
+        let ui = state.persisted_snapshot().settings.ui;
+        assert!(!ui.show_resource_status);
+        assert!(!ui.show_ports_status);
+        assert!(ui.show_usage_status);
+    }
+
+    #[test]
+    fn automation_deletion_respects_the_confirmation_preference() {
+        let mut state = AppState::default();
+        state.automations.push(AutomationConfig {
+            id: "delete-me".into(),
+            name: "Delete me".into(),
+            worktree_id: wt("/tmp/delete-me"),
+            schedule: "0 9 * * *".into(),
+            prompt: "check".into(),
+            timezone: "Asia/Seoul".into(),
+            provider: "claude".into(),
+            dtstart_unix_ms: 1,
+            enabled: true,
+            last_dispatched_unix_ms: None,
+        });
+
+        let _ = state.update(Message::AutomationDeleteRequested("delete-me".into()));
+        assert_eq!(
+            state.automation_ui.delete_confirm.as_deref(),
+            Some("delete-me")
+        );
+        assert_eq!(state.automations.len(), 1);
+
+        let _ = state.update(Message::AutomationDeleted("delete-me".into()));
+        assert!(state.automation_ui.delete_confirm.is_none());
+        assert!(state.automations.is_empty());
+    }
+
+    #[test]
+    fn worktree_action_menu_toggles_for_one_workspace_at_a_time() {
+        let mut state = AppState::default();
+        let first = wt("/tmp/first");
+        let second = wt("/tmp/second");
+
+        let _ = state.update(Message::WorktreeActionsToggled(first.clone()));
+        assert_eq!(state.worktree_actions_open(), Some(&first));
+        let _ = state.update(Message::WorktreeActionsToggled(second.clone()));
+        assert_eq!(state.worktree_actions_open(), Some(&second));
+        let _ = state.update(Message::WorktreeActionsToggled(second));
+        assert!(state.worktree_actions_open().is_none());
+    }
+
+    #[test]
+    fn worktree_removal_waits_for_confirmation_and_can_be_cancelled() {
+        let mut state = AppState::default();
+        let repo = some_repo("confirm-remove");
+        let repo_id = repo.id.clone();
+        let entry = entry_at("/tmp/confirm-remove-wt", "feature");
+        let worktree_id = worktree_id_for(&entry.path);
+        state.upsert_repo(repo);
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id.clone(), OpId(1), vec![entry.clone()]);
+
+        let _ = state.update(Message::RemoveWorktreeRequested {
+            repo_id,
+            worktree_id,
+            worktree_path: entry.path,
+            branch: entry.branch,
+        });
+
+        assert_eq!(
+            state.worktree_remove_confirm_name().as_deref(),
+            Some("feature")
+        );
+        assert!(state.pending_worktree_removals.is_empty());
+
+        let _ = state.update(Message::RemoveWorktreeCancelled);
+        assert!(state.worktree_remove_confirm_name().is_none());
+        assert!(state.pending_worktree_removals.is_empty());
+    }
+
+    #[test]
+    fn removing_a_project_unregisters_it_without_deleting_repository_files() {
+        let mut state = AppState::default();
+        let repo = some_repo("remove-project");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id.clone(),
+            OpId(1),
+            vec![entry_at("/tmp/remove-project-main", "main")],
+        );
+
+        let _ = state.update(Message::ProjectRemoveRequested(repo_id.clone()));
+        assert_eq!(state.project_remove_confirm_name(), Some("remove-project"));
+        let _ = state.update(Message::ProjectRemoveConfirmed);
+        assert!(state.repo_by_id(&repo_id).is_none());
+        assert!(state.worktrees_for(&repo_id).is_empty());
     }
 
     /// 드롭다운 라벨: 로그인 셸은 명시적 이름, 에이전트는 표의 display_name.
@@ -7702,5 +27434,584 @@ mod tests {
             state.session_store().is_running(id),
             "a worktree that is still listed must not have its session torn down"
         );
+    }
+
+    #[test]
+    fn automation_configuration_survives_the_app_snapshot_path() {
+        let mut state = AppState::default();
+        state.automations.push(AutomationConfig {
+            id: "automation-1".into(),
+            name: "daily review".into(),
+            worktree_id: wt("/tmp/accepted"),
+            schedule: "0 9 * * *".into(),
+            prompt: "review the open changes".into(),
+            timezone: "Asia/Seoul".into(),
+            provider: "claude".into(),
+            dtstart_unix_ms: 123,
+            enabled: true,
+            last_dispatched_unix_ms: Some(456),
+        });
+
+        let snapshot = state.persisted_snapshot();
+        assert_eq!(snapshot.settings.automations, state.automations);
+    }
+
+    #[test]
+    fn workspace_search_overlays_the_active_explorer_instead_of_closing_it() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/accepted");
+        state
+            .file_explorer
+            .begin(worktree.clone(), OpId(1), OpId(2));
+
+        let _ = state.update(Message::WorkspaceSearchRequested);
+
+        assert_eq!(state.file_explorer.worktree(), Some(&worktree));
+        assert!(state.quick_open.is_open());
+    }
+
+    #[test]
+    fn right_sidebar_activity_selection_is_explicit_and_reopenable() {
+        let mut state = AppState {
+            selected_worktree: Some(wt("/tmp/accepted")),
+            ..Default::default()
+        };
+
+        let _ = state.update(Message::RightSidebarTabSelected(RightSidebarTab::Agents));
+        assert_eq!(state.right_sidebar_tab(), RightSidebarTab::Agents);
+        assert!(state.right_sidebar_open());
+
+        let _ = state.update(Message::RightSidebarToggled);
+        assert!(!state.right_sidebar_open());
+        let _ = state.update(Message::RightSidebarToggled);
+        assert!(state.right_sidebar_open());
+        assert_eq!(state.right_sidebar_tab(), RightSidebarTab::Agents);
+    }
+
+    #[test]
+    fn tasks_are_a_route_and_do_not_destroy_the_active_workspace() {
+        let mut state = AppState::default();
+        let active = wt("/tmp/accepted");
+        state.selected_worktree = Some(active.clone());
+        state.tasks_open = false;
+
+        let _ = state.update(Message::TasksOpened);
+        assert!(state.tasks_open());
+        assert_eq!(state.selected_worktree(), Some(&active));
+
+        let _ = state.update(Message::TasksClosed);
+        assert!(!state.tasks_open());
+        assert_eq!(state.selected_worktree(), Some(&active));
+    }
+
+    #[test]
+    fn both_sidebar_toggles_can_be_closed_and_reopened() {
+        let mut state = AppState::default();
+        assert!(state.left_sidebar_open());
+        assert!(state.right_sidebar_open());
+
+        let _ = state.update(Message::LeftSidebarToggled);
+        let _ = state.update(Message::RightSidebarToggled);
+        assert!(!state.left_sidebar_open());
+        assert!(!state.right_sidebar_open());
+
+        let _ = state.update(Message::LeftSidebarToggled);
+        let _ = state.update(Message::RightSidebarToggled);
+        assert!(state.left_sidebar_open());
+        assert!(state.right_sidebar_open());
+    }
+
+    #[test]
+    fn title_bar_navigation_moves_between_recent_workspaces() {
+        let mut state = AppState::default();
+        let first = wt("/tmp/history-first");
+        let second = wt("/tmp/history-second");
+        state.selected_worktree = Some(first.clone());
+
+        let _ = state.update(Message::WorktreeSelected(second.clone()));
+        assert!(state.can_navigate_back());
+
+        let _ = state.update(Message::NavigationBack);
+        assert_eq!(state.selected_worktree(), Some(&first));
+        assert!(state.can_navigate_forward());
+
+        let _ = state.update(Message::NavigationForward);
+        assert_eq!(state.selected_worktree(), Some(&second));
+    }
+
+    #[test]
+    fn most_recent_tab_order_puts_the_active_workspace_first() {
+        let (mut state, _repo, [(_id_a, worktree_a), (_id_b, worktree_b)]) =
+            state_with_two_open_sessions();
+        state.ui_settings.tab_order_mru = true;
+        state.selected_worktree = Some(worktree_b.clone());
+        state.navigation_back = vec![worktree_a.clone()];
+
+        let ordered: Vec<WorktreeId> = state
+            .open_tab_items()
+            .into_iter()
+            .map(|(worktree, _)| worktree)
+            .collect();
+        assert_eq!(ordered, vec![worktree_b, worktree_a]);
+    }
+
+    #[test]
+    fn worktree_navigation_shortcuts_wrap_visible_workspaces() {
+        let mut state = AppState::default();
+        let repo = some_repo("shortcut-navigation");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(
+            repo_id,
+            OpId(1),
+            vec![
+                entry_at("/tmp/shortcut-one", "one"),
+                entry_at("/tmp/shortcut-two", "two"),
+            ],
+        );
+        state.selected_worktree = Some(wt("/tmp/shortcut-one"));
+
+        let _ = state.dispatch_keybinding_shortcut(KeybindingActionId::WorktreeNavigateDown, None);
+        assert_eq!(state.selected_worktree(), Some(&wt("/tmp/shortcut-two")));
+        let _ = state.dispatch_keybinding_shortcut(KeybindingActionId::WorktreeNavigateDown, None);
+        assert_eq!(state.selected_worktree(), Some(&wt("/tmp/shortcut-one")));
+        let _ = state.dispatch_keybinding_shortcut(KeybindingActionId::WorktreeNavigateUp, None);
+        assert_eq!(state.selected_worktree(), Some(&wt("/tmp/shortcut-two")));
+    }
+
+    #[test]
+    fn floating_workspace_opens_empty_then_starts_terminal_once_and_preserves_it_when_hidden() {
+        let mut state = AppState::default();
+        assert!(state.ui_settings.floating_workspace_enabled);
+
+        let _ = state.update(Message::FloatingWorkspaceToggled);
+        assert!(state.floating_workspace_open);
+        assert_eq!(
+            state.floating_workspace_content,
+            FloatingWorkspaceContent::Empty
+        );
+        assert!(state.pending_session_starts.is_empty());
+
+        let _ = state.update(Message::FloatingWorkspaceTerminalRequested);
+        assert_eq!(state.pending_session_starts.len(), 1);
+
+        let pending = state.pending_session_starts.clone();
+        let _ = state.update(Message::FloatingWorkspaceMinimized);
+        assert!(!state.floating_workspace_open);
+        assert_eq!(state.pending_session_starts, pending);
+
+        let _ = state.update(Message::FloatingWorkspaceToggled);
+        assert!(state.floating_workspace_open);
+        assert_eq!(state.pending_session_starts, pending);
+    }
+
+    #[test]
+    fn floating_workspace_supports_multiple_terminal_start_requests() {
+        let mut state = AppState::default();
+
+        let _ = state.update(Message::FloatingWorkspaceTerminalRequested);
+        let _ = state.update(Message::FloatingWorkspaceTerminalRequested);
+
+        assert_eq!(state.pending_session_starts.len(), 2);
+        let ids = state
+            .pending_session_starts
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(state
+            .pending_session_starts
+            .keys()
+            .all(|worktree| worktree.0.starts_with(FLOATING_WORKSPACE_ID_PREFIX)));
+    }
+
+    #[test]
+    fn floating_workspace_terminal_tabs_select_and_close_independently() {
+        let mut state = AppState::default();
+        let first = SessionId(41);
+        let second = SessionId(42);
+        state.floating_workspace_sessions = vec![first, second];
+        state.floating_workspace_session = Some(first);
+        state.floating_workspace_content = FloatingWorkspaceContent::Browser;
+
+        let _ = state.update(Message::FloatingWorkspaceTerminalSelected(second));
+        assert_eq!(state.floating_workspace_session, Some(second));
+        assert_eq!(
+            state.floating_workspace_content,
+            FloatingWorkspaceContent::Terminal
+        );
+
+        let _ = state.update(Message::FloatingWorkspaceTerminalClosed(second));
+        assert_eq!(state.floating_workspace_sessions, vec![first]);
+        assert_eq!(state.floating_workspace_session, Some(first));
+
+        let _ = state.update(Message::FloatingWorkspaceTerminalClosed(first));
+        assert!(state.floating_workspace_sessions.is_empty());
+        assert_eq!(state.floating_workspace_session, None);
+        assert_eq!(
+            state.floating_workspace_content,
+            FloatingWorkspaceContent::Empty
+        );
+    }
+
+    #[test]
+    fn floating_workspace_maximize_and_launcher_controls_are_independent() {
+        let mut state = AppState::default();
+        let _ = state.update(Message::FloatingWorkspaceToggled);
+        let _ = state.update(Message::FloatingWorkspaceMaximizedToggled);
+        assert!(state.floating_workspace_open);
+        assert!(state.floating_workspace_maximized);
+
+        state.floating_workspace_content = FloatingWorkspaceContent::Markdown;
+        let _ = state.update(Message::FloatingWorkspaceLauncherRequested);
+        assert_eq!(
+            state.floating_workspace_content,
+            FloatingWorkspaceContent::Empty
+        );
+        assert!(state.floating_workspace_open);
+        assert!(state.floating_workspace_maximized);
+    }
+
+    #[test]
+    fn floating_workspace_panel_drag_and_resize_are_clamped_and_retained() {
+        let mut state = AppState {
+            app_window_size: iced::Size::new(1_200.0, 800.0),
+            ..AppState::default()
+        };
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            900.0, 390.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspaceDragStarted(
+            FloatingWorkspaceDragTarget::Panel,
+        ));
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            700.0, 250.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspacePointerReleased);
+        assert_eq!(state.ui_settings.floating_workspace_panel_x, 332);
+        assert_eq!(state.ui_settings.floating_workspace_panel_y, 242);
+
+        let (_, _, width, height) = state.floating_workspace_panel_geometry();
+        let _ = state.update(Message::FloatingWorkspaceDragStarted(
+            FloatingWorkspaceDragTarget::Resize,
+        ));
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            10_000.0, 10_000.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspacePointerReleased);
+        assert!(f32::from(state.ui_settings.floating_workspace_panel_width) > width);
+        assert!(f32::from(state.ui_settings.floating_workspace_panel_height) > height);
+        let (x, y, resized_width, resized_height) = state.floating_workspace_panel_geometry();
+        assert!(x + resized_width <= state.app_window_size.width);
+        assert!(y + resized_height <= state.app_window_size.height);
+    }
+
+    #[test]
+    fn floating_workspace_trigger_click_toggles_and_drag_moves_without_toggling() {
+        let mut state = AppState {
+            app_window_size: iced::Size::new(1_200.0, 800.0),
+            ..AppState::default()
+        };
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            1_160.0, 760.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspaceDragStarted(
+            FloatingWorkspaceDragTarget::Trigger,
+        ));
+        let _ = state.update(Message::FloatingWorkspacePointerReleased);
+        assert!(state.floating_workspace_open);
+
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            1_160.0, 760.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspaceDragStarted(
+            FloatingWorkspaceDragTarget::Trigger,
+        ));
+        let _ = state.update(Message::FloatingWorkspacePointerMoved(Point::new(
+            800.0, 500.0,
+        )));
+        let _ = state.update(Message::FloatingWorkspacePointerReleased);
+        assert!(state.floating_workspace_open);
+        assert_eq!(state.ui_settings.floating_workspace_trigger_x, 782);
+        assert_eq!(state.ui_settings.floating_workspace_trigger_y, 482);
+    }
+
+    #[test]
+    fn secret_input_messages_redact_their_debug_output() {
+        let message =
+            Message::VoiceApiKeyDraftChanged(SecretDraft::new("sk-do-not-log-this".to_string()));
+        let debug = format!("{message:?}");
+        assert!(!debug.contains("sk-do-not-log-this"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_session_ids_reject_option_and_control_injection() {
+        assert_eq!(
+            valid_provider_session_id("  session-123  "),
+            Some("session-123".to_string())
+        );
+        assert_eq!(valid_provider_session_id("-danger"), None);
+        assert_eq!(valid_provider_session_id("line\nbreak"), None);
+        assert_eq!(valid_provider_session_id(&"x".repeat(513)), None);
+    }
+
+    #[test]
+    fn hibernation_planner_requires_idle_done_background_session_without_a_draft() {
+        let (mut state, id, worktree, _pane) = state_with_one_open_session();
+        state.ui_settings.experimental_agent_hibernation = true;
+        state.ui_settings.agent_hibernation_idle_ms = 60_000;
+        state.selected_worktree = None;
+        state.focused_pane = None;
+        let now = Instant::now();
+        state.badges.insert(
+            worktree.clone(),
+            PaneBadge {
+                expected: SpawnNonce(1),
+                allow_reattach_nonce_bind: false,
+                hook: Some((HookState::Done, now - Duration::from_secs(61))),
+                received_hook: true,
+                previous: BadgeState::Done,
+                no_agent_streak: 0,
+            },
+        );
+        state.live_agent_resume.insert(
+            worktree.clone(),
+            LiveAgentResume {
+                provider_session_id: "session-123".to_string(),
+                turn_started_at: Some(now - Duration::from_secs(120)),
+                done_at: Some(now - Duration::from_secs(61)),
+            },
+        );
+
+        let _task = state.poll_agent_hibernation();
+        assert!(
+            state.pending_agent_hibernations.contains_key(&id),
+            "a proven completed background session should begin hibernating"
+        );
+
+        state.pending_agent_hibernations.clear();
+        state
+            .terminal_last_input_at
+            .insert(id, now - Duration::from_secs(90));
+        let _task = state.poll_agent_hibernation();
+        assert!(
+            state.pending_agent_hibernations.is_empty(),
+            "input after the turn began may be an unsent draft and must block sleep"
+        );
+    }
+
+    #[test]
+    fn sleeping_claude_session_reuses_the_pane_id_and_exact_resume_argv() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/resume-claude");
+        let repo = RepoId("/tmp/resume-repo".into());
+        state.note_list_issued(repo.clone(), OpId(1));
+        state.apply_authoritative_listing(repo, OpId(1), vec![entry_at(&worktree.0, "resume")]);
+        let existing = state.session_store.next_id();
+        state.worktree_sessions.insert(worktree.clone(), existing);
+        state.session_worktrees.insert(existing, worktree.clone());
+        state.sleeping_agent_sessions.insert(
+            worktree.clone(),
+            SleepingAgentSession {
+                worktree_id: worktree.clone(),
+                agent: "claude".into(),
+                provider_session_id: "session-safe".into(),
+                captured_at_unix_ms: 1,
+            },
+        );
+
+        let (started, _task) = state.start_session_for(&worktree).unwrap();
+        assert_eq!(started, existing);
+        let spawn = state.session_store.last_spawn().unwrap();
+        assert_eq!(spawn.program, "claude");
+        assert_eq!(spawn.args, ["--resume", "session-safe"]);
+        assert!(state.waking_agent_sessions.contains(&worktree));
+        assert_eq!(
+            state
+                .persisted_snapshot()
+                .session
+                .sleeping_agent_sessions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sparse_presets_validate_persist_update_and_clear_create_selection() {
+        let mut state = AppState::default();
+        let repo = some_repo("sparse-settings");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+
+        let _ = state.update(Message::RepoSparsePresetNameChanged(
+            repo_id.clone(),
+            "Frontend".into(),
+        ));
+        let _ = state.update(Message::RepoSparsePresetDirectoriesChanged(
+            repo_id.clone(),
+            "apps/web\npackages/ui\napps/web".into(),
+        ));
+        let _ = state.update(Message::RepoSparsePresetSaved(repo_id.clone()));
+        let presets = &state.ui_settings.repo_sparse_presets[&repo_id.0];
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].directories, ["apps/web", "packages/ui"]);
+        let preset_id = presets[0].id.clone();
+
+        let _ = state.update(Message::WorktreeSparsePresetSelected(
+            repo_id.clone(),
+            preset_id.clone(),
+        ));
+        assert_eq!(
+            state.worktree_sparse_preset_draft.get(&repo_id),
+            Some(&preset_id)
+        );
+        let _ = state.update(Message::RepoSparsePresetRemoved(repo_id.clone(), preset_id));
+        assert!(!state
+            .ui_settings
+            .repo_sparse_presets
+            .contains_key(&repo_id.0));
+        assert!(!state.worktree_sparse_preset_draft.contains_key(&repo_id));
+    }
+
+    #[test]
+    fn repository_identity_edits_persist_and_are_purged_with_the_project() {
+        let mut state = AppState::default();
+        let repo = some_repo("identity");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+        let _ = state.update(Message::RepoDisplayNameChanged(
+            repo_id.clone(),
+            "Frontend App".into(),
+        ));
+        let _ = state.update(Message::RepoIconChanged(repo_id.clone(), "🐬".into()));
+        let _ = state.update(Message::RepoBadgeColorChanged(
+            repo_id.clone(),
+            "#2f81f7".into(),
+        ));
+        assert_eq!(
+            state.repo_by_id(&repo_id).unwrap().display_name,
+            "Frontend App"
+        );
+        let snapshot = state.persisted_snapshot();
+        assert_eq!(snapshot.repos[0].display_name, "Frontend App");
+        assert_eq!(snapshot.settings.ui.repo_icons[&repo_id.0], "🐬");
+        assert_eq!(
+            snapshot.settings.ui.repo_badge_colors[&repo_id.0],
+            "#2f81f7"
+        );
+
+        let _ = state.update(Message::ProjectRemoveRequested(repo_id.clone()));
+        let _ = state.update(Message::ProjectRemoveConfirmed);
+        assert!(!state.ui_settings.repo_icons.contains_key(&repo_id.0));
+        assert!(!state.ui_settings.repo_badge_colors.contains_key(&repo_id.0));
+    }
+
+    #[test]
+    fn source_control_ai_global_and_repository_overrides_persist_and_resolve() {
+        let mut state = AppState::default();
+        let repo = some_repo("source-control-ai");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+
+        let _ = state.update(Message::SourceControlAiAgentSelected("codex".into()));
+        let _ = state.update(Message::SourceControlAiModelChanged("gpt-5.4".into()));
+        let _ = state.update(Message::SourceControlAiPrDefaultToggled(
+            SourceControlAiPrDefault::UseTemplate,
+        ));
+        let _ = state.update(Message::RepoSourceControlAiVisibilitySelected(
+            repo_id.clone(),
+            "enabled".into(),
+        ));
+        let _ = state.update(Message::RepoSourceControlAiActionTemplateChanged(
+            repo_id.clone(),
+            "commitMessage".into(),
+            "{basePrompt}\nUse conventional commits.".into(),
+        ));
+        let _ = state.update(Message::RepoSourceControlAiPrDefaultSelected(
+            repo_id.clone(),
+            SourceControlAiPrDefault::Draft,
+            "enabled".into(),
+        ));
+
+        let resolved = state.source_control_ai_pr_defaults(&repo_id);
+        assert!(resolved.draft);
+        assert!(resolved.use_template);
+        let snapshot = state.persisted_snapshot();
+        assert_eq!(snapshot.settings.ui.source_control_ai.agent_id, "codex");
+        assert_eq!(snapshot.settings.ui.source_control_ai.model, "gpt-5.4");
+        assert_eq!(
+            snapshot.settings.ui.repo_source_control_ai[&repo_id.0].action_overrides
+                ["commitMessage"]
+                .command_input_template,
+            "{basePrompt}\nUse conventional commits."
+        );
+        let encoded = serde_json::to_string(&snapshot.settings.ui).unwrap();
+        let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.source_control_ai.agent_id, "codex");
+        assert!(decoded.repo_source_control_ai.contains_key(&repo_id.0));
+
+        let _ = state.update(Message::ProjectRemoveRequested(repo_id.clone()));
+        let _ = state.update(Message::ProjectRemoveConfirmed);
+        assert!(!state
+            .ui_settings
+            .repo_source_control_ai
+            .contains_key(&repo_id.0));
+    }
+
+    #[test]
+    fn project_host_setups_plan_complete_persist_unregister_and_purge() {
+        let mut state = AppState::default();
+        let repo = some_repo("project-host-setup");
+        let repo_id = repo.id.clone();
+        state.upsert_repo(repo);
+        state.ui_settings.ssh_hosts.push(SshHostSetting {
+            id: "ssh-build".into(),
+            label: "Build server".into(),
+            config_host: "build".into(),
+            hostname: "build.example.com".into(),
+            user: "james".into(),
+            port: 22,
+            identity_file: String::new(),
+            proxy_command: String::new(),
+            jump_host: String::new(),
+            system_ssh_connection_reuse: true,
+            relay_grace_period_seconds: 0,
+            source: "manual".into(),
+        });
+
+        let _ = state.update(Message::RepoHostSetupHostSelected(
+            repo_id.clone(),
+            "ssh-build".into(),
+        ));
+        let _ = state.update(Message::RepoHostSetupPlannedRequested(repo_id.clone()));
+        let planned = &state.ui_settings.repo_host_setups[&repo_id.0][0];
+        assert_eq!(planned.setup_state, "not-set-up");
+        assert_eq!(planned.setup_method, "provisioned");
+
+        let _ = state.update(Message::RepoHostSetupExistingFinished(
+            repo_id.clone(),
+            "ssh-build".into(),
+            "git".into(),
+            Ok("/srv/project-host-setup".into()),
+        ));
+        let ready = &state.persisted_snapshot().settings.ui.repo_host_setups[&repo_id.0][0];
+        assert_eq!(ready.setup_state, "ready");
+        assert_eq!(ready.setup_method, "imported-existing-folder");
+        assert_eq!(ready.path, "/srv/project-host-setup");
+
+        let setup_id = ready.id.clone();
+        let _ = state.update(Message::RepoHostSetupRemoved(repo_id.clone(), setup_id));
+        assert!(!state.ui_settings.repo_host_setups.contains_key(&repo_id.0));
+
+        let _ = state.update(Message::RepoHostSetupCloneFinished(
+            repo_id.clone(),
+            "ssh-build".into(),
+            Ok("/srv/project-host-setup".into()),
+        ));
+        let _ = state.update(Message::ProjectRemoveRequested(repo_id.clone()));
+        let _ = state.update(Message::ProjectRemoveConfirmed);
+        assert!(!state.ui_settings.repo_host_setups.contains_key(&repo_id.0));
     }
 }

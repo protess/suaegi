@@ -309,12 +309,16 @@ impl JiraClient {
     pub async fn list_projects(&self) -> Lookup<JiraPage<JiraProject>> {
         let base = self.base();
         let result = if self.connection.auth_type.is_cloud() {
-            let path_for =
-                |start_at: i64, max_results: i64| format!("{base}/project/search?maxResults={max_results}&startAt={start_at}");
+            let path_for = |start_at: i64, max_results: i64| {
+                format!("{base}/project/search?maxResults={max_results}&startAt={start_at}")
+            };
             self.paginate("values", path_for).await
         } else {
             // Server/DC `/project`는 플랫 배열(페이지네이션 없음).
-            match self.request(HttpMethod::Get, &format!("{base}/project"), None).await {
+            match self
+                .request(HttpMethod::Get, &format!("{base}/project"), None)
+                .await
+            {
                 Ok(v) => match v.as_array() {
                     Some(arr) => Ok((arr.clone(), false)),
                     // 성공인데 배열 아님 → 예상 밖. **빈 목록 아님** → Unknown.
@@ -346,7 +350,9 @@ impl JiraClient {
         let mut records: Vec<Value> = Vec::new();
         let mut start_at: i64 = 0;
         for _guard in 0..MAX_PAGES {
-            let v = self.request(HttpMethod::Get, &path_for(start_at, PAGE_SIZE), None).await?;
+            let v = self
+                .request(HttpMethod::Get, &path_for(start_at, PAGE_SIZE), None)
+                .await?;
             let items = page_items(&v, key);
             let fetched = items.len() as i64;
             records.extend(items);
@@ -371,7 +377,11 @@ impl JiraClient {
         let title = fields["summary"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .unwrap_or(if key.is_empty() { "Untitled issue" } else { key });
+            .unwrap_or(if key.is_empty() {
+                "Untitled issue"
+            } else {
+                key
+            });
         JiraIssue {
             id: id.to_string(),
             key: key.to_string(),
@@ -416,7 +426,11 @@ fn search_has_more(resp: &Value, count: usize) -> bool {
     if resp["isLast"].as_bool() == Some(true) {
         return false;
     }
-    if resp["nextPageToken"].as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+    if resp["nextPageToken"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
     if let Some(total) = resp["total"].as_i64() {
@@ -481,7 +495,11 @@ fn opt_str(v: &Value) -> Option<String> {
 
 fn string_array(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -534,7 +552,8 @@ mod tests {
             "labels":[]}}]}"#;
 
     /// 401 — Jira 에러 바디(errorMessages). **이 raw 문자열은 출력에 새면 안 된다.**
-    const ERR_401: &str = r#"{"errorMessages":["You are not authenticated. SECRET-JQL-INTERNALS"],"errors":{}}"#;
+    const ERR_401: &str =
+        r#"{"errorMessages":["You are not authenticated. SECRET-JQL-INTERNALS"],"errors":{}}"#;
 
     /// 404 not-found 바디.
     const ERR_404: &str = r#"{"errorMessages":["Issue does not exist or you do not have permission to see it."],"errors":{}}"#;
@@ -579,7 +598,10 @@ mod tests {
     #[test]
     fn auth_header_server_pat_is_bearer() {
         // Server + email 빈 문자열 → Bearer PAT.
-        assert_eq!(build_auth_header("", "pat123", JiraAuthType::Server), "Bearer pat123");
+        assert_eq!(
+            build_auth_header("", "pat123", JiraAuthType::Server),
+            "Bearer pat123"
+        );
     }
 
     #[test]
@@ -595,8 +617,14 @@ mod tests {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(200, MYSELF_CLOUD));
         let _ = client(t.clone(), cloud()).test_connection().await;
-        let expected_auth = format!("Basic {}", STANDARD.encode("ada@acme.com:jira_token_SECRET123"));
-        assert_eq!(t.last_header("Authorization").as_deref(), Some(expected_auth.as_str()));
+        let expected_auth = format!(
+            "Basic {}",
+            STANDARD.encode("ada@acme.com:jira_token_SECRET123")
+        );
+        assert_eq!(
+            t.last_header("Authorization").as_deref(),
+            Some(expected_auth.as_str())
+        );
         assert_eq!(t.last_header("User-Agent").as_deref(), Some("suaegi"));
     }
 
@@ -607,7 +635,10 @@ mod tests {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(200, MYSELF_CLOUD));
         let _ = client(t.clone(), cloud()).test_connection().await;
-        assert_eq!(t.requests()[0].url, "https://acme.atlassian.net/rest/api/3/myself");
+        assert_eq!(
+            t.requests()[0].url,
+            "https://acme.atlassian.net/rest/api/3/myself"
+        );
     }
 
     #[tokio::test]
@@ -615,7 +646,10 @@ mod tests {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(200, r#"{"name":"bob","displayName":"Bob"}"#));
         let _ = client(t.clone(), server_pat()).test_connection().await;
-        assert_eq!(t.requests()[0].url, "https://jira.internal/rest/api/2/myself");
+        assert_eq!(
+            t.requests()[0].url,
+            "https://jira.internal/rest/api/2/myself"
+        );
     }
 
     /// 검색 경로도 분기한다: Cloud=`/rest/api/3/search/jql`, Server=`/rest/api/2/search`.
@@ -623,13 +657,23 @@ mod tests {
     async fn search_path_branches_on_cloudness() {
         let t = Arc::new(FakeTransport::default());
         t.push_response(ok(200, SEARCH_CLOUD_ONE));
-        let _ = client(t.clone(), cloud()).search_issues("project = ENG").await;
-        assert_eq!(t.requests()[0].url, "https://acme.atlassian.net/rest/api/3/search/jql");
+        let _ = client(t.clone(), cloud())
+            .search_issues("project = ENG")
+            .await;
+        assert_eq!(
+            t.requests()[0].url,
+            "https://acme.atlassian.net/rest/api/3/search/jql"
+        );
 
         let t2 = Arc::new(FakeTransport::default());
         t2.push_response(ok(200, SEARCH_SERVER_ONE));
-        let _ = client(t2.clone(), server_pat()).search_issues("project = SRV").await;
-        assert_eq!(t2.requests()[0].url, "https://jira.internal/rest/api/2/search");
+        let _ = client(t2.clone(), server_pat())
+            .search_issues("project = SRV")
+            .await;
+        assert_eq!(
+            t2.requests()[0].url,
+            "https://jira.internal/rest/api/2/search"
+        );
     }
 
     // ---- test_connection ----
@@ -666,7 +710,10 @@ mod tests {
         let t = Arc::new(FakeTransport::default());
         t.push_response(Err(TransportError::Timeout));
         match client(t, cloud()).search_issues("x").await {
-            Lookup::Found(p) => panic!("timeout must not read as 'no issues'; got {} issues", p.items.len()),
+            Lookup::Found(p) => panic!(
+                "timeout must not read as 'no issues'; got {} issues",
+                p.items.len()
+            ),
             Lookup::NotFound => panic!("timeout must not read as NotFound"),
             Lookup::Unavailable(c) => assert_eq!(c.kind, TrackerUnavailable::Network),
         }
@@ -684,7 +731,10 @@ mod tests {
             t.push_response(ok(status, "{}"));
             match client(t, cloud()).search_issues("x").await {
                 Lookup::Found(p) => {
-                    panic!("status {status} must not read as empty; got {} issues", p.items.len())
+                    panic!(
+                        "status {status} must not read as empty; got {} issues",
+                        p.items.len()
+                    )
                 }
                 Lookup::Unavailable(c) => assert_eq!(c.kind, want, "status={status}"),
                 other => panic!("status {status}: expected Unavailable, got {other:?}"),
@@ -702,7 +752,10 @@ mod tests {
                 assert_eq!(c.kind, TrackerUnavailable::NotAuthenticated);
                 assert_eq!(c.user_message, None, "Jira never surfaces raw error body");
                 let rendered = format!("{c:?}");
-                assert!(!rendered.contains("SECRET-JQL-INTERNALS"), "raw body leaked: {rendered}");
+                assert!(
+                    !rendered.contains("SECRET-JQL-INTERNALS"),
+                    "raw body leaked: {rendered}"
+                );
             }
             other => panic!("expected Unavailable(NotAuthenticated), got {other:?}"),
         }
@@ -731,7 +784,10 @@ mod tests {
                 let i = &page.items[0];
                 assert_eq!(i.key, "ENG-1");
                 assert_eq!(i.title, "Fix the bug");
-                assert_eq!(i.description, "Steps to reproduce", "ADF body converted to Markdown");
+                assert_eq!(
+                    i.description, "Steps to reproduce",
+                    "ADF body converted to Markdown"
+                );
                 assert_eq!(i.url, "https://acme.atlassian.net/browse/ENG-1");
                 assert_eq!(i.project_key.as_deref(), Some("ENG"));
                 assert_eq!(i.status.as_deref(), Some("In Progress"));
@@ -750,7 +806,10 @@ mod tests {
         t.push_response(ok(200, SEARCH_SERVER_ONE));
         match client(t, server_pat()).search_issues("project = SRV").await {
             Lookup::Found(page) => {
-                assert_eq!(page.items[0].description, "Just plain text here.\nSecond line.");
+                assert_eq!(
+                    page.items[0].description,
+                    "Just plain text here.\nSecond line."
+                );
             }
             other => panic!("expected Found, got {other:?}"),
         }
@@ -760,7 +819,10 @@ mod tests {
     #[tokio::test]
     async fn search_empty_is_found_empty() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"startAt":0,"maxResults":50,"total":0,"issues":[]}"#));
+        t.push_response(ok(
+            200,
+            r#"{"startAt":0,"maxResults":50,"total":0,"issues":[]}"#,
+        ));
         match client(t, cloud()).search_issues("x").await {
             Lookup::Found(page) => {
                 assert!(page.items.is_empty());
@@ -774,8 +836,11 @@ mod tests {
     #[tokio::test]
     async fn search_surfaces_has_more_when_truncated() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"startAt":0,"maxResults":50,"total":120,"issues":[
-            {"id":"1","key":"ENG-1","fields":{"summary":"a"}}]}"#));
+        t.push_response(ok(
+            200,
+            r#"{"startAt":0,"maxResults":50,"total":120,"issues":[
+            {"id":"1","key":"ENG-1","fields":{"summary":"a"}}]}"#,
+        ));
         match client(t, cloud()).search_issues("x").await {
             Lookup::Found(page) => assert!(page.has_more, "total 120 > 1 returned → has_more"),
             other => panic!("expected Found, got {other:?}"),
@@ -811,8 +876,11 @@ mod tests {
     #[tokio::test]
     async fn get_issue_found() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"id":"10001","key":"ENG-1","fields":{
-            "summary":"Fix","description":"body","status":{"name":"Done"}}}"#));
+        t.push_response(ok(
+            200,
+            r#"{"id":"10001","key":"ENG-1","fields":{
+            "summary":"Fix","description":"body","status":{"name":"Done"}}}"#,
+        ));
         match client(t, cloud()).get_issue("ENG-1").await {
             Lookup::Found(i) => {
                 assert_eq!(i.key, "ENG-1");
@@ -839,11 +907,14 @@ mod tests {
     #[tokio::test]
     async fn comments_single_page_parsed() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"startAt":0,"maxResults":100,"total":1,"comments":[
+        t.push_response(ok(
+            200,
+            r#"{"startAt":0,"maxResults":100,"total":1,"comments":[
             {"id":"c1","body":{"type":"doc","version":1,"content":[
                 {"type":"paragraph","content":[{"type":"text","text":"Looks good"}]}]},
              "created":"2026-07-23T00:00:00.000Z",
-             "author":{"displayName":"Ada"}}]}"#));
+             "author":{"displayName":"Ada"}}]}"#,
+        ));
         match client(t.clone(), cloud()).get_issue_comments("ENG-1").await {
             Lookup::Found(page) => {
                 assert_eq!(page.items.len(), 1);
@@ -861,10 +932,16 @@ mod tests {
     async fn comments_paginate_two_pages() {
         let t = Arc::new(FakeTransport::default());
         // page1: total 3, maxResults 2, 2 comments → 더 있음. page2: 1 comment → 끝.
-        t.push_response(ok(200, r#"{"startAt":0,"maxResults":2,"total":3,"comments":[
-            {"id":"c1","body":"a"},{"id":"c2","body":"b"}]}"#));
-        t.push_response(ok(200, r#"{"startAt":2,"maxResults":2,"total":3,"comments":[
-            {"id":"c3","body":"c"}]}"#));
+        t.push_response(ok(
+            200,
+            r#"{"startAt":0,"maxResults":2,"total":3,"comments":[
+            {"id":"c1","body":"a"},{"id":"c2","body":"b"}]}"#,
+        ));
+        t.push_response(ok(
+            200,
+            r#"{"startAt":2,"maxResults":2,"total":3,"comments":[
+            {"id":"c3","body":"c"}]}"#,
+        ));
         match client(t.clone(), cloud()).get_issue_comments("ENG-1").await {
             Lookup::Found(page) => {
                 assert_eq!(page.items.len(), 3, "both pages accumulated");
@@ -874,7 +951,10 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
         assert_eq!(t.requests().len(), 2);
-        assert!(t.requests()[1].url.contains("startAt=2"), "second page uses startAt=2");
+        assert!(
+            t.requests()[1].url.contains("startAt=2"),
+            "second page uses startAt=2"
+        );
     }
 
     /// 코멘트 transient(1페이지 실패) → Unavailable, 절대 부분/빈 목록 아님.
@@ -893,9 +973,12 @@ mod tests {
     #[tokio::test]
     async fn list_projects_cloud_paged() {
         let t = Arc::new(FakeTransport::default());
-        t.push_response(ok(200, r#"{"startAt":0,"maxResults":100,"total":2,"isLast":true,"values":[
+        t.push_response(ok(
+            200,
+            r#"{"startAt":0,"maxResults":100,"total":2,"isLast":true,"values":[
             {"id":"1","key":"ENG","name":"Engineering"},
-            {"id":"2","key":"OPS","name":"Operations"}]}"#));
+            {"id":"2","key":"OPS","name":"Operations"}]}"#,
+        ));
         match client(t.clone(), cloud()).list_projects().await {
             Lookup::Found(page) => {
                 assert_eq!(page.items.len(), 2);
@@ -918,7 +1001,10 @@ mod tests {
             }
             other => panic!("expected Found, got {other:?}"),
         }
-        assert_eq!(t.requests()[0].url, "https://jira.internal/rest/api/2/project");
+        assert_eq!(
+            t.requests()[0].url,
+            "https://jira.internal/rest/api/2/project"
+        );
     }
 
     // ---- token redaction ----

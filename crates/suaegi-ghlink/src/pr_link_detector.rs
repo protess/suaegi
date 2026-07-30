@@ -155,7 +155,7 @@
 //! character-class scans, and the trailing-punctuation strip is a
 //! `trim_end_matches`.
 
-use crate::{GitHubItemKind, RepoSlug, parse_github_issue_or_pr_link};
+use crate::{parse_github_issue_or_pr_link, GitHubItemKind, RepoSlug};
 use std::collections::HashSet;
 use suaegi_misc::is_js_whitespace;
 
@@ -257,7 +257,10 @@ fn get_potential_github_pr_carry(value: &str) -> String {
     // here because both are monotonic in string position, and each prefix's
     // occurrence start is always a valid `&str` char boundary (the prefixes
     // are ASCII literals).
-    let scheme_index = HTTP_SCHEME_PREFIXES.iter().filter_map(|p| value.rfind(p)).max();
+    let scheme_index = HTTP_SCHEME_PREFIXES
+        .iter()
+        .filter_map(|p| value.rfind(p))
+        .max();
 
     if let Some(idx) = scheme_index {
         let tail = &value[idx..];
@@ -348,7 +351,9 @@ fn iterate_terminal_url_candidates(value: &str) -> Vec<TerminalUrlCandidate> {
         // past `candidate_start` — no separate UTF-16-aware step needed.
         search_start = candidate_end.max(candidate_start + 1);
 
-        if utf16_len(raw_url) > MAX_TERMINAL_GITHUB_PR_URL_LENGTH || !raw_url.contains(GITHUB_PR_PATH_MARKER) {
+        if utf16_len(raw_url) > MAX_TERMINAL_GITHUB_PR_URL_LENGTH
+            || !raw_url.contains(GITHUB_PR_PATH_MARKER)
+        {
             continue;
         }
 
@@ -382,7 +387,11 @@ fn match_sgr_sequence(chars: &[char], start: usize) -> Option<usize> {
     while chars.get(j).is_some_and(|&c| (' '..='/').contains(&c)) {
         j += 1;
     }
-    if chars.get(j) == Some(&'m') { Some(j + 1) } else { None }
+    if chars.get(j) == Some(&'m') {
+        Some(j + 1)
+    } else {
+        None
+    }
 }
 
 /// `.replace(TERMINAL_SGR_PATTERN, '')` (`O:149`).
@@ -451,7 +460,8 @@ impl TerminalGitHubPRLinkDetector {
         }
 
         // `O:148-150`: strip SGR sequences, then guard cursor controls.
-        let combined = replace_cursor_controls_with_guard(&strip_terminal_sgr_sequences(&raw_combined));
+        let combined =
+            replace_cursor_controls_with_guard(&strip_terminal_sgr_sequences(&raw_combined));
 
         let mut links = Vec::new();
         for candidate in iterate_terminal_url_candidates(&combined) {
@@ -512,7 +522,12 @@ mod tests {
         let mut d = TerminalGitHubPRLinkDetector::default();
         assert_eq!(
             d.observe("Created https://github.com/acme/orca/pull/42\r\n"),
-            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
         );
     }
 
@@ -531,13 +546,19 @@ mod tests {
         let mut d = TerminalGitHubPRLinkDetector::default();
         let issue8126_url = "https://github.com/owner/repo/pull/10";
         assert_eq!(d.observe(&format!("{issue8126_url}\x1b")), Vec::new());
-        assert_eq!(d.observe("[22m\n"), vec![pr(issue8126_url, "owner", "repo", 10)]);
+        assert_eq!(
+            d.observe("[22m\n"),
+            vec![pr(issue8126_url, "owner", "repo", 10)]
+        );
     }
 
     #[test]
     fn oracle_rejects_pr_urls_corrupted_by_cursor_movement() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/owne\x1b[1Cr/repo/pull/10\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/owne\x1b[1Cr/repo/pull/10\n"),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -545,7 +566,9 @@ mod tests {
         for cursor_move in ["\x1b[1A", "\x1b[1B"] {
             let mut d = TerminalGitHubPRLinkDetector::default();
             assert_eq!(
-                d.observe(&format!("https://github.com/owner/repo/pull/{cursor_move}10\n")),
+                d.observe(&format!(
+                    "https://github.com/owner/repo/pull/{cursor_move}10\n"
+                )),
                 Vec::new()
             );
         }
@@ -553,10 +576,14 @@ mod tests {
 
     #[test]
     fn oracle_does_not_fuse_screen_editing_controls_into_pr_urls() {
-        for screen_edit in ["\x08", "\x0b", "\x0c", "\x1bD", "\x1b[2J", "\x1b[2K", "\x1b[1S"] {
+        for screen_edit in [
+            "\x08", "\x0b", "\x0c", "\x1bD", "\x1b[2J", "\x1b[2K", "\x1b[1S",
+        ] {
             let mut d = TerminalGitHubPRLinkDetector::default();
             assert_eq!(
-                d.observe(&format!("https://github.com/owner/repo/pull/1{screen_edit}0\n")),
+                d.observe(&format!(
+                    "https://github.com/owner/repo/pull/1{screen_edit}0\n"
+                )),
                 Vec::new()
             );
         }
@@ -578,7 +605,12 @@ mod tests {
         assert_eq!(d.observe("https://github.com/acme/orca/pull/4"), Vec::new());
         assert_eq!(
             d.observe("2\r\n"),
-            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
         );
     }
 
@@ -588,7 +620,12 @@ mod tests {
         assert_eq!(d.observe("created https://gith"), Vec::new());
         assert_eq!(
             d.observe("ub.com/acme/orca/pull/42\n"),
-            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
         );
     }
 
@@ -609,7 +646,10 @@ mod tests {
     #[test]
     fn oracle_ignores_non_pr_github_shaped_links() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/acme/orca/issues/42\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/acme/orca/issues/42\n"),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -631,7 +671,12 @@ mod tests {
         let mut d = TerminalGitHubPRLinkDetector::default();
         assert_eq!(
             d.observe("Created http://github.internal/MyOrg/my_repo/pull/395\r\n"),
-            vec![pr("http://github.internal/MyOrg/my_repo/pull/395", "MyOrg", "my_repo", 395)]
+            vec![pr(
+                "http://github.internal/MyOrg/my_repo/pull/395",
+                "MyOrg",
+                "my_repo",
+                395
+            )]
         );
     }
 
@@ -658,8 +703,15 @@ mod tests {
         let mut d = TerminalGitHubPRLinkDetector::default();
         let noise = format!("{}\n", "/pull/not-a-url ".repeat(20_000));
         assert_eq!(
-            d.observe(&format!("{noise}Created https://github.com/acme/orca/pull/42\r\n")),
-            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+            d.observe(&format!(
+                "{noise}Created https://github.com/acme/orca/pull/42\r\n"
+            )),
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
         );
     }
 
@@ -667,7 +719,10 @@ mod tests {
     fn oracle_drops_overlong_incomplete_url_carry_instead_of_retaining_pasted_megabytes() {
         let mut d = TerminalGitHubPRLinkDetector::default();
         assert_eq!(
-            d.observe(&format!("https://github.com/acme/orca/pull/{}", "4".repeat(10_000))),
+            d.observe(&format!(
+                "https://github.com/acme/orca/pull/{}",
+                "4".repeat(10_000)
+            )),
             Vec::new()
         );
         assert_eq!(d.observe("2\r\n"), Vec::new());
@@ -705,7 +760,15 @@ mod tests {
     fn q2_seen_set_suppresses_reemission_from_retained_carry() {
         let mut d = TerminalGitHubPRLinkDetector::default();
         let first = d.observe("https://github.com/acme/orca/pull/42>");
-        assert_eq!(first, vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]);
+        assert_eq!(
+            first,
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
+        );
 
         let second = d.observe("\n");
         assert_eq!(second, Vec::new());
@@ -723,7 +786,10 @@ mod tests {
     /// isolate this mechanism.
     #[test]
     fn q2_whitespace_rule_clears_carry_directly() {
-        assert_eq!(get_potential_github_pr_carry("https://github.com/acme/orca/pull/42\n"), "");
+        assert_eq!(
+            get_potential_github_pr_carry("https://github.com/acme/orca/pull/42\n"),
+            ""
+        );
         assert_eq!(
             get_potential_github_pr_carry("https://github.com/acme/orca/pull/42>"),
             "https://github.com/acme/orca/pull/42>"
@@ -751,13 +817,31 @@ mod tests {
         assert_eq!(ends_with_http_scheme_prefix_fragment("creating h"), "h");
         assert_eq!(ends_with_http_scheme_prefix_fragment("creating ht"), "ht");
         assert_eq!(ends_with_http_scheme_prefix_fragment("creating htt"), "htt");
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating http"), "http");
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating https"), "https");
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating https:"), "https:");
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating https:/"), "https:/");
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating http"),
+            "http"
+        );
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating https"),
+            "https"
+        );
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating https:"),
+            "https:"
+        );
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating https:/"),
+            "https:/"
+        );
         // Only reachable via the "http://"-specific branch (Q11 note).
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating http:"), "http:");
-        assert_eq!(ends_with_http_scheme_prefix_fragment("creating http:/"), "http:/");
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating http:"),
+            "http:"
+        );
+        assert_eq!(
+            ends_with_http_scheme_prefix_fragment("creating http:/"),
+            "http:/"
+        );
         assert_eq!(ends_with_http_scheme_prefix_fragment("no scheme here"), "");
     }
 
@@ -767,19 +851,28 @@ mod tests {
     #[test]
     fn q7_backspace_control_char_rejected() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/owner/repo/pull/1\x080\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/owner/repo/pull/1\x080\n"),
+            Vec::new()
+        );
     }
 
     #[test]
     fn q7_vertical_tab_control_char_rejected() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/owner/repo/pull/1\x0b0\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/owner/repo/pull/1\x0b0\n"),
+            Vec::new()
+        );
     }
 
     #[test]
     fn q7_form_feed_control_char_rejected() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/owner/repo/pull/1\x0c0\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/owner/repo/pull/1\x0c0\n"),
+            Vec::new()
+        );
     }
 
     /// Q8: a genuine U+FFFD (not produced by the cursor-control guard) must
@@ -788,7 +881,10 @@ mod tests {
     #[test]
     fn q8_genuine_replacement_character_is_rejected() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/owner/repo/pull/1\u{fffd}0\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/owner/repo/pull/1\u{fffd}0\n"),
+            Vec::new()
+        );
     }
 
     /// Q4: non-ASCII ECMAScript whitespace terminators (NBSP, ideographic
@@ -800,7 +896,12 @@ mod tests {
             let input = format!("https://github.com/acme/orca/pull/42{ws}x\n");
             assert_eq!(
                 d.observe(&input),
-                vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)],
+                vec![pr(
+                    "https://github.com/acme/orca/pull/42",
+                    "acme",
+                    "orca",
+                    42
+                )],
                 "ws={ws:?}"
             );
         }
@@ -864,7 +965,10 @@ mod tests {
         // The `/pull/` marker is split by an SGR sequence ("pu" + SGR +
         // "ll/") — the raw-string gate bails before stripping ever gets a
         // chance to join it back together.
-        assert_eq!(d.observe("https://github.com/acme/orca/pu\x1b[0mll/42\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/acme/orca/pu\x1b[0mll/42\n"),
+            Vec::new()
+        );
 
         // Contrast: the identical URL, but with the SGR sequence placed
         // where it does NOT split the marker (right after the PR number) —
@@ -874,7 +978,12 @@ mod tests {
         let mut d2 = TerminalGitHubPRLinkDetector::default();
         assert_eq!(
             d2.observe("https://github.com/acme/orca/pull/42\x1b[0m\n"),
-            vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)]
+            vec![pr(
+                "https://github.com/acme/orca/pull/42",
+                "acme",
+                "orca",
+                42
+            )]
         );
     }
 
@@ -971,7 +1080,11 @@ mod tests {
     fn q3_dedupe_key_is_sensitive_to_trailing_path_segments() {
         let mut d = TerminalGitHubPRLinkDetector::default();
         assert_eq!(d.observe("https://github.com/acme/orca/pull/42\n").len(), 1);
-        assert_eq!(d.observe("https://github.com/acme/orca/pull/42/files\n").len(), 1);
+        assert_eq!(
+            d.observe("https://github.com/acme/orca/pull/42/files\n")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -993,7 +1106,12 @@ mod tests {
             let input = format!("https://github.com/acme/orca/pull/42{term}trailing\n");
             assert_eq!(
                 d.observe(&input),
-                vec![pr("https://github.com/acme/orca/pull/42", "acme", "orca", 42)],
+                vec![pr(
+                    "https://github.com/acme/orca/pull/42",
+                    "acme",
+                    "orca",
+                    42
+                )],
                 "term={term:?}"
             );
         }
@@ -1027,7 +1145,10 @@ mod tests {
             let mut d = TerminalGitHubPRLinkDetector::default();
             let input = format!("Opened (https://github.com/acme/orca/pull/42{term}\n");
             let result = d.observe(&input);
-            assert_eq!(result[0].url, "https://github.com/acme/orca/pull/42", "term={term:?}");
+            assert_eq!(
+                result[0].url, "https://github.com/acme/orca/pull/42",
+                "term={term:?}"
+            );
         }
     }
 
@@ -1037,7 +1158,10 @@ mod tests {
     #[test]
     fn issues_path_containing_pull_marker_parses_as_issue_not_pr() {
         let mut d = TerminalGitHubPRLinkDetector::default();
-        assert_eq!(d.observe("https://github.com/acme/orca/issues/42/pull/5\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/acme/orca/issues/42/pull/5\n"),
+            Vec::new()
+        );
     }
 
     /// `findNextHttpSchemeIndex` must pick whichever scheme occurs FIRST in
@@ -1059,7 +1183,10 @@ mod tests {
     fn reset_clears_both_carry_and_seen_urls() {
         let mut d = TerminalGitHubPRLinkDetector::default();
         assert_eq!(d.observe("https://github.com/acme/orca/pull/42\n").len(), 1);
-        assert_eq!(d.observe("https://github.com/acme/orca/pull/42\n"), Vec::new());
+        assert_eq!(
+            d.observe("https://github.com/acme/orca/pull/42\n"),
+            Vec::new()
+        );
         d.reset();
         assert_eq!(d.observe("https://github.com/acme/orca/pull/42\n").len(), 1);
     }

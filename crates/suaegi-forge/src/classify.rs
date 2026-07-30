@@ -114,7 +114,9 @@ mod tests {
     #[test]
     fn transient_failures_are_not_read_as_no_pr() {
         assert!(!is_no_pull_request("HTTP 429: API rate limit exceeded"));
-        assert!(!is_no_pull_request("error connecting: could not resolve host"));
+        assert!(!is_no_pull_request(
+            "error connecting: could not resolve host"
+        ));
         assert!(!is_no_pull_request("HTTP 401: Bad credentials"));
         assert!(!is_no_pull_request("HTTP 503: Service Unavailable"));
         // "could not find" 하나만으로는 안 된다 — "pull request"가 함께 있어야.
@@ -194,7 +196,10 @@ mod tests {
         let secret = "fatal: token ghp_SECRET_LEAK leaked in stderr blah";
         match classify_unavailable(secret) {
             ForgeUnavailable::Other(msg) => {
-                assert!(!msg.contains("ghp_SECRET_LEAK"), "raw stderr leaked to UI: {msg}");
+                assert!(
+                    !msg.contains("ghp_SECRET_LEAK"),
+                    "raw stderr leaked to UI: {msg}"
+                );
             }
             other => panic!("expected Other, got {other:?}"),
         }

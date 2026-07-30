@@ -108,9 +108,7 @@ mod tests {
     fn matches_the_english_git_fatal_on_stderr() {
         let error = GitErrorLike::ObjectLike(GitErrorFields {
             message: Some("git worktree remove failed"),
-            stderr: Some(
-                "fatal: working trees containing submodules cannot be moved or removed\n",
-            ),
+            stderr: Some("fatal: working trees containing submodules cannot be moved or removed\n"),
             stdout: None,
         });
         assert!(is_submodule_worktree_removal_refusal(&error));
@@ -151,9 +149,7 @@ mod tests {
     fn pin_uppercase_phrase_matches() {
         let error = GitErrorLike::ObjectLike(GitErrorFields {
             message: None,
-            stderr: Some(
-                "FATAL: WORKING TREES CONTAINING SUBMODULES CANNOT BE MOVED OR REMOVED",
-            ),
+            stderr: Some("FATAL: WORKING TREES CONTAINING SUBMODULES CANNOT BE MOVED OR REMOVED"),
             stdout: None,
         });
         assert!(is_submodule_worktree_removal_refusal(&error));

@@ -8,10 +8,13 @@ use crossbeam_channel::{Select, Sender, TryRecvError, TrySendError};
 
 use alacritty_terminal::grid::Scroll;
 
+use crate::bell_detector::BellDetector;
+use crate::daemon::{DaemonClientSession, SpawnSpec};
 use crate::grid::{GridSize, TerminalGrid, TerminalSnapshot, TitleChange};
 use crate::input_types::{
     CopyRequest, CopyTargets, KeyInput, MouseEncodeError, MouseIntent, MouseResult, WriteOutcome,
 };
+use crate::osc52::Osc52Detector;
 use crate::pty::{KillOutcome, PtySession, PtySpawn, TermError};
 
 const READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -72,20 +75,111 @@ pub struct SessionSpec {
 }
 
 pub struct TerminalSession {
-    pty: Arc<PtySession>,
+    backend: SessionBackend,
     grid: Arc<TerminalGrid>,
     generation: Arc<AtomicU64>,
     exit_code: Arc<AtomicI64>,
     running: Arc<AtomicBool>,
+    /// Monotonic count of real BEL characters observed outside OSC strings.
+    /// The UI polls this alongside `generation`, so the PTY reader never needs
+    /// to call platform notification APIs directly.
+    bell_count: Arc<AtomicU64>,
+    osc52_writes: Arc<Mutex<Vec<String>>>,
     /// Drop에서 닫아 라이터 스레드를 끝낸다
     writes: Mutex<Option<Sender<Vec<u8>>>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
+    /// `true`면 이 앱이 새 PTY를 만든 것이 아니라 이전 앱이 남긴 데몬
+    /// 세션에 붙었다. 앱 수명에 묶인 훅 포트 같은 신호원을 재사용하지 않도록
+    /// 상위 계층이 상태 감지 경로를 바꾸는 데 쓴다.
+    reattached: bool,
     /// `resize()`가 pty와 grid를 한 쌍으로 갱신하는 동안 다른 resize 호출이
     /// 끼어들지 못하게 막는다. `&self`가 `Sync`라 동시 호출이 가능한데, 이 락이
     /// 없으면 두 resize가 인터리브돼(PTY=A, PTY=B, grid=B, grid=A) pty와 grid가
     /// 서로 다른 크기로 어긋난 채 남을 수 있다.
     resize_lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+enum SessionBackend {
+    Local(Arc<PtySession>),
+    Daemon(Arc<DaemonClientSession>),
+}
+
+impl SessionBackend {
+    fn write(&self, bytes: &[u8]) -> Result<(), TermError> {
+        match self {
+            Self::Local(pty) => pty.write(bytes),
+            Self::Daemon(session) => session
+                .write(bytes)
+                .map_err(|error| TermError::Pty(error.to_string())),
+        }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) -> Result<(), TermError> {
+        match self {
+            Self::Local(pty) => pty.resize(rows, cols),
+            Self::Daemon(session) => session
+                .resize(rows, cols)
+                .map_err(|error| TermError::Pty(error.to_string())),
+        }
+    }
+
+    fn size(&self) -> Result<(u16, u16), TermError> {
+        match self {
+            Self::Local(pty) => pty.size(),
+            Self::Daemon(session) => session
+                .size()
+                .map_err(|error| TermError::Pty(error.to_string())),
+        }
+    }
+
+    fn kill(&self) -> Result<KillOutcome, TermError> {
+        match self {
+            Self::Local(pty) => pty.kill(),
+            Self::Daemon(session) => {
+                session
+                    .kill()
+                    .map_err(|error| TermError::Pty(error.to_string()))?;
+                Ok(KillOutcome::Signalled)
+            }
+        }
+    }
+
+    fn finish_reader(&self) -> Option<i32> {
+        match self {
+            Self::Local(pty) => {
+                let _ = pty.kill();
+                pty.wait().ok()
+            }
+            Self::Daemon(session) => session.exit_code(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn foreground_pgid(&self) -> Option<i32> {
+        match self {
+            Self::Local(pty) => pty.foreground_pgid(),
+            Self::Daemon(session) => session.foreground_pgid(),
+        }
+    }
+
+    fn kill_on_drop(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
+    fn disconnect(&self) {
+        if let Self::Daemon(session) = self {
+            session.disconnect();
+        }
+    }
+
+    fn terminal_replies_enabled(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Daemon(session) => session.terminal_replies_enabled(),
+        }
+    }
 }
 
 impl TerminalSession {
@@ -95,12 +189,67 @@ impl TerminalSession {
             cols: spec.pty.cols.max(1) as usize,
         };
         let (pty, reader) = PtySession::spawn(spec.pty)?;
+        Self::start_with_backend(
+            size,
+            spec.scrollback,
+            SessionBackend::Local(Arc::new(pty)),
+            Box::new(reader),
+            false,
+        )
+    }
 
-        let pty = Arc::new(pty);
-        let grid = Arc::new(TerminalGrid::new(size, spec.scrollback));
+    /// Starts or reattaches a stable daemon-owned PTY session.
+    ///
+    /// Dropping this client disconnects it without killing the hosted process;
+    /// callers use [`Self::kill`] for an explicit terminal close.
+    pub fn start_persistent(
+        spec: SessionSpec,
+        daemon_session_id: String,
+    ) -> Result<Self, TermError> {
+        let requested_size = GridSize {
+            rows: spec.pty.rows.max(1) as usize,
+            cols: spec.pty.cols.max(1) as usize,
+        };
+        let spawn = SpawnSpec {
+            program: spec.pty.program,
+            args: spec.pty.args,
+            cwd: spec.pty.cwd,
+            env: spec.pty.env,
+            rows: spec.pty.rows,
+            cols: spec.pty.cols,
+        };
+        let (session, reader, is_new) =
+            DaemonClientSession::create_or_attach(daemon_session_id, spawn)
+                .map_err(|error| TermError::Pty(error.to_string()))?;
+        let size = session
+            .size()
+            .map(|(rows, cols)| GridSize {
+                rows: rows as usize,
+                cols: cols as usize,
+            })
+            .unwrap_or(requested_size);
+        Self::start_with_backend(
+            size,
+            spec.scrollback,
+            SessionBackend::Daemon(session),
+            Box::new(reader),
+            !is_new,
+        )
+    }
+
+    fn start_with_backend(
+        size: GridSize,
+        scrollback: usize,
+        backend: SessionBackend,
+        mut reader: Box<dyn Read + Send>,
+        reattached: bool,
+    ) -> Result<Self, TermError> {
+        let grid = Arc::new(TerminalGrid::new(size, scrollback));
         let generation = Arc::new(AtomicU64::new(0));
         let exit_code = Arc::new(AtomicI64::new(NO_EXIT));
         let running = Arc::new(AtomicBool::new(true));
+        let bell_count = Arc::new(AtomicU64::new(0));
+        let osc52_writes = Arc::new(Mutex::new(Vec::new()));
         // UI 입력은 바운드(유실 허용), 장치 응답은 언바운드 별도 큐(유실 불가).
         // 하나의 큐를 공유하면 UI 입력이 큐를 채운 사이 리더가 응답 송신에서
         // 블로킹돼 PTY 출력 소비가 멈추는 교착이 생긴다.
@@ -113,7 +262,7 @@ impl TerminalSession {
         // — 예전에는 20ms 주기로만 깨어나 장치 질의 핸드셰이크(vim/neovim의
         // DA1/DSR/OSC 색상 질의 등)가 눈에 보이는 지연을 겪었다.
         let writer_thread = {
-            let writer_pty = Arc::clone(&pty);
+            let writer_backend = backend.clone();
             match std::thread::Builder::new()
                 .name("suaegi-pty-writer".to_string())
                 .spawn(move || {
@@ -135,7 +284,7 @@ impl TerminalSession {
                         loop {
                             match reply_rx.try_recv() {
                                 Ok(bytes) => {
-                                    if writer_pty.write(&bytes).is_err() {
+                                    if writer_backend.write(&bytes).is_err() {
                                         failed = true;
                                         break;
                                     }
@@ -161,14 +310,14 @@ impl TerminalSession {
                             // 리더가 select 대기 중에 사라졌다면 Err(_) — 다음
                             // 반복의 위쪽 드레인 루프가 Disconnected로 잡아 끝낸다.
                             if let Ok(bytes) = oper.recv(&reply_rx) {
-                                if writer_pty.write(&bytes).is_err() {
+                                if writer_backend.write(&bytes).is_err() {
                                     break;
                                 }
                             }
                         } else if oper.index() == ui_idx {
                             match oper.recv(&ui_rx) {
                                 Ok(bytes) => {
-                                    if writer_pty.write(&bytes).is_err() {
+                                    if writer_backend.write(&bytes).is_err() {
                                         break;
                                     }
                                 }
@@ -176,7 +325,7 @@ impl TerminalSession {
                                 // 비우고 끝낸다
                                 Err(_) => {
                                     while let Ok(bytes) = reply_rx.try_recv() {
-                                        let _ = writer_pty.write(&bytes);
+                                        let _ = writer_backend.write(&bytes);
                                     }
                                     break;
                                 }
@@ -198,23 +347,36 @@ impl TerminalSession {
         let reader_thread = {
             // 클로저로 옮길 클론은 이름을 달리한다 — 섀도잉하면 실패 분기에서
             // 바깥 `pty`를 쓸 수 없게 되어 컴파일 에러가 난다
-            let reader_pty = Arc::clone(&pty);
+            let reader_backend = backend.clone();
             let grid = Arc::clone(&grid);
             let generation = Arc::clone(&generation);
             let exit_code = Arc::clone(&exit_code);
             let running = Arc::clone(&running);
+            let reader_bell_count = Arc::clone(&bell_count);
+            let reader_osc52_writes = Arc::clone(&osc52_writes);
             // 클론은 이름을 달리해 소유권을 분명히 한다 — 같은 이름으로 섀도잉하면
             // 실패 분기에서 "moved value" 컴파일 에러가 난다
             let reader_reply_tx = reply_tx.clone();
-            let mut reader = reader;
             let spawned = std::thread::Builder::new()
                 .name("suaegi-pty-reader".to_string())
                 .spawn(move || {
                     let mut buf = vec![0u8; READ_BUFFER_SIZE];
+                    let mut bell_detector = BellDetector::new();
+                    let mut osc52_detector = Osc52Detector::default();
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => break, // EOF
                             Ok(n) => {
+                                if bell_detector.chunk_contains_bell(&buf[..n], None) {
+                                    reader_bell_count.fetch_add(1, Ordering::Release);
+                                }
+                                let writes = osc52_detector.feed(&buf[..n]);
+                                if !writes.is_empty() {
+                                    reader_osc52_writes
+                                        .lock()
+                                        .expect("OSC 52 queue mutex poisoned")
+                                        .extend(writes);
+                                }
                                 grid.feed(&buf[..n]);
                                 // 터미널이 만든 응답을 PTY로 돌려보내지 않으면
                                 // 장치 질의를 보낸 프로그램이 영원히 기다린다.
@@ -222,7 +384,12 @@ impl TerminalSession {
                                 // 찼다면(라이터가 막혀 못 비우는 중) 이 응답은
                                 // 버린다. 자기 tty를 읽지 않으면서 질의만
                                 // 쏟아내는 프로그램에 대한 유일한 안전한 대응이다.
+                                let terminal_replies_enabled =
+                                    reader_backend.terminal_replies_enabled();
                                 for reply in grid.take_pty_writes() {
+                                    if !terminal_replies_enabled {
+                                        continue;
+                                    }
                                     match reader_reply_tx.try_send(reply.into_bytes()) {
                                         Ok(()) => {}
                                         Err(TrySendError::Full(_)) => {}
@@ -239,14 +406,14 @@ impl TerminalSession {
                     // 아직 유효하므로(수확 전) 남은 자손을 안전하게 정리할 수 있고,
                     // 아래 블로킹 wait()가 살아 있는 자식 때문에 멈추지 않는다.
                     // 자식이 이미 스스로 종료했다면 무해한 no-op이다.
-                    let _ = reader_pty.kill();
-                    // EOF가 자식 종료보다 먼저 올 수 있으므로 블로킹 wait로 확정한다
+                    // 로컬 PTY는 여기서 kill+wait로 수확한다. 데몬 스트림의 EOF는
+                    // 앱 연결 종료일 수도 있으므로 절대 원격 PTY를 죽이지 않는다.
                     // 순서 의존성: exit_code를 먼저 저장하고 running을 나중에
                     // 저장한다 — PresenceMonitor::probe(presence.rs)가 이 순서에
                     // 기대어 "!is_running()을 봤다면 exit_code도 이미 발행됐다"고
                     // 가정한다. 이 둘의 저장 순서를 바꾸면 그 재읽기가 다시
                     // stale None을 볼 수 있다.
-                    if let Ok(code) = reader_pty.wait() {
+                    if let Some(code) = reader_backend.finish_reader() {
                         exit_code.store(code as i64, Ordering::Release);
                     }
                     running.store(false, Ordering::Release);
@@ -259,7 +426,7 @@ impl TerminalSession {
                     // 떨어뜨려야 라이터 루프가 Disconnected로 끝난다.
                     drop(ui_tx);
                     drop(reply_tx);
-                    let _ = pty.kill();
+                    let _ = backend.kill();
                     let _ = writer_thread.join();
                     return Err(TermError::ThreadSpawn(e.to_string()));
                 }
@@ -271,14 +438,17 @@ impl TerminalSession {
         drop(reply_tx);
 
         Ok(Self {
-            pty,
+            backend,
             grid,
             generation,
             exit_code,
             running,
+            bell_count,
+            osc52_writes,
             writes: Mutex::new(Some(ui_tx)),
             reader_thread: Mutex::new(Some(reader_thread)),
             writer_thread: Mutex::new(Some(writer_thread)),
+            reattached,
             resize_lock: Mutex::new(()),
         })
     }
@@ -306,7 +476,7 @@ impl TerminalSession {
         // pty.resize와 grid.resize를 한 쌍으로 직렬화한다 — 동시 호출이
         // 인터리브되면 둘이 서로 다른 크기로 어긋난 채 남을 수 있다.
         let _guard = self.resize_lock.lock().expect("resize mutex poisoned");
-        self.pty.resize(rows, cols)?;
+        self.backend.resize(rows, cols)?;
         self.grid.resize(GridSize {
             rows: rows as usize,
             cols: cols as usize,
@@ -320,7 +490,7 @@ impl TerminalSession {
     /// 있어야 한다 — snapshot()은 grid 크기만 준다.
     #[doc(hidden)]
     pub fn pty_size(&self) -> Result<(u16, u16), TermError> {
-        self.pty.size()
+        self.backend.size()
     }
 
     /// 테스트 전용 관찰창: 라이터 스레드가 이미 끝났는지. 프로덕션 코드는 이
@@ -355,6 +525,20 @@ impl TerminalSession {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Number of real terminal bells observed by this session.
+    pub fn bell_count(&self) -> u64 {
+        self.bell_count.load(Ordering::Acquire)
+    }
+
+    pub fn take_osc52_writes(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .osc52_writes
+                .lock()
+                .expect("OSC 52 queue mutex poisoned"),
+        )
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         match self.exit_code.load(Ordering::Acquire) {
             NO_EXIT => None,
@@ -366,12 +550,16 @@ impl TerminalSession {
         self.running.load(Ordering::Acquire)
     }
 
+    pub fn was_reattached(&self) -> bool {
+        self.reattached
+    }
+
     /// 안에서는 리더가 EOF를 본 뒤에만 `wait()`를 부르므로 억제(`Suppressed
     /// AfterReap`)가 관찰되더라도 언제나 안전하다 — 그 시점엔 자식이 이미 죽어
     /// 있거나 죽는 중이다. 그래도 반환값 자체는 raw `PtySession::kill()`과
     /// 동일하게 정직해야 하므로 그대로 넘긴다.
     pub fn kill(&self) -> Result<KillOutcome, TermError> {
-        self.pty.kill()
+        self.backend.kill()
     }
 
     pub fn take_title_changes(&self) -> Vec<TitleChange> {
@@ -469,14 +657,19 @@ impl TerminalSession {
 
     #[cfg(unix)]
     pub fn foreground_pgid(&self) -> Option<i32> {
-        self.pty.foreground_pgid()
+        self.backend.foreground_pgid()
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        // 세션 객체를 놓으면 자식 프로세스와 두 스레드가 반드시 정리되어야 한다.
-        let _ = self.pty.kill();
+        // 로컬 세션은 자식 프로세스까지 정리한다. 데몬 세션은 스트림만 끊어
+        // 앱 종료를 넘어 살아 있게 한다(명시적 pane close는 SessionStore가
+        // Drop 전에 kill을 별도 스레드로 보낸다).
+        if self.backend.kill_on_drop() {
+            let _ = self.backend.kill();
+        }
+        self.backend.disconnect();
         // 라이터 채널을 닫아 라이터 루프를 끝낸다
         if let Ok(mut writes) = self.writes.lock() {
             writes.take();

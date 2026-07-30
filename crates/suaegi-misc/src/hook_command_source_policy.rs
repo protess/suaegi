@@ -101,7 +101,10 @@ mod tests {
 
     #[test]
     fn normalizes_unknown_persisted_policies_to_shared_only() {
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("shared-first"))), SharedOnly);
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("shared-first"))),
+            SharedOnly
+        );
     }
 
     #[test]
@@ -116,8 +119,14 @@ mod tests {
 
     #[test]
     fn preserves_explicit_command_source_choices() {
-        assert_eq!(resolve_hook_command_source_policy(Some(Some("shared-only")), true), SharedOnly);
-        assert_eq!(resolve_hook_command_source_policy(Some(Some("run-both")), true), RunBoth);
+        assert_eq!(
+            resolve_hook_command_source_policy(Some(Some("shared-only")), true),
+            SharedOnly
+        );
+        assert_eq!(
+            resolve_hook_command_source_policy(Some(Some("run-both")), true),
+            RunBoth
+        );
     }
 
     // Mandatory extra pins (oracle-silent):
@@ -128,9 +137,18 @@ mod tests {
     /// converting an explicit opt-out into running the local script anyway.
     #[test]
     fn pin_explicit_local_only_is_preserved() {
-        assert_eq!(resolve_hook_command_source_policy(Some(Some("local-only")), false), LocalOnly);
-        assert_eq!(resolve_hook_command_source_policy(Some(Some("local-only")), true), LocalOnly);
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("local-only"))), LocalOnly);
+        assert_eq!(
+            resolve_hook_command_source_policy(Some(Some("local-only")), false),
+            LocalOnly
+        );
+        assert_eq!(
+            resolve_hook_command_source_policy(Some(Some("local-only")), true),
+            LocalOnly
+        );
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("local-only"))),
+            LocalOnly
+        );
     }
 
     /// F10 — `undefined` (`None`) and `null`/non-string (`Some(None)`) are
@@ -138,16 +156,28 @@ mod tests {
     /// `has_local_script` to produce `LocalOnly`.
     #[test]
     fn pin_undefined_and_null_are_not_interchangeable() {
-        assert_eq!(resolve_hook_command_source_policy(Some(None), true), SharedOnly);
+        assert_eq!(
+            resolve_hook_command_source_policy(Some(None), true),
+            SharedOnly
+        );
         assert_eq!(resolve_hook_command_source_policy(None, true), LocalOnly);
     }
 
     /// F11 — each policy member pinned directly, not just accepted-vs-fallback.
     #[test]
     fn pin_each_member_directly() {
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("shared-only"))), SharedOnly);
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("local-only"))), LocalOnly);
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("run-both"))), RunBoth);
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("shared-only"))),
+            SharedOnly
+        );
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("local-only"))),
+            LocalOnly
+        );
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("run-both"))),
+            RunBoth
+        );
     }
 
     /// F13 — no trim/case-fold: looser matching here is a security regression
@@ -155,8 +185,14 @@ mod tests {
     /// under input the source would have rejected to the safe fallback).
     #[test]
     fn pin_no_trim_or_case_fold() {
-        assert_eq!(normalize_hook_command_source_policy(Some(Some("Shared-Only"))), SharedOnly);
-        assert_eq!(normalize_hook_command_source_policy(Some(Some(" local-only "))), SharedOnly);
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some("Shared-Only"))),
+            SharedOnly
+        );
+        assert_eq!(
+            normalize_hook_command_source_policy(Some(Some(" local-only "))),
+            SharedOnly
+        );
         assert_eq!(
             resolve_hook_command_source_policy(Some(Some(" run-both ")), true),
             SharedOnly

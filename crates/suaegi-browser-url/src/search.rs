@@ -827,7 +827,7 @@ mod tests {
         assert!(!looks_like_search_query("foo.")); // trailing dot: `[a-z]{2,}` needs >=2 letters after it
         assert!(!looks_like_search_query("foo.a")); // single-letter TLD fails `{2,}`
         assert!(!looks_like_search_query(".com")); // no `[^\s]+` before the dot
-        // Contrasting true case: no `.`, no `:`, no space.
+                                                   // Contrasting true case: no `.`, no `:`, no space.
         assert!(looks_like_search_query("react"));
     }
 

@@ -50,6 +50,16 @@ pub enum FileStatus {
     Other(String),
 }
 
+/// Source-control UI view of one porcelain entry. Unlike [`FileStatus`], this
+/// preserves whether the index (`X`) and/or worktree (`Y`) side is dirty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedFileStatus {
+    pub path: String,
+    pub status: FileStatus,
+    pub staged: bool,
+    pub unstaged: bool,
+}
+
 /// 미병합(충돌) 경로의 종류. `git status --porcelain=v1`의 unmerged XY 코드를 **누가
 /// 무엇을 했는가**로 옮긴 것 — Orca `parseConflictKind`(status.ts:877-896)의 7종과 1:1.
 ///
@@ -142,13 +152,71 @@ pub async fn working_tree_status(
     parse_porcelain_status(&out.stdout)
 }
 
+/// Detailed counterpart of [`working_tree_status`] for write-capable source
+/// control surfaces.
+pub async fn working_tree_status_detailed(
+    runner: &GitRunner,
+    worktree: &Path,
+) -> Result<Vec<DetailedFileStatus>, GitError> {
+    let out = runner
+        .run(worktree, &["status", "--porcelain=v1", "-z"])
+        .await?;
+    parse_porcelain_details(&out.stdout)
+}
+
+pub fn parse_porcelain_details(stdout: &str) -> Result<Vec<DetailedFileStatus>, GitError> {
+    let args = "status --porcelain=v1 -z";
+    let mut entries = Vec::new();
+    let mut records = stdout.split('\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 4 || record.as_bytes()[2] != b' ' {
+            return Err(GitError::Parse {
+                args: args.to_string(),
+                detail: format!("malformed status record {record:?}"),
+            });
+        }
+        let x = record.as_bytes()[0] as char;
+        let y = record.as_bytes()[1] as char;
+        let path = &record[3..];
+        let status = if x == 'R' || x == 'C' {
+            let from = records.next().ok_or_else(|| GitError::Parse {
+                args: args.to_string(),
+                detail: format!("rename/copy record {record:?} missing origin path"),
+            })?;
+            if x == 'R' {
+                FileStatus::Renamed {
+                    from: from.to_string(),
+                }
+            } else {
+                FileStatus::Copied {
+                    from: from.to_string(),
+                }
+            }
+        } else {
+            classify_xy(x, y)
+        };
+        let untracked = x == '?' && y == '?';
+        entries.push(DetailedFileStatus {
+            path: path.to_string(),
+            status,
+            staged: !untracked && x != ' ',
+            unstaged: untracked || y != ' ',
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
 /// `git status --porcelain=v1 -z` 파서. **순수 함수라 단위 테스트로 직접 고정한다.**
 ///
 /// 각 레코드는 `XY<SP>PATH`(XY 2글자 + 공백 + 경로), NUL로 끝난다. `-z`라 경로는
 /// 이스케이프 없이 날것이다(특수문자/비ASCII 안전). rename/copy(`X`가 `R`/`C`)는
 /// **원본 경로가 다음 NUL 레코드**라 그 레코드를 하나 더 소비해야 한다 — 안 하면
 /// 이후 모든 레코드가 밀린다(`compare.rs`의 두-경로 규율과 같은 버그 클래스).
-fn parse_porcelain_status(stdout: &str) -> Result<HashMap<String, FileStatus>, GitError> {
+pub fn parse_porcelain_status(stdout: &str) -> Result<HashMap<String, FileStatus>, GitError> {
     let args = "status --porcelain=v1 -z";
     let mut map = HashMap::new();
     let mut records = stdout.split('\0');
@@ -236,7 +304,9 @@ fn classify_xy(x: char, y: char) -> FileStatus {
 mod tests {
     //! 순수 파서(`parse_porcelain_status`)를 실제 git이 내는 `-z` 바이트로 고정한다.
     //! 이 형태는 위 `sed`/`xxd` 실측(git 2.50.1)에서 그대로 가져왔다.
-    use super::{classify_xy, parse_porcelain_status, ConflictKind, FileStatus};
+    use super::{
+        classify_xy, parse_porcelain_details, parse_porcelain_status, ConflictKind, FileStatus,
+    };
 
     #[test]
     fn parses_modified_added_deleted_untracked() {
@@ -248,6 +318,24 @@ mod tests {
         assert_eq!(map.get("gone"), Some(&FileStatus::Deleted));
         assert_eq!(map.get("new"), Some(&FileStatus::Untracked));
         assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn detailed_status_preserves_index_and_worktree_sides() {
+        let entries = parse_porcelain_details("M  staged\0 M unstaged\0MM both\0?? new\0").unwrap();
+        let flags: Vec<(&str, bool, bool)> = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.staged, entry.unstaged))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("both", true, true),
+                ("new", false, true),
+                ("staged", true, false),
+                ("unstaged", false, true),
+            ]
+        );
     }
 
     // --- crux: rename 두-경로 소비 (mutant: R을 한-경로로 처리) ---

@@ -15,7 +15,7 @@ pub enum AgentKind {
 }
 
 /// 런치 커맨드가 플랫폼별로 갈리는 에이전트용(Orca `launchCmdByPlatform`).
-/// 33종 중 실제로 쓰는 행은 없지만(claude-agent-teams만 썼고 그건 제외됨) 모델을
+/// 현재 행 중 실제로 쓰는 플랫폼 오버라이드는 없지만(claude-agent-teams만 썼고 그건 제외됨) 모델을
 /// 온전히 옮겨 두어 새 에이전트가 "테이블 한 줄"로 추가되게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -25,7 +25,7 @@ pub enum Platform {
 }
 
 /// 설치 감지를 게이팅하는 런타임(Orca `detectUnsupportedRuntimes`,
-/// `NodeJS.Platform | 'wsl'`). 33종 모두 빈 목록이지만 게이트 자체는 살아 있다.
+/// `NodeJS.Platform | 'wsl'`). 현재 모든 행은 빈 목록이지만 게이트 자체는 살아 있다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Runtime {
     Linux,
@@ -97,9 +97,8 @@ pub struct AgentDef {
 /// 지원 에이전트 선언 테이블. 새 에이전트 추가는 여기 한 항목이면 된다.
 ///
 /// Orca `TUI_AGENT_CONFIG`(`src/shared/tui-agent-config.ts:46-296`)의 미러다.
-/// **33행 = 34종 − `claude-agent-teams`**. 그 행은 Orca 전용 CLI shim(`orca
-/// claude-teams`)에 shell-out하는데 suaegi 세계엔 `orca` 바이너리가 없어
-/// 무의미하다(플랜 §2.1 / Codex B2). 의도적으로 제외한다.
+/// Claude Agent Teams also uses the application CLI as its private tmux shim;
+/// Suaegi provides the same `suaegi claude-teams` launch contract.
 static AGENT_DEFS: &[AgentDef] = &[
     AgentDef {
         id: "claude",
@@ -119,6 +118,21 @@ static AGENT_DEFS: &[AgentDef] = &[
         prompt_injection: PromptInjection::Argv {
             separator: Some("--"),
         },
+        status: StatusSource::Hooks,
+    },
+    AgentDef {
+        id: "claude-agent-teams",
+        display_name: "Claude Agent Teams",
+        launch_program: "suaegi",
+        launch_args: &["claude-teams"],
+        launch_by_platform: &[],
+        detect_cmd: "suaegi",
+        detect_aliases: &["suaegi-app"],
+        required_commands: &["claude"],
+        unsupported_runtimes: &[Runtime::Windows, Runtime::Wsl],
+        expected_process: "suaegi",
+        package_marker: None,
+        prompt_injection: PromptInjection::StdinAfterStart,
         status: StatusSource::Hooks,
     },
     AgentDef {
@@ -185,6 +199,27 @@ static AGENT_DEFS: &[AgentDef] = &[
         expected_process: "ante",
         package_marker: None,
         prompt_injection: PromptInjection::StdinAfterStart,
+        status: StatusSource::OscTitle,
+    },
+    AgentDef {
+        id: "trae",
+        display_name: "Trae",
+        launch_program: "traecli",
+        launch_args: &[],
+        launch_by_platform: &[],
+        // `trae-cli` is an unrelated open-source agent. Orca detects the
+        // TRAE CN CLI through the unambiguous alias it ships.
+        detect_cmd: "traecli",
+        detect_aliases: &[],
+        required_commands: &[],
+        unsupported_runtimes: &[],
+        expected_process: "traecli",
+        package_marker: None,
+        // Cobra must stop option/subcommand parsing so prompts beginning with
+        // `help`, `config`, or `-` stay positional prompt text.
+        prompt_injection: PromptInjection::Argv {
+            separator: Some("--"),
+        },
         status: StatusSource::OscTitle,
     },
     AgentDef {
@@ -769,12 +804,13 @@ pub fn spawn_for_def(
         args,
         cwd: Some(cwd),
         env: Vec::new(),
+        env_remove: Vec::new(),
         rows,
         cols,
     }
 }
 
-/// id로 PTY 스폰 스펙을 만든다(33행 전체에 닿는 직접 실행 경로).
+/// id로 PTY 스폰 스펙을 만든다(전체 에이전트 행에 닿는 직접 실행 경로).
 ///
 /// - `None`이나 **미등록** id → 로그인 셸. `build_spawn(AgentKind::Custom, None, …)`의
 ///   기본 경로와 **byte-for-byte 동일**하다(같은 `login_shell()`, 빈 env, 같은 cwd) —
@@ -802,10 +838,56 @@ pub fn build_spawn_by_id(
                 args,
                 cwd: Some(cwd),
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 rows,
                 cols,
             }
         }
+    }
+}
+
+/// Builds an agent spawn with Orca-compatible per-agent command and argument
+/// overrides. `command_override` replaces the catalog command as a tokenized
+/// argv prefix; `configured_args` is appended before prompt injection so the
+/// prompt remains the final positional/flag value.
+pub fn build_spawn_by_id_with_profile(
+    id: Option<&str>,
+    prompt: Option<&str>,
+    cwd: PathBuf,
+    rows: u16,
+    cols: u16,
+    command_override: Option<&[String]>,
+    configured_args: &[String],
+) -> PtySpawn {
+    let Some(def) = id.and_then(agent_def_by_id) else {
+        return build_spawn_by_id(id, prompt, cwd, rows, cols);
+    };
+    let platform = current_platform();
+    let (default_program, default_args) = def
+        .launch_by_platform
+        .iter()
+        .find(|(candidate, _, _)| *candidate == platform)
+        .map(|(_, program, args)| (*program, *args))
+        .unwrap_or((def.launch_program, def.launch_args));
+    let (program, mut args) = command_override
+        .filter(|tokens| !tokens.is_empty())
+        .map(|tokens| (tokens[0].clone(), tokens[1..].to_vec()))
+        .unwrap_or_else(|| {
+            (
+                default_program.to_string(),
+                default_args.iter().map(|arg| (*arg).to_string()).collect(),
+            )
+        });
+    args.extend(configured_args.iter().cloned());
+    apply_prompt_injection(def, prompt, &mut args);
+    PtySpawn {
+        program,
+        args,
+        cwd: Some(cwd),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        rows,
+        cols,
     }
 }
 
@@ -834,6 +916,7 @@ pub fn build_spawn(
                 args,
                 cwd: Some(cwd),
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 rows,
                 cols,
             }
@@ -982,6 +1065,12 @@ fn is_launcher(basename: &str, launchers: &[&str]) -> bool {
 pub fn match_agent(command_line: &str) -> Option<&'static AgentDef> {
     let mut tokens = command_line.split_whitespace();
     let first = tokens.next()?;
+    let first_base = normalized_basename(first);
+    if matches!(first_base.as_str(), "suaegi" | "suaegi-app") {
+        return (tokens.next()?.eq_ignore_ascii_case("claude-teams"))
+            .then(|| agent_def_by_id("claude-agent-teams"))
+            .flatten();
+    }
 
     // 1) 직접 실행: basename 정확 일치.
     if let Some(def) = basename_matches(first) {
@@ -993,7 +1082,6 @@ pub fn match_agent(command_line: &str) -> Option<&'static AgentDef> {
     }
 
     // 3) 인터프리터 래핑: 런처면 진입점 토큰을 검사한다.
-    let first_base = normalized_basename(first);
     if is_launcher(&first_base, NODE_LAUNCHERS) {
         // 런처 플래그를 건너뛰고 첫 진입점(플래그 아님) 토큰만 본다 —
         // 프롬프트 텍스트("compare opencode vs orca")의 오탐을 막는다.
@@ -1026,11 +1114,14 @@ mod tests {
     // ── 테이블 완전성 ──────────────────────────────────────────────────────
 
     #[test]
-    fn table_has_the_thirty_three_usable_agents() {
-        // claude-agent-teams(Orca 전용 shim)를 제외한 33종.
-        assert_eq!(AGENT_DEFS.len(), 33, "expected 33 usable agents");
-        // claude-agent-teams는 의도적으로 없다.
-        assert!(agent_def_by_id("claude-agent-teams").is_none());
+    fn table_has_all_thirty_five_orca_agents() {
+        assert_eq!(AGENT_DEFS.len(), 35, "expected all 35 Orca agents");
+        assert!(agent_def_by_id("claude-agent-teams").is_some());
+        assert_eq!(
+            match_agent("suaegi claude-teams --resume session").map(|agent| agent.id),
+            Some("claude-agent-teams")
+        );
+        assert!(match_agent("suaegi status").is_none());
     }
 
     #[test]
@@ -1061,6 +1152,22 @@ mod tests {
                 def.id
             );
         }
+    }
+
+    #[test]
+    fn trae_uses_unambiguous_binary_and_positional_prompt_separator() {
+        let def = agent_def_by_id("trae").expect("Trae must be in the Orca agent catalog");
+        assert_eq!(def.detect_cmd, "traecli");
+        assert!(agent_def_by_id("trae-cli").is_none());
+        let spawn = spawn_for_def(
+            def,
+            Some("help me name this config"),
+            PathBuf::from("/tmp/repo"),
+            24,
+            80,
+        );
+        assert_eq!(spawn.program, "traecli");
+        assert_eq!(spawn.args, ["--", "help me name this config"]);
     }
 
     #[test]
@@ -1253,6 +1360,37 @@ mod tests {
         // kiro는 launch_program이 detect_cmd와 다른 행(kiro → kiro-cli) — 표를 실제로 탄다.
         let kiro = build_spawn_by_id(Some("kiro"), None, PathBuf::from("/tmp"), 24, 80);
         assert_eq!(kiro.program, "kiro-cli");
+    }
+
+    #[test]
+    fn launch_profile_replaces_command_and_places_args_before_prompt() {
+        let command = vec!["npx".to_string(), "codex".to_string()];
+        let configured = vec![
+            "--model".to_string(),
+            "gpt-5".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        ];
+        let spawn = build_spawn_by_id_with_profile(
+            Some("codex"),
+            Some("-fix this"),
+            PathBuf::from("/tmp/wt"),
+            24,
+            80,
+            Some(&command),
+            &configured,
+        );
+        assert_eq!(spawn.program, "npx");
+        assert_eq!(
+            spawn.args,
+            vec![
+                "codex",
+                "--model",
+                "gpt-5",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--",
+                "-fix this",
+            ]
+        );
     }
 
     #[test]

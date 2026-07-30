@@ -122,7 +122,10 @@ pub fn jira_connect_view(lookup: &Lookup<JiraViewer>) -> JiraConnectView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JiraIssueListView {
     /// 진짜 이슈 목록. 비어 있으면 "no issues"(진짜 없음). `has_more`는 절단을 표면화한다.
-    Issues { issues: Vec<JiraIssue>, has_more: bool },
+    Issues {
+        issues: Vec<JiraIssue>,
+        has_more: bool,
+    },
     /// 일시 실패 — **절대 "no issues"가 아니다.** 재시도 안내 문구를 나른다.
     Unavailable(String),
 }
@@ -193,6 +196,7 @@ mod tests {
             url: None,
             state: Some("In Progress".to_string()),
             assignee: Some("Ada".to_string()),
+            ..Default::default()
         }
     }
 
@@ -246,7 +250,10 @@ mod tests {
             IssueListView::Issues { issues, has_more } => {
                 assert_eq!(issues.len(), 2);
                 assert_eq!(issues[0].identifier, "ENG-1");
-                assert!(has_more, "truncation must be surfaced, not silently dropped");
+                assert!(
+                    has_more,
+                    "truncation must be surfaced, not silently dropped"
+                );
             }
             other => panic!("a found page must render as Issues, got {other:?}"),
         }
@@ -356,7 +363,10 @@ mod tests {
             JiraIssueListView::Issues { issues, has_more } => {
                 assert_eq!(issues.len(), 2);
                 assert_eq!(issues[0].key, "PROJ-1");
-                assert!(has_more, "truncation must be surfaced, not silently dropped");
+                assert!(
+                    has_more,
+                    "truncation must be surfaced, not silently dropped"
+                );
             }
             other => panic!("a found page must render as Issues, got {other:?}"),
         }
@@ -373,7 +383,10 @@ mod tests {
         assert_eq!(ok, JiraConnectView::Connected(viewer()));
         match bad {
             JiraConnectView::Failed(msg) => {
-                assert!(msg.contains("Jira email and API token"), "actionable hint, got {msg}");
+                assert!(
+                    msg.contains("Jira email and API token"),
+                    "actionable hint, got {msg}"
+                );
                 assert!(!msg.is_empty());
             }
             other => panic!("a failed connect must not read as Connected, got {other:?}"),
@@ -402,7 +415,10 @@ mod tests {
     fn jira_link_captures_key_and_site() {
         let with_site = jira_link_for(&jira_issue("PROJ-9"), Some("https://acme.atlassian.net"));
         assert_eq!(with_site.issue, "PROJ-9");
-        assert_eq!(with_site.site.as_deref(), Some("https://acme.atlassian.net"));
+        assert_eq!(
+            with_site.site.as_deref(),
+            Some("https://acme.atlassian.net")
+        );
 
         let without_site = jira_link_for(&jira_issue("PROJ-9"), None);
         assert_eq!(without_site.issue, "PROJ-9");

@@ -817,10 +817,7 @@ mod tests {
         let both = summarize(
             r#"{"url": "https://from-url.example", "httpUrl": "https://from-http-url.example"}"#,
         );
-        assert_eq!(
-            both.url,
-            Some("https://from-url.example".to_string())
-        );
+        assert_eq!(both.url, Some("https://from-url.example".to_string()));
         assert_eq!(both.transport, McpServerTransport::Http);
 
         let http_url_only = summarize(r#"{"httpUrl": "https://from-http-url.example"}"#);

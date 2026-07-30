@@ -65,6 +65,19 @@ pub const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # stdin은 어느 경로로 빠져나가든 **먼저** 비운다.
 body=$(cat 2>/dev/null)
 
+# PTY는 GUI보다 오래 산다. 생성 당시 env의 포트/token은 GUI 재시작 뒤 낡으므로
+# Orca와 같이 매 호출마다 owner-only endpoint 파일에서 현재 값을 새로 읽는다.
+# 예전 Suaegi가 띄운 PTY에는 SUAEGI_HOOK_ENDPOINT가 없으므로 스크립트 위치에서
+# 고정 경로를 복구한다.
+endpoint=${SUAEGI_HOOK_ENDPOINT:-}
+if [ -z "$endpoint" ]; then
+  script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+  [ -n "$script_dir" ] && endpoint="$script_dir/endpoint.env"
+fi
+if [ -n "$endpoint" ] && [ -r "$endpoint" ]; then
+  . "$endpoint" 2>/dev/null || :
+fi
+
 [ -n "$SUAEGI_HOOK_PORT" ] || exit 0
 [ -n "$SUAEGI_HOOK_TOKEN" ] || exit 0
 [ -n "$SUAEGI_PANE_KEY" ] || exit 0
@@ -145,6 +158,49 @@ pub fn hook_script_path() -> PathBuf {
     base.join("suaegi").join("hooks").join("suaegi-hook.sh")
 }
 
+/// 현재 GUI hook 서버의 좌표를 공개하는 restart-stable 파일.
+///
+/// Claude hook 프로세스는 PTY의 오래된 env 대신 이 파일을 매번 source한다.
+/// token이 들어가므로 파일은 반드시 owner-only(0600), 부모는 0700이다.
+pub fn hook_endpoint_path() -> PathBuf {
+    hook_script_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("endpoint.env")
+}
+
+/// endpoint를 같은 디렉터리의 임시 파일에 쓴 뒤 rename한다. hook이 동시에 source해도
+/// 반쪽짜리 port/token 조합을 보지 않게 하는 Orca와 같은 계약이다.
+pub fn write_hook_endpoint(path: &Path, port: u16, token: &str) -> io::Result<()> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hook token is not shell-safe",
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let temporary = parent.join(format!(".endpoint-{}.tmp", std::process::id()));
+    let contents = format!("SUAEGI_HOOK_PORT={port}\nSUAEGI_HOOK_TOKEN={token}\n");
+    std::fs::write(&temporary, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
 /// 훅 스크립트를 설치한다(있으면 덮어쓴다 — 내용이 바뀌었을 수 있다).
 /// 실행 비트를 세우지 않으면 `hook_command`의 `-x` 가드가 영영 거짓이 되어
 /// 훅이 조용히 하나도 발화하지 않는다.
@@ -186,6 +242,10 @@ pub fn spawn_env(
         ("SUAEGI_SPAWN_NONCE".to_string(), nonce.0.to_string()),
         ("SUAEGI_HOOK_PORT".to_string(), port.to_string()),
         ("SUAEGI_HOOK_TOKEN".to_string(), token.to_string()),
+        (
+            "SUAEGI_HOOK_ENDPOINT".to_string(),
+            hook_endpoint_path().to_string_lossy().into_owned(),
+        ),
     ]
 }
 
@@ -411,6 +471,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn endpoint_file_is_atomic_shell_safe_and_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks").join("endpoint.env");
+        write_hook_endpoint(&path, 53164, "abc_DEF-123").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "SUAEGI_HOOK_PORT=53164\nSUAEGI_HOOK_TOKEN=abc_DEF-123\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert!(
+            write_hook_endpoint(&path, 1, "unsafe token").is_err(),
+            "a shell-sourced token must reject whitespace/metacharacters"
+        );
+    }
+
+    /// Orca parity: a PTY survives the GUI and therefore carries dead coordinates.
+    /// The managed script must prefer the newly published endpoint on every invocation.
+    #[test]
+    fn surviving_pty_refreshes_stale_coordinates_from_the_endpoint_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("suaegi-hook.sh");
+        install_hook_script(&script).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_hook_endpoint(&dir.path().join("endpoint.env"), port, "fresh-token").unwrap();
+
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).ok();
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            request
+        });
+        let mut child = Command::new(&script)
+            .env("SUAEGI_HOOK_PORT", "1")
+            .env("SUAEGI_HOOK_TOKEN", "stale-token")
+            .env("SUAEGI_PANE_KEY", "cGFuZQ")
+            .env("SUAEGI_SPAWN_NONCE", "7")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"s","hook_event_name":"Stop"}"#)
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let request = receiver.join().unwrap();
+        assert!(request.contains("X-Suaegi-Token: fresh-token"));
+        assert!(
+            request.contains("POST /hook/claude"),
+            "the request must reach the fresh listener, not stale port 1"
+        );
+    }
+
     /// 스크립트가 **항상 exit 0**이고 stdin을 비우는지, 진짜로 돌려 확인한다.
     /// 서버가 없는 상태(포트가 죽어 있음)가 가장 흔한 실패 모드다.
     #[test]
@@ -510,6 +651,10 @@ mod tests {
         assert_eq!(event.spawn_nonce, SpawnNonce(7));
         assert_eq!(get("SUAEGI_SPAWN_NONCE"), "7");
         assert_eq!(get("SUAEGI_HOOK_PORT"), "51234");
+        assert!(
+            get("SUAEGI_HOOK_ENDPOINT").ends_with("/suaegi/hooks/endpoint.env"),
+            "surviving PTYs need a restart-stable endpoint file"
+        );
         assert_eq!(
             get("SUAEGI_HOOK_TOKEN"),
             "secret-token",

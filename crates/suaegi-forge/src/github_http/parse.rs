@@ -124,7 +124,12 @@ pub struct HttpPrHead {
 
 impl HttpPr {
     fn is_merged(&self) -> bool {
-        self.merged == Some(true) || self.merged_at.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        self.merged == Some(true)
+            || self
+                .merged_at
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
     }
 
     /// REST state("open"/"closed") + merged + draft → `ReviewState`(gh `review_state` 미러:
@@ -154,7 +159,8 @@ impl HttpPr {
             return MergeabilityState::Blocked;
         }
         // 3. 머지 가능: mergeable=true이고 상태가 clean류. unstable=비필수 체크 실패(머지는 가능).
-        if self.mergeable == Some(true) && matches!(s.as_str(), "clean" | "has_hooks" | "unstable") {
+        if self.mergeable == Some(true) && matches!(s.as_str(), "clean" | "has_hooks" | "unstable")
+        {
             return MergeabilityState::Mergeable;
         }
         // 4. 그 밖(unknown·빈 값·null mergeable) — 안전한 Unknown. **절대 Mergeable 아님.**
@@ -236,14 +242,23 @@ mod tests {
 
     #[test]
     fn non_github_remote_is_none() {
-        assert_eq!(parse_github_remote("https://gitlab.com/acme/widget.git"), None);
-        assert_eq!(parse_github_remote("git@bitbucket.org:acme/widget.git"), None);
+        assert_eq!(
+            parse_github_remote("https://gitlab.com/acme/widget.git"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("git@bitbucket.org:acme/widget.git"),
+            None
+        );
     }
 
     #[test]
     fn api_base_github_com_and_ghes() {
         assert_eq!(api_base("github.com"), "https://api.github.com");
-        assert_eq!(api_base("ghe.corp.example"), "https://ghe.corp.example/api/v3");
+        assert_eq!(
+            api_base("ghe.corp.example"),
+            "https://ghe.corp.example/api/v3"
+        );
     }
 
     fn pr(state: &str, draft: bool, merged: Option<bool>, merged_at: Option<&str>) -> HttpPr {
@@ -263,9 +278,18 @@ mod tests {
 
     #[test]
     fn review_state_mapping_merged_wins() {
-        assert_eq!(pr("open", false, None, None).review_state(), ReviewState::Open);
-        assert_eq!(pr("open", true, None, None).review_state(), ReviewState::Draft);
-        assert_eq!(pr("closed", false, None, None).review_state(), ReviewState::Closed);
+        assert_eq!(
+            pr("open", false, None, None).review_state(),
+            ReviewState::Open
+        );
+        assert_eq!(
+            pr("open", true, None, None).review_state(),
+            ReviewState::Draft
+        );
+        assert_eq!(
+            pr("closed", false, None, None).review_state(),
+            ReviewState::Closed
+        );
         assert_eq!(
             pr("closed", false, Some(true), None).review_state(),
             ReviewState::Merged
@@ -325,7 +349,10 @@ mod tests {
             pr_merge(None, "unknown").mergeability(),
             MergeabilityState::Unknown
         );
-        assert_eq!(pr_merge(None, "").mergeability(), MergeabilityState::Unknown);
+        assert_eq!(
+            pr_merge(None, "").mergeability(),
+            MergeabilityState::Unknown
+        );
         // mergeable=null이지만 상태가 clean이어도(계산 중) Mergeable로 넘기지 않는다.
         assert_eq!(
             pr_merge(None, "clean").mergeability(),
@@ -341,7 +368,12 @@ mod tests {
     #[test]
     fn null_user_becomes_ghost() {
         assert_eq!(user_login(None), "ghost");
-        assert_eq!(user_login(Some(HttpUser { login: String::new() })), "ghost");
+        assert_eq!(
+            user_login(Some(HttpUser {
+                login: String::new()
+            })),
+            "ghost"
+        );
         assert_eq!(
             user_login(Some(HttpUser {
                 login: "octocat".into()

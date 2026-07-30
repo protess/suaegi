@@ -14,12 +14,18 @@ use crate::provider::ForgeUnavailable;
 ///
 /// **이 판정이 permission(bare 403)보다 먼저 와야 한다** — 안 그러면 재시도하면 될 리밋을
 /// 확정적 permission 실패로 오독한다.
-pub fn is_rate_limited(status: u16, ratelimit_remaining: Option<&str>, retry_after: Option<&str>) -> bool {
+pub fn is_rate_limited(
+    status: u16,
+    ratelimit_remaining: Option<&str>,
+    retry_after: Option<&str>,
+) -> bool {
     if status == 429 {
         return true;
     }
     if status == 403 {
-        let remaining_zero = ratelimit_remaining.map(|v| v.trim() == "0").unwrap_or(false);
+        let remaining_zero = ratelimit_remaining
+            .map(|v| v.trim() == "0")
+            .unwrap_or(false);
         let has_retry_after = retry_after.map(|v| !v.trim().is_empty()).unwrap_or(false);
         return remaining_zero || has_retry_after;
     }

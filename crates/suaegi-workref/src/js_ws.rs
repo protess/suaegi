@@ -23,16 +23,16 @@
 /// patterns as `[{WS}]` (for `\s`) and inside the negated URL class. Kept in
 /// lockstep with [`is_js_whitespace`]: includes U+FEFF, excludes U+0085/U+180E.
 pub const WS_CLASS: &str = concat!(
-    r"\x09\x0A\x0B\x0C\x0D",    // Tab, LF, VT, FF, CR
-    r"\x20",                     // Space
-    r"\x{A0}",                   // No-Break Space
-    r"\x{1680}",                 // Ogham Space Mark
-    r"\x{2000}-\x{200A}",       // En Quad .. Hair Space
-    r"\x{2028}\x{2029}",        // Line/Paragraph Separator
-    r"\x{202F}",                 // Narrow No-Break Space
-    r"\x{205F}",                 // Medium Mathematical Space
-    r"\x{3000}",                 // Ideographic Space
-    r"\x{FEFF}",                 // Zero Width No-Break Space (BOM)
+    r"\x09\x0A\x0B\x0C\x0D", // Tab, LF, VT, FF, CR
+    r"\x20",                 // Space
+    r"\x{A0}",               // No-Break Space
+    r"\x{1680}",             // Ogham Space Mark
+    r"\x{2000}-\x{200A}",    // En Quad .. Hair Space
+    r"\x{2028}\x{2029}",     // Line/Paragraph Separator
+    r"\x{202F}",             // Narrow No-Break Space
+    r"\x{205F}",             // Medium Mathematical Space
+    r"\x{3000}",             // Ideographic Space
+    r"\x{FEFF}",             // Zero Width No-Break Space (BOM)
 );
 
 /// True for the exact ECMAScript whitespace set used by `\s` and
@@ -46,7 +46,8 @@ pub fn is_js_whitespace(ch: char) -> bool {
         | 0x0020 // Space
         | 0x00A0 // No-Break Space
         | 0x1680 // Ogham Space Mark
-        | 0x2000..=0x200A // En Quad .. Hair Space
+        | 0x2000
+            ..=0x200A // En Quad .. Hair Space
         | 0x2028 | 0x2029 // Line/Paragraph Separator
         | 0x202F // Narrow No-Break Space
         | 0x205F // Medium Mathematical Space

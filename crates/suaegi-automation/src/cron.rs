@@ -153,7 +153,11 @@ pub(crate) fn is_js_integer(value: f64) -> bool {
 
 /// `parseCronNumber` (`:101-109`): uppercase → name-map lookup → else `Number(...)`.
 /// Non-integer → error.
-fn parse_cron_number(value: &str, names: Option<NameLookup>, field: &str) -> Result<i64, CronError> {
+fn parse_cron_number(
+    value: &str,
+    names: Option<NameLookup>,
+    field: &str,
+) -> Result<i64, CronError> {
     let normalized = value.to_uppercase();
     let parsed = match names.and_then(|lookup| lookup(&normalized)) {
         Some(named) => named as f64,

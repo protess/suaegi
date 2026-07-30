@@ -49,10 +49,7 @@ pub fn clamp_used_percent(used_percent: f64) -> f64 {
 // Explicit min/max mirrors the JS `Math.min`/`Math.max` structure verbatim; the
 // non-finite input is already rejected above, so `f64::clamp` is not substituted.
 #[allow(clippy::manual_clamp)]
-pub fn get_displayed_usage_percentage(
-    used_percent: f64,
-    display: UsagePercentageDisplay,
-) -> f64 {
+pub fn get_displayed_usage_percentage(used_percent: f64, display: UsagePercentageDisplay) -> f64 {
     if !used_percent.is_finite() {
         return 0.0;
     }

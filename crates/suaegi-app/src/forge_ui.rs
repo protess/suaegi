@@ -360,7 +360,10 @@ mod tests {
     #[test]
     fn nothing_is_shown_before_a_fetch_or_for_a_non_github_repo() {
         assert_eq!(indicator_for(None), PrIndicator::Hidden);
-        assert_eq!(indicator_for(Some(&GithubStatus::Checking)), PrIndicator::Checking);
+        assert_eq!(
+            indicator_for(Some(&GithubStatus::Checking)),
+            PrIndicator::Checking
+        );
         assert_eq!(
             indicator_for(Some(&fetched(
                 GithubFetch::NotGitHub,
@@ -434,15 +437,19 @@ mod tests {
     #[test]
     fn create_errors_are_classified_never_raw() {
         assert_eq!(
-            create_error_text(ForgeError::Validation("base and title required".to_string())),
+            create_error_text(ForgeError::Validation(
+                "base and title required".to_string()
+            )),
             "base and title required"
         );
         assert_eq!(
             create_error_text(ForgeError::Unavailable(ForgeUnavailable::NotAuthenticated)),
             "run gh auth login"
         );
-        assert!(create_error_text(ForgeError::Unavailable(ForgeUnavailable::NotInstalled))
-            .contains("not installed"));
+        assert!(
+            create_error_text(ForgeError::Unavailable(ForgeUnavailable::NotInstalled))
+                .contains("not installed")
+        );
     }
 
     // ---- Plan 7b ----

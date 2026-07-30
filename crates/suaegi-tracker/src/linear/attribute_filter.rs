@@ -396,7 +396,9 @@ fn assert_priorities(value: &Value) -> Result<Vec<u8>, LinearIssueAttributeFilte
     }
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let n = entry.as_f64().filter(|n| n.fract() == 0.0 && (0.0..=4.0).contains(n));
+        let n = entry
+            .as_f64()
+            .filter(|n| n.fract() == 0.0 && (0.0..=4.0).contains(n));
         match n {
             Some(n) => out.push(n as u8),
             None => return Err(LinearIssueAttributeFilterError::PriorityInvalid { index }),

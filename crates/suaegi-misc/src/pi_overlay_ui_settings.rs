@@ -200,11 +200,17 @@ fn as_record_or_empty(value: &JsValue) -> JsRecord {
 pub fn merge_pi_overlay_ui_settings(settings: &JsValue) -> JsRecord {
     let mut merged = as_record_or_empty(settings);
     let terminal_input = merged.get("terminal").cloned();
-    let mut terminal = terminal_input.as_ref().map(as_record_or_empty).unwrap_or_default();
+    let mut terminal = terminal_input
+        .as_ref()
+        .map(as_record_or_empty)
+        .unwrap_or_default();
 
     terminal = terminal.with("clearOnShrink", JsValue::Bool(PI_OVERLAY_CLEAR_ON_SHRINK));
     merged = merged.with("terminal", JsValue::Object(terminal));
-    merged = merged.with("hideThinkingBlock", JsValue::Bool(PI_OVERLAY_HIDE_THINKING_BLOCK));
+    merged = merged.with(
+        "hideThinkingBlock",
+        JsValue::Bool(PI_OVERLAY_HIDE_THINKING_BLOCK),
+    );
 
     merged
 }
@@ -224,7 +230,10 @@ mod tests {
         let settings = JsValue::object([
             ("defaultProvider", JsValue::str("amazon-bedrock")),
             ("hideThinkingBlock", JsValue::Bool(false)),
-            ("packages", JsValue::array([JsValue::str("npm:pi-web-access")])),
+            (
+                "packages",
+                JsValue::array([JsValue::str("npm:pi-web-access")]),
+            ),
             (
                 "terminal",
                 JsValue::object([
@@ -237,7 +246,10 @@ mod tests {
         let expected = JsRecord::from_pairs([
             ("defaultProvider", JsValue::str("amazon-bedrock")),
             ("hideThinkingBlock", JsValue::Bool(true)),
-            ("packages", JsValue::array([JsValue::str("npm:pi-web-access")])),
+            (
+                "packages",
+                JsValue::array([JsValue::str("npm:pi-web-access")]),
+            ),
             (
                 "terminal",
                 JsValue::object([
@@ -259,7 +271,10 @@ mod tests {
         assert_eq!(
             merge_pi_overlay_ui_settings(&JsValue::Null),
             JsRecord::from_pairs([
-                ("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))])),
+                (
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                ),
                 ("hideThinkingBlock", JsValue::Bool(true)),
             ])
         );
@@ -268,7 +283,10 @@ mod tests {
         assert_eq!(
             merge_pi_overlay_ui_settings(&JsValue::object([("terminal", JsValue::str("compact"))])),
             JsRecord::from_pairs([
-                ("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))])),
+                (
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                ),
                 ("hideThinkingBlock", JsValue::Bool(true)),
             ])
         );
@@ -285,7 +303,10 @@ mod tests {
         assert_eq!(
             merged,
             JsRecord::new()
-                .with("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))]))
+                .with(
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                )
                 .with("hideThinkingBlock", JsValue::Bool(true))
         );
     }
@@ -312,7 +333,10 @@ mod tests {
                 ("defaultProvider", JsValue::str("x")),
                 ("hideThinkingBlock", JsValue::Bool(true)),
                 ("packages", JsValue::array([])),
-                ("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))])),
+                (
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                ),
             ])
         );
     }
@@ -325,7 +349,10 @@ mod tests {
     fn pin_p4_input_is_unchanged_after_the_call() {
         let settings = JsValue::object([
             ("hideThinkingBlock", JsValue::Bool(false)),
-            ("terminal", JsValue::object([("showImages", JsValue::Bool(true))])),
+            (
+                "terminal",
+                JsValue::object([("showImages", JsValue::Bool(true))]),
+            ),
         ]);
         let before = settings.clone();
 
@@ -339,8 +366,12 @@ mod tests {
     /// there is no recursive merge).
     #[test]
     fn pin_p4_deeply_nested_terminal_value_passes_through_unchanged() {
-        let nested = JsValue::object([("enabled", JsValue::Bool(false)), ("level", JsValue::number(3.0))]);
-        let settings = JsValue::object([("terminal", JsValue::object([("theme", nested.clone())]))]);
+        let nested = JsValue::object([
+            ("enabled", JsValue::Bool(false)),
+            ("level", JsValue::number(3.0)),
+        ]);
+        let settings =
+            JsValue::object([("terminal", JsValue::object([("theme", nested.clone())]))]);
 
         let merged = merge_pi_overlay_ui_settings(&settings);
 
@@ -359,11 +390,15 @@ mod tests {
     /// into the same non-record `{}` branch as `null`.
     #[test]
     fn pin_p6_array_input_does_not_spread_into_indexed_keys() {
-        let merged = merge_pi_overlay_ui_settings(&JsValue::array([JsValue::str("a"), JsValue::str("b")]));
+        let merged =
+            merge_pi_overlay_ui_settings(&JsValue::array([JsValue::str("a"), JsValue::str("b")]));
         assert_eq!(
             merged,
             JsRecord::new()
-                .with("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))]))
+                .with(
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                )
                 .with("hideThinkingBlock", JsValue::Bool(true))
         );
     }
@@ -373,12 +408,21 @@ mod tests {
     #[test]
     fn pin_p6_every_non_record_top_level_shape_collapses_the_same_way() {
         let expected = JsRecord::new()
-            .with("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))]))
+            .with(
+                "terminal",
+                JsValue::object([("clearOnShrink", JsValue::Bool(true))]),
+            )
             .with("hideThinkingBlock", JsValue::Bool(true));
 
         assert_eq!(merge_pi_overlay_ui_settings(&JsValue::Undefined), expected);
-        assert_eq!(merge_pi_overlay_ui_settings(&JsValue::str("settings")), expected);
-        assert_eq!(merge_pi_overlay_ui_settings(&JsValue::number(42.0)), expected);
+        assert_eq!(
+            merge_pi_overlay_ui_settings(&JsValue::str("settings")),
+            expected
+        );
+        assert_eq!(
+            merge_pi_overlay_ui_settings(&JsValue::number(42.0)),
+            expected
+        );
         assert_eq!(merge_pi_overlay_ui_settings(&JsValue::Bool(true)), expected);
     }
 
@@ -395,7 +439,8 @@ mod tests {
         }
 
         // Absent `terminal` key entirely.
-        let merged = merge_pi_overlay_ui_settings(&JsValue::object([("other", JsValue::Bool(true))]));
+        let merged =
+            merge_pi_overlay_ui_settings(&JsValue::object([("other", JsValue::Bool(true))]));
         assert_eq!(merged.get("terminal"), Some(&expected_terminal));
     }
 
@@ -413,8 +458,14 @@ mod tests {
             Some(JsValue::Object(record)) => record,
             other => panic!("expected terminal to be a record, got {other:?}"),
         };
-        assert_eq!(terminal.get("clearOnShrink"), Some(&JsValue::Bool(PI_OVERLAY_CLEAR_ON_SHRINK)));
-        assert_eq!(merged.get("hideThinkingBlock"), Some(&JsValue::Bool(PI_OVERLAY_HIDE_THINKING_BLOCK)));
+        assert_eq!(
+            terminal.get("clearOnShrink"),
+            Some(&JsValue::Bool(PI_OVERLAY_CLEAR_ON_SHRINK))
+        );
+        assert_eq!(
+            merged.get("hideThinkingBlock"),
+            Some(&JsValue::Bool(PI_OVERLAY_HIDE_THINKING_BLOCK))
+        );
     }
 
     /// P8: the three assignments are unconditional — even an input that
@@ -424,13 +475,19 @@ mod tests {
     fn pin_p8_already_true_input_stays_true_via_forced_assignment() {
         let settings = JsValue::object([
             ("hideThinkingBlock", JsValue::Bool(true)),
-            ("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))])),
+            (
+                "terminal",
+                JsValue::object([("clearOnShrink", JsValue::Bool(true))]),
+            ),
         ]);
         assert_eq!(
             merge_pi_overlay_ui_settings(&settings),
             JsRecord::from_pairs([
                 ("hideThinkingBlock", JsValue::Bool(true)),
-                ("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))])),
+                (
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                ),
             ])
         );
     }
@@ -439,12 +496,18 @@ mod tests {
     /// *appended* (new key), distinct from the oracle's overwrite case.
     #[test]
     fn pin_p8_terminal_without_clear_on_shrink_gets_it_appended() {
-        let settings = JsValue::object([("terminal", JsValue::object([("showImages", JsValue::Bool(true))]))]);
+        let settings = JsValue::object([(
+            "terminal",
+            JsValue::object([("showImages", JsValue::Bool(true))]),
+        )]);
         assert_eq!(
             merge_pi_overlay_ui_settings(&settings),
             JsRecord::from_pairs([(
                 "terminal",
-                JsValue::object([("showImages", JsValue::Bool(true)), ("clearOnShrink", JsValue::Bool(true))])
+                JsValue::object([
+                    ("showImages", JsValue::Bool(true)),
+                    ("clearOnShrink", JsValue::Bool(true))
+                ])
             )])
             .with("hideThinkingBlock", JsValue::Bool(true))
         );
@@ -458,7 +521,10 @@ mod tests {
         assert_eq!(
             merged,
             JsRecord::new()
-                .with("terminal", JsValue::object([("clearOnShrink", JsValue::Bool(true))]))
+                .with(
+                    "terminal",
+                    JsValue::object([("clearOnShrink", JsValue::Bool(true))])
+                )
                 .with("hideThinkingBlock", JsValue::Bool(true))
         );
     }

@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_orca_default_when_the_value_is_missing() {
-        assert_eq!(normalize_terminal_font_weight(None), DEFAULT_TERMINAL_FONT_WEIGHT);
+        assert_eq!(
+            normalize_terminal_font_weight(None),
+            DEFAULT_TERMINAL_FONT_WEIGHT
+        );
     }
 
     #[test]
@@ -120,11 +123,17 @@ mod tests {
     fn keeps_bold_text_heavier_than_the_base_terminal_weight() {
         assert_eq!(
             resolve_terminal_font_weights(Some(500.0)),
-            TerminalFontWeights { font_weight: 500.0, font_weight_bold: 700.0 }
+            TerminalFontWeights {
+                font_weight: 500.0,
+                font_weight_bold: 700.0
+            }
         );
         assert_eq!(
             resolve_terminal_font_weights(Some(800.0)),
-            TerminalFontWeights { font_weight: 800.0, font_weight_bold: 900.0 }
+            TerminalFontWeights {
+                font_weight: 800.0,
+                font_weight_bold: 900.0
+            }
         );
     }
 
@@ -144,7 +153,10 @@ mod tests {
     /// are the only inputs that exercise it.
     #[test]
     fn pin_non_finite_falls_back_to_default_not_min() {
-        assert_eq!(normalize_terminal_font_weight(Some(f64::NAN)), DEFAULT_TERMINAL_FONT_WEIGHT);
+        assert_eq!(
+            normalize_terminal_font_weight(Some(f64::NAN)),
+            DEFAULT_TERMINAL_FONT_WEIGHT
+        );
         assert_eq!(
             normalize_terminal_font_weight(Some(f64::INFINITY)),
             DEFAULT_TERMINAL_FONT_WEIGHT
@@ -172,11 +184,17 @@ mod tests {
     fn pin_bold_floor_and_delta_are_independently_observable() {
         assert_eq!(
             resolve_terminal_font_weights(Some(600.0)),
-            TerminalFontWeights { font_weight: 600.0, font_weight_bold: 800.0 }
+            TerminalFontWeights {
+                font_weight: 600.0,
+                font_weight_bold: 800.0
+            }
         );
         assert_eq!(
             resolve_terminal_font_weights(Some(100.0)),
-            TerminalFontWeights { font_weight: 100.0, font_weight_bold: 700.0 }
+            TerminalFontWeights {
+                font_weight: 100.0,
+                font_weight_bold: 700.0
+            }
         );
     }
 
@@ -186,11 +204,17 @@ mod tests {
     fn pin_resolve_normalizes_invalid_input() {
         assert_eq!(
             resolve_terminal_font_weights(None),
-            TerminalFontWeights { font_weight: 500.0, font_weight_bold: 700.0 }
+            TerminalFontWeights {
+                font_weight: 500.0,
+                font_weight_bold: 700.0
+            }
         );
         assert_eq!(
             resolve_terminal_font_weights(Some(1200.0)),
-            TerminalFontWeights { font_weight: 900.0, font_weight_bold: 900.0 }
+            TerminalFontWeights {
+                font_weight: 900.0,
+                font_weight_bold: 900.0
+            }
         );
     }
 

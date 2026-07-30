@@ -218,7 +218,10 @@ fn malformed_cron_labels_invalid() {
 #[test]
 fn rrule_labels_cover_every_preset() {
     assert_eq!(label("FREQ=HOURLY;BYMINUTE=5"), "Hourly at :05");
-    assert_eq!(label("FREQ=DAILY;BYHOUR=10;BYMINUTE=15"), "Daily at 10:15 AM");
+    assert_eq!(
+        label("FREQ=DAILY;BYHOUR=10;BYMINUTE=15"),
+        "Daily at 10:15 AM"
+    );
     assert_eq!(
         label("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=10;BYMINUTE=15"),
         "Weekdays at 10:15 AM"

@@ -54,8 +54,16 @@ async fn compare_reports_committed_changes() {
     assert_eq!(paths, vec!["README.md", "new.txt"]);
     let readme = cmp.files.iter().find(|f| f.path == "README.md").unwrap();
     assert_eq!(readme.status, ChangeStatus::Modified);
-    assert_eq!(readme.additions, Some(2), "additions and deletions are swapped");
-    assert_eq!(readme.deletions, Some(1), "additions and deletions are swapped");
+    assert_eq!(
+        readme.additions,
+        Some(2),
+        "additions and deletions are swapped"
+    );
+    assert_eq!(
+        readme.deletions,
+        Some(1),
+        "additions and deletions are swapped"
+    );
     // 새 파일도 비대칭이다(추가만 있고 삭제가 없다). 두 방향에서 고정한다.
     let created = cmp.files.iter().find(|f| f.path == "new.txt").unwrap();
     assert_eq!(created.additions, Some(1));

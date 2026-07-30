@@ -150,6 +150,9 @@ pub struct MouseIntent {
     /// Shift 오버라이드. **모드와 무관하므로 위젯이 판단한다** — 앱이 마우스
     /// 모드를 쥐고 있어도 Shift를 누르면 사용자가 선택할 수 있어야 한다.
     pub force_local: bool,
+    /// Additional discrete reports for mouse-aware full-screen TUIs. Local
+    /// scrollback and alternate-screen arrow emulation deliberately ignore it.
+    pub tui_wheel_multiplier: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

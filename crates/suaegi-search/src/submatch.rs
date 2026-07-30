@@ -49,11 +49,7 @@ pub fn build_submatch_regex(query: &str, opts: &SearchOptions) -> Option<regex::
 mod tests {
     use super::*;
 
-    fn opts_with(
-        use_regex: bool,
-        whole_word: bool,
-        case_sensitive: bool,
-    ) -> SearchOptions {
+    fn opts_with(use_regex: bool, whole_word: bool, case_sensitive: bool) -> SearchOptions {
         SearchOptions {
             use_regex: Some(use_regex),
             whole_word: Some(whole_word),

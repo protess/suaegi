@@ -61,6 +61,36 @@ async fn create_then_list_contains_exactly_the_new_worktree() {
 }
 
 #[tokio::test]
+async fn sparse_checkout_keeps_only_the_selected_directory_set() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    fixture::init_repo(repo_dir.path());
+    std::fs::create_dir_all(repo_dir.path().join("apps/web")).unwrap();
+    std::fs::create_dir_all(repo_dir.path().join("packages/core")).unwrap();
+    std::fs::write(repo_dir.path().join("apps/web/app.txt"), "web").unwrap();
+    std::fs::write(repo_dir.path().join("packages/core/lib.txt"), "core").unwrap();
+    fixture::run(repo_dir.path(), &["add", "apps", "packages"]);
+    fixture::run(repo_dir.path(), &["commit", "-m", "monorepo"]);
+    let repo = build_repo_now(repo_dir.path().to_path_buf()).unwrap();
+    let (repo, _) = probe_repo_now(repo).await.unwrap();
+    let created = create_worktree_now(
+        repo,
+        "sparse".into(),
+        "main".into(),
+        ws.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+
+    suaegi_app::sparse_checkout::apply(&created, &["apps/web".into()])
+        .await
+        .unwrap();
+    assert!(created.path.join("apps/web/app.txt").exists());
+    assert!(!created.path.join("packages/core/lib.txt").exists());
+    assert!(created.path.join("README.md").exists());
+}
+
+#[tokio::test]
 async fn remove_takes_the_worktree_out_of_the_listing() {
     let repo_dir = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
@@ -81,6 +111,7 @@ async fn remove_takes_the_worktree_out_of_the_listing() {
         created.path.clone(),
         false,
         Some(created.branch.clone()),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -93,6 +124,73 @@ async fn remove_takes_the_worktree_out_of_the_listing() {
         "the removed worktree must be gone from the listing"
     );
     assert!(!created.path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_symlink_is_ignored_and_unlinked_before_clean_removal() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    fixture::init_repo(repo_dir.path());
+    std::fs::write(repo_dir.path().join(".env"), "shared").unwrap();
+    let repo = build_repo_now(repo_dir.path().to_path_buf()).unwrap();
+    let (repo, _) = probe_repo_now(repo).await.unwrap();
+    let created = create_worktree_now(
+        repo.clone(),
+        "linked".into(),
+        "main".into(),
+        ws.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    std::os::unix::fs::symlink(repo.path.join(".env"), created.path.join(".env")).unwrap();
+
+    remove_worktree_now(
+        repo,
+        created.path.clone(),
+        false,
+        Some(created.branch),
+        vec![".env".into()],
+    )
+    .await
+    .unwrap();
+    assert!(!created.path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dirty_removal_keeps_configured_symlink_for_retry() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    fixture::init_repo(repo_dir.path());
+    std::fs::write(repo_dir.path().join(".env"), "shared").unwrap();
+    let repo = build_repo_now(repo_dir.path().to_path_buf()).unwrap();
+    let (repo, _) = probe_repo_now(repo).await.unwrap();
+    let created = create_worktree_now(
+        repo.clone(),
+        "dirty-linked".into(),
+        "main".into(),
+        ws.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    std::os::unix::fs::symlink(repo.path.join(".env"), created.path.join(".env")).unwrap();
+    std::fs::write(created.path.join("user-work.txt"), "do not remove").unwrap();
+
+    let error = remove_worktree_now(
+        repo,
+        created.path.clone(),
+        false,
+        Some(created.branch),
+        vec![".env".into()],
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("user-work.txt"));
+    assert!(std::fs::symlink_metadata(created.path.join(".env"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[tokio::test]

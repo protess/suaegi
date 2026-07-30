@@ -71,13 +71,9 @@ fn oracle_2_next_hourly_off_the_minute_advances() {
 fn oracle_3_next_weekdays_excludes_weekend() {
     use chrono::Datelike;
     let rrule = build_automation_rrule(AutomationSchedulePreset::Weekdays, 9, 30, None);
-    let next = next_automation_occurrence_after(
-        &rrule,
-        ms(2026, 5, 1, 0, 0),
-        ms(2026, 5, 15, 12, 0),
-        UTC,
-    )
-    .unwrap();
+    let next =
+        next_automation_occurrence_after(&rrule, ms(2026, 5, 1, 0, 0), ms(2026, 5, 15, 12, 0), UTC)
+            .unwrap();
     assert_eq!(next, ms(2026, 5, 18, 9, 30));
     let civil = UTC.timestamp_millis_opt(next).single().unwrap();
     assert_eq!(civil.weekday().num_days_from_sunday(), 1, "Monday");
@@ -166,7 +162,10 @@ fn f7_b_dtstart_equals_after_on_match_skips_strictly() {
     let boundary = ms(2026, 5, 15, 12, 0);
     let next = next_automation_occurrence_after("0 12 * * *", boundary, boundary, UTC).unwrap();
     assert_eq!(next, ms(2026, 5, 16, 12, 0));
-    assert_ne!(next, boundary, "the exact `after` minute must not be returned");
+    assert_ne!(
+        next, boundary,
+        "the exact `after` minute must not be returned"
+    );
 }
 
 /// (c) dtstart < after, after off the minute → floor then `<= after` advances one minute.
@@ -220,13 +219,9 @@ fn f7_e_scan_continues_past_non_matching_ceil() {
 #[test]
 fn forward_scan_is_strictly_after_anchor() {
     let rrule = build_automation_rrule(AutomationSchedulePreset::Daily, 9, 0, None);
-    let next = next_automation_occurrence_after(
-        &rrule,
-        ms(2026, 5, 10, 9, 0),
-        ms(2026, 5, 12, 9, 0),
-        UTC,
-    )
-    .unwrap();
+    let next =
+        next_automation_occurrence_after(&rrule, ms(2026, 5, 10, 9, 0), ms(2026, 5, 12, 9, 0), UTC)
+            .unwrap();
     assert_eq!(next, ms(2026, 5, 13, 9, 0));
 }
 
@@ -265,7 +260,8 @@ fn latest_before_dtstart_is_none_without_parsing() {
 #[test]
 fn parse_error_propagates_not_swallowed() {
     let rrule = "FREQ=WEEKLY;BYHOUR=9;BYMINUTE=0";
-    let next = next_automation_occurrence_after(rrule, ms(2026, 5, 1, 0, 0), ms(2026, 5, 2, 0, 0), UTC);
+    let next =
+        next_automation_occurrence_after(rrule, ms(2026, 5, 1, 0, 0), ms(2026, 5, 2, 0, 0), UTC);
     assert!(matches!(next, Err(OccurrenceError::Schedule(_))));
 
     // now >= dtstart, so the parse actually runs and its error surfaces.

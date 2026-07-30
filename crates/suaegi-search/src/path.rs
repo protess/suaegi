@@ -161,7 +161,10 @@ mod tests {
     /// `/` kept, removed by the caller's normalize). Oracle case 8 path shape.
     #[test]
     fn relative_posix_under_root() {
-        assert_eq!(relative_to_search_root("/root", "/root/src/a.ts"), "/src/a.ts");
+        assert_eq!(
+            relative_to_search_root("/root", "/root/src/a.ts"),
+            "/src/a.ts"
+        );
         assert_eq!(
             normalize_relative_path(&relative_to_search_root("/root", "/root/src/a.ts")),
             "src/a.ts"

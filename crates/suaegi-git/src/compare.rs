@@ -137,7 +137,7 @@ fn parse_count(token: &str, args: &str) -> Result<Option<u32>, GitError> {
 }
 
 /// numstat 카운트 맵: 경로 -> (추가 줄 수, 삭제 줄 수). `-`(바이너리)는 각각 None.
-pub(crate) type NumstatCounts = HashMap<String, (Option<u32>, Option<u32>)>;
+pub type NumstatCounts = HashMap<String, (Option<u32>, Option<u32>)>;
 
 /// `--numstat -z` 스트림을 `path -> (adds, dels)` 맵으로 판다. rename/copy는
 /// `"adds\tdels\t"`(빈 경로) 뒤에 from, to가 각각 **별도 NUL 레코드**로 이어지는
@@ -145,7 +145,7 @@ pub(crate) type NumstatCounts = HashMap<String, (Option<u32>, Option<u32>)>;
 ///
 /// `branch_compare`(working-tree diff)와 `commit_show`(commit..commit / `diff-tree
 /// --root`)가 공유한다: `-z` numstat 출력 형태가 세 경우 모두 동일하다.
-pub(crate) fn parse_numstat_z(stdout: &str) -> Result<NumstatCounts, GitError> {
+pub fn parse_numstat_z(stdout: &str) -> Result<NumstatCounts, GitError> {
     let args = "diff --numstat -z";
     let mut counts: NumstatCounts = HashMap::new();
     let mut records = stdout.split('\0');
@@ -187,7 +187,7 @@ pub(crate) fn parse_numstat_z(stdout: &str) -> Result<NumstatCounts, GitError> {
 ///
 /// `branch_compare`와 `commit_show`가 공유한다: 세 diff 형태(working-tree,
 /// commit..commit, `diff-tree --root`)의 `-z` name-status 출력이 동일하다.
-pub(crate) fn parse_name_status_z(
+pub fn parse_name_status_z(
     stdout: &str,
     counts: &NumstatCounts,
 ) -> Result<Vec<ChangedFile>, GitError> {

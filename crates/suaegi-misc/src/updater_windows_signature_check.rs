@@ -74,7 +74,9 @@ pub fn is_windows_signature_check_unavailable_failure(message: &str) -> bool {
 /// publisher — a genuine integrity failure that must drive a security-stop
 /// message, never a silent "retry" framing.
 pub fn is_windows_signature_mismatch_failure(message: &str) -> bool {
-    message.to_lowercase().contains("not signed by the application owner")
+    message
+        .to_lowercase()
+        .contains("not signed by the application owner")
 }
 
 #[cfg(test)]
@@ -143,7 +145,9 @@ mod tests {
 
     #[test]
     fn does_not_match_unrelated_errors() {
-        assert!(!is_windows_signature_mismatch_failure("net::ERR_HTTP2_PROTOCOL_ERROR"));
+        assert!(!is_windows_signature_mismatch_failure(
+            "net::ERR_HTTP2_PROTOCOL_ERROR"
+        ));
     }
 
     // Mandatory extra pins (oracle-silent — plan §5):
@@ -154,8 +158,7 @@ mod tests {
     /// `false` there and a deleted veto passes the whole upstream suite.
     #[test]
     fn pin_veto_survives_when_both_phrases_present() {
-        let message =
-            "Get-AuthenticodeSignature failed: not signed by the application owner";
+        let message = "Get-AuthenticodeSignature failed: not signed by the application owner";
         assert!(!is_windows_signature_check_unavailable_failure(message));
         assert!(is_windows_signature_mismatch_failure(message));
     }
@@ -183,7 +186,9 @@ mod tests {
     fn pin_empty_and_unrelated_message_is_false_on_both() {
         assert!(!is_windows_signature_check_unavailable_failure(""));
         assert!(!is_windows_signature_mismatch_failure(""));
-        assert!(!is_windows_signature_check_unavailable_failure("totally unrelated"));
+        assert!(!is_windows_signature_check_unavailable_failure(
+            "totally unrelated"
+        ));
         assert!(!is_windows_signature_mismatch_failure("totally unrelated"));
     }
 
@@ -215,7 +220,9 @@ mod tests {
     #[test]
     fn pin_dotted_capital_i_breaks_the_match_on_both_mechanisms() {
         let dotted_i_in_check = "get-authenticodes\u{0130}gnature";
-        assert!(!is_windows_signature_check_unavailable_failure(dotted_i_in_check));
+        assert!(!is_windows_signature_check_unavailable_failure(
+            dotted_i_in_check
+        ));
 
         let dotted_i_in_mismatch = "not s\u{0130}gned by the application owner";
         assert!(!is_windows_signature_mismatch_failure(dotted_i_in_mismatch));

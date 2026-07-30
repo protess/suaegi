@@ -67,26 +67,26 @@ mod tests {
     fn matches_synthetic_query_replies_that_must_be_sent_immediately() {
         // The full 20-vector "true" set from the oracle.
         let truthy: &[&[u8]] = &[
-            b"\x1b[3;1R",    // CPR
-            b"\x1b[22;1R",   // CPR
-            b"\x1b[0n",      // DSR
-            b"\x1b[?1;2c",   // DA
-            b"\x1b[?61;4c",  // DA
-            b"\x1b[>0;276;0c", // DA
-            b"\x1b[6;16;8t",   // window/cell pixel size
-            b"\x1b[4;384;640t", // window/cell pixel size
-            b"\x1b[?2026;2$y", // DECRPM private
-            b"\x1b[4;1$y",     // DECRPM ANSI
+            b"\x1b[3;1R",                        // CPR
+            b"\x1b[22;1R",                       // CPR
+            b"\x1b[0n",                          // DSR
+            b"\x1b[?1;2c",                       // DA
+            b"\x1b[?61;4c",                      // DA
+            b"\x1b[>0;276;0c",                   // DA
+            b"\x1b[6;16;8t",                     // window/cell pixel size
+            b"\x1b[4;384;640t",                  // window/cell pixel size
+            b"\x1b[?2026;2$y",                   // DECRPM private
+            b"\x1b[4;1$y",                       // DECRPM ANSI
             b"\x1b]11;rgb:2828/2c2c/3434\x1b\\", // OSC color (ST)
             b"\x1b]10;rgb:c0c0/c0c0/c0c0\x07",   // OSC color (BEL)
-            b"\x1b[?12;5R", // DECXCPR
-            b"\x1b[8;24;80t", // text-area size
-            b"\x1b[?0u",  // kitty flags
-            b"\x1b[?31u", // kitty flags
-            b"\x1bP1$r2 q\x1b\\", // DCS DECRQSS
-            b"\x1bP1$r0m\x1b\\",  // DCS DECRQSS
-            b"\x1bP0$r\x1b\\",    // DCS DECRQSS
-            b"\x1bP>|xterm.js(5.6.0)\x1b\\", // DCS XTVERSION
+            b"\x1b[?12;5R",                      // DECXCPR
+            b"\x1b[8;24;80t",                    // text-area size
+            b"\x1b[?0u",                         // kitty flags
+            b"\x1b[?31u",                        // kitty flags
+            b"\x1bP1$r2 q\x1b\\",                // DCS DECRQSS
+            b"\x1bP1$r0m\x1b\\",                 // DCS DECRQSS
+            b"\x1bP0$r\x1b\\",                   // DCS DECRQSS
+            b"\x1bP>|xterm.js(5.6.0)\x1b\\",     // DCS XTVERSION
         ];
         assert_eq!(truthy.len(), 20);
         for v in truthy {
@@ -114,17 +114,17 @@ mod tests {
             b"\x1b[H", // Home
             b"\x1b[F", // End
             b"\x1b[15~",
-            b"\x1b[3~", // Delete
-            b"\x1b",    // bare Escape
-            b"\x1bb",   // Alt+b
-            b"\x1bP",   // Alt+Shift+P (prefix of DCS grammar)
-            b"\x1b[97;5u", // kitty keystroke
-            b"\x1b[13u",   // kitty keystroke
-            b"\x1b[1;2P",  // modified F1
-            b"\x1b[1;2Q",  // modified F2
-            b"\x1b[1;2S",  // modified F4
-            b"\x1b[200~",  // bracketed paste start
-            b"\x1b[201~",  // bracketed paste end
+            b"\x1b[3~",                    // Delete
+            b"\x1b",                       // bare Escape
+            b"\x1bb",                      // Alt+b
+            b"\x1bP",                      // Alt+Shift+P (prefix of DCS grammar)
+            b"\x1b[97;5u",                 // kitty keystroke
+            b"\x1b[13u",                   // kitty keystroke
+            b"\x1b[1;2P",                  // modified F1
+            b"\x1b[1;2Q",                  // modified F2
+            b"\x1b[1;2S",                  // modified F4
+            b"\x1b[200~",                  // bracketed paste start
+            b"\x1b[201~",                  // bracketed paste end
             b"\x1b]11;rgb:2828/2c2c/3434", // incomplete OSC (no terminator)
             b"\x1bP1$r2 q",                // incomplete DCS (no terminator)
         ];

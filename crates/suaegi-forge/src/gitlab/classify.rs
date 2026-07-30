@@ -199,8 +199,12 @@ mod tests {
         assert!(is_no_merge_request(
             "no open merge request available for \"feat\""
         ));
-        assert!(is_no_merge_request("no merge request found for this branch"));
-        assert!(is_no_merge_request("GET .../merge_requests/9: 404 Merge Request Not Found"));
+        assert!(is_no_merge_request(
+            "no merge request found for this branch"
+        ));
+        assert!(is_no_merge_request(
+            "GET .../merge_requests/9: 404 Merge Request Not Found"
+        ));
     }
 
     /// **핵심 회귀 방어**: 일시 오류(레이트리밋·네트워크·auth)와 **프로젝트 404**는
@@ -211,7 +215,9 @@ mod tests {
         assert!(!is_no_merge_request("could not resolve host gitlab.com"));
         assert!(!is_no_merge_request("HTTP 401: unauthorized"));
         // 프로젝트 404는 repo가 사라진 것 — "merge request"가 없으니 no-MR 아니다.
-        assert!(!is_no_merge_request("GET .../projects/x: 404 Project Not Found"));
+        assert!(!is_no_merge_request(
+            "GET .../projects/x: 404 Project Not Found"
+        ));
         // 맨 404 하나로는 안 된다.
         assert!(!is_no_merge_request("404 Not Found"));
     }

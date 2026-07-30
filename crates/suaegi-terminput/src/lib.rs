@@ -190,11 +190,11 @@
 //! (explicit incremental `.next()` calls), the second trivially by
 //! `is_terminal_input_too_large`'s O(1) shape.
 
+use std::str::CharIndices;
 use suaegi_misc::{
     measure_clipboard_text_byte_length, measure_clipboard_text_byte_length_with_yield,
     CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS,
 };
-use std::str::CharIndices;
 
 /// `TI:7`. Default per-chunk byte budget for [`iterate_terminal_input_chunks`]
 /// / [`split_terminal_input_chunks`] (16 KiB). U2: a chunk can still exceed
@@ -487,7 +487,10 @@ mod tests {
 
     #[test]
     fn oracle_keeps_small_terminal_input_as_one_chunk() {
-        assert_eq!(split_terminal_input_chunks("npm test", None), vec!["npm test"]);
+        assert_eq!(
+            split_terminal_input_chunks("npm test", None),
+            vec!["npm test"]
+        );
     }
 
     #[test]
@@ -503,7 +506,10 @@ mod tests {
         let chunks = split_terminal_input_chunks(&text, None);
         assert_eq!(
             chunks,
-            vec!["x".repeat(TERMINAL_INPUT_CHUNK_MAX_BYTES as usize).as_str(), "x"]
+            vec![
+                "x".repeat(TERMINAL_INPUT_CHUNK_MAX_BYTES as usize).as_str(),
+                "x"
+            ]
         );
     }
 
@@ -553,8 +559,12 @@ mod tests {
         let max_bytes = Some(text.encode_utf16().count() as f64 * 3.0);
         let mut calls = 0u32;
         let mut yield_to_event_loop = || calls += 1;
-        let result =
-            is_terminal_input_too_large_with_yield(&text, max_bytes, None, &mut yield_to_event_loop);
+        let result = is_terminal_input_too_large_with_yield(
+            &text,
+            max_bytes,
+            None,
+            &mut yield_to_event_loop,
+        );
         assert!(!result);
         assert!(calls > 0);
     }
@@ -564,7 +574,9 @@ mod tests {
     ) {
         let mut noop = || {};
         assert_eq!(
-            is_terminal_input_too_large_with_deferred_measurement("npm test", None, None, &mut noop),
+            is_terminal_input_too_large_with_deferred_measurement(
+                "npm test", None, None, &mut noop
+            ),
             TerminalInputTooLargeDecision::Immediate(false)
         );
         assert_eq!(
@@ -636,7 +648,10 @@ mod tests {
     fn pin_max_chunk_bytes_fractional_value_is_accepted_without_flooring() {
         // 3 one-byte chars, budget 2.5: "aa" (2 <= 2.5) then a 3rd char
         // pushes 2+1=3 > 2.5, so it splits into ["aa", "a"].
-        assert_eq!(split_terminal_input_chunks("aaa", Some(2.5)), vec!["aa", "a"]);
+        assert_eq!(
+            split_terminal_input_chunks("aaa", Some(2.5)),
+            vec!["aa", "a"]
+        );
     }
 
     /// U11: the four `assert_*`-shaped call one error path never carries the
@@ -675,11 +690,21 @@ mod tests {
         ));
 
         assert_eq!(
-            is_terminal_input_too_large_with_deferred_measurement("abcde", Some(5.0), None, &mut noop),
+            is_terminal_input_too_large_with_deferred_measurement(
+                "abcde",
+                Some(5.0),
+                None,
+                &mut noop
+            ),
             TerminalInputTooLargeDecision::Immediate(false)
         );
         assert_eq!(
-            is_terminal_input_too_large_with_deferred_measurement("abcdef", Some(5.0), None, &mut noop),
+            is_terminal_input_too_large_with_deferred_measurement(
+                "abcdef",
+                Some(5.0),
+                None,
+                &mut noop
+            ),
             TerminalInputTooLargeDecision::Immediate(true)
         );
     }
@@ -750,7 +775,10 @@ mod tests {
             None,
             &mut noop,
         );
-        assert!(matches!(decision, TerminalInputTooLargeDecision::Immediate(false)));
+        assert!(matches!(
+            decision,
+            TerminalInputTooLargeDecision::Immediate(false)
+        ));
     }
 
     /// U3: each of the three routing arms, plus the fact that
@@ -809,7 +837,10 @@ mod tests {
     #[test]
     fn pin_deferred_yield_cadence_threshold_is_strict_greater_than() {
         let text = "x".repeat(CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS as usize);
-        assert_eq!(text.encode_utf16().count() as u64, CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS);
+        assert_eq!(
+            text.encode_utf16().count() as u64,
+            CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS
+        );
         let mut calls = 0u32;
         let mut cb = || calls += 1;
         let decision = is_terminal_input_too_large_with_deferred_measurement(

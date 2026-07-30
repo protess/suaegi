@@ -106,8 +106,8 @@ pub fn build_native_chat_unsubscribe(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_native_chat_subscription_id, build_native_chat_unsubscribe,
-        NativeChatUnsubscribeRpc, NATIVE_CHAT_UNSUBSCRIBE_METHOD,
+        build_native_chat_subscription_id, build_native_chat_unsubscribe, NativeChatUnsubscribeRpc,
+        NATIVE_CHAT_UNSUBSCRIBE_METHOD,
     };
 
     // Oracle: native-chat-stream-unsubscribe.test.ts

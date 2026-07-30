@@ -54,21 +54,21 @@ mod submatch;
 mod types;
 
 pub use clamp::{clamp_line_context, Clamped};
-pub use driver::{run_search, SearchError};
 pub use constants::{
     DEFAULT_SEARCH_MAX_RESULTS, MAX_LINE_CONTENT_LENGTH, MAX_MATCHES_PER_FILE,
     SEARCH_MAX_FILE_SIZE, SEARCH_TIMEOUT_MS, TRUNCATION_MARKER,
 };
-pub use ingest::{finalize, ingest_git_grep_line, ingest_rg_json_line, Ingest};
+pub use driver::{run_search, SearchError};
 pub use git_grep_args::{build_git_grep_args, to_git_glob_pathspec};
 pub use glob::split_search_glob_patterns;
-pub use rg_args::build_rg_args;
-pub use submatch::build_submatch_regex;
+pub use ingest::{finalize, ingest_git_grep_line, ingest_rg_json_line, Ingest};
 pub use match_count::{
     is_valid_match_count, normalize_search_file_match_count, normalize_search_result,
 };
 pub use path::normalize_relative_path;
 pub use regex_escape::escape_regex;
+pub use rg_args::build_rg_args;
+pub use submatch::build_submatch_regex;
 pub use types::{
     create_accumulator, SearchAccumulator, SearchFileResult, SearchMatch, SearchOptions,
     SearchResult,

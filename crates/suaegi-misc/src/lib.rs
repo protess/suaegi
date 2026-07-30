@@ -252,9 +252,7 @@ pub use github_project_ref_input::{
 pub use github_work_items_query_bounds::{
     is_github_work_items_query_too_large, GITHUB_WORK_ITEMS_QUERY_MAX_BYTES,
 };
-pub use gitlab_projects::{
-    compute_next_gitlab_recents, GitLabRecentProject, GITLAB_RECENTS_MAX,
-};
+pub use gitlab_projects::{compute_next_gitlab_recents, GitLabRecentProject, GITLAB_RECENTS_MAX};
 pub use harness_injected_user_turns::{
     is_known_harness_injected_user_turn_text, HARNESS_INJECTED_TURN_PREFIXES,
     KNOWN_HARNESS_TAG_NAMES,

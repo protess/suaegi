@@ -239,7 +239,10 @@ mod tests {
         let frame = encode_serve_sim_touch_frame(&touch);
 
         assert_eq!(frame[0], SERVE_SIM_TOUCH_MESSAGE_TAG);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":0.25,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":0.25,\"y\":0.75}".to_vec()
+        );
     }
 
     // -- E1: ECMAScript number formatting, exact bytes, no parsing ----------
@@ -253,7 +256,10 @@ mod tests {
             edge: None,
         };
         let frame = encode_serve_sim_touch_frame(&touch);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":1,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":1,\"y\":0.75}".to_vec()
+        );
     }
 
     #[test]
@@ -265,7 +271,10 @@ mod tests {
             edge: None,
         };
         let frame = encode_serve_sim_touch_frame(&touch);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":0,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":0,\"y\":0.75}".to_vec()
+        );
     }
 
     #[test]
@@ -277,7 +286,10 @@ mod tests {
             edge: None,
         };
         let frame = encode_serve_sim_touch_frame(&touch);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":0,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":0,\"y\":0.75}".to_vec()
+        );
     }
 
     #[test]
@@ -304,7 +316,10 @@ mod tests {
             edge: None,
         };
         let frame = encode_serve_sim_touch_frame(&touch);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":null,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":null,\"y\":0.75}".to_vec()
+        );
     }
 
     #[test]
@@ -369,7 +384,10 @@ mod tests {
             edge: None,
         };
         let frame = encode_serve_sim_touch_frame(&touch);
-        assert_eq!(frame, b"\x03{\"type\":\"move\",\"x\":0.25,\"y\":0.75}".to_vec());
+        assert_eq!(
+            frame,
+            b"\x03{\"type\":\"move\",\"x\":0.25,\"y\":0.75}".to_vec()
+        );
         assert!(!String::from_utf8(frame).unwrap().contains("edge"));
     }
 

@@ -62,10 +62,16 @@ pub struct AutomationRun {
 /// The cap is negative-clamped (`max(0, cap)`) so a negative cap keeps nothing rather than
 /// dropping from the tail. The result preserves the ORIGINAL append order: it is a filter over
 /// `runs` retaining every kept-final id plus every non-final run.
-pub fn prune_automation_runs(runs: &[AutomationRun], max_per_automation: i64) -> Vec<AutomationRun> {
+pub fn prune_automation_runs(
+    runs: &[AutomationRun],
+    max_per_automation: i64,
+) -> Vec<AutomationRun> {
     // Why: a dispatched run's completion can land hours later — only final runs are evictable.
     let mut groups: HashMap<&str, Vec<&AutomationRun>> = HashMap::new();
-    for run in runs.iter().filter(|r| is_final_automation_run_status(r.status)) {
+    for run in runs
+        .iter()
+        .filter(|r| is_final_automation_run_status(r.status))
+    {
         groups.entry(&run.automation_id).or_default().push(run);
     }
 
@@ -86,9 +92,7 @@ pub fn prune_automation_runs(runs: &[AutomationRun], max_per_automation: i64) ->
 
     // Survivors keep their original append order — callers index by position.
     runs.iter()
-        .filter(|run| {
-            kept.contains(run.id.as_str()) || !is_final_automation_run_status(run.status)
-        })
+        .filter(|run| kept.contains(run.id.as_str()) || !is_final_automation_run_status(run.status))
         .cloned()
         .collect()
 }

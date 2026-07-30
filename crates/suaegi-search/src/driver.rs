@@ -223,10 +223,9 @@ where
     cmd.process_group(0);
 
     // Spawn failure = backend-unavailable / hard-transient: Err, never Ok(empty).
-    let mut child = cmd.spawn().map_err(|source| SearchError::Spawn {
-        program,
-        source,
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|source| SearchError::Spawn { program, source })?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
@@ -731,7 +730,10 @@ mod tests {
         .await
         .expect("exit-2-with-matches must be Ok, not a discard");
         assert_eq!(res.total_matches, 1, "the streamed match is preserved");
-        assert!(res.truncated, "exit-2 incompleteness must be flagged truncated");
+        assert!(
+            res.truncated,
+            "exit-2 incompleteness must be flagged truncated"
+        );
     }
 
     /// **H2 — exit 2 with NO matches is a hard error (transient≠empty).** We can't
@@ -753,7 +755,14 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, SearchError::Exit { program: "git", code: Some(2), .. }),
+            matches!(
+                err,
+                SearchError::Exit {
+                    program: "git",
+                    code: Some(2),
+                    ..
+                }
+            ),
             "exit-2-no-matches must be Err(Exit 2), got {err:?}"
         );
     }

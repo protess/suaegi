@@ -12,6 +12,7 @@ fn spec(cmd: (String, Vec<String>)) -> PtySpawn {
         args: cmd.1,
         cwd: None,
         env: Vec::new(),
+        env_remove: Vec::new(),
         rows: 24,
         cols: 80,
     }
