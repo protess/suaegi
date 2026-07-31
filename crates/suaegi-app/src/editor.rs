@@ -882,12 +882,12 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
     let body: Element<'_, Message> = match &editor.document {
         Document::Closed => return None,
         Document::Loading { .. } => column![
-            editor_header(editor, false, false, false, false, false),
+            editor_header(state, false, false, false, false, false),
             container(text("Opening file…").size(14)).padding(10)
         ]
         .into(),
         Document::Unavailable { message, .. } => column![
-            editor_header(editor, false, false, false, false, false),
+            editor_header(state, false, false, false, false, false),
             container(
                 text(message)
                     .size(14)
@@ -904,7 +904,7 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
                 PreviewKind::Pdf => format!("PDF first-page preview · {size} bytes"),
             };
             column![
-                editor_header(editor, false, false, false, false, false),
+                editor_header(state, false, false, false, false, false),
                 container(
                     column![
                         iced::widget::image(iced::widget::image::Handle::from_bytes(bytes.clone()))
@@ -996,7 +996,7 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
                     .style(crate::theme::top_bar)
             });
             let mut layout = column![editor_header(
-                editor,
+                state,
                 *dirty,
                 saving.is_some(),
                 *close_confirmation,
@@ -1095,15 +1095,46 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
 }
 
 fn editor_header(
-    editor: &EditorState,
+    state: &AppState,
     dirty: bool,
     saving: bool,
     close_confirmation: bool,
     markdown_tools: bool,
     markdown_preview: bool,
 ) -> Element<'_, Message> {
+    let editor = state.editor();
     let mut tabs = row![].spacing(2).align_y(Alignment::Center);
-    for tab in editor.tabs() {
+    if let (Some(panes), Some(worktree)) = (state.panes(), editor.worktree()) {
+        for (pane, session) in panes
+            .iter()
+            .filter(|(_, session)| state.worktree_for_session(**session) == Some(worktree))
+        {
+            let terminal = button(
+                row![
+                    text("▣").size(12).color(crate::theme::MUTED),
+                    text(state.session_tab_title(*session)).size(13),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::WorkspaceTerminalTabSelected(*session))
+            .padding([3, 5])
+            .style(crate::theme::ghost_button);
+            let close = button("×")
+                .on_press(Message::PaneCloseRequested(*pane))
+                .padding([2, 4])
+                .style(crate::theme::ghost_button);
+            tabs = tabs.push(
+                container(row![terminal, close].spacing(0).align_y(Alignment::Center))
+                    .style(crate::theme::top_bar),
+            );
+        }
+    }
+    for tab in editor
+        .tabs()
+        .into_iter()
+        .filter(|tab| editor.worktree() == Some(&tab.worktree))
+    {
         let name = std::path::Path::new(&tab.path)
             .file_name()
             .and_then(|name| name.to_str())

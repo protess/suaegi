@@ -143,16 +143,69 @@ where
                 theme::top_bar
             },
         );
+        let mut title_tabs = row![tab].spacing(2).align_y(iced::Alignment::Center);
+        if state.focused_session() == Some(session_id) {
+            if let Some(worktree) = state.worktree_for_session(session_id) {
+                for editor_tab in state
+                    .editor()
+                    .tabs()
+                    .into_iter()
+                    .filter(|editor_tab| &editor_tab.worktree == worktree)
+                {
+                    let name = std::path::Path::new(&editor_tab.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&editor_tab.path)
+                        .to_string();
+                    let marker = if editor_tab.saving {
+                        "…"
+                    } else if editor_tab.dirty {
+                        "M"
+                    } else {
+                        ""
+                    };
+                    let select = button(
+                        row![
+                            text("▤").size(12).color(theme::MUTED),
+                            text(name).size(13),
+                            text(marker).size(11).color(theme::MUTED),
+                        ]
+                        .spacing(5)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .on_press(Message::EditorTabSelected {
+                        worktree: editor_tab.worktree.clone(),
+                        path: editor_tab.path.clone(),
+                    })
+                    .padding([3, 5])
+                    .style(theme::ghost_button);
+                    let close = button(text("×").size(12))
+                        .on_press(Message::EditorTabCloseRequested {
+                            worktree: editor_tab.worktree,
+                            path: editor_tab.path,
+                        })
+                        .padding([2, 4])
+                        .style(theme::ghost_button);
+                    title_tabs = title_tabs.push(
+                        container(
+                            row![select, close]
+                                .spacing(0)
+                                .align_y(iced::Alignment::Center),
+                        )
+                        .style(theme::top_bar),
+                    );
+                }
+            }
+        }
         let title_bar = pane_grid::TitleBar::new(
-            row![
-                tab,
-                button(text("+").size(14))
-                    .on_press(Message::BrowserOpenRequested)
-                    .padding([2, 6])
-                    .style(theme::ghost_button),
-                Space::new().width(Length::Fill),
-            ]
-            .align_y(iced::Alignment::Center),
+            title_tabs
+                .push(
+                    button(text("+").size(14))
+                        .on_press(Message::BrowserOpenRequested)
+                        .padding([2, 6])
+                        .style(theme::ghost_button),
+                )
+                .push(Space::new().width(Length::Fill)),
         )
         .padding(4);
 

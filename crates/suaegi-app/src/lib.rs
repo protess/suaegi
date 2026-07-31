@@ -216,11 +216,10 @@ impl AppState {
         } else {
             if self.floating_workspace_owns_editor() {
                 workbench::view(self)
+            } else if self.workspace_editor_active() {
+                editor::view(self).unwrap_or_else(|| workbench::view(self))
             } else {
-                match editor::view(self) {
-                    Some(editor) => editor,
-                    None => workbench::view(self),
-                }
+                workbench::view(self)
             }
         };
 
