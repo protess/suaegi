@@ -102,7 +102,10 @@ by tests or live-app QA.
   preference. Multiple editor documents remain live at once: opening another
   file preserves dirty buffers and in-flight saves, tab selection restores the
   exact document, close confirmation applies only to the selected dirty tab,
-  and worktree removal retires every tab owned by that worktree.
+  and worktree removal retires every tab owned by that worktree. Agent
+  terminals and editor documents now share the workspace tab strip, so opening
+  a file from Explorer adds a sibling tab instead of replacing the Claude
+  surface; switching either way preserves both the PTY and editor buffers.
 - File editors and diff views share Orca's explicit editor-font preference,
   including the empty-value fallback to the configured terminal font.
 - `orca.yaml worktree.sharedDirectories` is normalized with Orca's path safety
@@ -313,7 +316,7 @@ paths remain implemented rather than counted complete by method name alone.
 
 ## Verification baseline
 
-- `cargo test -p suaegi-app --lib`: 731 passed, 2 ignored after the current
+- `cargo test -p suaegi-app --lib`: 733 passed, 2 ignored after the current
   UI/runtime, settings-route, integration-preflight, Floating Workspace,
   browser dialog, orchestration, Linear, and daemon loop.
 - `cargo test --workspace`: passing after the final native Claude Agent Teams,
@@ -324,7 +327,7 @@ paths remain implemented rather than counted complete by method name alone.
 - `cargo test -p suaegi-term --test daemon_survival_test`: verifies the daemon
   is a detached session leader and the PTY accepts input after disconnect and
   reattach.
-- `cargo test -p suaegi-app --lib`: 728 tests passing with two opt-in live
+- `cargo test -p suaegi-app --lib`: 733 tests passing with two opt-in live
   credential/network probes ignored, including the Floating
   Workspace lifecycle, multi-document editor tabs, browser
   URL/bounds/cookie/profile-store handling, remote pairing, usage, SSH,

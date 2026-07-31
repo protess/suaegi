@@ -1621,6 +1621,7 @@ pub enum Message {
         worktree: WorktreeId,
         path: String,
     },
+    WorkspaceTerminalTabSelected(SessionId),
     EditorTabCloseRequested {
         worktree: WorktreeId,
         path: String,
@@ -2542,6 +2543,11 @@ pub struct AppState {
     file_explorer: FileExplorerState,
     // ---- Plan 9 M8: minimal embedded editor ----
     editor: EditorState,
+    /// The editor documents and the visible workspace tab are separate
+    /// concerns. Orca keeps an agent terminal alive as a sibling tab when a
+    /// file is opened; using `editor.is_open()` as the center-view selector
+    /// made Suaegi replace the terminal surface instead.
+    workspace_editor_active: bool,
     // ---- Quick Open palette over the ported lister/fuzzy backend ----
     quick_open: QuickOpenState,
     // ---- Streamed repository content search ----
@@ -2898,6 +2904,7 @@ impl Default for AppState {
             diff: DiffState::default(),
             file_explorer: FileExplorerState::default(),
             editor: EditorState::default(),
+            workspace_editor_active: false,
             quick_open: QuickOpenState::default(),
             content_search: ContentSearchState::default(),
             source_control: SourceControlState::default(),
@@ -6880,6 +6887,14 @@ impl AppState {
         &self.editor
     }
 
+    pub(crate) fn workspace_editor_active(&self) -> bool {
+        self.workspace_editor_active
+    }
+
+    pub(crate) fn worktree_for_session(&self, session: SessionId) -> Option<&WorktreeId> {
+        self.session_worktrees.get(&session)
+    }
+
     pub(crate) fn quick_open(&self) -> &QuickOpenState {
         &self.quick_open
     }
@@ -6914,6 +6929,7 @@ impl AppState {
     fn open_editor_file(&mut self, worktree: WorktreeId, path: String) -> iced::Task<Message> {
         if self.editor.is_document(&worktree, &path) {
             self.editor.activate(&worktree, &path);
+            self.workspace_editor_active = true;
             return iced::Task::none();
         }
         self.load_editor_document(worktree, path)
@@ -6926,6 +6942,7 @@ impl AppState {
             };
             let op = self.next_op();
             self.editor.begin_load(worktree.clone(), path.clone(), op);
+            self.workspace_editor_active = true;
             return crate::editor::load_file(worktree, root, path, op);
         }
         let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
@@ -6933,6 +6950,7 @@ impl AppState {
         };
         let op = self.next_op();
         self.editor.begin_load(worktree.clone(), path.clone(), op);
+        self.workspace_editor_active = true;
         if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
             let message_worktree = worktree.clone();
             let message_path = path.clone();
@@ -18828,16 +18846,36 @@ impl AppState {
                 }
             }
             Message::EditorTabSelected { worktree, path } => {
-                self.editor.activate(&worktree, &path);
-                self.editor
-                    .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                if self.editor.activate(&worktree, &path) {
+                    self.workspace_editor_active = true;
+                    self.editor
+                        .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                }
                 iced::Task::none()
+            }
+            Message::WorkspaceTerminalTabSelected(session) => {
+                let pane = self.panes.as_ref().and_then(|panes| {
+                    panes
+                        .iter()
+                        .find_map(|(pane, candidate)| (*candidate == session).then_some(*pane))
+                });
+                self.workspace_editor_active = false;
+                pane.map_or_else(iced::Task::none, |pane| self.focus_pane(pane))
             }
             Message::EditorTabCloseRequested { worktree, path } => {
                 if self.editor.activate(&worktree, &path) {
+                    let editor_was_active = self.workspace_editor_active;
                     let closed = self.editor.request_close();
                     if closed && worktree.0 == "__suaegi_floating_workspace__" {
                         self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                    if closed {
+                        self.workspace_editor_active = editor_was_active && self.editor.is_open();
+                    } else {
+                        // A dirty tab needs its keep/discard controls visible.
+                        // Closing it from the terminal tab strip must not leave
+                        // that confirmation hidden behind the terminal.
+                        self.workspace_editor_active = true;
                     }
                 }
                 iced::Task::none()
@@ -18934,8 +18972,13 @@ impl AppState {
             }
             Message::EditorCloseRequested => {
                 let floating = self.floating_workspace_owns_editor();
-                if self.editor.request_close() && floating {
-                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                if self.editor.request_close() {
+                    if floating {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                    if !self.editor.is_open() {
+                        self.workspace_editor_active = false;
+                    }
                 }
                 iced::Task::none()
             }
@@ -18948,6 +18991,9 @@ impl AppState {
                 self.editor.discard_and_close();
                 if floating {
                     self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                }
+                if !self.editor.is_open() {
+                    self.workspace_editor_active = false;
                 }
                 iced::Task::none()
             }
@@ -27514,6 +27560,76 @@ mod tests {
 
         assert_eq!(state.file_explorer.worktree(), Some(&worktree));
         assert!(state.quick_open.is_open());
+    }
+
+    #[test]
+    fn terminal_and_editor_tabs_switch_without_replacing_each_other() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/accepted");
+        let session = SessionId(91);
+        let (panes, pane) = pane_grid::State::new(session);
+        state.panes = Some(panes);
+        state.focused_pane = Some(pane);
+        state.session_worktrees.insert(session, worktree.clone());
+        state
+            .editor
+            .begin_load(worktree.clone(), "src/lib.rs".into(), OpId(1));
+        state.workspace_editor_active = true;
+
+        let _ = state.update(Message::WorkspaceTerminalTabSelected(session));
+
+        assert!(!state.workspace_editor_active());
+        assert!(
+            state.editor.is_document(&worktree, "src/lib.rs"),
+            "switching back to Claude must keep the file tab alive"
+        );
+
+        let _ = state.update(Message::EditorTabSelected {
+            worktree: worktree.clone(),
+            path: "src/lib.rs".into(),
+        });
+
+        assert!(state.workspace_editor_active());
+        assert_eq!(state.focused_session(), Some(session));
+    }
+
+    #[test]
+    fn closing_a_dirty_file_from_the_terminal_strip_reveals_its_confirmation() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/accepted");
+        state
+            .editor
+            .begin_load(worktree.clone(), "src/lib.rs".into(), OpId(1));
+        assert!(state.editor.accept_load(
+            &worktree,
+            "src/lib.rs",
+            OpId(1),
+            Ok(crate::editor::EditorLoad::Ready {
+                text: "a".into(),
+                size: 1,
+                signature: suaegi_git::fs::FileSignature {
+                    size: 1,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                },
+            }),
+        ));
+        state
+            .editor
+            .perform(iced::widget::text_editor::Action::Edit(
+                iced::widget::text_editor::Edit::Insert('!'),
+            ));
+        state.workspace_editor_active = false;
+
+        let _ = state.update(Message::EditorTabCloseRequested {
+            worktree,
+            path: "src/lib.rs".into(),
+        });
+
+        assert!(
+            state.workspace_editor_active(),
+            "the keep/discard controls must not remain hidden behind Claude"
+        );
+        assert!(state.editor.has_unsaved_changes());
     }
 
     #[test]
