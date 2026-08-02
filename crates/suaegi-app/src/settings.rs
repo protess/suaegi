@@ -58,6 +58,18 @@ struct HostSetupChoice {
     label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MicrophoneChoice {
+    label: String,
+    device: Option<crate::speech::MicrophoneDevice>,
+}
+
+impl std::fmt::Display for MicrophoneChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
 impl std::fmt::Display for HostSetupChoice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.label)
@@ -4910,6 +4922,68 @@ fn voice_content(state: &AppState) -> Element<'_, Message> {
     } else {
         "Required for GPT-4o transcription models"
     };
+    let preferred_id = state.ui_settings().voice_microphone_device_id.as_deref();
+    let preferred_label = state.ui_settings().voice_microphone_device_label.as_deref();
+    let mut microphone_choices = vec![MicrophoneChoice {
+        label: "System Default".to_string(),
+        device: None,
+    }];
+    microphone_choices.extend(state.voice_microphones().iter().cloned().map(|device| {
+        MicrophoneChoice {
+            label: device.label.clone(),
+            device: Some(device),
+        }
+    }));
+    let mut selected_microphone = preferred_id.and_then(|id| {
+        microphone_choices
+            .iter()
+            .find(|choice| choice.device.as_ref().is_some_and(|device| device.id == id))
+            .cloned()
+    });
+    if selected_microphone.is_none() && preferred_id.is_some() {
+        if let Some(label) = preferred_label {
+            let matching = microphone_choices
+                .iter()
+                .filter(|choice| {
+                    choice
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| device.label.eq_ignore_ascii_case(label))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching.len() == 1 {
+                selected_microphone = matching.into_iter().next();
+            }
+        }
+    }
+    if selected_microphone.is_none() {
+        if let Some(id) = preferred_id {
+            let label = preferred_label.unwrap_or(id);
+            let suffix = if state.voice_microphones_known() {
+                " (Unavailable)"
+            } else {
+                ""
+            };
+            let choice = MicrophoneChoice {
+                label: format!("{label}{suffix}"),
+                device: Some(crate::speech::MicrophoneDevice {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                }),
+            };
+            selected_microphone = Some(choice.clone());
+            microphone_choices.push(choice);
+        }
+    }
+    let selected_microphone = selected_microphone.or_else(|| microphone_choices.first().cloned());
+    let microphone_picker = pick_list(
+        microphone_choices,
+        selected_microphone,
+        |choice: MicrophoneChoice| Message::VoiceMicrophoneSelected(choice.device),
+    )
+    .width(Length::Fixed(210.0))
+    .text_size(11);
 
     settings_card(
         column![
@@ -4942,6 +5016,33 @@ fn voice_content(state: &AppState) -> Element<'_, Message> {
             text("Toggle: press ⌘E once to start, again to stop. Hold: dictate while ⌘E is held.")
                 .size(11)
                 .color(theme::MUTED),
+            row![
+                column![
+                    text("Microphone").size(12),
+                    text("System default follows the macOS input device setting.")
+                        .size(11)
+                        .color(theme::MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                microphone_picker,
+                button(
+                    text(if state.voice_microphones_loading() {
+                        "Checking…"
+                    } else {
+                        "Refresh"
+                    })
+                    .size(11)
+                )
+                .on_press_maybe(
+                    (!state.voice_microphones_loading())
+                        .then_some(Message::VoiceMicrophonesRefreshRequested),
+                )
+                .padding([5, 8])
+                .style(theme::ghost_button),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
             rule::horizontal(1),
             choice_row_owned("Speech Model", model_value, UiChoice::VoiceModel,),
             model_action,

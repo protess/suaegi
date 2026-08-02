@@ -626,6 +626,14 @@ pub struct UiSettings {
     pub voice_models_dir: String,
     pub voice_language: String,
     pub voice_dictation_mode: String,
+    /// Stable CPAL device id for the preferred dictation microphone. `None`
+    /// follows the operating system default.
+    #[serde(default)]
+    pub voice_microphone_device_id: Option<String>,
+    /// Cached display name used to recover a preference when an audio backend
+    /// rotates the stable id, and to identify an unplugged device in Settings.
+    #[serde(default)]
+    pub voice_microphone_device_label: Option<String>,
     pub voice_terminal_confirm_before_insert: bool,
     pub voice_openai_api_key_configured: bool,
     pub voice_user_models: Vec<VoiceUserModelSetting>,
@@ -909,6 +917,8 @@ impl Default for UiSettings {
             voice_models_dir: String::new(),
             voice_language: "en".to_string(),
             voice_dictation_mode: "toggle".to_string(),
+            voice_microphone_device_id: None,
+            voice_microphone_device_label: None,
             voice_terminal_confirm_before_insert: false,
             voice_openai_api_key_configured: false,
             voice_user_models: Vec::new(),
@@ -1116,6 +1126,23 @@ mod tests {
             "a missing marker must identify settings written by the old renderer"
         );
         assert_eq!(legacy.terminal_font_weight, 400);
+    }
+
+    #[test]
+    fn legacy_voice_settings_follow_the_system_default_microphone() {
+        let mut legacy = serde_json::to_value(UiSettings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("voice_microphone_device_id");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("voice_microphone_device_label");
+
+        let legacy: UiSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.voice_microphone_device_id, None);
+        assert_eq!(legacy.voice_microphone_device_label, None);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # Orca Rust port status
 
-Last audited: 2026-07-30
+Last audited: 2026-08-03
 
-Reference: `reference/orca` at `4543bb68` (2026-07-29).
+Reference: `reference/orca` at `7c716702` (2026-08-02).
 
 ## Completion target
 
@@ -56,6 +56,12 @@ by tests or live-app QA.
   cursor/background and focused/unfocused pane opacity, divider thickness,
   hide-pointer-while-typing, and semantic-selection word separators.
 - Native macOS keep-awake assertion while agents are working or waiting.
+- Voice dictation follows Orca's microphone preference model: Settings lists
+  live input devices alongside the system default, persists a stable id and
+  cached label, heals a rotated id through a unique label match, retains an
+  unplugged preference as unavailable, and falls back to the system default
+  without losing that preference. Device discovery and the native picker were
+  exercised in the live macOS app.
 - Orca-style confirmation before an active coding-agent terminal is stopped,
   independently configurable from pinned-tab confirmation.
 - Orchestration and Computer Use settings now detect installed global skills,

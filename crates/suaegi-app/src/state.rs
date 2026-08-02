@@ -1243,6 +1243,9 @@ pub enum Message {
         Result<crate::remote_runtime::RemoteProviderAccounts, String>,
     ),
     VoiceEnabledToggled,
+    VoiceMicrophonesRefreshRequested,
+    VoiceMicrophonesLoaded(Result<Vec<crate::speech::MicrophoneDevice>, String>),
+    VoiceMicrophoneSelected(Option<crate::speech::MicrophoneDevice>),
     VoiceDictationShortcutPressed,
     VoiceDictationShortcutReleased,
     VoiceDictationToggled,
@@ -2286,6 +2289,9 @@ pub struct AppState {
     voice_dictation_state: VoiceDictationState,
     voice_api_key_draft: String,
     voice_status: Option<String>,
+    voice_microphones: Vec<crate::speech::MicrophoneDevice>,
+    voice_microphones_known: bool,
+    voice_microphones_loading: bool,
     pending_voice_transcript: Option<String>,
     voice_model_busy: Option<String>,
     app_window_size: iced::Size,
@@ -2766,6 +2772,9 @@ impl Default for AppState {
             voice_dictation_state: VoiceDictationState::Idle,
             voice_api_key_draft: String::new(),
             voice_status: None,
+            voice_microphones: Vec::new(),
+            voice_microphones_known: false,
+            voice_microphones_loading: false,
             pending_voice_transcript: None,
             voice_model_busy: None,
             app_window_size: iced::Size::new(1228.0, 768.0),
@@ -4882,6 +4891,18 @@ impl AppState {
 
     pub(crate) fn voice_status(&self) -> Option<&str> {
         self.voice_status.as_deref()
+    }
+
+    pub(crate) fn voice_microphones(&self) -> &[crate::speech::MicrophoneDevice] {
+        &self.voice_microphones
+    }
+
+    pub(crate) fn voice_microphones_known(&self) -> bool {
+        self.voice_microphones_known
+    }
+
+    pub(crate) fn voice_microphones_loading(&self) -> bool {
+        self.voice_microphones_loading
     }
 
     pub(crate) fn pending_voice_transcript(&self) -> Option<&str> {
@@ -12085,6 +12106,9 @@ impl AppState {
                     SettingsSection::ProviderAccounts => {
                         self.update(Message::RemoteProviderAccountsRefreshRequested)
                     }
+                    SettingsSection::Voice => {
+                        self.update(Message::VoiceMicrophonesRefreshRequested)
+                    }
                     SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
                     _ => iced::Task::none(),
                 }
@@ -12107,6 +12131,9 @@ impl AppState {
                     }
                     SettingsSection::ProviderAccounts => {
                         self.update(Message::RemoteProviderAccountsRefreshRequested)
+                    }
+                    SettingsSection::Voice => {
+                        self.update(Message::VoiceMicrophonesRefreshRequested)
                     }
                     SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
                     _ => iced::Task::none(),
@@ -13964,18 +13991,78 @@ impl AppState {
                     self.ui_settings.voice_enabled = false;
                     self.voice_status = Some("Voice dictation disabled.".to_string());
                 } else {
-                    match crate::speech::start_capture() {
-                        Ok(()) => {
+                    match crate::speech::start_capture(
+                        self.ui_settings.voice_microphone_device_id.as_deref(),
+                        self.ui_settings.voice_microphone_device_label.as_deref(),
+                    ) {
+                        Ok(started) => {
                             crate::speech::cancel_capture();
                             self.ui_settings.voice_enabled = true;
-                            self.voice_status = Some(
-                                "Microphone permission granted. Voice dictation enabled.".into(),
-                            );
+                            if started.fell_back_to_default {
+                                self.voice_status = Some(
+                                    "Selected microphone unavailable. Voice is enabled and will use the system default."
+                                        .into(),
+                                );
+                            } else {
+                                if self.ui_settings.voice_microphone_device_id.is_some() {
+                                    self.ui_settings.voice_microphone_device_id = started.device_id;
+                                    self.ui_settings.voice_microphone_device_label =
+                                        Some(started.device_label.clone());
+                                }
+                                self.voice_status = Some(format!(
+                                    "Microphone access granted · {}",
+                                    started.device_label
+                                ));
+                            }
                         }
                         Err(error) => {
                             self.voice_status = Some(error);
                         }
                     }
+                }
+                self.persist();
+                self.update(Message::VoiceMicrophonesRefreshRequested)
+            }
+            Message::VoiceMicrophonesRefreshRequested => {
+                if self.voice_microphones_loading {
+                    return iced::Task::none();
+                }
+                self.voice_microphones_loading = true;
+                iced::Task::perform(
+                    async { crate::speech::list_input_devices() },
+                    Message::VoiceMicrophonesLoaded,
+                )
+            }
+            Message::VoiceMicrophonesLoaded(result) => {
+                self.voice_microphones_loading = false;
+                self.voice_microphones_known = result.is_ok();
+                match result {
+                    Ok(devices) => self.voice_microphones = devices,
+                    Err(error) => {
+                        self.voice_microphones.clear();
+                        self.voice_status = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::VoiceMicrophoneSelected(device) => {
+                if !self.ui_settings.voice_enabled {
+                    self.voice_status =
+                        Some("Enable Voice Dictation before choosing a microphone.".into());
+                    return iced::Task::none();
+                }
+                if let Some(device) = device {
+                    self.ui_settings.voice_microphone_device_id = Some(device.id);
+                    self.ui_settings.voice_microphone_device_label = Some(device.label.clone());
+                    self.voice_status = Some(format!(
+                        "{} will be used for the next dictation.",
+                        device.label
+                    ));
+                } else {
+                    self.ui_settings.voice_microphone_device_id = None;
+                    self.ui_settings.voice_microphone_device_label = None;
+                    self.voice_status =
+                        Some("Dictation will follow the system default microphone.".into());
                 }
                 self.persist();
                 iced::Task::none()
@@ -14014,12 +14101,30 @@ impl AppState {
                                 Some("Select and prepare a speech model before dictating.".into());
                             return iced::Task::none();
                         }
-                        match crate::speech::start_capture() {
-                            Ok(()) => {
+                        match crate::speech::start_capture(
+                            self.ui_settings.voice_microphone_device_id.as_deref(),
+                            self.ui_settings.voice_microphone_device_label.as_deref(),
+                        ) {
+                            Ok(started) => {
                                 self.voice_dictation_state = VoiceDictationState::Recording;
-                                self.voice_status = Some(
-                                    "Listening… Press the dictation shortcut again to stop.".into(),
-                                );
+                                if started.fell_back_to_default {
+                                    self.voice_status = Some(
+                                        "Selected microphone unavailable; listening on the system default. Press the shortcut again to stop."
+                                            .into(),
+                                    );
+                                } else {
+                                    if self.ui_settings.voice_microphone_device_id.is_some() {
+                                        self.ui_settings.voice_microphone_device_id =
+                                            started.device_id;
+                                        self.ui_settings.voice_microphone_device_label =
+                                            Some(started.device_label.clone());
+                                        self.persist();
+                                    }
+                                    self.voice_status = Some(format!(
+                                        "Listening on {}… Press the dictation shortcut again to stop.",
+                                        started.device_label
+                                    ));
+                                }
                             }
                             Err(error) => {
                                 self.voice_status = Some(error);
@@ -27906,6 +28011,30 @@ mod tests {
         let debug = format!("{message:?}");
         assert!(!debug.contains("sk-do-not-log-this"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn voice_microphone_selection_persists_id_and_label_or_system_default() {
+        let mut state = AppState::default();
+        state.ui_settings.voice_enabled = true;
+        let device = crate::speech::MicrophoneDevice {
+            id: "coreaudio:test-input".to_string(),
+            label: "Studio Microphone".to_string(),
+        };
+
+        let _ = state.update(Message::VoiceMicrophoneSelected(Some(device.clone())));
+        assert_eq!(
+            state.ui_settings.voice_microphone_device_id.as_deref(),
+            Some(device.id.as_str())
+        );
+        assert_eq!(
+            state.ui_settings.voice_microphone_device_label.as_deref(),
+            Some(device.label.as_str())
+        );
+
+        let _ = state.update(Message::VoiceMicrophoneSelected(None));
+        assert_eq!(state.ui_settings.voice_microphone_device_id, None);
+        assert_eq!(state.ui_settings.voice_microphone_device_label, None);
     }
 
     #[test]
