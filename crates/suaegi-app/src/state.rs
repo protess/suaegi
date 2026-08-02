@@ -1681,11 +1681,12 @@ pub enum Message {
     TaskCreateRequested,
     TaskProjectsOpenRequested,
     TaskRefreshRequested,
+    TaskPageRequested(usize),
     TaskItemsLoaded {
         op: OpId,
         repo_id: RepoId,
         kind: TaskKind,
-        result: Result<Vec<crate::tasks::TaskWorkItem>, String>,
+        result: Result<crate::tasks::TaskPageResult, String>,
     },
     TaskItemOpen(String),
     SourceControlToggled {
@@ -2301,8 +2302,10 @@ pub struct AppState {
     task_provider: TaskProvider,
     task_query: String,
     task_repo_selection: HashSet<RepoId>,
+    task_current_page: usize,
+    task_total_pages: usize,
     task_items: Vec<crate::tasks::TaskWorkItem>,
-    task_items_by_repo: HashMap<RepoId, Vec<crate::tasks::TaskWorkItem>>,
+    task_items_by_repo: HashMap<RepoId, crate::tasks::TaskPageResult>,
     task_items_pending: HashSet<RepoId>,
     task_item_errors: HashMap<RepoId, String>,
     task_items_loading: bool,
@@ -2784,6 +2787,8 @@ impl Default for AppState {
             task_provider: TaskProvider::Github,
             task_query: "is:issue is:open".to_string(),
             task_repo_selection: HashSet::new(),
+            task_current_page: 0,
+            task_total_pages: 1,
             task_items: Vec::new(),
             task_items_by_repo: HashMap::new(),
             task_items_pending: HashSet::new(),
@@ -5753,6 +5758,14 @@ impl AppState {
         &self.task_items
     }
 
+    pub(crate) fn task_current_page(&self) -> usize {
+        self.task_current_page
+    }
+
+    pub(crate) fn task_total_pages(&self) -> usize {
+        self.task_total_pages
+    }
+
     pub(crate) fn task_items_loading(&self) -> bool {
         self.task_items_loading
     }
@@ -7402,7 +7415,11 @@ impl AppState {
         crate::source_control::load_status(worktree, entry.path, op)
     }
 
-    fn request_task_items(&mut self) -> iced::Task<Message> {
+    fn request_task_items(&mut self, reset_page: bool) -> iced::Task<Message> {
+        if reset_page {
+            self.task_current_page = 0;
+            self.task_total_pages = 1;
+        }
         self.task_items_error = None;
         if !matches!(
             self.task_provider,
@@ -7413,6 +7430,8 @@ impl AppState {
             self.task_items_by_repo.clear();
             self.task_items_pending.clear();
             self.task_item_errors.clear();
+            self.task_current_page = 0;
+            self.task_total_pages = 1;
             return iced::Task::none();
         }
         let targets = self
@@ -7424,6 +7443,7 @@ impl AppState {
         if targets.is_empty() {
             self.task_items_loading = false;
             self.task_items.clear();
+            self.task_total_pages = 1;
             return iced::Task::none();
         }
         let op = self.next_op();
@@ -7437,13 +7457,19 @@ impl AppState {
         let kind = self.task_kind;
         let preset = self.task_preset;
         let query = self.task_query.clone();
+        let page = self.task_current_page;
         iced::Task::batch(
             targets
                 .into_iter()
                 .map(|(repo_id, repo_path)| match provider {
-                    TaskProvider::Github => {
-                        crate::tasks::load_github_work(op, repo_id, repo_path, kind, query.clone())
-                    }
+                    TaskProvider::Github => crate::tasks::load_github_work(
+                        op,
+                        repo_id,
+                        repo_path,
+                        kind,
+                        query.clone(),
+                        page,
+                    ),
                     TaskProvider::Gitlab => crate::tasks::load_gitlab_work(
                         op,
                         repo_id,
@@ -7457,11 +7483,16 @@ impl AppState {
         )
     }
 
-    fn finish_task_item_batch(&mut self) {
+    fn finish_task_item_batch(&mut self) -> bool {
         let mut seen = HashSet::new();
         let mut items = Vec::new();
+        let mut total_pages = 1;
         for repo in &self.repos {
-            for item in self.task_items_by_repo.get(&repo.id).into_iter().flatten() {
+            let Some(page) = self.task_items_by_repo.get(&repo.id) else {
+                continue;
+            };
+            total_pages = total_pages.max(page.total_pages);
+            for item in &page.items {
                 if seen.insert(item.url.clone()) {
                     items.push(item.clone());
                 }
@@ -7474,6 +7505,11 @@ impl AppState {
                 .then_with(|| left.url.cmp(&right.url))
         });
         self.task_items = items;
+        self.task_total_pages = total_pages;
+        let page_was_clamped = self.task_current_page >= self.task_total_pages;
+        if page_was_clamped {
+            self.task_current_page = self.task_total_pages.saturating_sub(1);
+        }
         self.task_items_loading = false;
         self.task_items_op = None;
         self.task_items_error = if self.task_items.is_empty() && !self.task_item_errors.is_empty() {
@@ -7489,6 +7525,7 @@ impl AppState {
         } else {
             None
         };
+        page_was_clamped
     }
 
     fn request_remote_provider_accounts(&mut self) -> iced::Task<Message> {
@@ -19281,7 +19318,7 @@ impl AppState {
                 self.activity_open = false;
                 self.tasks_open = true;
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(false),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19307,7 +19344,7 @@ impl AppState {
                         self.task_preset.query(kind).to_string()
                     };
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19320,7 +19357,7 @@ impl AppState {
                     String::new()
                 };
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19335,7 +19372,7 @@ impl AppState {
                     String::new()
                 };
                 match provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19364,7 +19401,7 @@ impl AppState {
                 );
                 self.persist();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19374,19 +19411,21 @@ impl AppState {
                 self.ui_settings.default_repo_selection = None;
                 self.persist();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
             }
             Message::TaskQueryChanged(query) => {
                 self.task_query = query;
+                self.task_current_page = 0;
+                self.task_total_pages = 1;
                 iced::Task::none()
             }
             Message::TaskQueryCleared => {
                 self.task_query.clear();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19474,10 +19513,22 @@ impl AppState {
                 iced::Task::none()
             }
             Message::TaskRefreshRequested => match self.task_provider {
-                TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(false),
                 TaskProvider::Jira => self.request_jira_issues(),
                 TaskProvider::Linear => self.request_linear_issues(),
             },
+            Message::TaskPageRequested(page) => {
+                if self.task_provider != TaskProvider::Github
+                    || self.task_kind == TaskKind::Projects
+                    || self.task_items_loading
+                    || page >= self.task_total_pages
+                    || page == self.task_current_page
+                {
+                    return iced::Task::none();
+                }
+                self.task_current_page = page;
+                self.request_task_items(false)
+            }
             Message::TaskItemsLoaded {
                 op,
                 repo_id,
@@ -19496,8 +19547,8 @@ impl AppState {
                             self.task_item_errors.insert(repo_id, error);
                         }
                     }
-                    if self.task_items_pending.is_empty() {
-                        self.finish_task_item_batch();
+                    if self.task_items_pending.is_empty() && self.finish_task_item_batch() {
+                        return self.request_task_items(false);
                     }
                 }
                 iced::Task::none()
@@ -27289,20 +27340,54 @@ mod tests {
             op: OpId(77),
             repo_id: first.id.clone(),
             kind: TaskKind::Issues,
-            result: Ok(vec![duplicate.clone()]),
+            result: Ok(crate::tasks::TaskPageResult {
+                items: vec![duplicate.clone()],
+                total_pages: 3,
+            }),
         });
         assert!(state.task_items_loading);
         let _ = state.update(Message::TaskItemsLoaded {
             op: OpId(77),
             repo_id: second.id,
             kind: TaskKind::Issues,
-            result: Ok(vec![duplicate, newer.clone()]),
+            result: Ok(crate::tasks::TaskPageResult {
+                items: vec![duplicate, newer.clone()],
+                total_pages: 5,
+            }),
         });
 
         assert!(!state.task_items_loading);
         assert_eq!(state.task_items.len(), 2);
         assert_eq!(state.task_items[0].url, newer.url);
         assert_eq!(state.task_items_op, None);
+        assert_eq!(state.task_total_pages, 5);
+    }
+
+    #[test]
+    fn github_task_pagination_preserves_refreshes_and_resets_for_query_changes() {
+        let mut state = AppState::default();
+        let repo = some_repo("tasks-pagination");
+        state.upsert_repo(repo.clone());
+        state.task_repo_selection.insert(repo.id);
+        state.task_provider = TaskProvider::Github;
+        state.task_kind = TaskKind::Issues;
+        state.task_current_page = 2;
+        state.task_total_pages = 5;
+
+        let _ = state.update(Message::TaskRefreshRequested);
+        assert_eq!(state.task_current_page, 2);
+
+        // Complete the synthetic in-flight request before exercising a page
+        // click; the task itself is deliberately not polled by this reducer test.
+        state.task_items_loading = false;
+        state.task_items_op = None;
+        state.task_items_pending.clear();
+        let _ = state.update(Message::TaskPageRequested(3));
+        assert_eq!(state.task_current_page, 3);
+
+        let _ = state.update(Message::TaskQueryChanged("label:bug".to_string()));
+        assert_eq!(state.task_current_page, 0);
+        assert_eq!(state.task_total_pages, 1);
     }
 
     #[test]

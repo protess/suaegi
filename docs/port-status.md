@@ -32,6 +32,10 @@ by tests or live-app QA.
   confirm-gated merge. Integrations settings run the real `gh`/`glab`
   preflights and distinguish connected, missing, unauthenticated, and outdated
   CLI states, with install guidance and an explicit re-check action.
+- GitHub Tasks uses numbered Search API pages instead of truncating every
+  project at the first 100 items. Page counts are capped at GitHub's reachable
+  1,000-result window, multi-project counts use the longest project, manual
+  refreshes retain the active page, and query/scope changes reset to page one.
 - Linear and Jira read/link UI, with secrets kept outside the JSON state.
 - Safe filesystem backend: containment, symlink policy, directory listing,
   ignore/status queries, bounded reads, stale-write protection and external
