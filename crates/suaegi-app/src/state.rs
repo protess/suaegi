@@ -1773,11 +1773,21 @@ pub enum Message {
         generation: u64,
         snapshot: TerminalSnapshot,
     },
+    SnapshotFailed {
+        id: SessionId,
+        generation: u64,
+        error: String,
+    },
     /// `SessionStore::request_presence`의 완료.
     PresenceReady {
         id: SessionId,
         generation: u64,
         presence: AgentPresence,
+    },
+    PresenceFailed {
+        id: SessionId,
+        generation: u64,
+        error: String,
     },
     /// `presence_poll::subscription`의 티어링된 타이머 틱. 그 자체로는 화면을
     /// 갱신하지 않는다 — in-flight가 아닌 세션마다 `request_presence`를 내는
@@ -20998,6 +21008,15 @@ impl AppState {
                 .session_store
                 .apply_snapshot(id, generation, snapshot)
                 .unwrap_or_else(iced::Task::none),
+            Message::SnapshotFailed {
+                id,
+                generation,
+                error,
+            } => {
+                eprintln!("terminal snapshot failed (session {}): {error}", id.0);
+                self.session_store.snapshot_failed(id, generation);
+                iced::Task::none()
+            }
             Message::PaneClicked(pane) => self.focus_pane(pane),
 
             Message::Terminal { id, command } => self.dispatch_term_command(id, command),
@@ -21227,6 +21246,15 @@ impl AppState {
                             Some(format!("Could not hibernate the completed agent: {error}"));
                     }
                 }
+                iced::Task::none()
+            }
+            Message::PresenceFailed {
+                id,
+                generation,
+                error,
+            } => {
+                eprintln!("terminal presence probe failed (session {}): {error}", id.0);
+                self.session_store.presence_failed(id, generation);
                 iced::Task::none()
             }
 

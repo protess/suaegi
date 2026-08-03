@@ -178,6 +178,38 @@ fn an_own_result_that_arrives_stale_still_releases_its_guard() {
 }
 
 #[test]
+fn a_snapshot_worker_failure_releases_only_its_own_guard() {
+    let mut store = SessionStore::for_test();
+    let id = store.start_for_test(platform::echo("x"));
+    assert!(store.request_snapshot(id, 5).0);
+
+    store.snapshot_failed(id, 4);
+    assert!(
+        !store.request_snapshot(id, 6).0,
+        "a stale failure must not release generation 5"
+    );
+    store.snapshot_failed(id, 5);
+    assert!(
+        store.request_snapshot(id, 6).0,
+        "the owning failure must release the snapshot guard"
+    );
+}
+
+#[test]
+fn a_presence_worker_failure_allows_the_next_poll_to_retry() {
+    let mut store = SessionStore::for_test();
+    let id = store.start_for_test(platform::sleep_seconds(30));
+    assert!(store.request_presence(id, 1).0);
+    assert!(!store.request_presence(id, 2).0);
+
+    store.presence_failed(id, 1);
+    assert!(
+        store.request_presence(id, 2).0,
+        "a failed probe must not leave presence polling permanently in flight"
+    );
+}
+
+#[test]
 fn output_arriving_during_a_snapshot_is_not_lost() {
     // 스냅샷이 도는 동안 generation이 올라가면 구독은 그 세대를 이미 알린 뒤라
     // 다시 알리지 않는다. 완료 시점에 다시 요청하지 않으면 그 출력은 영영
