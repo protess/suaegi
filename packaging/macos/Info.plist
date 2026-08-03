@@ -24,10 +24,16 @@
     <false/>
     <key>LSUIElement</key>
     <false/>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Suaegi uses Apple Events only when you ask it to control another Mac app.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Suaegi uses the microphone only while voice dictation is active.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Suaegi captures the screen only when you run a computer-use action.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
