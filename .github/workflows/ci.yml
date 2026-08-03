@@ -32,6 +32,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install ripgrep search backend
+        run: brew install ripgrep
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2.85.7
         with:
