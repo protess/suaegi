@@ -490,6 +490,7 @@ fn window_focus_message(
         iced::Event::Window(iced::window::Event::Resized(size)) => {
             Some(Message::AppWindowResized(size))
         }
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClose),
         iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
             Some(Message::FloatingWorkspacePointerMoved(position))
         }
@@ -2279,6 +2280,7 @@ pub fn run() -> iced::Result {
         .centered()
         .decorations(false)
         .transparent(true)
+        .exit_on_close_request(false)
         .run()
         .inspect(|_| drop(local_rpc_server))
 }

@@ -1072,6 +1072,7 @@ pub enum Message {
     LocalRpcRequested(crate::local_rpc::LocalRpcRequest),
     // ---- Native window chrome (Orca-style inset title bar) ----
     WindowClose,
+    WindowShutdownFinished,
     WindowMinimize,
     WindowMaximize,
     WindowDrag,
@@ -2389,6 +2390,9 @@ pub struct AppState {
     /// `persist()`는 조용히 아무것도 하지 않는다. 실 앱 경로에서는 `boot()`이
     /// 항상 `Some`을 채운다.
     persistence: Option<PersistenceHandle>,
+    /// The first close request owns the final persistence barrier. Repeated
+    /// native/custom close events must not enqueue competing final writes.
+    shutdown_started: bool,
 
     // ---- Task 6: 세션 생명주기 + 워크벤치 배선 ----
     session_store: SessionStore,
@@ -2875,6 +2879,7 @@ impl Default for AppState {
             load_origin: LoadOrigin::Fresh,
             last_save_status: None,
             persistence: None,
+            shutdown_started: false,
             session_store: SessionStore::new(),
             panes: None,
             focused_pane: None,
@@ -19840,7 +19845,31 @@ impl AppState {
                 self.automation_ui.open(self.selected_worktree.clone());
                 iced::Task::none()
             }
-            Message::WindowClose => iced::window::latest()
+            Message::WindowClose => {
+                if self.shutdown_started {
+                    iced::Task::none()
+                } else {
+                    self.shutdown_started = true;
+                    let final_snapshot = self.persisted_snapshot();
+                    let completion = self
+                        .persistence
+                        .as_mut()
+                        .and_then(|persistence| persistence.begin_shutdown(final_snapshot));
+                    match completion {
+                        Some(completion) => {
+                            crate::background::blocking(move |mut sender| {
+                                // Match Orca's bounded teardown window. The wait
+                                // happens off the UI thread, so the window stays
+                                // repaintable and Force Quit remains effective.
+                                let _ = completion.recv_timeout(Duration::from_secs(20));
+                                let _ = sender.try_send(Message::WindowShutdownFinished);
+                            })
+                        }
+                        None => self.update(Message::WindowShutdownFinished),
+                    }
+                }
+            }
+            Message::WindowShutdownFinished => iced::window::latest()
                 .then(|id| id.map_or_else(iced::Task::none, iced::window::close)),
             Message::WindowMinimize => iced::window::latest()
                 .then(|id| id.map_or_else(iced::Task::none, |id| iced::window::minimize(id, true))),

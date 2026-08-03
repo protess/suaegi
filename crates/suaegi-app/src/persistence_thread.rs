@@ -17,6 +17,11 @@ enum Request {
         state: Box<PersistedState>,
     },
     OverrideFutureSchemaGuard,
+    Shutdown {
+        seq: u64,
+        state: Box<PersistedState>,
+        completed: std_mpsc::Sender<()>,
+    },
 }
 
 /// 앱 데이터 파일의 기본 위치. OS별 config 디렉터리(macOS:
@@ -145,6 +150,26 @@ impl PersistenceHandle {
                         Ok(Request::OverrideFutureSchemaGuard) => {
                             store.override_future_schema_guard()
                         }
+                        Ok(Request::Shutdown {
+                            seq,
+                            state,
+                            completed,
+                        }) => {
+                            if let Some((old_seq, _)) = pending.take() {
+                                let _ = worker_res_tx.unbounded_send(SaveReport {
+                                    seq: old_seq,
+                                    status: SaveStatus::Superseded { by: seq },
+                                });
+                            }
+                            let status = match store.save(&state) {
+                                Ok(SaveOutcome::Written) => SaveStatus::Written,
+                                Ok(SaveOutcome::SkippedUnchanged) => SaveStatus::SkippedUnchanged,
+                                Err(error) => SaveStatus::Failed(error.to_string()),
+                            };
+                            let _ = worker_res_tx.unbounded_send(SaveReport { seq, status });
+                            let _ = completed.send(());
+                            break;
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             if let Some((seq, state)) = pending.take() {
                                 let status = match store.save(&state) {
@@ -219,13 +244,51 @@ impl PersistenceHandle {
             let _ = tx.send(Request::OverrideFutureSchemaGuard);
         }
     }
+
+    /// Queue the final snapshot and retire this writer. Waiting on the returned
+    /// receiver is intentionally left to a background thread: durable file
+    /// syscalls can stall indefinitely on a disconnected/network-mounted
+    /// profile directory and must never park the native UI thread.
+    pub fn begin_shutdown(&mut self, state: PersistedState) -> Option<std_mpsc::Receiver<()>> {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let (completed_tx, completed_rx) = std_mpsc::channel();
+        let sent = self.tx.as_ref().is_some_and(|tx| {
+            tx.send(Request::Shutdown {
+                seq,
+                state: Box::new(state),
+                completed: completed_tx,
+            })
+            .is_ok()
+        });
+        self.tx.take();
+        if sent {
+            Some(completed_rx)
+        } else {
+            let _ = self.results.unbounded_send(SaveReport {
+                seq,
+                status: SaveStatus::Failed("persistence worker is gone".to_string()),
+            });
+            None
+        }
+    }
 }
 
 impl Drop for PersistenceHandle {
     fn drop(&mut self) {
         self.tx.take(); // 워커가 Disconnected를 보게 한다
-        if let Some(t) = self.thread.take() {
-            let _ = t.join(); // flush 대기 — 저장 하나는 수십 ms
+        #[cfg(not(test))]
+        {
+            // Never join from Drop. AppState performs a bounded, asynchronous
+            // shutdown; an unexpected drop must still leave the process responsive
+            // if the worker is stuck inside a durable filesystem syscall.
+            self.thread.take();
+        }
+        // State unit tests intentionally use handle drop as their deterministic
+        // flush seam. Keep that test-only contract without shipping the
+        // blocking destructor path in the app binary.
+        #[cfg(test)]
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
