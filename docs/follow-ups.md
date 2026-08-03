@@ -63,7 +63,7 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
    Darwin의 `openpty`가 프로세스를 넘나들며 경쟁하므로(자세한 건 `55c4abd`) 프로세스 내부
    조치로는 못 막는다. `.config/nextest.toml`은 macOS의 `suaegi-term`과 실제 세션을 여는
    `suaegi-app` 테스트를 공용 `darwin-pty` 그룹(max-threads=1)에 넣었다. 전체 동시성도 4로
-   제한했고, 동일 설정의 전체 실행에서 3795개가 통과하고 6개 opt-in 테스트만 건너뛰었다.
+   제한했고, 동일 설정의 최종 전체 실행에서 3797개가 통과하고 6개 opt-in 테스트만 건너뛰었다.
 
 4c. **`suaegi-git` 테스트는 개발자의 전역 gitignore를 읽는다 — 고쳤지만 함정을 기록해 둔다.**
    Plan 5에서 발견: git이 파일을 **나열하는지**에 의존하는 테스트는 그 개발자의
@@ -191,7 +191,7 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
     플레이키하다**~~ (`crates/suaegi-term/tests/session_test.rs`) → CI를 libtest 바이너리
     단위 병렬 실행에서 nextest의 테스트별 프로세스 실행으로 바꿨다. 이 테스트가 읽는
     프로세스 RSS에는 이제 같은 바이너리의 다른 테스트 할당이 섞이지 않는다. 전역 동시성
-    4와 Darwin PTY 직렬 그룹을 적용한 전체 3795개 실행에서 RSS 회귀 테스트도 통과했다.
+    4와 Darwin PTY 직렬 그룹을 적용한 전체 3797개 실행에서 RSS 회귀 테스트도 통과했다.
 
 ## PR4 적대적 리뷰에서 넘긴 것 (이어서)
 
@@ -330,16 +330,12 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     `~/Library/Application Support/suaegi/data.json`)과 기본 worktree 루트
     `~/suaegi-workspaces`가 서로 다른 위치임을 명시했다.
 
-19. **Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**
-    담당 에이전트는 마우스/키보드로 앱 창을 직접 조작할 수 있는 수단이 없었고
-    (합성 클릭은 이 플랜의 좌표 계산이 멀티 모니터 환경에서 엉뚱한 창을 때린
-    전례가 있어 명시적으로 금지돼 있다), 그래서 실제로 확인한 건 앱이
-    뜨는지·부팅 시 repo/worktree가 복원되는지(데이터 파일을 직접 심어
-    재현)뿐이다. **사람이 직접 확인해야 할 것**: worktree 생성 버튼 클릭 →
-    실제 세션이 셸 출력을 보여주는지, 두 번째 worktree로 분할했을 때 양쪽이
-    독립적으로 도는지, worktree 여러 개를 빠르게 닫아도 UI가 멈추지 않는지
-    (reaper 검증 — `SessionStore`의 각 로직은 단위 테스트로 실측했지만 실제
-    `pane_grid` UI에서 연타했을 때의 체감은 다른 문제다).
+19. ~~**Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**~~ →
+    최신 ad-hoc signed macOS 앱을 실제 창으로 검증했다. 복원된 세 worktree PTY가 각자 셸/
+    Claude 출력을 유지했고, 같은 worktree의 새 split 두 쪽에 서로 다른 표식을 보냈을 때
+    각각 자기 출력만 받았다. 테스트용 터미널 세 개를 연속 닫아도 UI와 RPC가 즉시 응답했다.
+    네이티브 빨간 닫기 버튼으로 종료한 뒤 재실행하자 활성 `test-a`, 사용자 작업공간 순서
+    `main → agent-test → test-a → test-b`, 기존 PTY 출력과 Claude 세션이 모두 복원됐다.
 
 ## Plan 3 최종 리뷰에서 넘긴 것
 
