@@ -1,4 +1,4 @@
-use crate::domain::{PersistedState, SCHEMA_VERSION};
+use crate::domain::{PersistedPane, PersistedState, SCHEMA_VERSION};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -14,6 +14,10 @@ pub enum PersistenceError {
     Serialize(#[from] serde_json::Error),
     #[error("data file was written by a newer app version; saving is blocked")]
     FutureSchemaGuard,
+    #[error(
+        "terminal layout is too deeply nested to save safely (maximum depth: {MAX_PERSISTED_PANE_DEPTH})"
+    )]
+    LayoutTooDeep,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +42,25 @@ pub struct LoadOutcome {
 /// 백업 슬롯 개수. `Store` 밖에서 존재 여부를 확인할 때(예: suaegi-app의
 /// LoadOrigin 판별)도 같은 개수를 알아야 하므로 public.
 pub const BACKUP_SLOTS: usize = 5;
+
+/// serde_json's reader rejects documents near its recursion limit while its
+/// writer has no matching guard. Keep ample headroom for the enum/object
+/// wrappers around every split so anything we write remains readable.
+pub const MAX_PERSISTED_PANE_DEPTH: usize = 48;
+
+fn pane_layout_exceeds_safe_depth(root: &PersistedPane) -> bool {
+    let mut stack = vec![(root, 1_usize)];
+    while let Some((pane, depth)) = stack.pop() {
+        if depth > MAX_PERSISTED_PANE_DEPTH {
+            return true;
+        }
+        if let PersistedPane::Split { a, b, .. } = pane {
+            stack.push((a, depth + 1));
+            stack.push((b, depth + 1));
+        }
+    }
+    false
+}
 
 pub struct Store {
     data_file: PathBuf,
@@ -186,6 +209,14 @@ impl Store {
         if self.future_schema_guard {
             return Err(PersistenceError::FutureSchemaGuard);
         }
+        if state
+            .session
+            .panes
+            .as_ref()
+            .is_some_and(pane_layout_exceeds_safe_depth)
+        {
+            return Err(PersistenceError::LayoutTooDeep);
+        }
         let json = serde_json::to_string_pretty(state)?;
         let hash = content_hash(&json);
         if self.last_written_hash == Some(hash) {
@@ -226,6 +257,22 @@ mod tests {
         s
     }
 
+    fn layout_at_depth(depth: usize) -> PersistedPane {
+        assert!(depth > 0);
+        let mut pane = PersistedPane::Leaf(WorktreeId("/tmp/layout/root".into()));
+        for level in 1..depth {
+            pane = PersistedPane::Split {
+                axis: PersistedAxis::Horizontal,
+                ratio: 0.5,
+                a: Box::new(pane),
+                b: Box::new(PersistedPane::Leaf(WorktreeId(format!(
+                    "/tmp/layout/{level}"
+                )))),
+            };
+        }
+        pane
+    }
+
     #[test]
     fn save_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -235,6 +282,40 @@ mod tests {
         let loaded = store.load();
         assert_eq!(loaded.state, state);
         assert_eq!(loaded.source, LoadSource::MainFile);
+    }
+
+    #[test]
+    fn the_maximum_safe_layout_depth_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut store = Store::new(file.clone());
+        let mut state = sample_state("depth-boundary");
+        state.session.panes = Some(layout_at_depth(MAX_PERSISTED_PANE_DEPTH));
+
+        assert_eq!(store.save(&state).unwrap(), SaveOutcome::Written);
+        assert_eq!(Store::new(file).load().state, state);
+    }
+
+    #[test]
+    fn an_unsafe_layout_depth_is_rejected_before_touching_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let original = sample_state("safe-original");
+        let mut store = Store::new(file.clone());
+        store.save(&original).unwrap();
+        let original_json = std::fs::read_to_string(&file).unwrap();
+
+        let mut too_deep = sample_state("unsafe-replacement");
+        too_deep.session.panes = Some(layout_at_depth(MAX_PERSISTED_PANE_DEPTH + 1));
+        assert!(matches!(
+            store.save(&too_deep),
+            Err(PersistenceError::LayoutTooDeep)
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original_json);
+        assert!(
+            !Store::backup_path(&file, 0).exists(),
+            "validation must run before backup rotation"
+        );
     }
 
     #[test]
