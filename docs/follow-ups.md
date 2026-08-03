@@ -218,7 +218,13 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
 
 ## PR4 적대적 리뷰에서 넘긴 것 (이어서)
 
-27. **in-flight 가드가 unwind에 안전하지 않다 — 네 곳 전부에 대한 결정이 필요하다.**
+27. ~~**in-flight 가드가 unwind에 안전하지 않다 — 네 곳 전부에 대한 결정이 필요하다.**~~
+    → presence/snapshot/resize/extract 네 워커를 공통 panic→completion 경계로 함께
+    처리했다. `TerminalSession::resize_lock`도 poison을 회수하도록 바꿔 한 번의 패닉 뒤
+    이후 resize가 연쇄 실패하지 않는다. 가드별 실패 해제와 poison 복구를 회귀 테스트로
+    고정했다.
+
+    기존 조사:
     (21번과 같은 뿌리이고, Plan 4가 같은 모양을 두 개 더 늘렸다.)
 
     `TerminalSession::resize_lock`이 **`std::sync::Mutex`**이고 `.expect("resize mutex poisoned")`로
@@ -399,7 +405,13 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
 
 ## PR4 적대적 리뷰에서 넘긴 것
 
-21. **백그라운드 클로저 안의 임의 패닉은 여전히 가드를 영영 못 푼다.**
+21. ~~**백그라운드 클로저 안의 임의 패닉은 여전히 가드를 영영 못 푼다.**~~ →
+    네 워커 경로를 공통 `catch_unwind` 경계로 감쌌고 패닉도 완료 메시지로 바꿨다.
+    스냅샷 실패는 같은 generation만, presence 실패는 직렬 bool 가드를, resize 실패는
+    기존 `ResizeApplied(Err)` 경로를, selection 실패는 조용한 `None` 완료를 사용한다.
+    따라서 다음 dirty/tick/resize/copy 요청이 다시 진행된다.
+
+    기존 조사:
     (`crates/suaegi-app/src/session_store.rs`) 이번 리뷰에서 `probe_with`의
     poisoned-mutex `expect`는 락을 회수하는 쪽으로 고쳤다(패닉 원인 하나
     제거) — 하지만 `request_presence_with`/`request_snapshot`의 백그라운드

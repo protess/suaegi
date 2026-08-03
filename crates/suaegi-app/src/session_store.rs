@@ -12,6 +12,7 @@
 //! 스레드에서 떨어뜨린다.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -547,12 +548,19 @@ impl SessionStore {
         slot.snapshot_in_flight = Some(generation);
         let session = Arc::clone(&slot.session);
         let task = background::blocking(move |mut sender| {
-            let snapshot = session.snapshot();
-            let _ = sender.try_send(Message::SnapshotReady {
-                id,
-                generation,
-                snapshot,
-            });
+            let message = match guarded_background("terminal snapshot", || session.snapshot()) {
+                Ok(snapshot) => Message::SnapshotReady {
+                    id,
+                    generation,
+                    snapshot,
+                },
+                Err(error) => Message::SnapshotFailed {
+                    id,
+                    generation,
+                    error,
+                },
+            };
+            let _ = sender.try_send(message);
         });
         (true, task)
     }
@@ -617,15 +625,33 @@ impl SessionStore {
         .then(move |()| {
             let session = Arc::clone(&session);
             background::blocking(move |mut sender| {
-                let snapshot = session.snapshot();
-                let _ = sender.try_send(Message::SnapshotReady {
-                    id,
-                    generation: current_generation,
-                    snapshot,
-                });
+                let message = match guarded_background("terminal snapshot", || session.snapshot()) {
+                    Ok(snapshot) => Message::SnapshotReady {
+                        id,
+                        generation: current_generation,
+                        snapshot,
+                    },
+                    Err(error) => Message::SnapshotFailed {
+                        id,
+                        generation: current_generation,
+                        error,
+                    },
+                };
+                let _ = sender.try_send(message);
             })
         });
         Some(task)
+    }
+
+    /// Release only the generation owned by a panicking snapshot worker. A
+    /// stale failure cannot unlock a newer request.
+    pub fn snapshot_failed(&mut self, id: SessionId, generation: u64) {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return;
+        };
+        if slot.snapshot_in_flight == Some(generation) {
+            slot.snapshot_in_flight = None;
+        }
     }
 
     pub fn request_presence(&mut self, id: SessionId, generation: u64) -> (bool, Task<Message>) {
@@ -659,12 +685,21 @@ impl SessionStore {
         let session = Arc::clone(&slot.session);
         let monitor = Arc::clone(&slot.monitor);
         let task = background::blocking(move |mut sender| {
-            let presence = Self::probe_with(&session, &monitor, probe.as_ref());
-            let _ = sender.try_send(Message::PresenceReady {
-                id,
-                generation,
-                presence,
-            });
+            let message = match guarded_background("terminal presence probe", || {
+                Self::probe_with(&session, &monitor, probe.as_ref())
+            }) {
+                Ok(presence) => Message::PresenceReady {
+                    id,
+                    generation,
+                    presence,
+                },
+                Err(error) => Message::PresenceFailed {
+                    id,
+                    generation,
+                    error,
+                },
+            };
+            let _ = sender.try_send(message);
         });
         (true, task)
     }
@@ -704,6 +739,14 @@ impl SessionStore {
         if generation >= slot.presence_generation {
             slot.presence = presence;
             slot.presence_generation = generation;
+        }
+    }
+
+    pub fn presence_failed(&mut self, id: SessionId, _generation: u64) {
+        if let Some(slot) = self.slots.get_mut(&id) {
+            // Presence requests are strictly serial, so the only worker able
+            // to report a failure owns this boolean guard.
+            slot.presence_in_flight = false;
         }
     }
 
@@ -915,7 +958,8 @@ fn resize_task(
     seq: u64,
 ) -> Task<Message> {
     background::blocking(move |mut sender| {
-        let result = session.resize(rows, cols).map_err(|e| e.to_string());
+        let result = guarded_background("terminal resize", || session.resize(rows, cols))
+            .and_then(|result| result.map_err(|error| error.to_string()));
         let _ = sender.try_send(Message::ResizeApplied { id, seq, result });
     })
 }
@@ -928,12 +972,32 @@ fn extract_task(
     request: CopyRequest,
 ) -> Task<Message> {
     background::blocking(move |mut sender| {
-        let text = session.extract_selection(request.epoch);
+        let text = guarded_background("terminal selection extraction", || {
+            session.extract_selection(request.epoch)
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("{error} (session {})", id.0);
+            None
+        });
         let _ = sender.try_send(Message::SelectionExtracted {
             id,
             targets: request.to,
             text,
         });
+    })
+}
+
+/// Convert arbitrary worker panics into ordinary completion errors. The
+/// sender remains alive after unwinding is caught, so every in-flight guard
+/// receives a terminal message and can be released.
+fn guarded_background<T>(operation: &'static str, work: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(work)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        format!("{operation} panicked: {detail}")
     })
 }
 
@@ -1095,6 +1159,21 @@ impl SessionStore {
 #[cfg(test)]
 mod resize_coalescer_tests {
     use super::*;
+
+    #[test]
+    fn background_panics_become_completion_errors() {
+        let error = guarded_background("synthetic worker", || -> () {
+            panic!("boom");
+        })
+        .expect_err("the panic must be contained");
+        assert!(error.contains("synthetic worker"));
+        assert!(error.contains("boom"));
+        assert_eq!(
+            guarded_background("healthy worker", || 42).unwrap(),
+            42,
+            "catching one panic must not affect later workers"
+        );
+    }
 
     /// 워커가 도는 동안 아무것도 안 오면 그대로 끝난다.
     #[test]

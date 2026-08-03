@@ -475,7 +475,10 @@ impl TerminalSession {
         }
         // pty.resize와 grid.resize를 한 쌍으로 직렬화한다 — 동시 호출이
         // 인터리브되면 둘이 서로 다른 크기로 어긋난 채 남을 수 있다.
-        let _guard = self.resize_lock.lock().expect("resize mutex poisoned");
+        let _guard = self
+            .resize_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.backend.resize(rows, cols)?;
         self.grid.resize(GridSize {
             rows: rows as usize,
@@ -761,5 +764,29 @@ mod tests {
             "should return shortly after the thread finishes, not wait out the full \
              deadline, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_poisoned_resize_mutex_can_be_recovered() {
+        let mutex = Arc::new(Mutex::new(()));
+        let worker_mutex = Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = worker_mutex.lock().unwrap();
+            panic!("synthetic resize failure");
+        })
+        .join();
+        assert!(mutex.is_poisoned());
+
+        let recovered = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(recovered);
+        match mutex.try_lock() {
+            Ok(guard) => drop(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                panic!("recovering poison must not leave the resize lock held")
+            }
+        };
     }
 }
