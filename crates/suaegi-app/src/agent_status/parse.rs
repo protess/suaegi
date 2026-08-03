@@ -231,13 +231,17 @@ pub fn parse_hook(pane: &str, nonce: &str, body: &[u8]) -> Result<HookEvent, Par
         .and_then(event_name)
         .ok_or(ParseError::EventName)?;
 
-    // **없으면 `None`이다. `Some(true)`가 아니다.** `Stop`에서는 항상 있지만
-    // `StopFailure`에는 **구조적으로 없다**(실측 §1.6.2) — 그래서 리듀서가
-    // `HookEventName`으로 분기한다. 여기서는 있는 그대로만 옮긴다.
-    let background_tasks_empty = obj
+    // Unknown/malformed/non-terminal inventory entries fail active. Claude may
+    // retain completed tasks in this array, so array emptiness alone is not a
+    // running-work signal.
+    let background_work_active = obj
         .get("background_tasks")
         .and_then(|v| v.as_array())
-        .map(|a| a.is_empty());
+        .map(|tasks| tasks.iter().any(background_task_is_active));
+    let session_crons_active = obj
+        .get("session_crons")
+        .and_then(|v| v.as_array())
+        .map(|crons| !crons.is_empty());
 
     Ok(HookEvent {
         pane_key: PaneKey(WorktreeId(pane_key)),
@@ -260,8 +264,48 @@ pub fn parse_hook(pane: &str, nonce: &str, body: &[u8]) -> Result<HookEvent, Par
                 let bounded: String = prompt.chars().take(512).collect();
                 (!bounded.trim().is_empty()).then_some(bounded)
             }),
-        background_tasks_empty,
+        background_work_active,
+        session_crons_active,
+        interrupted: obj.get("is_interrupt").and_then(|v| v.as_bool()) == Some(true),
     })
+}
+
+fn background_task_is_active(value: &serde_json::Value) -> bool {
+    const TERMINAL_STATUSES: &[&str] = &[
+        "idle",
+        "done",
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+        "finished",
+        "failed",
+        "error",
+        "terminated",
+        "exited",
+        "aborted",
+        "expired",
+        "skipped",
+        "crashed",
+        "killed",
+        "cancelled",
+        "canceled",
+        "timed_out",
+    ];
+    let Some(object) = value.as_object() else {
+        return true;
+    };
+    let Some(status) = object
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    else {
+        return true;
+    };
+    !TERMINAL_STATUSES
+        .iter()
+        .any(|terminal| status.eq_ignore_ascii_case(terminal))
 }
 
 /// 우리가 **등록한** 이름만 받는다. 모르는 이름은 거절이다 — 훅 스크립트는 우리가
@@ -400,14 +444,15 @@ mod tests {
         );
         assert_eq!(running.event, HookEventName::Stop);
         assert_eq!(
-            running.background_tasks_empty,
-            Some(false),
-            "비지 않은 background_tasks를 비었다고 읽으면 배지가 일찍 done이 된다"
+            running.background_work_active,
+            Some(true),
+            "running background task를 놓치면 배지가 일찍 done이 된다"
         );
+        assert_eq!(running.session_crons_active, Some(false));
 
         // §1.6.6 ② — 진짜 끝
         let done = p(r#"{"session_id":"s","hook_event_name":"Stop","background_tasks":[]}"#);
-        assert_eq!(done.background_tasks_empty, Some(true));
+        assert_eq!(done.background_work_active, Some(false));
 
         // §1.6.2 — StopFailure엔 background_tasks가 **구조적으로 없다**
         let sf = p(
@@ -416,7 +461,7 @@ mod tests {
         );
         assert_eq!(sf.event, HookEventName::StopFailure);
         assert_eq!(
-            sf.background_tasks_empty, None,
+            sf.background_work_active, None,
             "StopFailure에 없는 필드를 Some으로 합성하면 안 된다"
         );
 
@@ -433,6 +478,32 @@ mod tests {
             "agent_id":"a22e0af17822ae8e3","agent_type":"","background_tasks":[]}"#);
         assert_eq!(ss.event, HookEventName::SubagentStop);
         assert_eq!(ss.agent_id.as_deref(), Some("a22e0af17822ae8e3"));
+    }
+
+    #[test]
+    fn background_inventory_distinguishes_terminal_unknown_and_interrupted_work() {
+        let pane = encode_pane_key(&PaneKey(WorktreeId("/tmp/ws/demo".into())));
+        let parse = |body: &str| parse_hook(&pane, "3", body.as_bytes()).unwrap();
+
+        let terminal = parse(
+            r#"{"session_id":"s","hook_event_name":"Stop","background_tasks":[
+                {"id":"one","type":"shell","status":"completed"},
+                {"id":"two","type":"subagent","status":"failed"}
+            ],"session_crons":[]}"#,
+        );
+        assert_eq!(terminal.background_work_active, Some(false));
+
+        let unknown = parse(
+            r#"{"session_id":"s","hook_event_name":"Stop","background_tasks":[
+                {"id":"future","type":"future-kind","status":"new-state"}
+            ],"session_crons":[{"id":"cron"}]}"#,
+        );
+        assert_eq!(unknown.background_work_active, Some(true));
+        assert_eq!(unknown.session_crons_active, Some(true));
+
+        let interrupted =
+            parse(r#"{"session_id":"s","hook_event_name":"StopFailure","is_interrupt":true}"#);
+        assert!(interrupted.interrupted);
     }
 
     /// 리드/서브 구별은 **`agent_id` 키의 유무**다(실측 §1.4.2).

@@ -18,6 +18,7 @@ use iced::advanced::renderer::Quad;
 use iced::advanced::{mouse, renderer, text};
 use iced::alignment;
 use iced::{Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, Theme};
+use unicode_width::UnicodeWidthStr;
 
 use suaegi_term::grid::{SnapshotCell, TerminalSnapshot, ViewportSelection};
 
@@ -517,6 +518,123 @@ fn draw_grid<Renderer>(
             );
         }
     }
+
+    if state.focused {
+        if let (Some(cursor), Some(content)) = (snapshot.cursor, state.ime_preedit.as_deref()) {
+            draw_preedit(
+                renderer,
+                content,
+                cursor.row,
+                cursor.col,
+                cols,
+                bounds,
+                clip,
+                metrics,
+                font,
+                text_size,
+                p,
+                pane_opacity,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PreeditLayout {
+    bounds: Rectangle,
+    tail_aligned: bool,
+}
+
+fn preedit_layout(
+    content: &str,
+    row: usize,
+    col: usize,
+    cols: usize,
+    bounds: Rectangle,
+    metrics: CellMetrics,
+) -> Option<PreeditLayout> {
+    if content.is_empty() || col >= cols {
+        return None;
+    }
+    let available = cols - col;
+    let content_cols = UnicodeWidthStr::width(content).max(1);
+    let visible_cols = content_cols.min(available);
+    Some(PreeditLayout {
+        bounds: Rectangle {
+            x: bounds.x + col as f32 * metrics.width(),
+            y: bounds.y + row as f32 * metrics.height(),
+            width: visible_cols as f32 * metrics.width(),
+            height: metrics.height(),
+        },
+        // Xterm's composition view follows the end of a long composition. Right
+        // alignment provides the same behavior while the terminal layer clips it.
+        tail_aligned: content_cols > available,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_preedit<Renderer>(
+    renderer: &mut Renderer,
+    content: &str,
+    row: usize,
+    col: usize,
+    cols: usize,
+    bounds: Rectangle,
+    clip: Rectangle,
+    metrics: CellMetrics,
+    font: Font,
+    text_size: Pixels,
+    p: &Palette,
+    pane_opacity: f32,
+) where
+    Renderer: text::Renderer<Font = Font>,
+{
+    let Some(layout) = preedit_layout(content, row, col, cols, bounds, metrics) else {
+        return;
+    };
+    let Some(preedit_clip) = layout.bounds.intersection(&clip) else {
+        return;
+    };
+
+    let mut background = p.background();
+    background.a *= pane_opacity;
+    renderer.fill_quad(quad(layout.bounds), background);
+
+    let mut foreground = p.foreground();
+    foreground.a *= pane_opacity;
+    let (align_x, x) = if layout.tail_aligned {
+        (
+            text::Alignment::Right,
+            layout.bounds.x + layout.bounds.width,
+        )
+    } else {
+        (text::Alignment::Default, layout.bounds.x)
+    };
+    renderer.fill_text(
+        text::Text {
+            content: content.to_owned(),
+            bounds: layout.bounds.size(),
+            size: text_size,
+            line_height: text::LineHeight::Absolute(Pixels(metrics.height())),
+            font,
+            align_x,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::None,
+        },
+        Point::new(x, layout.bounds.y),
+        foreground,
+        preedit_clip,
+    );
+    renderer.fill_quad(
+        quad(Rectangle {
+            x: layout.bounds.x,
+            y: layout.bounds.y + layout.bounds.height - stroke(layout.bounds.height),
+            width: layout.bounds.width,
+            height: stroke(layout.bounds.height),
+        }),
+        foreground,
+    );
 }
 
 /// 이번 프레임에 그릴 커서 모양. `None`이면 그리지 않는다.
@@ -709,6 +827,34 @@ mod tests {
 
     fn blue() -> Color {
         p().resolve(BG)
+    }
+
+    #[test]
+    fn preedit_starts_at_the_terminal_cursor_and_counts_cjk_cells() {
+        let metrics = CellMetrics::new(8.0, 16.0).unwrap();
+        let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(800.0, 400.0));
+        assert_eq!(
+            preedit_layout("한글", 3, 5, 80, bounds, metrics),
+            Some(PreeditLayout {
+                bounds: Rectangle::new(Point::new(50.0, 68.0), Size::new(32.0, 16.0)),
+                tail_aligned: false,
+            })
+        );
+    }
+
+    #[test]
+    fn long_preedit_is_clipped_to_the_grid_and_keeps_its_tail_visible() {
+        let metrics = CellMetrics::new(8.0, 16.0).unwrap();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(80.0, 32.0));
+        assert_eq!(
+            preedit_layout("abcdef", 1, 7, 10, bounds, metrics),
+            Some(PreeditLayout {
+                bounds: Rectangle::new(Point::new(56.0, 16.0), Size::new(24.0, 16.0)),
+                tail_aligned: true,
+            })
+        );
+        assert_eq!(preedit_layout("", 0, 0, 10, bounds, metrics), None);
+        assert_eq!(preedit_layout("x", 0, 10, 10, bounds, metrics), None);
     }
 
     // ------------------------------------------------------------ 기본과 교환

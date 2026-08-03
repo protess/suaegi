@@ -17,6 +17,15 @@ fn drain(rx: futures::channel::mpsc::UnboundedReceiver<SaveReport>) -> Vec<SaveR
     futures::executor::block_on(futures::StreamExt::collect::<Vec<_>>(rx))
 }
 
+fn shutdown(handle: &mut PersistenceHandle, final_state: PersistedState) {
+    let completed = handle
+        .begin_shutdown(final_state)
+        .expect("persistence worker accepted shutdown");
+    completed
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("persistence worker completed shutdown");
+}
+
 #[test]
 fn a_missing_data_file_is_fresh_not_a_recovery_failure() {
     // 신규 설치에서 "데이터 손실" 경고를 띄우면 안 된다
@@ -50,9 +59,10 @@ fn a_missing_main_file_with_corrupt_backups_is_not_fresh() {
 fn saves_land_on_disk_and_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("data.json");
-    let boot = PersistenceHandle::spawn(file.clone());
+    let mut boot = PersistenceHandle::spawn(file.clone());
     boot.handle.save(state_with("alpha"));
-    drop(boot.handle); // flush + join
+    shutdown(&mut boot.handle, state_with("alpha"));
+    drop(boot.handle);
 
     let again = PersistenceHandle::spawn(file);
     assert!(matches!(again.load.origin, LoadOrigin::Loaded));
@@ -64,10 +74,11 @@ fn rapid_saves_are_debounced_into_a_single_write() {
     // "마지막 상태가 파일에 있다"만 보면 50번 전부 fsync해도 통과한다.
     // debounce를 검증하려면 실제 쓰기 횟수를 세야 한다.
     let dir = tempfile::tempdir().unwrap();
-    let boot = PersistenceHandle::spawn(dir.path().join("data.json"));
+    let mut boot = PersistenceHandle::spawn(dir.path().join("data.json"));
     for i in 0..50 {
         boot.handle.save(state_with(&format!("s{i}")));
     }
+    shutdown(&mut boot.handle, state_with("s49"));
     drop(boot.handle);
     let reports = drain(boot.results);
     let written = reports
@@ -85,10 +96,11 @@ fn every_issued_seq_is_reported_exactly_once() {
     // debounce로 대체된 요청도 조용히 사라지면 안 된다 — Superseded로 답이 와야
     // 호출자가 "이 저장은 어떻게 됐나"를 항상 알 수 있다.
     let dir = tempfile::tempdir().unwrap();
-    let boot = PersistenceHandle::spawn(dir.path().join("data.json"));
+    let mut boot = PersistenceHandle::spawn(dir.path().join("data.json"));
     let seqs: Vec<u64> = (0..10)
         .map(|i| boot.handle.save(state_with(&format!("s{i}"))))
         .collect();
+    shutdown(&mut boot.handle, state_with("s9"));
     drop(boot.handle);
 
     let reports = drain(boot.results);
@@ -101,8 +113,8 @@ fn every_issued_seq_is_reported_exactly_once() {
         .filter(|r| matches!(r.status, SaveStatus::Superseded { .. }))
         .count();
     assert_eq!(
-        superseded, 9,
-        "nine of ten were replaced before they could be written"
+        superseded, 10,
+        "the explicit final snapshot replaces all ten debounced requests"
     );
 }
 
@@ -116,17 +128,47 @@ fn a_future_schema_file_blocks_saves_visibly() {
     future.schema_version = SCHEMA_VERSION + 1;
     std::fs::write(&file, serde_json::to_string(&future).unwrap()).unwrap();
 
-    let boot = PersistenceHandle::spawn(file);
+    let mut boot = PersistenceHandle::spawn(file);
     assert!(boot.load.save_blocked);
-    let seq = boot.handle.save(state_with("attempt"));
+    boot.handle.save(state_with("attempt"));
+    shutdown(&mut boot.handle, state_with("attempt"));
     drop(boot.handle);
     let reports = drain(boot.results);
     let blocked = reports
         .iter()
-        .find(|r| r.seq == seq)
-        .expect("report for the blocked save");
+        .find(|report| matches!(report.status, SaveStatus::Failed(_)))
+        .expect("report for the blocked final save");
     assert!(
         matches!(blocked.status, SaveStatus::Failed(_)),
         "a blocked save must report Failed, not silence"
+    );
+}
+
+#[test]
+fn an_explicit_future_schema_override_backs_up_then_replaces_the_newer_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.json");
+    let mut future = state_with("from-the-future");
+    future.schema_version = SCHEMA_VERSION + 1;
+    let future_json = serde_json::to_string_pretty(&future).unwrap();
+    std::fs::write(&file, &future_json).unwrap();
+
+    let mut boot = PersistenceHandle::spawn(file.clone());
+    assert!(boot.load.save_blocked);
+    assert!(
+        boot.handle.override_future_schema_guard(),
+        "the live worker must accept the explicit override"
+    );
+    shutdown(&mut boot.handle, state_with("current-version"));
+    drop(boot.handle);
+
+    let main: PersistedState =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(main.schema_version, SCHEMA_VERSION);
+    assert_eq!(main.repos[0].display_name, "current-version");
+    assert_eq!(
+        std::fs::read_to_string(file.with_file_name("data.json.bak.0")).unwrap(),
+        future_json,
+        "the newer document must remain recoverable after the user accepts replacement"
     );
 }

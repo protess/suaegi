@@ -8,39 +8,20 @@
 MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드리스 하네스로는 **구조적으로**
 못 잡는 부류다 — IME·창·실 프로세스가 있어야만 발동한다.
 
-28. **IME 조합창 위치·인라인 렌더링이 최소 구현이다** (`crates/suaegi-app/src/terminal/`).
-    한글 자소 분리는 `fix/terminal-ime-input`으로 고쳤다(위젯이 `Event::InputMethod`를
-    처리하고 `Commit`을 PTY로 보낸다). 남은 것: **조합창 위치**가 커서 셀 기준이나
-    폴백이 좌상단이라 정밀하지 않고, **on-the-spot 인라인 렌더링**을 안 해서 조합 중
-    글자는 런타임의 over-the-spot 오버레이로만 보인다. 실사용에서 위치가 거슬리면
-    `terminal/render.rs`에서 preedit를 커서 위치에 직접 그리는 쪽으로 간다.
+28. ~~**IME 조합창 위치·인라인 렌더링이 최소 구현이다.**~~ → preedit를 현재 터미널
+    커서 셀에 on-the-spot으로 직접 그린다. 후보창도 같은 셀의 정확한 사각형을 사용하고,
+    IME purpose를 `Terminal`로 전달한다. CJK 전각 문자는 두 칸으로 계산하며 그리드 오른쪽을
+    넘는 긴 조합은 xterm처럼 끝부분이 계속 보인다. 정상 경로에서는 런타임 over-the-spot
+    문자열을 비워 중복 표시를 막고, 측정이나 커서가 없는 예외 경로에서만 오버레이로
+    폴백한다. Commit의 전체 UTF-8 문자열 전달과 자소 분리 방지는 기존 경로를 유지한다.
 
-29. **거부한 권한 요청이 배지를 주황(`Waiting`)에 남긴다 — claude가 종료 훅을 안 준다.**
-    (`crates/suaegi-app/src/agent_status/`) **실측했다.** 훅 서버에 임시 로그를 붙여
-    거부 시 도착 순서를 관측했다:
-
-    ```
-    SessionStart → UserPromptSubmit → PreToolUse → PermissionRequest
-    [사용자가 "no" 선택] → (아무 훅도 오지 않음)
-    ```
-
-    즉 **거부는 claude의 턴을 중단시키는데 중단에는 `Stop`이 붙지 않는다**(정상 완료
-    때만 Stop이 뜬다). 우리 리듀서는 마지막 훅(`PermissionRequest`→`Waiting`)을 정확히
-    따르고 있고, `Waiting`은 나이로 감쇠하지 않게 설계됐다(답 없는 질문은 몇 시간이고
-    정당하게 Waiting). claude가 프로세스로 살아있으므로 presence도 `Exited`/`NoAgent`로
-    안 바뀐다 → **다음 훅(다음 `UserPromptSubmit` → 초록)이나 종료 전까지 주황에 고착.**
-
-    이건 **우리 코드의 버그가 아니라** hook 기반 탐지의 구조적 한계다 — 거부에 대한
-    신호가 애초에 오지 않으므로 리듀서가 손쓸 데이터가 없다. 정상 완료(회색 Done)와
-    거부(주황 고착)가 둘 다 "claude가 유휴 상태로 프롬프트에서 대기"인데 색이 달라
-    비일관적이다. 선택지:
-    - **(a) 그대로 둔다.** 거부 후 claude는 실제로 다음 지시를 기다리므로 "이 pane이
-      당신을 기다린다"(주황)는 틀린 말이 아니다. 종료 조건을 문서화만 한다.
-    - **(b) presence로 보강한다.** claude가 유휴 프롬프트에 있는지(활동 없음)를 별도로
-      감지해 `Waiting`을 `Done`으로 낮춘다. 다만 "생각 중"과 "유휴"를 프로세스 존재만으로
-      구별할 신호가 지금은 없다 — 새 신호원(자식의 tty 상태 등)을 찾아야 한다.
-    - 정상 완료(`Stop`→회색)가 실제로 도는지는 이 세션에서 확인하지 못했다(먼저
-      마무리했다). (a)/(b) 결정 전에 그것부터 확인한다.
+29. ~~**거부한 권한 요청이 배지를 주황(`Waiting`)에 영구히 남긴다.**~~ → Orca의
+    현재 `AGENT_STATUS_STALE_AFTER_MS`와 동일하게 Working/Waiting/Done 훅 상태 모두에
+    30분 freshness gate를 적용했다. Claude는 권한 거부 뒤 `Stop`을 보내지 않으므로
+    즉시 Done을 추측할 수 없고, 다음 실제 훅이 오기 전에는 Waiting을 유지하는 것이
+    정직하다. 다만 한 번 거부한 pane이 영구 주황으로 남지는 않으며, 정확히 30분까지는
+    fresh이고 1ms를 넘으면 Unknown으로 감쇠한다. 세션 종료는 30분을 기다리지 않고
+    장부를 즉시 제거한다.
 
 ## Plan 3(UI 배선) 시작 전에 처리 — 완료
 
@@ -64,13 +45,13 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
 
 ## CI 도입 시 처리
 
-4. **테스트 타임아웃 하네스**
-   `saturated_write_queue_does_not_stall_the_reader`(session_test.rs)는 회귀 시
-   깔끔한 어서션 실패가 아니라 **행**으로 실패한다. 이 저장소엔 아직 CI가 없어
-   지금은 무해하지만, CI를 붙일 때 `cargo-nextest`의 per-test timeout이나 잡 레벨
-   타임아웃을 반드시 함께 설정한다.
+4. ~~**테스트 타임아웃 하네스**~~ → GitHub Actions의 macOS Rust 잡이
+   `cargo-nextest` CI 프로필을 사용한다. 개별 테스트는 60초를 두 번 넘기면 종료되고,
+   전체 스위트에는 90분, 잡에는 120분의 상한이 있다. 따라서
+   `saturated_write_queue_does_not_stall_the_reader` 같은 회귀도 무한히 매달리지 않고
+   실패로 끝난다.
 
-4b. **PTY를 여는 테스트가 전체 스위트 부하에서 여전히 플레이키하다.**
+4b. ~~**PTY를 여는 테스트가 전체 스위트 부하에서 여전히 플레이키하다.**~~
    `55c4abd`의 `openpty` 재시도가 대부분을 잡았지만, 동시에 도는 프로세스가 많으면 여전히 난다.
    특징이 일정하다: **전체 스위트에서만, 매번 다른 테스트 이름으로, 재실행하면 통과.**
    관측된 것 — `pty_test` 전반, `session_test`,
@@ -80,8 +61,9 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
    그 실행의 패닉 메시지를 남기지 못해 **확정은 아니다.**
 
    Darwin의 `openpty`가 프로세스를 넘나들며 경쟁하므로(자세한 건 `55c4abd`) 프로세스 내부
-   조치로는 못 막는다. CI를 붙일 때 **PTY를 여는 테스트를 직렬화**하거나(전용 게이트,
-   또는 `--test-threads` 제한) 시스템 pty 풀 상한을 확인한다.
+   조치로는 못 막는다. `.config/nextest.toml`은 macOS의 `suaegi-term`과 실제 세션을 여는
+   `suaegi-app` 테스트를 공용 `darwin-pty` 그룹(max-threads=1)에 넣었다. 전체 동시성도 4로
+   제한했고, 동일 설정의 최종 전체 실행에서 3797개가 통과하고 6개 opt-in 테스트만 건너뛰었다.
 
 4c. **`suaegi-git` 테스트는 개발자의 전역 gitignore를 읽는다 — 고쳤지만 함정을 기록해 둔다.**
    Plan 5에서 발견: git이 파일을 **나열하는지**에 의존하는 테스트는 그 개발자의
@@ -97,9 +79,9 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
    **수정**: 공용 픽스처(`crates/suaegi-git/tests/fixture/mod.rs`)가 테스트 저장소에
    `core.excludesFile=/dev/null`을 설정한다. 새 테스트는 이 픽스처를 쓰면 자동으로 격리된다.
 
-5. **`CACHE_REVALIDATE_AFTER` 경계 미테스트** (`crates/suaegi-term/src/presence.rs`)
-   20회 히트 후 재검증 경로에 테스트가 없다. 폴링 주기를 소유하는 Plan 3에서
-   이 상수가 의미를 갖게 되므로 그때 단위 테스트를 추가한다.
+5. ~~**`CACHE_REVALIDATE_AFTER` 경계 미테스트**~~ (`crates/suaegi-term/src/presence.rs`)
+   → 첫 프로세스 조회 뒤 정확히 20회까지는 캐시된 에이전트를 반환하고, 21번째 히트에서
+   같은 pgid를 다시 조회해 셸로 바뀐 상태를 `NoAgent`로 반영하는 경계 테스트를 추가했다.
 
 ## 성능 — 실측 완료
 
@@ -117,43 +99,35 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
 
 ## 결정 필요 (코드 변경 보류)
 
-8. **Windows에서 `claude.exe` 미탐지** (`crates/suaegi-term/src/agent.rs`)
-   `process_names`가 codex는 `&["codex", "codex.exe"]`로 두 형태를 다 갖고
-   있지만 claude는 `&["claude", "claude-code"]`뿐이라 `.exe` 확장자가 없다.
-   Windows에서 basename 매칭이 `claude.exe`를 놓친다(pre-existing, 이
-   브랜치의 변경으로 생긴 문제 아님). `bcd6b5b`에서 확정한 basename-only
-   매칭 규칙과 어떻게 맞물릴지(단순히 `"claude.exe"`를 추가할지, 확장자를
-   벗기는 정규화를 basename_matches에 넣을지) 별도로 결정한 뒤에 고친다.
+8. ~~**Windows에서 `claude.exe` 미탐지**~~ (`crates/suaegi-term/src/agent.rs`) →
+   basename-only 규칙은 유지하고, 공용 `normalized_basename`이 `.exe`/`.cmd`/`.bat`/
+   `.ps1`을 대소문자 구분 없이 벗기도록 정리돼 있다. 따라서 Claude만 별칭을 늘리는 대신
+   모든 등록 에이전트가 동일한 Windows 규칙을 쓴다. 대문자 `CLAUDE.EXE`가 포함된 전체
+   Windows 경로를 Claude로 잡고, 이름이 디렉터리에만 등장하는 경로는 계속 거부하는
+   회귀 테스트로 고정했다.
 
 ## Plan 5 리뷰에서 결정이 필요해 남긴 것
 
-28. **미래 스키마 거부에 앱 안에서 빠져나갈 길이 없다.** 가드 자체는 정확히 작동한다 —
-    실측: 미래 스키마 파일을 열면 `load source = Default, guarded = true`, 저장은
-    `Err("saving is blocked")`로 막히고, **백업 회전도 일어나지 않아 원본이 보존된다.**
-    (17번과 달리 여기서 확인된 건 "조용하다"가 아니라 "회복 수단이 없다"이다.)
+28. ~~**미래 스키마 거부에 앱 안에서 빠져나갈 길이 없다.**~~ → 사이드바에 영구 경고와
+    2단계 확인(`Review save options…` → `Back up & replace`)을 연결했다. 확인 전에는
+    기존 가드가 계속 저장을 막고, 확인 후에는 persistence worker의 FIFO에서 가드 해제가
+    새 스냅샷보다 먼저 처리된다. `Store::save`는 기존 신버전 본파일을 `bak.0`으로 회전한
+    뒤 현재 버전 파일로 교체한다. 워커가 이미 종료됐다면 경고를 해제하지 않고 저장 실패를
+    표시한다.
 
-    문제는 회복 경로다. `LoadDiagnostics::save_blocked`(`persistence_thread.rs:116`)를
-    `AppState`가 읽지 않고, `override_future_schema_guard`(`:217`)는 어떤 `Message`에도
-    UI에도 연결돼 있지 않다. 앱을 다운그레이드한 사용자는 일반적인 `SaveStatus::Failed`만
-    보고 **앱 안에서는 아무것도 할 수 없다.** 파일을 손으로 지우거나 되돌리는 수밖에 없다.
+    회귀 테스트는 확인을 열거나 취소한 동안 원본이 한 바이트도 바뀌지 않는 것, 최종 확인
+    후 본파일이 현재 스키마로 저장되는 것, 신버전 JSON이 `bak.0`에 그대로 남는 것을 검증한다.
 
-    UX 결정이 필요하다: 부팅 직후 알릴지, 덮어쓰기 버튼을 줄지, 백업으로 되돌리기를 줄지.
+29. ~~**직렬화에는 깊이 제한이 없다(로드에는 있다).**~~ → 저장 가능한 pane 트리 깊이를
+    48로 제한했다. serde enum/object 래퍼까지 포함해 reader 재귀 한계에 충분한 여유를 두며,
+    48단계는 실제 저장→로드 왕복을 검증한다. 49단계는 JSON 직렬화, 백업 회전, 본파일 교체
+    전에 `LayoutTooDeep`으로 거부되어 기존 파일과 백업을 그대로 보존한다.
 
-29. **직렬화에는 깊이 제한이 없다(로드에는 있다).** serde_json의 재귀 제한이 읽기를 막아주지만
-    (실측: 깊이 1000에서 `recursion limit exceeded`), 쓰기에는 제한이 없다. 약 128단계보다
-    깊은 레이아웃을 저장하면 **다시 읽을 수 없는 파일**이 된다 — NaN 비율과 같은 전손 형태다.
-    실현하려면 PTY를 128개 띄워 중첩 분할해야 하므로 현실적으로 도달 불가에 가깝다.
-    레이아웃 깊이에 상한을 두면 닫힌다.
-
-30. **훅 서버: 16개의 조용한 연결이면 여전히 배지가 막힌다 — 알려진 잔여 한계다.**
-    연결당 스레드 + `MAX_CONNECTIONS = 16` + 초과 시 즉시 503으로 고쳤고, 공격 비용이
-    연결 1개 → 16개로, 실패 양상이 5초 무응답 정체 → 훅의 1.5초 예산 안에 들어오는 즉시
-    503으로, 관측 가능성이 불가 → `refused()` 카운터로 바뀌었다. **그래도 제거된 것은
-    아니다** — 테스트가 이 잔여를 덮지 않고 고정한다.
-
-    진짜로 없애려면 **첫 헤더 바이트에 짧은 별도 타임아웃**이 필요하다(정상 curl은 즉시
-    쓰고, 놀고 있는 연결은 영영 안 쓴다). 창이 5초 → ~1초로 줄어 16슬롯을 붙들기가
-    훨씬 어려워진다. 타임아웃 의미론을 바꾸는 변경이라 이번 브랜치에 넣지 않았다.
+30. ~~**훅 서버: 16개의 조용한 연결이면 여전히 배지가 막힌다.**~~ → 첫 헤더 바이트에
+    500ms 예산을 두고, 헤더+본문 전체에도 기존 5초의 절대 데드라인을 적용했다. 연결 16개를
+    모두 잡은 클라이언트가 소켓을 닫지 않아도 슬롯은 curl의 1.5초 예산 안에 자동 회수되며,
+    그 뒤 정상 훅이 204와 실제 이벤트를 받는 것을 테스트한다. 바이트를 조금씩 보내 5초
+    타임아웃을 매번 재설정하던 전통적 slowloris 경로도 절대 데드라인으로 닫혔다.
 
 ## 개발 환경 (코드 아님)
 
@@ -213,19 +187,21 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
     5가지 뮤테이션(재시도 비활성화/첫 오류 반환/첫 백오프 비-즉시/is_zero 가드 제거/
     루프 off-by-one)이 각각 해당 테스트를 실제로 실패시키는 것을 확인했다.
 
-23. **`flooding_unread_device_queries_does_not_grow_memory_unbounded`가 병렬 실행에서
-    플레이키하다** (`crates/suaegi-term/tests/session_test.rs`). 22번과는 **다른 원인**이라
-    이번에 고치지 않고 남긴다. 이 테스트는 `process_rss_kb()`로 **프로세스 전체** RSS를
-    재는데, 같은 프로세스 안에서 다른 13개 테스트가 동시에 할당하고 있어 그 할당이
-    측정값에 섞인다. 실측: 단독 실행(`--exact`) 25회는 25/25 통과, 전체 병렬 실행
-    20회 중 1회 실패(`RSS grew by 10672KB`, 임계값 10MB). 즉 임계값을 넘긴 주체가
-    이 테스트가 아닐 수 있다. 제대로 고치려면 프로세스 전역 값 대신 큐 자체의 크기를
-    관측하거나 이 테스트만 직렬화해야 한다 — 어느 쪽도 이번 수정 범위 밖이라 기록만
-    해 둔다.
+23. ~~**`flooding_unread_device_queries_does_not_grow_memory_unbounded`가 병렬 실행에서
+    플레이키하다**~~ (`crates/suaegi-term/tests/session_test.rs`) → CI를 libtest 바이너리
+    단위 병렬 실행에서 nextest의 테스트별 프로세스 실행으로 바꿨다. 이 테스트가 읽는
+    프로세스 RSS에는 이제 같은 바이너리의 다른 테스트 할당이 섞이지 않는다. 전역 동시성
+    4와 Darwin PTY 직렬 그룹을 적용한 전체 3797개 실행에서 RSS 회귀 테스트도 통과했다.
 
 ## PR4 적대적 리뷰에서 넘긴 것 (이어서)
 
-27. **in-flight 가드가 unwind에 안전하지 않다 — 네 곳 전부에 대한 결정이 필요하다.**
+27. ~~**in-flight 가드가 unwind에 안전하지 않다 — 네 곳 전부에 대한 결정이 필요하다.**~~
+    → presence/snapshot/resize/extract 네 워커를 공통 panic→completion 경계로 함께
+    처리했다. `TerminalSession::resize_lock`도 poison을 회수하도록 바꿔 한 번의 패닉 뒤
+    이후 resize가 연쇄 실패하지 않는다. 가드별 실패 해제와 poison 복구를 회귀 테스트로
+    고정했다.
+
+    기존 조사:
     (21번과 같은 뿌리이고, Plan 4가 같은 모양을 두 개 더 늘렸다.)
 
     `TerminalSession::resize_lock`이 **`std::sync::Mutex`**이고 `.expect("resize mutex poisoned")`로
@@ -277,7 +253,7 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
     대조적으로 `extract_selection`은 10000행 스크롤백 전체 선택에서 평균 **5.8ms**로
     명확해서, 플랜이 이미 정한 워커 배치가 가정이 아니라 실측으로 정당화됐다.
 
-25. **`rustfmt.toml`이 없어 `cargo fmt`가 저장소 전체를 재정렬한다 — 관례 결정 필요.**
+25. ~~**`rustfmt.toml`이 없어 `cargo fmt`가 저장소 전체를 재정렬한다 — 관례 결정 필요.**~~
     Plan 4 구현 중 한 에이전트가 `cargo fmt -p suaegi-app`을 돌렸다가 import가 크레이트
     전역으로 재정렬돼 손으로 되돌렸다. 원인: 크레이트가 edition 2021이라 rustfmt가
     기본으로 style_edition 2021을 고르는데, 코드 일부는 2024 스타일(소문자 우선
@@ -287,11 +263,10 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
     통일돼 있지 않다. `style_edition = "2024"`를 넣어도 import 차이가 17곳 남고,
     그 방향이 제각각이다. `rustfmt.toml`이 없는 채로 여러 세션이 각자 써온 결과다.
 
-    그래서 이번에 정하지 않았다. 어느 스타일로 통일할지는 저장소 전체를 한 번에
-    건드리는 결정이고, 그 리포맷 커밋은 Plan 4 diff와 섞이면 안 된다.
-    **정한 뒤 별도 커밋으로** `rustfmt.toml` 추가 + 전체 리포맷을 한다.
-    그때까지는 `cargo fmt`를 크레이트 전체에 돌리지 말고 건드린 파일만
-    `rustfmt <file>`로 맞춘다.
+    저장소의 Rust edition과 같은 2021 style edition을 명시하는 `rustfmt.toml`을 추가했다.
+    현재 트리 전체가 이 규칙의 `cargo fmt --all -- --check`를 통과하며, CI가 앞으로의
+    혼용도 차단한다. 기존 소스 전체를 의미 없이 재작성하지 않고 현재 형식을 기준선으로
+    고정했다.
 
 ## Plan 4로 넘기는 것 (터미널 커스텀 위젯)
 
@@ -316,73 +291,55 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     남고 위젯의 첫 레이아웃이 발행하는 `Resize`가 실제 크기로 고친다. pane 크기에 맞춘 실제 리사이즈는 커스텀
     위젯이 크기를 알 수 있어야 가능하다.
 
-26. **위젯 밖으로 나간 마우스 이동은 선택을 더 이상 늘리지 않는다** (`crates/suaegi-app/src/terminal/mouse.rs`).
-    실제 터미널은 커서가 창 밖으로 나가도 좌표를 가장자리로 **clamp해서 선택을 계속
-    늘린다**. 지금은 `Cursor::position_in` → `hit_test`가 둘 다 `Option`이라 밖으로
-    나가는 순간 인텐트가 만들어지지 않고 선택이 그 자리에 멈춘다.
+26. ~~**위젯 밖으로 나간 마우스 이동은 선택을 더 이상 늘리지 않는다**~~
+    (`crates/suaegi-app/src/terminal/mouse.rs`) → 이 위젯 안에서 시작해 아직 버튼을 누르고
+    있는 제스처에 한해서, 밖의 포인터를 가장 가까운 행/열 가장자리 셀로 clamp한다. 왼쪽은
+    첫 셀의 왼쪽, 오른쪽은 마지막 셀의 오른쪽 선택 경계를 보존하며 위/아래도 첫/마지막
+    행으로 붙는다. hover와 휠은 밖에서 계속 무시하므로 다른 pane의 입력을 훔치지 않는다.
 
-    플랜의 문자 그대로를 구현한 결과이고, clamp 규칙은 플랜에 없다. 없는 규칙을 조용히
-    발명하는 대신 **현재 동작을 테스트로 고정**해 뒀다. 익숙한 감각을 원하면 clamp 규칙을
-    정해서 넣는다 — 어느 축을 어디로 붙일지(가장 가까운 가장자리 셀), 그리고 위젯 밖
-    이동을 계속 받으려면 pane_grid가 그 이벤트를 우리에게 주는지부터 확인해야 한다.
-
-    (관련: release는 밖에서 일어나도 **반드시 발행한다.** 안 하면 그리드의 포인터 래치가
+    release는 밖에서 일어나도 **반드시 발행한다.** 안 하면 그리드의 포인터 래치가
     영영 안 풀려서, 밖에서 손을 뗀 뒤 그냥 마우스를 움직이기만 해도 선택이 계속 늘어난다.
-    `resolve_route`가 매칭되는 Release에서만 래치를 푼다. 회귀 테스트 있음.)
+    이제 사용 가능한 외부 좌표는 같은 가장자리로 clamp하고, OS가 좌표 자체를 잃은 경우만
+    마지막으로 알려진 셀을 사용한다. 네 가장자리 motion과 외부 release 회귀 테스트가 있다.
 
 ## Plan 5로 넘기는 것
 
-14. **세션 레이아웃 복원.** `PersistedState.session.active_worktree_id`는
-    Task 8에서 배선했다 — worktree를 선택할 때마다 `AppState::persist()`가
-    실제로 디스크에 쓴다(`state.rs`의 `Message::WorktreeSelected` 핸들러).
-    하지만 부팅 시(`AppState::boot`/`from_load`)에는 읽지 않는다 — 재시작 후
-    어느 worktree가 선택돼 있었는지, 어떤 pane 분할이 열려 있었는지 복원하는
-    UI는 Plan 5 몫이다.
+14. ~~**세션 레이아웃 복원.**~~ → `from_load`가 활성 worktree와 `PersistedPane`
+    트리를 읽고, hydration 뒤 세션을 재시작해 split 축·비율·활성 pane을 복원한다. 일부
+    worktree가 사라졌거나 시작에 실패하면 살아 있는 형제만 승격하며, 일시적 실패가 좋은
+    저장 레이아웃을 덮지 않도록 원본을 보존한다. 디스크 왕복과 부분 실패 테스트가 있다.
 
-15. **worktree 메타데이터가 재조회 때마다 유실된다.** `AppState::persisted_snapshot`
-    (`state.rs`)이 저장하는 `Worktree.created_at_unix_ms`/`created_with_agent`는
-    `worktrees_by_repo`(git이 돌려주는 `WorktreeEntry`)에서 매번 새로 합성한
-    자리표시자(`0`/`None`)다 — 실제 생성 시각·생성 에이전트를 추적하는 곳이
-    Plan 3엔 없다. git이 그 정보를 안 주므로, 어딘가(아마 세션 시작 시점)에서
-    직접 기록해 둬야 한다. 세션 레이아웃 복원이 이 메타데이터를 쓰게 되는
-    시점에 같이 처리한다.
+15. ~~**worktree 메타데이터가 재조회 때마다 유실된다.**~~ → 앱 소유
+    `WorktreeMeta`가 생성 에이전트·시각과 연결된 작업 항목을 보존한다. 부팅 시 디스크 값을
+    씨딩하고 저장 스냅샷에 재주입하므로 git 재조회나 앱 재시작이 값을 `0`/`None`으로
+    되돌리지 않는다. 생성 경로와 load→save 왕복을 테스트한다.
 
-16. **에이전트 상태 3색(working/waiting/done).** 지금 사이드바 배지는
-    "에이전트가 떠 있는가"만 안다(`AgentPresence`). hook 서버가 붙는 Plan 5의
-    몫이다(계획 문서에 이미 명시돼 있다).
+16. ~~**에이전트 상태 3색(working/waiting/done).**~~ → Claude hook, 프로세스 존재,
+    OSC title을 pane별 reducer에서 합성해 Unknown/Working/Waiting/Done을 구분한다. 사이드바는
+    네 상태를 서로 다른 glyph와 색으로 렌더하고 비정상 종료를 별도 오류 상태로 표시한다.
 
 ## Task 8에서 남긴 것
 
-17. **future-schema 저장 가드가 부팅 시점엔 조용하다.** `PersistenceHandle::spawn`이
-    반환하는 `LoadDiagnostics.save_blocked`는 `AppState::boot`이 지금 아무데도
-    쓰지 않는다 — 가드가 서 있어도 사용자가 뭔가를 바꿔 첫 `persist()` 호출이
-    실패할 때까지는(그제서야 `SaveStatus::Failed`가 상태 표시줄에 뜬다) 조용하다.
-    Task 0이 막으려 한 게 바로 이 케이스(손상된 본파일 + 미래 스키마 백업)인데,
-    사용자는 앱을 열고 몇 걸음 걷기 전까지는 "저장이 막혀 있다"는 걸 모른다.
-    부팅 직후에 바로 보여줄지, 그냥 첫 실패 시 알리는 지금 방식으로 충분한지는
-    UX 판단이 필요해 코드를 바꾸지 않고 남겨둔다.
+17. ~~**future-schema 저장 가드가 부팅 시점엔 조용하다.**~~ → `from_load`가
+    `save_blocked`를 즉시 상태로 올리고 사이드바가 첫 저장 전부터 영구 경고를 렌더한다.
+    2단계 `Review save options…` → `Back up & replace` 확인 전에는 원본을 건드리지 않으며,
+    승인하면 신버전 파일을 백업한 뒤 현재 스키마로 교체한다.
 
-18. **앱 데이터 파일 위치.** `crates/suaegi-app/src/persistence_thread.rs`의
-    `default_data_file()`이 `dirs::config_dir()/suaegi/data.json`(macOS:
-    `~/Library/Application Support/suaegi/data.json`)으로 정했다 —
-    `workspace_root`(worktree들이 실제로 생기는 곳, 기본값
-    `~/suaegi-workspaces`)와는 다른 위치다. 여태 이 결정이 어디에도 문서화돼
-    있지 않았다.
+18. ~~**앱 데이터 파일 위치.**~~ → `docs/port-status.md`의 Local data 절에
+    `dirs::config_dir()/suaegi/data.json`(macOS는
+    `~/Library/Application Support/suaegi/data.json`)과 기본 worktree 루트
+    `~/suaegi-workspaces`가 서로 다른 위치임을 명시했다.
 
-19. **Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**
-    담당 에이전트는 마우스/키보드로 앱 창을 직접 조작할 수 있는 수단이 없었고
-    (합성 클릭은 이 플랜의 좌표 계산이 멀티 모니터 환경에서 엉뚱한 창을 때린
-    전례가 있어 명시적으로 금지돼 있다), 그래서 실제로 확인한 건 앱이
-    뜨는지·부팅 시 repo/worktree가 복원되는지(데이터 파일을 직접 심어
-    재현)뿐이다. **사람이 직접 확인해야 할 것**: worktree 생성 버튼 클릭 →
-    실제 세션이 셸 출력을 보여주는지, 두 번째 worktree로 분할했을 때 양쪽이
-    독립적으로 도는지, worktree 여러 개를 빠르게 닫아도 UI가 멈추지 않는지
-    (reaper 검증 — `SessionStore`의 각 로직은 단위 테스트로 실측했지만 실제
-    `pane_grid` UI에서 연타했을 때의 체감은 다른 문제다).
+19. ~~**Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**~~ →
+    최신 ad-hoc signed macOS 앱을 실제 창으로 검증했다. 복원된 세 worktree PTY가 각자 셸/
+    Claude 출력을 유지했고, 같은 worktree의 새 split 두 쪽에 서로 다른 표식을 보냈을 때
+    각각 자기 출력만 받았다. 테스트용 터미널 세 개를 연속 닫아도 UI와 RPC가 즉시 응답했다.
+    네이티브 빨간 닫기 버튼으로 종료한 뒤 재실행하자 활성 `test-a`, 사용자 작업공간 순서
+    `main → agent-test → test-a → test-b`, 기존 PTY 출력과 Claude 세션이 모두 복원됐다.
 
 ## Plan 3 최종 리뷰에서 넘긴 것
 
-20. **앱 종료 시 세션 drop이 UI 스레드에서 일어난다.** `AppState`/`SessionStore`가
+20. ~~**앱 종료 시 세션 drop이 UI 스레드에서 일어난다.**~~ `AppState`/`SessionStore`가
     보통 경로(`close()` → `Reaper`)를 거치는 건 pane을 하나씩 닫을 때뿐이다.
     창을 닫아 앱이 종료될 때는 `iced::application(...).run()`이 이벤트 루프를
     빠져나오며 `AppState`(그리고 그 안의 `SessionStore` 슬롯들)를 제자리에서
@@ -392,21 +349,20 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     종료가 지연될 뿐이다. 하지만 "마지막 drop은 UI 스레드 밖에서" 규칙이 지켜지지
     않는 유일한 경로다.
 
-    깨끗한 수정은 `iced::window::close_requests()`를 구독해 첫 닫기 요청을
-    가로채고, 그 시점에 모든 세션을 `SessionStore::close()`(→ Reaper)로 은퇴시킨
-    뒤, 전부(또는 바운드된 타임아웃까지) 정리될 때까지 기다렸다가 그제서야
-    `window::close(id)`를 실제로 발행하는 것이다. 이번 리뷰에서는 이걸 구현하지
-    않았다: `Message` 변형과 구독 배선이 새로 필요하고, "창 닫기 요청을 가로채고
-    실제로 닫는" 흐름은 이 저장소의 테스트 하네스(진짜 창이 없는 plain `#[test]`)로
-    의미 있게 검증할 방법이 없다 — 마우스/키보드로 창을 조작하는 것도 이 플랜
-    범위에서 명시적으로 금지돼 있다(위 19번 참고). 검증 못 할 종료 경로 변경을
-    머지 직전에 밀어 넣는 것보다, "행이 아니라 지연된 종료"라는 지금 동작을
-    문서화해 두는 쪽을 택했다. 실제 창으로 종료를 조작해 확인할 수 있는 사람이
-    붙는 시점(또는 Plan 4/5에서 UI 자동화가 생기는 시점)에 다시 본다.
+    → 네이티브 `CloseRequested`를 `WindowClose`로 가로채 첫 요청에서만 최종 스냅샷을
+    persistence worker에 보낸다. 완료 대기는 UI 스레드 밖에서 최대 20초로 제한하고, 완료
+    또는 타임아웃 뒤 실제 `window::close`를 발행한다. 중복 close는 무시되며 최종 스냅샷이
+    대기 중 debounce 저장을 대체하는 worker 테스트와 실제 macOS close/relaunch로 검증했다.
 
 ## PR4 적대적 리뷰에서 넘긴 것
 
-21. **백그라운드 클로저 안의 임의 패닉은 여전히 가드를 영영 못 푼다.**
+21. ~~**백그라운드 클로저 안의 임의 패닉은 여전히 가드를 영영 못 푼다.**~~ →
+    네 워커 경로를 공통 `catch_unwind` 경계로 감쌌고 패닉도 완료 메시지로 바꿨다.
+    스냅샷 실패는 같은 generation만, presence 실패는 직렬 bool 가드를, resize 실패는
+    기존 `ResizeApplied(Err)` 경로를, selection 실패는 조용한 `None` 완료를 사용한다.
+    따라서 다음 dirty/tick/resize/copy 요청이 다시 진행된다.
+
+    기존 조사:
     (`crates/suaegi-app/src/session_store.rs`) 이번 리뷰에서 `probe_with`의
     poisoned-mutex `expect`는 락을 회수하는 쪽으로 고쳤다(패닉 원인 하나
     제거) — 하지만 `request_presence_with`/`request_snapshot`의 백그라운드
@@ -427,7 +383,15 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
 
 ## Plan 9 M5(안전 파일 write) 리뷰에서 넘긴 것
 
-30. **`FileSignature`(size+mtime)가 same-mtime-tick·same-size 외부 편집을 못 잡는다**
+30. ~~**`FileSignature`(size+mtime)가 same-mtime-tick·same-size 외부 편집을 못 잡는다.**~~
+    → 로컬 편집 문서의 signature에 Unix dev/inode/ctime 변경 표식과 SHA-256 내용 지문을
+    추가했다. macOS/Linux watcher는 stat-only 변경 표식으로 평상시 파일 내용을 다시 읽지
+    않고, 표식을 제공하지 않는 플랫폼만 size/mtime 동률 때 내용을 해시한다. stat 값을
+    일부러 같게 만든 테스트에서 watcher가 변경을 발견하고 autosave가
+    외부 내용 `bbbb`를 덮지 않는 것을 검증한다. 내용 해시를 제공하지 않는 원격 프로토콜은
+    기존 stat 계약을 유지한다.
+
+    기존 조사:
     (`crates/suaegi-git/src/fs.rs`, `FileSignature`/`write_file`). staleness 검사는
     `metadata.len()` + `metadata.modified()`만 비교한다 — 파일시스템 mtime 해상도 안에서
     같은 바이트 수로 외부 편집이 일어나면 지문이 그대로라 `write_file`이 clobber할 수
@@ -436,7 +400,12 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     content-hash(또는 inode+ctime)를 추가해 stat 동률일 때도 실제 변경을 감지한다.
     watcher 서브시스템(Plan 9 미포팅)이 붙는 후속 플랜과 함께 보는 게 자연스럽다.
 
-31. **크래시 시 `.tmpXXXXXX` 형제가 잔존해 diff 패널에 untracked로 뜬다**
+31. ~~**크래시 시 임시 형제가 잔존해 diff 패널에 untracked로 뜬다.**~~ → 편집기 원자
+    저장 임시 파일을 예약 이름 `.suaegi-editor-tmp-*.tmp`로 만들고, branch compare의
+    untracked 수집에서 접두·접미사와 비어 있지 않은 랜덤 본문이 모두 맞는 파일만 제외한다.
+    정상/오류 경로는 tempfile Drop이 계속 정리하고, 크래시 잔존물만 diff 잡음에서 사라진다.
+
+    기존 조사:
     (`crates/suaegi-git/src/fs.rs`, `write_file` step 7). 원자적 쓰기는
     `NamedTempFile::new_in(parent)`로 형제 temp를 만든 뒤 `persist`(rename)한다. 정상
     경로와 실패 경로(`Drop`)는 temp를 정리하지만, **`persist` 직전 프로세스가 크래시하면**

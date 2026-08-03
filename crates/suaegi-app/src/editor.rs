@@ -752,9 +752,14 @@ pub fn load_file_now(worktree: PathBuf, path: String) -> Result<EditorLoad, Stri
     }
 }
 
-pub async fn file_signature_now(worktree: PathBuf, path: String) -> Result<FileSignature, String> {
+pub async fn file_signature_now(
+    worktree: PathBuf,
+    path: String,
+    expected: FileSignature,
+) -> Result<FileSignature, String> {
     tokio::task::spawn_blocking(move || {
-        suaegi_git::fs::file_signature(&worktree, &path).map_err(|error| error.to_string())
+        suaegi_git::fs::file_signature_for_compare(&worktree, &path, &expected)
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("File signature worker failed: {error}"))?
@@ -882,12 +887,12 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
     let body: Element<'_, Message> = match &editor.document {
         Document::Closed => return None,
         Document::Loading { .. } => column![
-            editor_header(editor, false, false, false, false, false),
+            editor_header(state, false, false, false, false, false),
             container(text("Opening file…").size(14)).padding(10)
         ]
         .into(),
         Document::Unavailable { message, .. } => column![
-            editor_header(editor, false, false, false, false, false),
+            editor_header(state, false, false, false, false, false),
             container(
                 text(message)
                     .size(14)
@@ -904,7 +909,7 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
                 PreviewKind::Pdf => format!("PDF first-page preview · {size} bytes"),
             };
             column![
-                editor_header(editor, false, false, false, false, false),
+                editor_header(state, false, false, false, false, false),
                 container(
                     column![
                         iced::widget::image(iced::widget::image::Handle::from_bytes(bytes.clone()))
@@ -996,7 +1001,7 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
                     .style(crate::theme::top_bar)
             });
             let mut layout = column![editor_header(
-                editor,
+                state,
                 *dirty,
                 saving.is_some(),
                 *close_confirmation,
@@ -1095,15 +1100,46 @@ pub fn view(state: &AppState) -> Option<Element<'_, Message>> {
 }
 
 fn editor_header(
-    editor: &EditorState,
+    state: &AppState,
     dirty: bool,
     saving: bool,
     close_confirmation: bool,
     markdown_tools: bool,
     markdown_preview: bool,
 ) -> Element<'_, Message> {
+    let editor = state.editor();
     let mut tabs = row![].spacing(2).align_y(Alignment::Center);
-    for tab in editor.tabs() {
+    if let (Some(panes), Some(worktree)) = (state.panes(), editor.worktree()) {
+        for (pane, session) in panes
+            .iter()
+            .filter(|(_, session)| state.worktree_for_session(**session) == Some(worktree))
+        {
+            let terminal = button(
+                row![
+                    text("▣").size(12).color(crate::theme::MUTED),
+                    text(state.session_tab_title(*session)).size(13),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::WorkspaceTerminalTabSelected(*session))
+            .padding([3, 5])
+            .style(crate::theme::ghost_button);
+            let close = button("×")
+                .on_press(Message::PaneCloseRequested(*pane))
+                .padding([2, 4])
+                .style(crate::theme::ghost_button);
+            tabs = tabs.push(
+                container(row![terminal, close].spacing(0).align_y(Alignment::Center))
+                    .style(crate::theme::top_bar),
+            );
+        }
+    }
+    for tab in editor
+        .tabs()
+        .into_iter()
+        .filter(|tab| editor.worktree() == Some(&tab.worktree))
+    {
         let name = std::path::Path::new(&tab.path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -1191,6 +1227,8 @@ mod tests {
         FileSignature {
             size,
             mtime: SystemTime::UNIX_EPOCH,
+            change_marker: None,
+            content_hash: Some([0; 32]),
         }
     }
 

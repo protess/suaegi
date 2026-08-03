@@ -31,7 +31,9 @@ use suaegi_keys::{KeybindingActionId, KeybindingFileSnapshot};
 use suaegi_secrets::Secret;
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
-use suaegi_term::input_types::{CopyTargets, MouseAction, TermMouseButton, WriteOutcome};
+use suaegi_term::input_types::{
+    CopyTargets, KeyInput, MouseAction, NamedKey, TermKey, TermMouseButton, WriteOutcome,
+};
 use suaegi_term::presence::AgentPresence;
 use suaegi_tracker::{
     IssuePage, JiraAuthType, JiraConnection, JiraIssue, JiraPage, JiraViewer, LinearWorkspace,
@@ -39,8 +41,9 @@ use suaegi_tracker::{
 };
 
 use crate::agent_status::contract::{
-    hook_outcome, reduce, BadgeInput, BadgeState, HookEvent, HookOutcome, HookState, Hydration,
-    HydrationStep, PaneKey, SpawnNonce, LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
+    hook_outcome, is_ask_user_question_tool, reduce, BadgeInput, BadgeState, HookEvent,
+    HookOutcome, HookState, Hydration, HydrationStep, PaneKey, SpawnNonce, HOOK_STALE_AFTER,
+    LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
 };
 use crate::agent_status::server::HookServer;
 use crate::automation::AutomationUiState;
@@ -1069,12 +1072,16 @@ pub enum Message {
     LocalRpcRequested(crate::local_rpc::LocalRpcRequest),
     // ---- Native window chrome (Orca-style inset title bar) ----
     WindowClose,
+    WindowShutdownFinished,
     WindowMinimize,
     WindowMaximize,
     WindowDrag,
     WindowOpened(iced::window::Id),
     AppWindowFocusChanged(bool),
     AppWindowResized(iced::Size),
+    FutureSchemaOverrideRequested,
+    FutureSchemaOverrideCancelled,
+    FutureSchemaOverrideConfirmed,
     BrowserOpenRequested,
     BrowserClosed,
     BrowserTabCreated,
@@ -1243,6 +1250,9 @@ pub enum Message {
         Result<crate::remote_runtime::RemoteProviderAccounts, String>,
     ),
     VoiceEnabledToggled,
+    VoiceMicrophonesRefreshRequested,
+    VoiceMicrophonesLoaded(Result<Vec<crate::speech::MicrophoneDevice>, String>),
+    VoiceMicrophoneSelected(Option<crate::speech::MicrophoneDevice>),
     VoiceDictationShortcutPressed,
     VoiceDictationShortcutReleased,
     VoiceDictationToggled,
@@ -1558,6 +1568,8 @@ pub enum Message {
     },
     /// UI 선택 표시만 한다. worktree 선택으로 세션을 시작하는 것은 Task 5의 몫이다.
     WorktreeSelected(WorktreeId),
+    WorktreeDragStarted(WorktreeId),
+    WorktreeDragHovered(WorktreeId),
     /// Plan 9 M7: 선택한 worktree의 파일 트리를 열거나, 이미 같은 트리면 닫는다.
     FileExplorerToggled {
         worktree: WorktreeId,
@@ -1621,6 +1633,7 @@ pub enum Message {
         worktree: WorktreeId,
         path: String,
     },
+    WorkspaceTerminalTabSelected(SessionId),
     EditorTabCloseRequested {
         worktree: WorktreeId,
         path: String,
@@ -1677,11 +1690,12 @@ pub enum Message {
     TaskCreateRequested,
     TaskProjectsOpenRequested,
     TaskRefreshRequested,
+    TaskPageRequested(usize),
     TaskItemsLoaded {
         op: OpId,
         repo_id: RepoId,
         kind: TaskKind,
-        result: Result<Vec<crate::tasks::TaskWorkItem>, String>,
+        result: Result<crate::tasks::TaskPageResult, String>,
     },
     TaskItemOpen(String),
     SourceControlToggled {
@@ -1759,11 +1773,21 @@ pub enum Message {
         generation: u64,
         snapshot: TerminalSnapshot,
     },
+    SnapshotFailed {
+        id: SessionId,
+        generation: u64,
+        error: String,
+    },
     /// `SessionStore::request_presence`의 완료.
     PresenceReady {
         id: SessionId,
         generation: u64,
         presence: AgentPresence,
+    },
+    PresenceFailed {
+        id: SessionId,
+        generation: u64,
+        error: String,
     },
     /// `presence_poll::subscription`의 티어링된 타이머 틱. 그 자체로는 화면을
     /// 갱신하지 않는다 — in-flight가 아닌 세션마다 `request_presence`를 내는
@@ -2285,6 +2309,9 @@ pub struct AppState {
     voice_dictation_state: VoiceDictationState,
     voice_api_key_draft: String,
     voice_status: Option<String>,
+    voice_microphones: Vec<crate::speech::MicrophoneDevice>,
+    voice_microphones_known: bool,
+    voice_microphones_loading: bool,
     pending_voice_transcript: Option<String>,
     voice_model_busy: Option<String>,
     app_window_size: iced::Size,
@@ -2294,8 +2321,10 @@ pub struct AppState {
     task_provider: TaskProvider,
     task_query: String,
     task_repo_selection: HashSet<RepoId>,
+    task_current_page: usize,
+    task_total_pages: usize,
     task_items: Vec<crate::tasks::TaskWorkItem>,
-    task_items_by_repo: HashMap<RepoId, Vec<crate::tasks::TaskWorkItem>>,
+    task_items_by_repo: HashMap<RepoId, crate::tasks::TaskPageResult>,
     task_items_pending: HashSet<RepoId>,
     task_item_errors: HashMap<RepoId, String>,
     task_items_loading: bool,
@@ -2372,10 +2401,18 @@ pub struct AppState {
     /// 헛경고를 내지 않기 위한 안전한 값이다.
     load_origin: LoadOrigin,
     last_save_status: Option<SaveStatus>,
+    /// A newer Suaegi build wrote at least one persistence document. Saves
+    /// remain blocked until the user explicitly accepts a backup-and-replace
+    /// flow in the sidebar; never silently downgrade the on-disk schema.
+    future_schema_guarded: bool,
+    future_schema_override_confirming: bool,
     /// `None`이면 저장이 배선되지 않은 상태(테스트, 또는 미래에 실패한 부팅) —
     /// `persist()`는 조용히 아무것도 하지 않는다. 실 앱 경로에서는 `boot()`이
     /// 항상 `Some`을 채운다.
     persistence: Option<PersistenceHandle>,
+    /// The first close request owns the final persistence barrier. Repeated
+    /// native/custom close events must not enqueue competing final writes.
+    shutdown_started: bool,
 
     // ---- Task 6: 세션 생명주기 + 워크벤치 배선 ----
     session_store: SessionStore,
@@ -2395,6 +2432,10 @@ pub struct AppState {
     floating_workspace_markdown_root: Option<PathBuf>,
     floating_workspace_pointer: Point,
     floating_workspace_drag: Option<FloatingWorkspaceDrag>,
+    /// Sidebar worktree currently being dragged. Reordering happens when the
+    /// pointer crosses another row and is persisted once on pointer release.
+    worktree_dragging: Option<WorktreeId>,
+    worktree_drag_changed: bool,
     floating_pending_commands: Vec<String>,
     keep_awake_process: Option<std::process::Child>,
     /// worktree당 세션 하나. 이미 열린 worktree를 다시 선택하면 새 세션을 또
@@ -2542,6 +2583,11 @@ pub struct AppState {
     file_explorer: FileExplorerState,
     // ---- Plan 9 M8: minimal embedded editor ----
     editor: EditorState,
+    /// The editor documents and the visible workspace tab are separate
+    /// concerns. Orca keeps an agent terminal alive as a sibling tab when a
+    /// file is opened; using `editor.is_open()` as the center-view selector
+    /// made Suaegi replace the terminal surface instead.
+    workspace_editor_active: bool,
     // ---- Quick Open palette over the ported lister/fuzzy backend ----
     quick_open: QuickOpenState,
     // ---- Streamed repository content search ----
@@ -2609,6 +2655,15 @@ struct PaneBadge {
     /// permission 대기 `Waiting`을 `Done`으로 덮어 MVP가 검증한 주황 배지를 회귀시킨다).
     /// **스폰마다 [`PaneBadge::new`]로 리셋되므로 세션 교체를 넘어 새지 않는다.**
     received_hook: bool,
+    /// The current Waiting state is Claude's interactive question rather than
+    /// a permission request. Claude emits no follow-up hook when Enter or
+    /// Escape resolves this surface, so terminal input supplies the fallback.
+    waiting_for_question: bool,
+    /// Latest authoritative lead-session background task inventory. This must
+    /// survive later hook payloads that omit the inventory.
+    claude_background_work_active: bool,
+    /// Latest authoritative lead-session scheduled-task inventory.
+    claude_session_crons_active: bool,
     /// `NoAgent` streak가 확정되기 전에 유지할 값.
     previous: BadgeState,
     no_agent_streak: u8,
@@ -2621,6 +2676,9 @@ impl PaneBadge {
             allow_reattach_nonce_bind: false,
             hook: None,
             received_hook: false,
+            waiting_for_question: false,
+            claude_background_work_active: false,
+            claude_session_crons_active: false,
             previous: BadgeState::Unknown,
             no_agent_streak: 0,
         }
@@ -2760,6 +2818,9 @@ impl Default for AppState {
             voice_dictation_state: VoiceDictationState::Idle,
             voice_api_key_draft: String::new(),
             voice_status: None,
+            voice_microphones: Vec::new(),
+            voice_microphones_known: false,
+            voice_microphones_loading: false,
             pending_voice_transcript: None,
             voice_model_busy: None,
             app_window_size: iced::Size::new(1228.0, 768.0),
@@ -2769,6 +2830,8 @@ impl Default for AppState {
             task_provider: TaskProvider::Github,
             task_query: "is:issue is:open".to_string(),
             task_repo_selection: HashSet::new(),
+            task_current_page: 0,
+            task_total_pages: 1,
             task_items: Vec::new(),
             task_items_by_repo: HashMap::new(),
             task_items_pending: HashSet::new(),
@@ -2839,7 +2902,10 @@ impl Default for AppState {
             daemon_action_confirm: None,
             load_origin: LoadOrigin::Fresh,
             last_save_status: None,
+            future_schema_guarded: false,
+            future_schema_override_confirming: false,
             persistence: None,
+            shutdown_started: false,
             session_store: SessionStore::new(),
             panes: None,
             focused_pane: None,
@@ -2853,6 +2919,8 @@ impl Default for AppState {
             floating_workspace_markdown_root: None,
             floating_workspace_pointer: Point::ORIGIN,
             floating_workspace_drag: None,
+            worktree_dragging: None,
+            worktree_drag_changed: false,
             floating_pending_commands: Vec::new(),
             keep_awake_process: None,
             worktree_sessions: HashMap::new(),
@@ -2898,6 +2966,7 @@ impl Default for AppState {
             diff: DiffState::default(),
             file_explorer: FileExplorerState::default(),
             editor: EditorState::default(),
+            workspace_editor_active: false,
             quick_open: QuickOpenState::default(),
             content_search: ContentSearchState::default(),
             source_control: SourceControlState::default(),
@@ -3119,9 +3188,18 @@ impl AppState {
     /// 그대로 쓴다.
     pub(crate) fn from_load(load: LoadDiagnostics) -> AppState {
         let mut state = AppState::default();
+        state.future_schema_guarded = load.save_blocked;
         state.repos = load.state.repos;
         state.workspace_root = load.state.settings.workspace_root;
         state.ui_settings = load.state.settings.ui;
+        if !state.ui_settings.terminal_font_defaults_orca_v2 {
+            if state.ui_settings.terminal_font_family == "SF Mono"
+                && state.ui_settings.terminal_font_weight == 400
+            {
+                state.ui_settings.terminal_font_weight = 500;
+            }
+            state.ui_settings.terminal_font_defaults_orca_v2 = true;
+        }
         if state.ui_settings.left_sidebar_appearance == "solid" {
             state.ui_settings.left_sidebar_appearance = "match-terminal".to_string();
         }
@@ -4282,6 +4360,23 @@ impl AppState {
                 })
                 .map(ephemeral_worktree_entry),
         );
+        // A listing may have started before a sidebar drag completed. Preserve
+        // the live vector order for known rows while still accepting refreshed
+        // branch/head metadata and appending newly discovered worktrees.
+        if let Some(current) = self.worktrees_by_repo.get(&repo) {
+            let rank: HashMap<WorktreeId, usize> = current
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (worktree_id_for(&entry.path), index))
+                .collect();
+            let mut indexed = entries.into_iter().enumerate().collect::<Vec<_>>();
+            indexed.sort_by_key(|(incoming_index, entry)| {
+                rank.get(&worktree_id_for(&entry.path))
+                    .copied()
+                    .map_or((1, *incoming_index), |rank| (0, rank))
+            });
+            entries = indexed.into_iter().map(|(_, entry)| entry).collect();
+        }
         let still_present: HashSet<WorktreeId> =
             entries.iter().map(|e| worktree_id_for(&e.path)).collect();
         let vanished: Vec<WorktreeId> = self
@@ -4363,6 +4458,41 @@ impl AppState {
             .get(repo)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn worktree_is_dragging(&self, worktree: &WorktreeId) -> bool {
+        self.worktree_dragging.as_ref() == Some(worktree)
+    }
+
+    fn reorder_dragged_worktree_over(&mut self, target: &WorktreeId) -> bool {
+        let Some(source) = self.worktree_dragging.as_ref() else {
+            return false;
+        };
+        if source == target {
+            return false;
+        }
+        let Some((repo_id, source_index, target_index)) =
+            self.worktrees_by_repo
+                .iter()
+                .find_map(|(repo_id, entries)| {
+                    let source_index = entries
+                        .iter()
+                        .position(|entry| worktree_id_for(&entry.path) == *source)?;
+                    let target_index = entries
+                        .iter()
+                        .position(|entry| worktree_id_for(&entry.path) == *target)?;
+                    Some((repo_id.clone(), source_index, target_index))
+                })
+        else {
+            return false;
+        };
+        let entries = self
+            .worktrees_by_repo
+            .get_mut(&repo_id)
+            .expect("the matching repository was just found");
+        let moved = entries.remove(source_index);
+        entries.insert(target_index.min(entries.len()), moved);
+        true
     }
 
     pub(crate) fn worktree_is_visible(&self, entry: &WorktreeEntry) -> bool {
@@ -4867,6 +4997,18 @@ impl AppState {
 
     pub(crate) fn voice_status(&self) -> Option<&str> {
         self.voice_status.as_deref()
+    }
+
+    pub(crate) fn voice_microphones(&self) -> &[crate::speech::MicrophoneDevice] {
+        &self.voice_microphones
+    }
+
+    pub(crate) fn voice_microphones_known(&self) -> bool {
+        self.voice_microphones_known
+    }
+
+    pub(crate) fn voice_microphones_loading(&self) -> bool {
+        self.voice_microphones_loading
     }
 
     pub(crate) fn pending_voice_transcript(&self) -> Option<&str> {
@@ -5717,6 +5859,14 @@ impl AppState {
         &self.task_items
     }
 
+    pub(crate) fn task_current_page(&self) -> usize {
+        self.task_current_page
+    }
+
+    pub(crate) fn task_total_pages(&self) -> usize {
+        self.task_total_pages
+    }
+
     pub(crate) fn task_items_loading(&self) -> bool {
         self.task_items_loading
     }
@@ -6399,11 +6549,6 @@ impl AppState {
     /// 새 세션의 배지를 덮는 것을 막는 유일한 방어다.
     fn apply_hook(&mut self, event: &HookEvent) -> bool {
         let worktree_id = &event.pane_key.0;
-        let outcome = hook_outcome(event);
-        let should_notify = matches!(outcome, HookOutcome::Set(HookState::Done))
-            && self.ui_settings.notifications_enabled
-            && self.ui_settings.notification_agent_task_complete
-            && !(self.ui_settings.notification_suppress_when_focused && self.app_window_focused);
         // presence를 **먼저** 읽는다(아래에서 `badges`를 가변 대여하므로).
         let presence = self.worktree_presence(worktree_id);
         let Some((expected_nonce, allow_reattach_nonce_bind)) = self
@@ -6431,6 +6576,43 @@ impl AppState {
                 badge.allow_reattach_nonce_bind = false;
             }
         }
+        let is_turn_boundary = matches!(
+            event.event,
+            crate::agent_status::contract::HookEventName::Stop
+                | crate::agent_status::contract::HookEventName::StopFailure
+        );
+        let mut outcome = hook_outcome(event);
+        if event.agent_id.is_none() {
+            let badge = self
+                .badges
+                .get_mut(worktree_id)
+                .expect("badge existence was checked above");
+            if matches!(outcome, HookOutcome::Reset) || event.interrupted {
+                badge.claude_background_work_active = false;
+                badge.claude_session_crons_active = false;
+            } else {
+                if let Some(active) = event.background_work_active {
+                    badge.claude_background_work_active = active;
+                }
+                if let Some(active) = event.session_crons_active {
+                    badge.claude_session_crons_active = active;
+                } else if is_turn_boundary && event.background_work_active.is_some() {
+                    // Current Claude may omit an empty cron inventory while still
+                    // providing background_tasks at the turn boundary.
+                    badge.claude_session_crons_active = false;
+                }
+            }
+            if is_turn_boundary
+                && !event.interrupted
+                && (badge.claude_background_work_active || badge.claude_session_crons_active)
+            {
+                outcome = HookOutcome::Set(HookState::Working);
+            }
+        }
+        let should_notify = matches!(outcome, HookOutcome::Set(HookState::Done))
+            && self.ui_settings.notifications_enabled
+            && self.ui_settings.notification_agent_task_complete
+            && !(self.ui_settings.notification_suppress_when_focused && self.app_window_focused);
         self.note_agent_resume_hook(event, outcome);
         if self.ui_settings.tab_auto_generate_title {
             if let (Some(session_id), Some(title)) = (
@@ -6462,8 +6644,15 @@ impl AppState {
         badge.received_hook = true;
         match outcome {
             HookOutcome::Ignore => {}
-            HookOutcome::Reset => badge.hook = None,
-            HookOutcome::Set(state) => badge.hook = Some((state, Instant::now())),
+            HookOutcome::Reset => {
+                badge.hook = None;
+                badge.waiting_for_question = false;
+            }
+            HookOutcome::Set(state) => {
+                badge.hook = Some((state, Instant::now()));
+                badge.waiting_for_question = state == HookState::Waiting
+                    && is_ask_user_question_tool(event.tool_name.as_deref());
+            }
         }
         // **훅이 바뀌면 "유지할 값"도 같이 갱신한다.**
         //
@@ -6842,6 +7031,14 @@ impl AppState {
         self.last_save_status.as_ref()
     }
 
+    pub(crate) fn future_schema_guarded(&self) -> bool {
+        self.future_schema_guarded
+    }
+
+    pub(crate) fn future_schema_override_confirming(&self) -> bool {
+        self.future_schema_override_confirming
+    }
+
     /// 존재하면 갱신, 없으면 등록 순서 끝에 추가한다 (등록 순서를 보존한다).
     pub(crate) fn upsert_repo(&mut self, repo: Repo) {
         if let Some(existing) = self.repos.iter_mut().find(|r| r.id == repo.id) {
@@ -6870,6 +7067,14 @@ impl AppState {
 
     pub(crate) fn editor(&self) -> &EditorState {
         &self.editor
+    }
+
+    pub(crate) fn workspace_editor_active(&self) -> bool {
+        self.workspace_editor_active
+    }
+
+    pub(crate) fn worktree_for_session(&self, session: SessionId) -> Option<&WorktreeId> {
+        self.session_worktrees.get(&session)
     }
 
     pub(crate) fn quick_open(&self) -> &QuickOpenState {
@@ -6906,6 +7111,7 @@ impl AppState {
     fn open_editor_file(&mut self, worktree: WorktreeId, path: String) -> iced::Task<Message> {
         if self.editor.is_document(&worktree, &path) {
             self.editor.activate(&worktree, &path);
+            self.workspace_editor_active = true;
             return iced::Task::none();
         }
         self.load_editor_document(worktree, path)
@@ -6918,6 +7124,7 @@ impl AppState {
             };
             let op = self.next_op();
             self.editor.begin_load(worktree.clone(), path.clone(), op);
+            self.workspace_editor_active = true;
             return crate::editor::load_file(worktree, root, path, op);
         }
         let Some((_repo_id, entry)) = self.find_worktree(&worktree) else {
@@ -6925,6 +7132,7 @@ impl AppState {
         };
         let op = self.next_op();
         self.editor.begin_load(worktree.clone(), path.clone(), op);
+        self.workspace_editor_active = true;
         if let Some((target, project_root)) = self.remote_ssh_for_worktree(&worktree) {
             let message_worktree = worktree.clone();
             let message_path = path.clone();
@@ -7042,7 +7250,11 @@ impl AppState {
             )
         } else {
             iced::Task::perform(
-                crate::editor::file_signature_now(entry.path.clone(), path.clone()),
+                crate::editor::file_signature_now(
+                    entry.path.clone(),
+                    path.clone(),
+                    expected.clone(),
+                ),
                 {
                     let worktree = worktree.clone();
                     let path = path.clone();
@@ -7355,7 +7567,11 @@ impl AppState {
         crate::source_control::load_status(worktree, entry.path, op)
     }
 
-    fn request_task_items(&mut self) -> iced::Task<Message> {
+    fn request_task_items(&mut self, reset_page: bool) -> iced::Task<Message> {
+        if reset_page {
+            self.task_current_page = 0;
+            self.task_total_pages = 1;
+        }
         self.task_items_error = None;
         if !matches!(
             self.task_provider,
@@ -7366,6 +7582,8 @@ impl AppState {
             self.task_items_by_repo.clear();
             self.task_items_pending.clear();
             self.task_item_errors.clear();
+            self.task_current_page = 0;
+            self.task_total_pages = 1;
             return iced::Task::none();
         }
         let targets = self
@@ -7377,6 +7595,7 @@ impl AppState {
         if targets.is_empty() {
             self.task_items_loading = false;
             self.task_items.clear();
+            self.task_total_pages = 1;
             return iced::Task::none();
         }
         let op = self.next_op();
@@ -7390,13 +7609,19 @@ impl AppState {
         let kind = self.task_kind;
         let preset = self.task_preset;
         let query = self.task_query.clone();
+        let page = self.task_current_page;
         iced::Task::batch(
             targets
                 .into_iter()
                 .map(|(repo_id, repo_path)| match provider {
-                    TaskProvider::Github => {
-                        crate::tasks::load_github_work(op, repo_id, repo_path, kind, query.clone())
-                    }
+                    TaskProvider::Github => crate::tasks::load_github_work(
+                        op,
+                        repo_id,
+                        repo_path,
+                        kind,
+                        query.clone(),
+                        page,
+                    ),
                     TaskProvider::Gitlab => crate::tasks::load_gitlab_work(
                         op,
                         repo_id,
@@ -7410,11 +7635,16 @@ impl AppState {
         )
     }
 
-    fn finish_task_item_batch(&mut self) {
+    fn finish_task_item_batch(&mut self) -> bool {
         let mut seen = HashSet::new();
         let mut items = Vec::new();
+        let mut total_pages = 1;
         for repo in &self.repos {
-            for item in self.task_items_by_repo.get(&repo.id).into_iter().flatten() {
+            let Some(page) = self.task_items_by_repo.get(&repo.id) else {
+                continue;
+            };
+            total_pages = total_pages.max(page.total_pages);
+            for item in &page.items {
                 if seen.insert(item.url.clone()) {
                     items.push(item.clone());
                 }
@@ -7427,6 +7657,11 @@ impl AppState {
                 .then_with(|| left.url.cmp(&right.url))
         });
         self.task_items = items;
+        self.task_total_pages = total_pages;
+        let page_was_clamped = self.task_current_page >= self.task_total_pages;
+        if page_was_clamped {
+            self.task_current_page = self.task_total_pages.saturating_sub(1);
+        }
         self.task_items_loading = false;
         self.task_items_op = None;
         self.task_items_error = if self.task_items.is_empty() && !self.task_item_errors.is_empty() {
@@ -7442,6 +7677,7 @@ impl AppState {
         } else {
             None
         };
+        page_was_clamped
     }
 
     fn request_remote_provider_accounts(&mut self) -> iced::Task<Message> {
@@ -8566,9 +8802,9 @@ impl AppState {
             // **배지 장부도 같이 간다.** 남겨두면 세션이 사라진 뒤에도 마지막
             // 훅 상태가 살아 있는데, presence는 세션이 없으므로 `Unknown`으로
             // 떨어지고 — 리듀서의 `Unknown` 팔은 훅을 그대로 신뢰한다. 마지막
-            // 훅이 `Waiting`이었다면 **`Waiting`은 나이로 감쇠하지 않으므로**
-            // 사이드바 행(git 목록으로 그려지므로 세션과 무관하게 살아남는다)에
-            // 주황색 "사람을 기다림" 표시가 영구히 박힌다.
+            // 훅이 `Waiting`이었다면 freshness 만료까지 최대 30분 동안 사이드바
+            // 행(git 목록으로 그려지므로 세션과 무관하게 살아남는다)에 잘못된
+            // 주황색 "사람을 기다림" 표시가 남는다.
             // 지우면 `worktree_badge`가 `None` 가지를 타 `Unknown`이 된다 —
             // 세션이 없을 때 정직한 답이다. 맵이 무한히 자라는 것도 같이 막는다.
             self.badges.remove(&worktree_id);
@@ -8739,6 +8975,50 @@ impl AppState {
         }
     }
 
+    fn infer_claude_question_resolved(&mut self, id: SessionId, input: &KeyInput) -> bool {
+        let plain_submit_or_escape = !input.repeat
+            && !input.mods.shift
+            && !input.mods.ctrl
+            && !input.mods.alt
+            && !input.mods.logo
+            && matches!(
+                input.key,
+                TermKey::Named(NamedKey::Enter | NamedKey::Escape)
+            );
+        if !plain_submit_or_escape {
+            return false;
+        }
+        let Some(worktree_id) = self.session_worktrees.get(&id).cloned() else {
+            return false;
+        };
+        let presence = self.worktree_presence(&worktree_id);
+        let now = Instant::now();
+        let Some(badge) = self.badges.get_mut(&worktree_id) else {
+            return false;
+        };
+        let waiting_is_fresh = badge.hook.is_some_and(|(state, at)| {
+            state == HookState::Waiting && now.saturating_duration_since(at) <= HOOK_STALE_AFTER
+        });
+        if !badge.received_hook || !badge.waiting_for_question || !waiting_is_fresh {
+            return false;
+        }
+
+        // Claude sends no hook after AskUserQuestion is submitted or dismissed.
+        // The key was successfully queued to this exact session and this badge
+        // is still the same fresh waiting baseline, so synthesize the omitted
+        // post-question state. A later real hook remains authoritative.
+        badge.hook = Some((HookState::Working, now));
+        badge.waiting_for_question = false;
+        if !matches!(presence, AgentPresence::NoAgent) {
+            badge.previous = BadgeState::Working;
+        }
+        self.prompt_cache_started.remove(&worktree_id);
+        if let Some(live) = self.live_agent_resume.get_mut(&worktree_id) {
+            live.done_at = None;
+        }
+        true
+    }
+
     /// 위젯이 발행한 커맨드를 세션에 적용한다. 실행 스레드는 Task 0.8의 정책
     /// 표를 따른다: `Key`/`Paste`/`Mouse`/`Scroll`은 UI 스레드에서 곧바로(그리드가
     /// 짧은 term 락으로 인코딩 후 `try_send`), `Resize`와 선택 추출은 워커로.
@@ -8762,6 +9042,9 @@ impl AppState {
                 self.pending_injections.remove(&id);
                 self.terminal_last_input_at.insert(id, Instant::now());
                 let outcome = session.send_key(&input);
+                if outcome == WriteOutcome::Queued {
+                    self.infer_claude_question_resolved(id, &input);
+                }
                 self.note_write(id, outcome);
                 iced::Task::none()
             }
@@ -12059,6 +12342,9 @@ impl AppState {
                     SettingsSection::ProviderAccounts => {
                         self.update(Message::RemoteProviderAccountsRefreshRequested)
                     }
+                    SettingsSection::Voice => {
+                        self.update(Message::VoiceMicrophonesRefreshRequested)
+                    }
                     SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
                     _ => iced::Task::none(),
                 }
@@ -12081,6 +12367,9 @@ impl AppState {
                     }
                     SettingsSection::ProviderAccounts => {
                         self.update(Message::RemoteProviderAccountsRefreshRequested)
+                    }
+                    SettingsSection::Voice => {
+                        self.update(Message::VoiceMicrophonesRefreshRequested)
                     }
                     SettingsSection::Plugins => self.update(Message::PluginsRefreshRequested),
                     _ => iced::Task::none(),
@@ -13938,18 +14227,78 @@ impl AppState {
                     self.ui_settings.voice_enabled = false;
                     self.voice_status = Some("Voice dictation disabled.".to_string());
                 } else {
-                    match crate::speech::start_capture() {
-                        Ok(()) => {
+                    match crate::speech::start_capture(
+                        self.ui_settings.voice_microphone_device_id.as_deref(),
+                        self.ui_settings.voice_microphone_device_label.as_deref(),
+                    ) {
+                        Ok(started) => {
                             crate::speech::cancel_capture();
                             self.ui_settings.voice_enabled = true;
-                            self.voice_status = Some(
-                                "Microphone permission granted. Voice dictation enabled.".into(),
-                            );
+                            if started.fell_back_to_default {
+                                self.voice_status = Some(
+                                    "Selected microphone unavailable. Voice is enabled and will use the system default."
+                                        .into(),
+                                );
+                            } else {
+                                if self.ui_settings.voice_microphone_device_id.is_some() {
+                                    self.ui_settings.voice_microphone_device_id = started.device_id;
+                                    self.ui_settings.voice_microphone_device_label =
+                                        Some(started.device_label.clone());
+                                }
+                                self.voice_status = Some(format!(
+                                    "Microphone access granted · {}",
+                                    started.device_label
+                                ));
+                            }
                         }
                         Err(error) => {
                             self.voice_status = Some(error);
                         }
                     }
+                }
+                self.persist();
+                self.update(Message::VoiceMicrophonesRefreshRequested)
+            }
+            Message::VoiceMicrophonesRefreshRequested => {
+                if self.voice_microphones_loading {
+                    return iced::Task::none();
+                }
+                self.voice_microphones_loading = true;
+                iced::Task::perform(
+                    async { crate::speech::list_input_devices() },
+                    Message::VoiceMicrophonesLoaded,
+                )
+            }
+            Message::VoiceMicrophonesLoaded(result) => {
+                self.voice_microphones_loading = false;
+                self.voice_microphones_known = result.is_ok();
+                match result {
+                    Ok(devices) => self.voice_microphones = devices,
+                    Err(error) => {
+                        self.voice_microphones.clear();
+                        self.voice_status = Some(error);
+                    }
+                }
+                iced::Task::none()
+            }
+            Message::VoiceMicrophoneSelected(device) => {
+                if !self.ui_settings.voice_enabled {
+                    self.voice_status =
+                        Some("Enable Voice Dictation before choosing a microphone.".into());
+                    return iced::Task::none();
+                }
+                if let Some(device) = device {
+                    self.ui_settings.voice_microphone_device_id = Some(device.id);
+                    self.ui_settings.voice_microphone_device_label = Some(device.label.clone());
+                    self.voice_status = Some(format!(
+                        "{} will be used for the next dictation.",
+                        device.label
+                    ));
+                } else {
+                    self.ui_settings.voice_microphone_device_id = None;
+                    self.ui_settings.voice_microphone_device_label = None;
+                    self.voice_status =
+                        Some("Dictation will follow the system default microphone.".into());
                 }
                 self.persist();
                 iced::Task::none()
@@ -13988,12 +14337,30 @@ impl AppState {
                                 Some("Select and prepare a speech model before dictating.".into());
                             return iced::Task::none();
                         }
-                        match crate::speech::start_capture() {
-                            Ok(()) => {
+                        match crate::speech::start_capture(
+                            self.ui_settings.voice_microphone_device_id.as_deref(),
+                            self.ui_settings.voice_microphone_device_label.as_deref(),
+                        ) {
+                            Ok(started) => {
                                 self.voice_dictation_state = VoiceDictationState::Recording;
-                                self.voice_status = Some(
-                                    "Listening… Press the dictation shortcut again to stop.".into(),
-                                );
+                                if started.fell_back_to_default {
+                                    self.voice_status = Some(
+                                        "Selected microphone unavailable; listening on the system default. Press the shortcut again to stop."
+                                            .into(),
+                                    );
+                                } else {
+                                    if self.ui_settings.voice_microphone_device_id.is_some() {
+                                        self.ui_settings.voice_microphone_device_id =
+                                            started.device_id;
+                                        self.ui_settings.voice_microphone_device_label =
+                                            Some(started.device_label.clone());
+                                        self.persist();
+                                    }
+                                    self.voice_status = Some(format!(
+                                        "Listening on {}… Press the dictation shortcut again to stop.",
+                                        started.device_label
+                                    ));
+                                }
                             }
                             Err(error) => {
                                 self.voice_status = Some(error);
@@ -16017,13 +16384,18 @@ impl AppState {
                 iced::Task::none()
             }
             Message::FloatingWorkspacePointerReleased => {
+                self.worktree_dragging = None;
+                let reordered_worktree = std::mem::take(&mut self.worktree_drag_changed);
                 let Some(drag) = self.floating_workspace_drag.take() else {
+                    if reordered_worktree {
+                        self.persist();
+                    }
                     return iced::Task::none();
                 };
                 if drag.target == FloatingWorkspaceDragTarget::Trigger && !drag.moved {
                     return self.update(Message::FloatingWorkspaceToggled);
                 }
-                if drag.moved {
+                if drag.moved || reordered_worktree {
                     self.persist();
                 }
                 iced::Task::none()
@@ -18586,6 +18958,15 @@ impl AppState {
                     }
                 }
             }
+            Message::WorktreeDragStarted(id) => {
+                self.worktree_dragging = Some(id.clone());
+                self.worktree_drag_changed = false;
+                iced::Task::none()
+            }
+            Message::WorktreeDragHovered(target) => {
+                self.worktree_drag_changed |= self.reorder_dragged_worktree_over(&target);
+                iced::Task::none()
+            }
             Message::WorktreeSelected(id) => {
                 self.automation_ui.close();
                 self.mobile_open = false;
@@ -18820,16 +19201,36 @@ impl AppState {
                 }
             }
             Message::EditorTabSelected { worktree, path } => {
-                self.editor.activate(&worktree, &path);
-                self.editor
-                    .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                if self.editor.activate(&worktree, &path) {
+                    self.workspace_editor_active = true;
+                    self.editor
+                        .refresh_spellcheck(self.ui_settings.rich_markdown_spellcheck);
+                }
                 iced::Task::none()
+            }
+            Message::WorkspaceTerminalTabSelected(session) => {
+                let pane = self.panes.as_ref().and_then(|panes| {
+                    panes
+                        .iter()
+                        .find_map(|(pane, candidate)| (*candidate == session).then_some(*pane))
+                });
+                self.workspace_editor_active = false;
+                pane.map_or_else(iced::Task::none, |pane| self.focus_pane(pane))
             }
             Message::EditorTabCloseRequested { worktree, path } => {
                 if self.editor.activate(&worktree, &path) {
+                    let editor_was_active = self.workspace_editor_active;
                     let closed = self.editor.request_close();
                     if closed && worktree.0 == "__suaegi_floating_workspace__" {
                         self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                    if closed {
+                        self.workspace_editor_active = editor_was_active && self.editor.is_open();
+                    } else {
+                        // A dirty tab needs its keep/discard controls visible.
+                        // Closing it from the terminal tab strip must not leave
+                        // that confirmation hidden behind the terminal.
+                        self.workspace_editor_active = true;
                     }
                 }
                 iced::Task::none()
@@ -18926,8 +19327,13 @@ impl AppState {
             }
             Message::EditorCloseRequested => {
                 let floating = self.floating_workspace_owns_editor();
-                if self.editor.request_close() && floating {
-                    self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                if self.editor.request_close() {
+                    if floating {
+                        self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                    }
+                    if !self.editor.is_open() {
+                        self.workspace_editor_active = false;
+                    }
                 }
                 iced::Task::none()
             }
@@ -18940,6 +19346,9 @@ impl AppState {
                 self.editor.discard_and_close();
                 if floating {
                     self.floating_workspace_content = FloatingWorkspaceContent::Empty;
+                }
+                if !self.editor.is_open() {
+                    self.workspace_editor_active = false;
                 }
                 iced::Task::none()
             }
@@ -19122,7 +19531,7 @@ impl AppState {
                 self.activity_open = false;
                 self.tasks_open = true;
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(false),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19148,7 +19557,7 @@ impl AppState {
                         self.task_preset.query(kind).to_string()
                     };
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19161,7 +19570,7 @@ impl AppState {
                     String::new()
                 };
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19176,7 +19585,7 @@ impl AppState {
                     String::new()
                 };
                 match provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19205,7 +19614,7 @@ impl AppState {
                 );
                 self.persist();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19215,19 +19624,21 @@ impl AppState {
                 self.ui_settings.default_repo_selection = None;
                 self.persist();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
             }
             Message::TaskQueryChanged(query) => {
                 self.task_query = query;
+                self.task_current_page = 0;
+                self.task_total_pages = 1;
                 iced::Task::none()
             }
             Message::TaskQueryCleared => {
                 self.task_query.clear();
                 match self.task_provider {
-                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                    TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(true),
                     TaskProvider::Jira => self.request_jira_issues(),
                     TaskProvider::Linear => self.request_linear_issues(),
                 }
@@ -19315,10 +19726,22 @@ impl AppState {
                 iced::Task::none()
             }
             Message::TaskRefreshRequested => match self.task_provider {
-                TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(),
+                TaskProvider::Github | TaskProvider::Gitlab => self.request_task_items(false),
                 TaskProvider::Jira => self.request_jira_issues(),
                 TaskProvider::Linear => self.request_linear_issues(),
             },
+            Message::TaskPageRequested(page) => {
+                if self.task_provider != TaskProvider::Github
+                    || self.task_kind == TaskKind::Projects
+                    || self.task_items_loading
+                    || page >= self.task_total_pages
+                    || page == self.task_current_page
+                {
+                    return iced::Task::none();
+                }
+                self.task_current_page = page;
+                self.request_task_items(false)
+            }
             Message::TaskItemsLoaded {
                 op,
                 repo_id,
@@ -19337,8 +19760,8 @@ impl AppState {
                             self.task_item_errors.insert(repo_id, error);
                         }
                     }
-                    if self.task_items_pending.is_empty() {
-                        self.finish_task_item_batch();
+                    if self.task_items_pending.is_empty() && self.finish_task_item_batch() {
+                        return self.request_task_items(false);
                     }
                 }
                 iced::Task::none()
@@ -19529,7 +19952,31 @@ impl AppState {
                 self.automation_ui.open(self.selected_worktree.clone());
                 iced::Task::none()
             }
-            Message::WindowClose => iced::window::latest()
+            Message::WindowClose => {
+                if self.shutdown_started {
+                    iced::Task::none()
+                } else {
+                    self.shutdown_started = true;
+                    let final_snapshot = self.persisted_snapshot();
+                    let completion = self
+                        .persistence
+                        .as_mut()
+                        .and_then(|persistence| persistence.begin_shutdown(final_snapshot));
+                    match completion {
+                        Some(completion) => {
+                            crate::background::blocking(move |mut sender| {
+                                // Match Orca's bounded teardown window. The wait
+                                // happens off the UI thread, so the window stays
+                                // repaintable and Force Quit remains effective.
+                                let _ = completion.recv_timeout(Duration::from_secs(20));
+                                let _ = sender.try_send(Message::WindowShutdownFinished);
+                            })
+                        }
+                        None => self.update(Message::WindowShutdownFinished),
+                    }
+                }
+            }
+            Message::WindowShutdownFinished => iced::window::latest()
                 .then(|id| id.map_or_else(iced::Task::none, iced::window::close)),
             Message::WindowMinimize => iced::window::latest()
                 .then(|id| id.map_or_else(iced::Task::none, |id| iced::window::minimize(id, true))),
@@ -19570,6 +20017,38 @@ impl AppState {
                 if self.active_plugin_panel.is_some() && self.right_sidebar_open {
                     self.plugin_panel_error =
                         crate::plugin_panel::resize(self.plugin_panel_bounds()).err();
+                }
+                iced::Task::none()
+            }
+            Message::FutureSchemaOverrideRequested => {
+                self.future_schema_override_confirming = self.future_schema_guarded;
+                iced::Task::none()
+            }
+            Message::FutureSchemaOverrideCancelled => {
+                self.future_schema_override_confirming = false;
+                iced::Task::none()
+            }
+            Message::FutureSchemaOverrideConfirmed => {
+                if !self.future_schema_guarded {
+                    self.future_schema_override_confirming = false;
+                    return iced::Task::none();
+                }
+                let override_queued = self
+                    .persistence
+                    .as_ref()
+                    .is_some_and(PersistenceHandle::override_future_schema_guard);
+                if override_queued {
+                    // The worker channel is FIFO: the override is processed
+                    // before this snapshot. Store::save rotates the newer main
+                    // file into bak.0 before replacing it.
+                    self.future_schema_guarded = false;
+                    self.future_schema_override_confirming = false;
+                    self.last_save_status = None;
+                    self.persist();
+                } else {
+                    self.last_save_status = Some(SaveStatus::Failed(
+                        "Could not reach the settings persistence worker.".to_string(),
+                    ));
                 }
                 iced::Task::none()
             }
@@ -20533,6 +21012,15 @@ impl AppState {
                 .session_store
                 .apply_snapshot(id, generation, snapshot)
                 .unwrap_or_else(iced::Task::none),
+            Message::SnapshotFailed {
+                id,
+                generation,
+                error,
+            } => {
+                eprintln!("terminal snapshot failed (session {}): {error}", id.0);
+                self.session_store.snapshot_failed(id, generation);
+                iced::Task::none()
+            }
             Message::PaneClicked(pane) => self.focus_pane(pane),
 
             Message::Terminal { id, command } => self.dispatch_term_command(id, command),
@@ -20762,6 +21250,15 @@ impl AppState {
                             Some(format!("Could not hibernate the completed agent: {error}"));
                     }
                 }
+                iced::Task::none()
+            }
+            Message::PresenceFailed {
+                id,
+                generation,
+                error,
+            } => {
+                eprintln!("terminal presence probe failed (session {}): {error}", id.0);
+                self.session_store.presence_failed(id, generation);
                 iced::Task::none()
             }
 
@@ -23820,6 +24317,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sidebar_drag_order_survives_a_concurrent_authoritative_refresh() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/reordered".into());
+        let a = entry_at("/tmp/reordered/a", "a");
+        let b = entry_at("/tmp/reordered/b", "b");
+        let c = entry_at("/tmp/reordered/c", "c");
+        state
+            .worktrees_by_repo
+            .insert(repo_id.clone(), vec![a.clone(), b.clone(), c.clone()]);
+
+        state.worktree_dragging = Some(worktree_id_for(&a.path));
+        assert!(state.reorder_dragged_worktree_over(&worktree_id_for(&c.path)));
+        assert_eq!(state.worktree_names(&repo_id), vec!["b", "c", "a"]);
+
+        let mut refreshed_a = a;
+        refreshed_a.head = Some("new-head".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id.clone(), OpId(1), vec![refreshed_a, b, c]);
+        assert_eq!(
+            state.worktree_names(&repo_id),
+            vec!["b", "c", "a"],
+            "a refresh started before the drag must not restore stale list order"
+        );
+        assert_eq!(
+            state.worktrees_by_repo[&repo_id][2].head.as_deref(),
+            Some("new-head"),
+            "preserving order must still accept refreshed worktree metadata"
+        );
+    }
+
     // ---- 저장 트리거와 디바운스 ----
 
     /// 리사이즈는 드래그 한 번에 수십 번 온다. **최신 세대만 저장한다.**
@@ -24071,6 +24599,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn future_schema_replacement_requires_two_steps_and_preserves_the_newer_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut future = PersistedState {
+            schema_version: suaegi_core::domain::SCHEMA_VERSION + 1,
+            ..PersistedState::default()
+        };
+        future.repos.push(some_repo("newer-version"));
+        let future_json = serde_json::to_string_pretty(&future).unwrap();
+        std::fs::write(&file, &future_json).unwrap();
+
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        let mut state = AppState::from_load(boot.load);
+        state.persistence = Some(boot.handle);
+        state.hydration = Hydration::opened();
+        assert!(state.future_schema_guarded());
+
+        let _ = state.update(Message::FutureSchemaOverrideRequested);
+        assert!(state.future_schema_guarded());
+        assert!(state.future_schema_override_confirming());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            future_json,
+            "opening the confirmation must never touch the newer document"
+        );
+
+        let _ = state.update(Message::FutureSchemaOverrideCancelled);
+        assert!(state.future_schema_guarded());
+        assert!(!state.future_schema_override_confirming());
+
+        let _ = state.update(Message::FutureSchemaOverrideRequested);
+        let _ = state.update(Message::FutureSchemaOverrideConfirmed);
+        assert!(!state.future_schema_guarded());
+        assert!(!state.future_schema_override_confirming());
+        let saved = flush_and_reload(state, &file);
+        assert_eq!(saved.schema_version, suaegi_core::domain::SCHEMA_VERSION);
+        assert_eq!(
+            std::fs::read_to_string(file.with_file_name("data.json.bak.0")).unwrap(),
+            future_json,
+            "confirming replacement must retain the newer file as the first backup"
+        );
+    }
+
+    #[test]
+    fn legacy_sf_mono_default_migrates_to_orcas_medium_weight_once() {
+        let mut disk = PersistedState::default();
+        disk.settings.ui.terminal_font_family = "SF Mono".into();
+        disk.settings.ui.terminal_font_weight = 400;
+        disk.settings.ui.terminal_font_defaults_orca_v2 = false;
+
+        let state = AppState::from_load(LoadDiagnostics {
+            state: disk,
+            origin: LoadOrigin::Loaded,
+            save_blocked: false,
+        });
+
+        assert_eq!(state.ui_settings().terminal_font_weight, 500);
+        assert!(state.ui_settings().terminal_font_defaults_orca_v2);
+    }
+
+    #[test]
+    fn explicit_nondefault_terminal_weight_survives_the_typography_migration() {
+        let mut disk = PersistedState::default();
+        disk.settings.ui.terminal_font_family = "SF Mono".into();
+        disk.settings.ui.terminal_font_weight = 300;
+        disk.settings.ui.terminal_font_defaults_orca_v2 = false;
+
+        let state = AppState::from_load(LoadDiagnostics {
+            state: disk,
+            origin: LoadOrigin::Loaded,
+            save_blocked: false,
+        });
+
+        assert_eq!(
+            state.ui_settings().terminal_font_weight,
+            300,
+            "only Suaegi's old 400 default may be upgraded"
+        );
+        assert!(state.ui_settings().terminal_font_defaults_orca_v2);
+    }
+
     /// **디스크 → `from_load` → `begin_layout_restore`의 이음매.** 위의 복원
     /// 테스트들은 `pending_restore_tree`를 직접 세우므로, 저장된 트리를 부팅이
     /// 실제로 **읽어오는지**는 검사하지 못한다 — 그 한 줄이 죽어도 전부 통과한다
@@ -24216,7 +24826,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty: Some(true),
+            background_work_active: Some(false),
+            session_crons_active: Some(false),
+            interrupted: false,
         }
     }
 
@@ -24319,6 +24931,63 @@ mod tests {
         assert!(!state.badges.contains_key(&wt("/tmp/other")));
     }
 
+    #[test]
+    fn enter_and_escape_clear_only_a_fresh_claude_question_wait() {
+        use suaegi_term::input_types::{KeyLocation, Mods};
+
+        for key in [NamedKey::Enter, NamedKey::Escape] {
+            let (mut state, id, worktree, _pane) = state_with_one_open_session();
+            state
+                .badges
+                .insert(worktree.clone(), PaneBadge::new(SpawnNonce(7)));
+            let mut question = hook(&worktree.0, 7, HookEventName::PreToolUse);
+            question.tool_name = Some("AskUserQuestion".into());
+            assert!(state.apply_hook(&question));
+            assert!(state.badges[&worktree].waiting_for_question);
+
+            assert!(state.infer_claude_question_resolved(
+                id,
+                &KeyInput {
+                    key: TermKey::Named(key),
+                    physical_latin: None,
+                    location: KeyLocation::Standard,
+                    mods: Mods::default(),
+                    text: None,
+                    repeat: false,
+                }
+            ));
+            assert_eq!(
+                state.badges[&worktree].hook.map(|(state, _)| state),
+                Some(HookState::Working)
+            );
+            assert!(!state.badges[&worktree].waiting_for_question);
+        }
+
+        let (mut permission, id, worktree, _pane) = state_with_one_open_session();
+        permission
+            .badges
+            .insert(worktree.clone(), PaneBadge::new(SpawnNonce(8)));
+        let mut bash = hook(&worktree.0, 8, HookEventName::PermissionRequest);
+        bash.tool_name = Some("Bash".into());
+        assert!(permission.apply_hook(&bash));
+        assert!(!permission.infer_claude_question_resolved(
+            id,
+            &KeyInput {
+                key: TermKey::Named(NamedKey::Escape),
+                physical_latin: None,
+                location: KeyLocation::Standard,
+                mods: Mods::default(),
+                text: None,
+                repeat: false,
+            }
+        ));
+        assert_eq!(
+            permission.badges[&worktree].hook.map(|(state, _)| state),
+            Some(HookState::Waiting),
+            "Escape must not clear an ordinary permission request"
+        );
+    }
+
     /// `SessionStart`는 장부를 **지운다**. 옛 세션의 `Working`을 물려받으면 아무
     /// 일도 안 하는 pane이 도는 스피너로 보인다.
     #[test]
@@ -24343,6 +25012,62 @@ mod tests {
             state.badges[&wt("/tmp/wt-a")].hook.is_none(),
             "a fresh session starts from Unknown, not from whatever the last one was doing"
         );
+    }
+
+    #[test]
+    fn turn_boundaries_preserve_live_background_and_cron_evidence_until_drained_or_interrupted() {
+        let id = wt("/tmp/wt-a");
+        let mut state = state_with_badge(&id.0, 1);
+
+        let mut running = hook(&id.0, 1, HookEventName::Stop);
+        running.background_work_active = Some(true);
+        running.session_crons_active = Some(true);
+        assert!(state.apply_hook(&running));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working)
+        );
+
+        let mut thin_failure = hook(&id.0, 1, HookEventName::StopFailure);
+        thin_failure.background_work_active = None;
+        thin_failure.session_crons_active = None;
+        assert!(state.apply_hook(&thin_failure));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working),
+            "a thin non-interrupted StopFailure cannot discard prior live work"
+        );
+
+        let mut drained = hook(&id.0, 1, HookEventName::Stop);
+        drained.background_work_active = Some(false);
+        drained.session_crons_active = None;
+        assert!(state.apply_hook(&drained));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Done),
+            "a present drained task inventory also clears an omitted empty cron inventory"
+        );
+
+        let mut scheduled = hook(&id.0, 1, HookEventName::Stop);
+        scheduled.background_work_active = Some(false);
+        scheduled.session_crons_active = Some(true);
+        assert!(state.apply_hook(&scheduled));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working)
+        );
+
+        let mut interrupted = hook(&id.0, 1, HookEventName::StopFailure);
+        interrupted.background_work_active = None;
+        interrupted.session_crons_active = None;
+        interrupted.interrupted = true;
+        assert!(state.apply_hook(&interrupted));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Done)
+        );
+        assert!(!state.badges[&id].claude_background_work_active);
+        assert!(!state.badges[&id].claude_session_crons_active);
     }
 
     #[test]
@@ -24657,7 +25382,9 @@ mod tests {
             tool_name: Some("Bash".into()),
             agent_id: None,
             prompt: None,
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
 
         assert_eq!(
@@ -24684,7 +25411,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Review community PR https://github.com/acme/app/pull/1094".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(state.session_tab_title(id), "PR 1094 - Review community");
 
@@ -24696,7 +25425,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please replace the first title".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(
             state.session_tab_title(id),
@@ -24737,7 +25468,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please fix the auth bug".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert!(state.auto_branch_rename_in_flight.contains(&worktree_id));
 
@@ -24756,7 +25489,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please fix the auth bug".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert!(
             !imported.auto_branch_rename_in_flight.contains(&imported_id),
@@ -24911,9 +25646,9 @@ mod tests {
     /// **닫힌 pane의 배지가 `Waiting`에 굳으면 안 된다.**
     ///
     /// 세션이 사라지면 presence는 `Unknown`으로 떨어지고, 리듀서의 `Unknown` 팔은
-    /// 훅을 그대로 신뢰한다. 마지막 훅이 `Waiting`이었다면 **`Waiting`은 나이로
-    /// 감쇠하지 않으므로** 사이드바 행(git 목록으로 그려져 세션과 무관하게
-    /// 살아남는다)에 주황색 표시가 영구히 박힌다. `Exited` 행은 이걸 못 막는다 —
+    /// 훅을 그대로 신뢰한다. 마지막 훅이 `Waiting`이었다면 freshness 만료까지
+    /// 최대 30분 동안 사이드바 행(git 목록으로 그려져 세션과 무관하게 살아남는다)에
+    /// 주황색 표시가 남는다. `Exited` 행은 이걸 못 막는다 —
     /// presence가 `Exited`로 관측될 일이 아예 없기 때문이다.
     #[test]
     fn closing_a_pane_does_not_strand_its_badge_on_waiting() {
@@ -24929,7 +25664,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(
             state.worktree_badge(&worktree_id),
@@ -24942,9 +25679,8 @@ mod tests {
         assert_eq!(
             state.worktree_badge(&worktree_id),
             BadgeState::Unknown,
-            "with the session gone the honest answer is Unknown — leaving Waiting puts a \
-             permanent orange 'needs you' marker on a worktree nobody is working in, and \
-             nothing can ever clear it because Waiting does not decay with age"
+            "with the session gone the honest answer is Unknown — leaving Waiting keeps an \
+             orange 'needs you' marker until the shared 30-minute freshness window expires"
         );
         assert!(
             !state.badges.contains_key(&worktree_id),
@@ -27092,20 +27828,54 @@ mod tests {
             op: OpId(77),
             repo_id: first.id.clone(),
             kind: TaskKind::Issues,
-            result: Ok(vec![duplicate.clone()]),
+            result: Ok(crate::tasks::TaskPageResult {
+                items: vec![duplicate.clone()],
+                total_pages: 3,
+            }),
         });
         assert!(state.task_items_loading);
         let _ = state.update(Message::TaskItemsLoaded {
             op: OpId(77),
             repo_id: second.id,
             kind: TaskKind::Issues,
-            result: Ok(vec![duplicate, newer.clone()]),
+            result: Ok(crate::tasks::TaskPageResult {
+                items: vec![duplicate, newer.clone()],
+                total_pages: 5,
+            }),
         });
 
         assert!(!state.task_items_loading);
         assert_eq!(state.task_items.len(), 2);
         assert_eq!(state.task_items[0].url, newer.url);
         assert_eq!(state.task_items_op, None);
+        assert_eq!(state.task_total_pages, 5);
+    }
+
+    #[test]
+    fn github_task_pagination_preserves_refreshes_and_resets_for_query_changes() {
+        let mut state = AppState::default();
+        let repo = some_repo("tasks-pagination");
+        state.upsert_repo(repo.clone());
+        state.task_repo_selection.insert(repo.id);
+        state.task_provider = TaskProvider::Github;
+        state.task_kind = TaskKind::Issues;
+        state.task_current_page = 2;
+        state.task_total_pages = 5;
+
+        let _ = state.update(Message::TaskRefreshRequested);
+        assert_eq!(state.task_current_page, 2);
+
+        // Complete the synthetic in-flight request before exercising a page
+        // click; the task itself is deliberately not polled by this reducer test.
+        state.task_items_loading = false;
+        state.task_items_op = None;
+        state.task_items_pending.clear();
+        let _ = state.update(Message::TaskPageRequested(3));
+        assert_eq!(state.task_current_page, 3);
+
+        let _ = state.update(Message::TaskQueryChanged("label:bug".to_string()));
+        assert_eq!(state.task_current_page, 0);
+        assert_eq!(state.task_total_pages, 1);
     }
 
     #[test]
@@ -27471,6 +28241,78 @@ mod tests {
     }
 
     #[test]
+    fn terminal_and_editor_tabs_switch_without_replacing_each_other() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/accepted");
+        let session = SessionId(91);
+        let (panes, pane) = pane_grid::State::new(session);
+        state.panes = Some(panes);
+        state.focused_pane = Some(pane);
+        state.session_worktrees.insert(session, worktree.clone());
+        state
+            .editor
+            .begin_load(worktree.clone(), "src/lib.rs".into(), OpId(1));
+        state.workspace_editor_active = true;
+
+        let _ = state.update(Message::WorkspaceTerminalTabSelected(session));
+
+        assert!(!state.workspace_editor_active());
+        assert!(
+            state.editor.is_document(&worktree, "src/lib.rs"),
+            "switching back to Claude must keep the file tab alive"
+        );
+
+        let _ = state.update(Message::EditorTabSelected {
+            worktree: worktree.clone(),
+            path: "src/lib.rs".into(),
+        });
+
+        assert!(state.workspace_editor_active());
+        assert_eq!(state.focused_session(), Some(session));
+    }
+
+    #[test]
+    fn closing_a_dirty_file_from_the_terminal_strip_reveals_its_confirmation() {
+        let mut state = AppState::default();
+        let worktree = wt("/tmp/accepted");
+        state
+            .editor
+            .begin_load(worktree.clone(), "src/lib.rs".into(), OpId(1));
+        assert!(state.editor.accept_load(
+            &worktree,
+            "src/lib.rs",
+            OpId(1),
+            Ok(crate::editor::EditorLoad::Ready {
+                text: "a".into(),
+                size: 1,
+                signature: suaegi_git::fs::FileSignature {
+                    size: 1,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    change_marker: None,
+                    content_hash: Some([0; 32]),
+                },
+            }),
+        ));
+        state
+            .editor
+            .perform(iced::widget::text_editor::Action::Edit(
+                iced::widget::text_editor::Edit::Insert('!'),
+            ));
+        state.workspace_editor_active = false;
+
+        let _ = state.update(Message::EditorTabCloseRequested {
+            worktree,
+            path: "src/lib.rs".into(),
+        });
+
+        assert!(
+            state.workspace_editor_active(),
+            "the keep/discard controls must not remain hidden behind Claude"
+        );
+        assert!(state.editor.has_unsaved_changes());
+    }
+
+    #[test]
     fn right_sidebar_activity_selection_is_explicit_and_reopenable() {
         let mut state = AppState {
             selected_worktree: Some(wt("/tmp/accepted")),
@@ -27747,6 +28589,30 @@ mod tests {
     }
 
     #[test]
+    fn voice_microphone_selection_persists_id_and_label_or_system_default() {
+        let mut state = AppState::default();
+        state.ui_settings.voice_enabled = true;
+        let device = crate::speech::MicrophoneDevice {
+            id: "coreaudio:test-input".to_string(),
+            label: "Studio Microphone".to_string(),
+        };
+
+        let _ = state.update(Message::VoiceMicrophoneSelected(Some(device.clone())));
+        assert_eq!(
+            state.ui_settings.voice_microphone_device_id.as_deref(),
+            Some(device.id.as_str())
+        );
+        assert_eq!(
+            state.ui_settings.voice_microphone_device_label.as_deref(),
+            Some(device.label.as_str())
+        );
+
+        let _ = state.update(Message::VoiceMicrophoneSelected(None));
+        assert_eq!(state.ui_settings.voice_microphone_device_id, None);
+        assert_eq!(state.ui_settings.voice_microphone_device_label, None);
+    }
+
+    #[test]
     fn provider_session_ids_reject_option_and_control_injection() {
         assert_eq!(
             valid_provider_session_id("  session-123  "),
@@ -27772,6 +28638,9 @@ mod tests {
                 allow_reattach_nonce_bind: false,
                 hook: Some((HookState::Done, now - Duration::from_secs(61))),
                 received_hook: true,
+                waiting_for_question: false,
+                claude_background_work_active: false,
+                claude_session_crons_active: false,
                 previous: BadgeState::Done,
                 no_agent_streak: 0,
             },

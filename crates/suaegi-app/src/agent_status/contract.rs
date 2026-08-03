@@ -79,16 +79,17 @@ pub struct HookEvent {
     /// First known agent prompt, bounded during parsing and never persisted.
     /// It is used only to derive an optional stable tab title.
     pub prompt: Option<String>,
-    /// **`Stop`에서만 `None`을 "비지 않음"으로 취급한다**(보수적). 백그라운드
-    /// 서브에이전트가 도는 중에 `Done`을 찍으면 배지가 done↔working으로 깜빡인다
-    /// (실측 §1.6.6: 한 턴에 `Stop`이 두 번 오고, 첫 번째 뒤에 도구 호출이 8개 더 왔다).
-    ///
-    /// **`StopFailure`에는 이 필드가 구조적으로 없다**(실측 §1.6.2 — `session_crons`,
-    /// `permission_mode`도 없는 훨씬 얇은 페이로드다). 가끔 빠지는 게 아니라 아예
-    /// 없으므로 보수적 기본값을 적용하면 `StopFailure`가 **영원히 `Done`이 될 수 없고**,
-    /// 무한 스피너를 막으려고 등록한 이벤트가 그 원인이 된다. 그래서 리듀서가
-    /// [`HookEventName`]으로 분기한다 — 이 필드만 보고 판단하지 않는다.
-    pub background_tasks_empty: Option<bool>,
+    /// `background_tasks` inventory가 있으면 현재 non-terminal 작업이 하나라도
+    /// 있는지 보수적으로 정규화한 값이다. `None`은 inventory 부재이며, 앱은 pane에
+    /// 마지막으로 받아들인 권위 있는 값을 유지한다.
+    pub background_work_active: Option<bool>,
+    /// `session_crons` inventory가 있으면 예약 작업 존재 여부다. background inventory가
+    /// 있는 turn boundary에서 이 필드만 빠진 경우는 최신 Claude의 "empty omitted"
+    /// 형식으로 간주해 앱이 기존 값을 지운다.
+    pub session_crons_active: Option<bool>,
+    /// lead Stop/StopFailure가 사용자의 interrupt로 끝났는지 여부. 인터럽트는 이전
+    /// background/cron 증거를 즉시 폐기할 수 있는 유일한 turn boundary다.
+    pub interrupted: bool,
     // **`prompt_is_task_notification`이 없는 것은 의도다.** 서브에이전트 완료가
     // 합성 `UserPromptSubmit`을 주입하지만(조사 §1.6.5에 접두사까지 실측돼 있다),
     // 이 플랜은 그걸 거르지 않는다 — 배지 결과가 같고(리드가 서브에이전트 결과를
@@ -108,7 +109,9 @@ impl std::fmt::Debug for HookEvent {
             .field("tool_name", &self.tool_name)
             .field("agent_id", &self.agent_id)
             .field("prompt", &self.prompt.as_ref().map(|_| "<redacted>"))
-            .field("background_tasks_empty", &self.background_tasks_empty)
+            .field("background_work_active", &self.background_work_active)
+            .field("session_crons_active", &self.session_crons_active)
+            .field("interrupted", &self.interrupted)
             .finish()
     }
 }
@@ -160,12 +163,11 @@ pub enum HookState {
     Done,
 }
 
-/// `Working` 훅 상태가 이 나이를 넘으면 [`BadgeState::Unknown`]으로 떨어진다.
-/// **`Waiting`에는 적용하지 않는다** — 답 없는 `AskUserQuestion`은 몇 시간이고
-/// 정당하게 `Waiting`이다. 오래돼서 의심스러운 것은 `Working`뿐이다.
-///
-/// Orca와 같은 30분이다. 측정된 API 재시도 창(~210초)보다 길어 정상 재시도 중
-/// `Unknown`으로 튀지 않고, 긴 Claude 도구 작업도 Orca보다 먼저 회색으로 변하지 않는다.
+/// 훅 상태가 이 나이를 넘으면 [`BadgeState::Unknown`]으로 떨어진다.
+/// Orca의 `AGENT_STATUS_STALE_AFTER_MS`와 같은 30분이며 Working/Waiting/Done 모두
+/// 같은 freshness gate를 통과한다. 측정된 API 재시도 창(~210초)보다 길어 정상
+/// 재시도 중 `Unknown`으로 튀지 않으면서, 거부 뒤 후속 훅이 없는 PermissionRequest가
+/// 영구적인 주황 배지로 남는 것도 막는다.
 pub const HOOK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// `NoAgent`를 몇 번 연속으로 봐야 `Done`으로 확정하는가. `presence.rs`가 셸이
@@ -195,10 +197,12 @@ pub struct BadgeInput {
 /// | `Exited{code}` | 무엇이든 | `Done` (코드≠0이면 오류 표시) — **최우선** |
 /// | `NoAgent`, streak < 3 | 무엇이든 | `previous` 유지 (셸 exec 중 포그라운드 전이) |
 /// | `NoAgent`, streak ≥ 3 | 무엇이든 | `Done` |
-/// | `Agent(_)` | `Waiting` (나이 무관) | `Waiting` — **절대 감쇠시키지 않는다** |
+/// | `Agent(_)` | `Waiting`, [`HOOK_STALE_AFTER`] 이내 | `Waiting` |
+/// | `Agent(_)` | `Waiting`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
 /// | `Agent(_)` | `Working`, [`HOOK_STALE_AFTER`] 이내 | `Working` |
 /// | `Agent(_)` | `Working`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
-/// | `Agent(_)` | `Done`, 나이 무관 | `Done` |
+/// | `Agent(_)` | `Done`, [`HOOK_STALE_AFTER`] 이내 | `Done` |
+/// | `Agent(_)` | `Done`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
 /// | `Agent(_)` | 없음 | `Unknown` |
 /// | `Unknown` | 있음 | 훅 그대로 (나이 규칙 동일) |
 /// | `Unknown` | 없음 | `Unknown` — **`Done`을 합성하지 않는다** |
@@ -206,12 +210,8 @@ pub struct BadgeInput {
 /// `Exited`가 최우선인 것은 크래시한 에이전트를 처리하는 규칙이다: 크래시한
 /// 에이전트는 `Stop`을 내지 않으므로 훅만으로는 영원히 `Working`이다.
 ///
-/// **단 "멈춘 배지를 막는 유일한 규칙"은 아니다 — 그렇게 적혀 있었고 틀렸다.**
-/// 이 행은 presence가 실제로 `Exited`로 관측될 때만 닿는다. 세션이 닫히면
-/// presence 조회가 `Unknown`으로 떨어져 이 행에 **영영 도달하지 못하고**, 그때
-/// 남아 있던 `Waiting` 훅은 나이로도 감쇠하지 않아 배지가 굳는다. 그쪽은
-/// 리듀서가 아니라 **호출부가 장부를 정리해서** 막는다
-/// (`AppState::close_session`이 `badges`에서 지운다).
+/// 세션이 닫힐 때는 호출부도 장부를 즉시 정리한다. freshness 감쇠만 기다리면 닫힌
+/// pane의 잘못된 상태가 최대 30분 남고 맵도 계속 자라기 때문이다.
 ///
 /// **`Agent(_)`와 `Unknown`이 같은 팔인 것은 표를 그대로 옮긴 결과다** — 위 표의
 /// 마지막 두 행이 `Agent(_)`의 대응 행과 글자 그대로 같다. presence가 "에이전트가
@@ -236,20 +236,12 @@ pub fn reduce(input: &BadgeInput) -> BadgeState {
             // **`Done`을 합성하지 않는다.** 훅을 못 봤다는 것은 끝났다는 뜻이
             // 아니다 — 신뢰 대화상자 대기 중이면 `SessionStart`조차 오지 않는다.
             None => BadgeState::Unknown,
-            // **나이를 보지 않는다.** 답 없는 권한 프롬프트는 몇 시간이고
-            // 정당하게 `Waiting`이다.
+            Some((_, at)) if input.now.saturating_duration_since(at) > HOOK_STALE_AFTER => {
+                BadgeState::Unknown
+            }
             Some((HookState::Waiting, _)) => BadgeState::Waiting,
             Some((HookState::Done, _)) => BadgeState::Done,
-            Some((HookState::Working, at)) => {
-                // 오래돼서 의심스러운 것은 `Working`뿐이다. `saturating_`인
-                // 이유는 시계가 뒤로 간 입력(테스트가 만드는)에서 패닉하지
-                // 않기 위해서다.
-                if input.now.saturating_duration_since(at) > HOOK_STALE_AFTER {
-                    BadgeState::Unknown
-                } else {
-                    BadgeState::Working
-                }
-            }
+            Some((HookState::Working, _)) => BadgeState::Working,
         },
     }
 }
@@ -267,6 +259,17 @@ pub enum HookOutcome {
     Set(HookState),
 }
 
+pub fn is_ask_user_question_tool(tool_name: Option<&str>) -> bool {
+    tool_name.is_some_and(|tool| {
+        let normalized = tool
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        normalized == "askuserquestion" || normalized == "requestuserinput"
+    })
+}
+
 /// 이벤트 → 훅 상태. **전부 실측이다**(조사 §1.4, §1.6) — 여기서 다시 추론하지 않는다.
 ///
 /// | 이벤트 | 결과 | 근거 |
@@ -276,18 +279,12 @@ pub enum HookOutcome {
 /// | 일반 `PreToolUse`/`PostToolUse`/`PostToolUseFailure` | `Set(Working)` | |
 /// | `PreToolUse(AskUserQuestion)` | `Set(Waiting)` | 자동 허용 뒤 사람의 답을 기다린다 |
 /// | `PermissionRequest` | `Set(Waiting)` | 사용자 승인 대기 |
-/// | `Stop` + background 빔 | `Set(Done)` | |
-/// | `Stop` + background 안 빔 | `Set(Working)` | 서브에이전트가 도는 중이다 |
-/// | `StopFailure` | `Set(Done)` **무조건** | 이 이벤트엔 `background_tasks`가 **구조적으로 없다** |
+/// | `Stop`/`StopFailure` | `Set(Done)` | pane 장부의 background/cron 증거는 앱에서 합성한다 |
 /// | `SubagentStop`/`SessionEnd` | `Ignore` | |
 ///
-/// **`StopFailure`가 `background_tasks`를 보지 않는 이유**가 이 함수에서 가장
-/// 틀리기 쉬운 곳이다. 페이로드에 그 필드가 **아예 없고**(`session_crons`,
-/// `permission_mode`도 없다 — `Stop`보다 훨씬 얇다), [`HookEvent`]의 보수적 규칙은
-/// `None`을 "비지 않음"으로 읽는다. 둘을 합치면 `StopFailure`는 **영원히 `Done`이
-/// 될 수 없고** pane이 계속 돈다 — 이 이벤트를 등록한 이유가 정확히 그 무한
-/// 스피너를 막는 것이었는데 그 자체가 원인이 된다. 필드가 가끔 빠지는 게 아니라
-/// 구조적으로 없으므로 보수적 기본값이 **이 이벤트에는 틀린다.**
+/// Turn-boundary의 effective state는 이 순수 매핑 뒤에 pane별 inventory를 가진
+/// `AppState::apply_hook`가 계산한다. 그래야 inventory가 빠진 다음 StopFailure도
+/// 직전의 살아 있는 background 작업을 보존하고, interrupt만 이를 명시적으로 끝낸다.
 ///
 /// **`SessionEnd`를 무시하는 이유**: 종료 판정은 presence 폴링의 `Exited`/`NoAgent`가
 /// 권위다. 훅은 async라 프로세스가 죽으면 아예 안 올 수도 있고, 폴링만이 그걸 본다.
@@ -301,31 +298,14 @@ pub fn hook_outcome(event: &HookEvent) -> HookOutcome {
         HookEventName::UserPromptSubmit
         | HookEventName::PostToolUse
         | HookEventName::PostToolUseFailure => HookOutcome::Set(HookState::Working),
-        HookEventName::PreToolUse
-            if event.tool_name.as_deref().is_some_and(|tool| {
-                let normalized = tool
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                normalized == "askuserquestion"
-            }) =>
-        {
+        HookEventName::PreToolUse if is_ask_user_question_tool(event.tool_name.as_deref()) => {
             // Claude auto-allows AskUserQuestion, so it emits PreToolUse while actually
             // blocked on the user's answer. Orca maps this exact case to waiting.
             HookOutcome::Set(HookState::Waiting)
         }
         HookEventName::PreToolUse => HookOutcome::Set(HookState::Working),
         HookEventName::PermissionRequest => HookOutcome::Set(HookState::Waiting),
-        HookEventName::Stop => match event.background_tasks_empty {
-            Some(true) => HookOutcome::Set(HookState::Done),
-            // **`None`은 "비지 않음"이다**(보수적). 없다고 done을 찍으면
-            // 백그라운드 서브에이전트가 도는 중에 끝난 것으로 보인다.
-            // `Working`으로 **덮어쓰는** 것이지 무시하는 것이 아니다 — 그래야
-            // 나이가 갱신돼, 오래 도는 서브에이전트가 `Unknown`으로 새지 않는다.
-            Some(false) | None => HookOutcome::Set(HookState::Working),
-        },
-        HookEventName::StopFailure => HookOutcome::Set(HookState::Done),
+        HookEventName::Stop | HookEventName::StopFailure => HookOutcome::Set(HookState::Done),
         HookEventName::SubagentStop | HookEventName::SessionEnd => HookOutcome::Ignore,
     }
 }
@@ -534,10 +514,9 @@ mod tests {
             (Some(HookState::Working), FRESH, BadgeState::Working),
             (Some(HookState::Working), STALE, BadgeState::Unknown),
             (Some(HookState::Waiting), FRESH, BadgeState::Waiting),
-            // 나이 무관.
-            (Some(HookState::Waiting), STALE, BadgeState::Waiting),
+            (Some(HookState::Waiting), STALE, BadgeState::Unknown),
             (Some(HookState::Done), FRESH, BadgeState::Done),
-            (Some(HookState::Done), STALE, BadgeState::Done),
+            (Some(HookState::Done), STALE, BadgeState::Unknown),
         ];
         for (hook, age, want) in expected {
             let got = reduce(&input(
@@ -594,42 +573,37 @@ mod tests {
         );
     }
 
-    /// **`Waiting`은 절대 감쇠하지 않는다.** 답 없는 권한 프롬프트는 몇 시간이고
-    /// 정당하게 `Waiting`이다. 오래돼서 의심스러운 것은 `Working`뿐이다.
+    /// Orca는 모든 explicit agent row에 같은 30분 freshness gate를 적용한다.
+    /// Claude가 권한 거부 뒤 후속 훅을 주지 않아도 주황 배지가 영구히 남지 않는다.
     #[test]
-    fn waiting_never_decays_however_old_it_gets() {
-        for age in [
-            FRESH,
-            HOOK_STALE_AFTER,
-            HOOK_STALE_AFTER * 10,
-            Duration::from_secs(60 * 60 * 8),
-        ] {
+    fn every_hook_state_uses_orcas_shared_freshness_gate() {
+        for state in [HookState::Working, HookState::Waiting, HookState::Done] {
             assert_eq!(
                 reduce(&input(
                     AgentPresence::Agent("claude"),
-                    Some(HookState::Waiting),
-                    age,
+                    Some(state),
+                    HOOK_STALE_AFTER,
                     BadgeState::Unknown,
                     0
                 )),
-                BadgeState::Waiting,
-                "a permission prompt unanswered for {age:?} is still legitimately Waiting"
+                match state {
+                    HookState::Working => BadgeState::Working,
+                    HookState::Waiting => BadgeState::Waiting,
+                    HookState::Done => BadgeState::Done,
+                },
+                "the exact Orca boundary is still fresh for {state:?}"
             );
-            // 대조군: 같은 나이의 `Working`은 실제로 감쇠한다 — 위 단언이
-            // "나이가 아무 데도 안 쓰인다"로 설명되면 안 된다.
-            if age > HOOK_STALE_AFTER {
-                assert_eq!(
-                    reduce(&input(
-                        AgentPresence::Agent("claude"),
-                        Some(HookState::Working),
-                        age,
-                        BadgeState::Unknown,
-                        0
-                    )),
-                    BadgeState::Unknown,
-                    "control: Working at {age:?} DOES decay, so the age is genuinely consulted"
-                );
-            }
+            assert_eq!(
+                reduce(&input(
+                    AgentPresence::Agent("claude"),
+                    Some(state),
+                    HOOK_STALE_AFTER + Duration::from_millis(1),
+                    BadgeState::Done,
+                    0
+                )),
+                BadgeState::Unknown,
+                "one millisecond past Orca's freshness window decays {state:?}"
+            );
         }
     }
 
@@ -741,7 +715,7 @@ mod tests {
 
     // ---- 이벤트 → 훅 상태 매핑 (실측) ----
 
-    fn event(name: HookEventName, background_tasks_empty: Option<bool>) -> HookEvent {
+    fn event(name: HookEventName, background_work_active: Option<bool>) -> HookEvent {
         HookEvent {
             pane_key: PaneKey(WorktreeId("/tmp/wt".into())),
             spawn_nonce: SpawnNonce(1),
@@ -750,7 +724,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty,
+            background_work_active,
+            session_crons_active: None,
+            interrupted: false,
         }
     }
 
@@ -790,7 +766,12 @@ mod tests {
 
     #[test]
     fn claude_ask_user_question_pre_tool_is_waiting_like_orca() {
-        for tool_name in ["AskUserQuestion", "ask_user_question", "ask-user-question"] {
+        for tool_name in [
+            "AskUserQuestion",
+            "ask_user_question",
+            "ask-user-question",
+            "request_user_input",
+        ] {
             let mut event = event(HookEventName::PreToolUse, None);
             event.tool_name = Some(tool_name.to_string());
             assert_eq!(
@@ -807,53 +788,17 @@ mod tests {
         );
     }
 
-    /// **`Stop`은 "끝났다"가 아니다.** Agent 도구는 기본이 백그라운드 실행이라
-    /// 서브에이전트가 도는 중에 `Stop`이 먼저 온다(실측: 한 턴에 `Stop`이 두 번).
-    /// ①에서 done을 찍으면 배지가 done으로 갔다가 뒤따르는 도구 호출 8개에 다시
-    /// working으로 돌아온다.
     #[test]
-    fn stop_only_means_done_when_no_background_task_is_running() {
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, Some(true))),
-            HookOutcome::Set(HookState::Done),
-            "the final Stop carries an empty background_tasks and IS done"
-        );
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, Some(false))),
-            HookOutcome::Set(HookState::Working),
-            "a Stop while a subagent is still running must stay working, or the badge \
-             flickers done->working across the subagent's remaining tool calls"
-        );
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, None)),
-            HookOutcome::Set(HookState::Working),
-            "absent background_tasks is treated as NOT empty (conservative) — the wrong \
-             way round marks a running agent finished"
-        );
-    }
-
-    /// **`StopFailure`는 `background_tasks`를 보지 않는다.** 페이로드에 그 필드가
-    /// 구조적으로 없고, 보수적 규칙(`None` = 비지 않음)을 적용하면 이 이벤트는
-    /// **영원히 done이 될 수 없다** — 등록한 이유가 그 무한 스피너를 막는 것인데
-    /// 그 자체가 원인이 된다.
-    #[test]
-    fn stop_failure_is_done_unconditionally() {
-        for background in [None, Some(false), Some(true)] {
-            assert_eq!(
-                hook_outcome(&event(HookEventName::StopFailure, background)),
-                HookOutcome::Set(HookState::Done),
-                "StopFailure must reach done regardless of background_tasks ({background:?}) — \
-                 the field is structurally absent from this payload, so the conservative \
-                 default is wrong here and would strand the pane on a spinner forever"
-            );
+    fn turn_boundaries_report_done_before_stateful_background_evidence_is_applied() {
+        for name in [HookEventName::Stop, HookEventName::StopFailure] {
+            for background in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    hook_outcome(&event(name, background)),
+                    HookOutcome::Set(HookState::Done),
+                    "pane-level background state must be applied after the pure event mapping"
+                );
+            }
         }
-        // 대조군: 같은 `background` 값으로 `Stop`은 갈린다 — 위가 "무조건 done"이
-        // 아니라 "이 이벤트만 무조건"임을 고정한다.
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, None)),
-            HookOutcome::Set(HookState::Working),
-            "control: Stop with the same absent field does NOT reach done"
-        );
     }
 
     /// `SessionStart`는 `Ignore`가 아니라 `Reset`이다. 둘을 `None` 하나로 뭉개면

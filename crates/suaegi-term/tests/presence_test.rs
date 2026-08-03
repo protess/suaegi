@@ -26,6 +26,23 @@ impl ProcessProbe for CountingProbe {
     }
 }
 
+struct SequenceProbe {
+    lines: std::cell::RefCell<std::collections::VecDeque<String>>,
+    calls: std::cell::Cell<usize>,
+}
+
+impl ProcessProbe for SequenceProbe {
+    fn command_line(&self, _pid: i32) -> Option<String> {
+        self.calls.set(self.calls.get() + 1);
+        let mut lines = self.lines.borrow_mut();
+        if lines.len() > 1 {
+            lines.pop_front()
+        } else {
+            lines.front().cloned()
+        }
+    }
+}
+
 fn spec(cmd: (String, Vec<String>)) -> SessionSpec {
     SessionSpec {
         pty: PtySpawn {
@@ -147,6 +164,38 @@ mod unix_only {
         monitor.probe(&session, &probe);
         monitor.probe(&session, &probe);
         assert_eq!(probe.calls.get(), 1, "same agent pgid must not re-probe");
+    }
+
+    #[test]
+    fn cached_agent_is_revalidated_after_exactly_twenty_hits() {
+        let (session, _) = running_session();
+        let probe = SequenceProbe {
+            lines: std::cell::RefCell::new(std::collections::VecDeque::from([
+                "claude".to_string(),
+                "/bin/zsh".to_string(),
+            ])),
+            calls: std::cell::Cell::new(0),
+        };
+        let mut monitor = PresenceMonitor::default();
+
+        assert_eq!(
+            monitor.probe(&session, &probe),
+            AgentPresence::Agent("claude")
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                monitor.probe(&session, &probe),
+                AgentPresence::Agent("claude")
+            );
+        }
+        assert_eq!(probe.calls.get(), 1, "twenty cache hits remain cached");
+
+        assert_eq!(monitor.probe(&session, &probe), AgentPresence::NoAgent);
+        assert_eq!(
+            probe.calls.get(),
+            2,
+            "the next hit must revalidate the pgid"
+        );
     }
 
     #[test]

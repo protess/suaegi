@@ -7,9 +7,8 @@
 //! 그 창에서 인코딩하면 **개행이 든 붙여넣기가 그대로 실행된다.** 따라서
 //! 호출자(`TerminalGrid`)가 락을 쥔 채 진짜 모드를 읽어 여기 넘긴다.
 //!
-//! 레거시 xterm 인코딩만 다룬다. kitty 키보드 프로토콜은 꺼져 있다
-//! (`Config::kitty_keyboard`가 기본 `false`이고 `TerminalGrid::new`는
-//! `scrolling_history`만 덮어쓴다).
+//! 기본 입력은 레거시 xterm 인코딩을 따르되, 애플리케이션이 Kitty keyboard
+//! protocol을 협상한 동안 modified Enter는 Orca와 같은 CSI-u를 사용한다.
 
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
@@ -53,12 +52,34 @@ const UTF8_MAX_COORD: usize = 2015;
 /// 3. `text` — IME·데드키·평범한 타이핑
 /// 4. `TermKey::Char` 폴백(`text`가 없을 때)
 pub fn encode_key(input: &KeyInput, mode: TermMode) -> Option<Vec<u8>> {
+    encode_key_with_kitty(input, mode, false)
+}
+
+pub fn encode_key_with_kitty(
+    input: &KeyInput,
+    mode: TermMode,
+    kitty_keyboard_active: bool,
+) -> Option<Vec<u8>> {
     // macOS의 Cmd, 그 외의 Super는 **터미널 입력이 아니다.** 위젯의
     // `classify_shortcut`이 Copy/Paste가 아니라고 판정한 나머지 Cmd 조합이
     // 여기까지 흘러오면 `text` 갈래에서 맨 글자가 셸로 나간다 — `Cmd+W`가
     // `w`를 입력하는 식이다.
     if input.mods.logo {
         return None;
+    }
+
+    if input.key == TermKey::Named(NamedKey::Enter) {
+        let mods = input.mods;
+        if mods.shift && !mods.ctrl && !mods.alt {
+            return Some(if kitty_keyboard_active {
+                b"\x1b[13;2u".to_vec()
+            } else {
+                b"\x1b\r".to_vec()
+            });
+        }
+        if mods.ctrl && !mods.shift && !mods.alt {
+            return Some(b"\x1b[13;5u".to_vec());
+        }
     }
 
     if let Some(bytes) = encode_keypad(input, mode) {
@@ -842,6 +863,30 @@ mod tests {
             &named(NamedKey::Enter),
             TermMode::LINE_FEED_NEW_LINE,
             Some(b"\r\n"),
+        );
+    }
+
+    #[test]
+    fn modified_enter_matches_orca_keyboard_protocol_policy() {
+        let mut shift_enter = named(NamedKey::Enter);
+        shift_enter.mods = mods(true, false, false);
+        assert_eq!(
+            encode_key_with_kitty(&shift_enter, TermMode::NONE, false),
+            Some(b"\x1b\r".to_vec()),
+            "plain shells receive Orca's legacy Meta+Enter fallback"
+        );
+        assert_eq!(
+            encode_key_with_kitty(&shift_enter, TermMode::NONE, true),
+            Some(b"\x1b[13;2u".to_vec()),
+            "a negotiated Kitty client receives CSI-u Shift+Enter"
+        );
+
+        let mut ctrl_enter = named(NamedKey::Enter);
+        ctrl_enter.mods = mods(false, true, false);
+        assert_eq!(
+            encode_key_with_kitty(&ctrl_enter, TermMode::NONE, false),
+            Some(b"\x1b[13;5u".to_vec()),
+            "Orca always encodes Ctrl+Enter as CSI-u"
         );
     }
 

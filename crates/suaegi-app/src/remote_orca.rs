@@ -35,6 +35,8 @@ fn signature(size: u64, mtime_ms: f64) -> Result<FileSignature, String> {
     Ok(FileSignature {
         size,
         mtime: UNIX_EPOCH + Duration::from_nanos(nanos),
+        change_marker: None,
+        content_hash: None,
     })
 }
 

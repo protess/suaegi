@@ -1,8 +1,8 @@
 # Orca Rust port status
 
-Last audited: 2026-07-30
+Last audited: 2026-08-03
 
-Reference: `reference/orca` at `4543bb68` (2026-07-29).
+Reference: `reference/orca` at `7c716702` (2026-08-02).
 
 ## Completion target
 
@@ -12,12 +12,21 @@ scope is superseded. A settings row is not considered ported until its value is
 persisted, its runtime behavior is wired, and the behavior has been exercised
 by tests or live-app QA.
 
+## Local data
+
+- Durable application state and rolling backups live under the platform config
+  directory at `suaegi/data.json` (macOS:
+  `~/Library/Application Support/suaegi/data.json`).
+- Worktrees are separate user project data. Their default root is
+  `~/suaegi-workspaces`, or the custom workspace root selected in Settings.
+
 ## Implemented and wired
 
 - Repository registration, worktree create/list/remove, persistence and restore.
 - Native PTY sessions, GPU terminal rendering, splits, focus, mouse, clipboard,
-  IME commit handling and all 35 Orca agent launch/detection entries, including
-  Trae CLI and Claude Agent Teams.
+  IME commit handling and cursor-anchored on-the-spot CJK preedit rendering, and
+  all 35 Orca agent launch/detection entries, including Trae CLI and Claude
+  Agent Teams.
 - Orca's Agents pane launch profiles are wired end-to-end: PATH refresh,
   enable/disable filtering, default selection, per-agent command/argument/env
   overrides, reserved-environment protection, and Yolo/Manual permission
@@ -26,16 +35,32 @@ by tests or live-app QA.
   `--teammate-mode in-process` exactly once, while native panes install a
   private `tmux` shim and translate Claude's bounded tmux protocol into native
   Suaegi splits.
-- Claude hooks plus process/title-based agent status badges.
+- Claude hooks plus process/title-based agent status badges. Auto-allowed
+  `AskUserQuestion`/`request_user_input` calls enter the same waiting state as
+  Orca and plain Enter/Escape resolves that wait even when Claude omits the
+  follow-up hook. Turn boundaries retain pane-scoped non-terminal background
+  task and scheduled-cron evidence across thin payloads, ignore completed
+  inventory rows, and clear retained work on drain or explicit interruption.
+  All explicit hook rows share Orca's 30-minute freshness boundary, so Claude's
+  hook-less permission-denial path cannot strand a permanent waiting badge.
 - Diff panel and restored pane layouts.
 - GitHub and GitLab review providers; PR/MR create, status, review/comments and
   confirm-gated merge. Integrations settings run the real `gh`/`glab`
   preflights and distinguish connected, missing, unauthenticated, and outdated
   CLI states, with install guidance and an explicit re-check action.
+- GitHub Tasks uses numbered Search API pages instead of truncating every
+  project at the first 100 items. Page counts are capped at GitHub's reachable
+  1,000-result window, multi-project counts use the longest project, manual
+  refreshes retain the active page, and query/scope changes reset to page one.
 - Linear and Jira read/link UI, with secrets kept outside the JSON state.
 - Safe filesystem backend: containment, symlink policy, directory listing,
   ignore/status queries, bounded reads, stale-write protection and external
   editor launch.
+- Native close requests enter a single bounded teardown path: the final state
+  snapshot is durably written by the persistence worker while the UI remains
+  responsive, duplicate close events cannot race another final write, and a
+  stalled filesystem cannot trap the main thread in a destructor join. A live
+  macOS close/relaunch preserved a valid current state file.
 - Git history/show, staging, commit, discard, fetch/pull/push and branch reads.
 - Backend crates for Quick Open, content search, automation schedules, browser
   URLs/screencast, MCP inspection and the smaller Orca protocol/normalizer ports.
@@ -46,13 +71,30 @@ by tests or live-app QA.
   configurable cwd, proxy/history/terminal preferences, button/status-bar
   triggers, attention state, and draggable/resizable geometry that survives
   relaunch.
+- Sidebar workspaces can be reordered with a dedicated drag grip. The live
+  vector order persists across relaunch, authoritative Git refreshes keep that
+  order while accepting fresh metadata, and a refresh that began before a drag
+  cannot restore its stale ordering.
 - Orca terminal themes, scoped shell history, cursor blinking, OSC 52 clipboard,
   macOS Option-as-Alt/JIS yen handling, bell and agent-completion notifications.
+- Modified Enter now follows Orca's live terminal policy: Ctrl+Enter uses CSI-u,
+  while Shift+Enter uses Kitty CSI-u only after the child negotiates the Kitty
+  keyboard protocol and otherwise falls back to legacy Meta+Enter. The tracker
+  follows push/pop, reset, alternate-screen, split-chunk, and replay semantics.
+- macOS terminal typography resolves Orca's `SF Mono` CSS alias to the native
+  `.SF NS Mono` family, uses Orca's 500 default weight, and migrates the former
+  400 default once without overwriting a user-selected weight.
 - Extended Orca terminal controls now affect the native renderer and input
   path: horizontal/vertical grid padding, normal/fast/TUI wheel multipliers,
   cursor/background and focused/unfocused pane opacity, divider thickness,
   hide-pointer-while-typing, and semantic-selection word separators.
 - Native macOS keep-awake assertion while agents are working or waiting.
+- Voice dictation follows Orca's microphone preference model: Settings lists
+  live input devices alongside the system default, persists a stable id and
+  cached label, heals a rotated id through a unique label match, retains an
+  unplugged preference as unavailable, and falls back to the system default
+  without losing that preference. Device discovery and the native picker were
+  exercised in the live macOS app.
 - Orca-style confirmation before an active coding-agent terminal is stopped,
   independently configurable from pinned-tab confirmation.
 - Orchestration and Computer Use settings now detect installed global skills,
@@ -99,7 +141,10 @@ by tests or live-app QA.
   preference. Multiple editor documents remain live at once: opening another
   file preserves dirty buffers and in-flight saves, tab selection restores the
   exact document, close confirmation applies only to the selected dirty tab,
-  and worktree removal retires every tab owned by that worktree.
+  and worktree removal retires every tab owned by that worktree. Agent
+  terminals and editor documents now share the workspace tab strip, so opening
+  a file from Explorer adds a sibling tab instead of replacing the Claude
+  surface; switching either way preserves both the PTY and editor buffers.
 - File editors and diff views share Orca's explicit editor-font preference,
   including the empty-value fallback to the configured terminal font.
 - `orca.yaml worktree.sharedDirectories` is normalized with Orca's path safety
@@ -310,19 +355,22 @@ paths remain implemented rather than counted complete by method name alone.
 
 ## Verification baseline
 
-- `cargo test -p suaegi-app --lib`: 728 passed, 2 ignored after the current
+- GitHub Actions now runs Rust 1.94 on macOS with formatting, workspace Clippy,
+  nextest, and documentation-test gates. The CI profile bounds individual and
+  global run time, serializes Darwin PTY users, and limits overall test
+  concurrency to keep resource-sensitive coverage deterministic.
+- `cargo nextest run --workspace --profile ci`: 3797 passed, 6 opt-in tests
+  skipped. `cargo test --workspace --doc` also passes.
+- `cargo test -p suaegi-app --lib`: 747 passed, 2 ignored after the current
   UI/runtime, settings-route, integration-preflight, Floating Workspace,
-  browser dialog, orchestration, Linear, and daemon loop.
-- `cargo test --workspace`: passing after the final native Claude Agent Teams,
-  browser-dialog, Linear deep-context, and headless runtime loop; all unit,
-  integration, and documentation tests completed.
-- `cargo test -p suaegi-term --lib`: 286 tests passing, including authenticated
+  browser dialog, orchestration, Linear, terminal IME, and daemon loop.
+- `cargo test -p suaegi-term --lib`: 289 tests passing, including authenticated
   PTY I/O, warm replay and duplicate terminal-query suppression.
 - `cargo test -p suaegi-term --test daemon_survival_test`: verifies the daemon
   is a detached session leader and the PTY accepts input after disconnect and
   reattach.
-- `cargo test -p suaegi-app --lib`: 728 tests passing with two opt-in live
-  credential/network probes ignored, including the Floating
+- The app library's 747 passing tests sit alongside two opt-in live
+  credential/network probes that remain ignored, and cover the Floating
   Workspace lifecycle, multi-document editor tabs, browser
   URL/bounds/cookie/profile-store handling, remote pairing, usage, SSH,
   emulator, voice, encrypted runtime server, and current settings/runtime

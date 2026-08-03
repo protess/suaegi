@@ -4,6 +4,11 @@
 //! 레벨을 읽고(M2) 파일 하나를 안전하게 읽고(M4) 원자적으로 쓴다(M5).
 
 use crate::compare::{resolve_for_read, resolve_for_write, Resolved, BINARY_SNIFF_BYTES};
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(unix)]
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 use std::time::SystemTime;
@@ -12,6 +17,10 @@ use std::time::SystemTime;
 /// 50 MB. **버퍼링 전에** stat 크기로 걸러 큰 파일을 통째로 메모리에 올리지 않는다
 /// (`filesystem.ts:565-569`). `FileDiff::TooLarge`와 같은 규율.
 pub const MAX_TEXT_FILE_SIZE: u64 = 50 * 1024 * 1024;
+/// Reserved sibling name used only for crash-safe editor writes. A process
+/// crash may leave one behind; compare.rs recognizes this exact namespace.
+pub const EDITOR_TEMP_PREFIX: &str = ".suaegi-editor-tmp-";
+pub const EDITOR_TEMP_SUFFIX: &str = ".tmp";
 
 /// 디렉터리 한 엔트리. `is_dir`/`is_symlink`는 **링크 자체**의 타입이다
 /// (`symlink_metadata`, Orca `withFileTypes` + `:447-462`) — 심링크→디렉터리라도
@@ -236,27 +245,29 @@ pub fn read_editable_file(worktree: &Path, rel_path: &str) -> io::Result<Editabl
         let text = String::from_utf8(bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "file content changed encoding")
         })?;
+        let mut signature = after;
+        signature.content_hash = Some(content_hash(text.as_bytes()));
         Ok(EditableFileRead::Ready {
             text,
             size,
-            signature: after,
+            signature,
         })
     }
 }
 
-/// 파일이 우리가 마지막으로 본 이후 **밖에서 바뀌었는지**만 감지하기 위한 최소 지문.
-/// `size`(`metadata.len()`) + `mtime`(`metadata.modified()`). 콘텐츠 해시가 아니라
-/// stat 기반이라 값싸고, 편집기가 저장 후 재베이스라인하는 데 충분하다
-/// (Orca `editor-autosave-controller.ts:143-145`). `SystemTime`은 `Eq`라 그대로 비교한다.
-///
-/// **블라인드 스팟(Orca 패리티, follow-up)**: size와 mtime이 **둘 다** 안 바뀐 외부
-/// 편집은 못 잡는다 — 같은 mtime tick(파일시스템 해상도) 안에서 같은 바이트 수로 덮어쓰면
-/// staleness 검사를 통과해 clobber될 수 있다. content-hash(또는 inode+ctime) 추가는
-/// `docs/follow-ups.md`에 기록된 후속 작업이다.
+/// 파일이 우리가 마지막으로 본 이후 **밖에서 바뀌었는지** 감지하는 지문.
+/// size+mtime은 값싼 1차 게이트이고, 로컬 편집 문서는 SHA-256을 함께 보관해
+/// same-size/same-mtime 외부 편집도 잡는다. 원격 런타임처럼 내용 지문을 제공하지
+/// 않는 어댑터는 `None`으로 기존 stat 계약을 유지한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSignature {
     pub size: u64,
     pub mtime: SystemTime,
+    /// Unix dev/inode/ctime fingerprint. It lets the normal watcher path stay
+    /// stat-only while still noticing an in-place rewrite whose size and mtime
+    /// were preserved. `None` on adapters/platforms without this metadata.
+    pub change_marker: Option<u64>,
+    pub content_hash: Option<[u8; 32]>,
 }
 
 impl FileSignature {
@@ -264,8 +275,32 @@ impl FileSignature {
         Ok(Self {
             size: meta.len(),
             mtime: meta.modified()?,
+            change_marker: metadata_change_marker(meta),
+            content_hash: None,
         })
     }
+
+    fn same_stat(&self, other: &Self) -> bool {
+        self.size == other.size && self.mtime == other.mtime
+    }
+}
+
+#[cfg(unix)]
+fn metadata_change_marker(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut hasher = DefaultHasher::new();
+    (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()).hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+#[cfg(not(unix))]
+fn metadata_change_marker(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+fn content_hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 pub fn file_signature(worktree: &Path, rel_path: &str) -> io::Result<FileSignature> {
@@ -276,6 +311,34 @@ pub fn file_signature(worktree: &Path, rel_path: &str) -> io::Result<FileSignatu
             format!("refusing to inspect a symlink as an editable file: {rel_path:?}"),
         )),
     }
+}
+
+/// Watcher signature optimized for the normal unchanged case: metadata is
+/// checked first, and content is read only when it ties the expected stat and
+/// an expected hash exists. A stat difference already proves staleness.
+pub fn file_signature_for_compare(
+    worktree: &Path,
+    rel_path: &str,
+    expected: &FileSignature,
+) -> io::Result<FileSignature> {
+    let path = match resolve_for_read(worktree, rel_path)? {
+        Resolved::Regular(path) => path,
+        Resolved::Symlink(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to inspect a symlink as an editable file: {rel_path:?}"),
+            ));
+        }
+    };
+    let mut signature = FileSignature::from_metadata(&std::fs::metadata(&path)?)?;
+    if signature.same_stat(expected) {
+        if signature.change_marker.is_some() && signature.change_marker == expected.change_marker {
+            signature.content_hash = expected.content_hash;
+        } else if expected.content_hash.is_some() {
+            signature.content_hash = Some(content_hash(&std::fs::read(path)?));
+        }
+    }
+    Ok(signature)
 }
 
 /// `write_file`의 결과. 손실 없이 썼거나(`Written`), 밖에서 바뀐 파일을 덮어쓰지 않고
@@ -388,7 +451,16 @@ pub fn write_file(
     if let Some(expected_sig) = expected {
         match std::fs::metadata(&target) {
             Ok(meta) => {
-                let disk = FileSignature::from_metadata(&meta)?;
+                let mut disk = FileSignature::from_metadata(&meta)?;
+                if disk.same_stat(expected_sig) {
+                    if disk.change_marker.is_some()
+                        && disk.change_marker == expected_sig.change_marker
+                    {
+                        disk.content_hash = expected_sig.content_hash;
+                    } else if expected_sig.content_hash.is_some() {
+                        disk.content_hash = Some(content_hash(&std::fs::read(&target)?));
+                    }
+                }
                 if disk != *expected_sig {
                     return Ok(WriteOutcome::StaleConflict { disk: Some(disk) });
                 }
@@ -404,16 +476,19 @@ pub fn write_file(
     //    `NamedTempFile` drop이 정리한다(`persistence.rs:200-206` 패턴).
     //    NOTE(follow-up): persist 직전에 **크래시**하면 `.tmpXXXXXX` 형제가 남아
     //    `branch_compare`의 untracked 수집에 뜬다(잔존 정리는 `docs/follow-ups.md` 기록).
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(EDITOR_TEMP_PREFIX)
+        .suffix(EDITOR_TEMP_SUFFIX)
+        .tempfile_in(parent)?;
     tmp.write_all(content)?;
     tmp.as_file().sync_all()?;
     tmp.persist(&target).map_err(|e| e.error)?;
 
     // 새 on-disk 지문을 돌려준다 — 편집기가 재베이스라인한다.
     let meta = std::fs::metadata(&target)?;
-    Ok(WriteOutcome::Written {
-        signature: FileSignature::from_metadata(&meta)?,
-    })
+    let mut signature = FileSignature::from_metadata(&meta)?;
+    signature.content_hash = Some(content_hash(content));
+    Ok(WriteOutcome::Written { signature })
 }
 
 #[cfg(all(test, unix))]
@@ -421,8 +496,8 @@ mod tests {
     //! 실제 파일/디렉터리/심링크를 `tempdir`에 만들어 검증한다(모킹 금지). 각 crux
     //! 테스트는 하나의 mutant를 죽이도록 설계됐다.
     use super::{
-        list_dir, read_editable_file, read_file, read_file_with_cap, write_file, EditableFileRead,
-        FileContent, FileRead, FileSignature, WriteOutcome,
+        file_signature_for_compare, list_dir, read_editable_file, read_file, read_file_with_cap,
+        write_file, EditableFileRead, FileContent, FileRead, FileSignature, WriteOutcome,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -761,6 +836,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn content_hash_catches_a_same_size_same_mtime_stat_collision() {
+        let wt = worktree();
+        let original = written_sig(write_file(wt.path(), "same.txt", b"aaaa", None).unwrap());
+        fs::write(wt.path().join("same.txt"), b"bbbb").unwrap();
+        let current_meta = fs::metadata(wt.path().join("same.txt")).unwrap();
+        let forged_stat_tie = FileSignature {
+            size: current_meta.len(),
+            mtime: current_meta.modified().unwrap(),
+            change_marker: None,
+            content_hash: original.content_hash,
+        };
+
+        let watched = file_signature_for_compare(wt.path(), "same.txt", &forged_stat_tie).unwrap();
+        assert_ne!(
+            watched, forged_stat_tie,
+            "the watcher must hash content when size and mtime tie"
+        );
+
+        let outcome = write_file(wt.path(), "same.txt", b"cccc", Some(&forged_stat_tie)).unwrap();
+        assert!(matches!(outcome, WriteOutcome::StaleConflict { .. }));
+        assert_eq!(
+            fs::read(wt.path().join("same.txt")).unwrap(),
+            b"bbbb",
+            "a stat collision must not let autosave clobber the external content"
+        );
+    }
+
     // --- M5: 파일이 우리 밑에서 삭제됐으면 그것도 conflict(disk=None) ---
     #[test]
     fn write_stale_conflict_when_deleted_underneath() {
@@ -834,6 +937,10 @@ mod tests {
             other => panic!("expected editable text, got {other:?}"),
         };
         assert_eq!(text, "hello");
+        assert!(
+            signature.content_hash.is_some(),
+            "editable local reads must establish a content baseline"
+        );
 
         let outcome = write_file(wt.path(), "note.txt", b"updated", Some(&signature)).unwrap();
         assert!(matches!(outcome, WriteOutcome::Written { .. }));

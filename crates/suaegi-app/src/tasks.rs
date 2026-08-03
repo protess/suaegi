@@ -17,12 +17,78 @@ pub struct TaskWorkItem {
     pub url: String,
 }
 
+pub const GITHUB_TASK_PAGE_SIZE: usize = 50;
+const GITHUB_SEARCH_RESULT_WINDOW: usize = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPageResult {
+    pub items: Vec<TaskWorkItem>,
+    pub total_pages: usize,
+}
+
+fn github_search_query(kind: TaskKind, query: &str, repository: &str) -> String {
+    let mut query = query.trim().to_string();
+    let qualifier = if kind == TaskKind::PullRequests {
+        "is:pr"
+    } else {
+        "is:issue"
+    };
+    if !query.split_whitespace().any(|part| part == qualifier) {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(qualifier);
+    }
+    if !query.is_empty() {
+        query.push(' ');
+    }
+    query.push_str("repo:");
+    query.push_str(repository);
+    query
+}
+
+fn parse_github_search_page(raw: &str) -> Result<TaskPageResult, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|_| "GitHub returned unexpected task data.".to_string())?;
+    let total_count = value
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let reachable_count = total_count.min(GITHUB_SEARCH_RESULT_WINDOW);
+    let total_pages = reachable_count.div_ceil(GITHUB_TASK_PAGE_SIZE).max(1);
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            Some(TaskWorkItem {
+                number: value.get("number")?.as_u64()?,
+                title: value.get("title")?.as_str()?.to_string(),
+                state: value
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("open")
+                    .to_uppercase(),
+                updated_at: value
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                url: value.get("html_url")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    Ok(TaskPageResult { items, total_pages })
+}
+
 pub fn load_github_work(
     op: crate::state::OpId,
     repo_id: RepoId,
     repo_path: PathBuf,
     kind: TaskKind,
     query: String,
+    page: usize,
 ) -> iced::Task<Message> {
     iced::Task::perform(
         async move {
@@ -44,26 +110,22 @@ pub fn load_github_work(
                             "GitHub projects could not be loaded.".to_string()
                         }
                     })?;
-                return parse_projects(&output.stdout, &query);
+                return parse_projects(&output.stdout, &query).map(|items| TaskPageResult {
+                    items,
+                    total_pages: 1,
+                });
             }
             let runner = suaegi_forge::GhRunner::new();
-            let noun = if kind == TaskKind::PullRequests {
-                "pr"
-            } else {
-                "issue"
-            };
-            let output = runner
+            let repository = runner
                 .run(
                     &repo_path,
                     &[
-                        noun,
-                        "list",
-                        "--search",
-                        query.as_str(),
-                        "--limit",
-                        "100",
+                        "repo",
+                        "view",
                         "--json",
-                        "number,title,state,updatedAt,url",
+                        "nameWithOwner",
+                        "--jq",
+                        ".nameWithOwner",
                     ],
                 )
                 .await
@@ -71,10 +133,54 @@ pub fn load_github_work(
                     if error.is_gh_not_found() {
                         "GitHub CLI is not installed.".to_string()
                     } else {
-                        "GitHub tasks could not be loaded.".to_string()
+                        "GitHub repository identity could not be resolved.".to_string()
                     }
                 })?;
-            parse_work_items(&output.stdout)
+            let repository = repository.stdout.trim();
+            if repository.is_empty() {
+                return Err("GitHub repository identity could not be resolved.".to_string());
+            }
+            let query = github_search_query(kind, &query, repository);
+            let query_arg = format!("q={query}");
+            let page_arg = format!("page={}", page.saturating_add(1));
+            let per_page_arg = format!("per_page={GITHUB_TASK_PAGE_SIZE}");
+            let output = runner
+                .run(
+                    &repo_path,
+                    &[
+                        "api",
+                        "-X",
+                        "GET",
+                        "search/issues",
+                        "-f",
+                        query_arg.as_str(),
+                        "-F",
+                        page_arg.as_str(),
+                        "-F",
+                        per_page_arg.as_str(),
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    if error.is_gh_not_found() {
+                        "GitHub CLI is not installed.".to_string()
+                    } else if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("first 1000 search results")
+                    {
+                        format!(
+                            "Page {} is beyond what GitHub search can return.",
+                            page.saturating_add(1)
+                        )
+                    } else {
+                        format!(
+                            "Page {} could not be loaded from GitHub.",
+                            page.saturating_add(1)
+                        )
+                    }
+                })?;
+            parse_github_search_page(&output.stdout)
         },
         move |result| Message::TaskItemsLoaded {
             op,
@@ -101,7 +207,10 @@ pub fn load_gitlab_work(
                     .run(&repo_path, &["api", "todos?state=pending&per_page=50"])
                     .await
                     .map_err(classify_glab_task_error)?;
-                return parse_gitlab_todos(&output.stdout, &query);
+                return parse_gitlab_todos(&output.stdout, &query).map(|items| TaskPageResult {
+                    items,
+                    total_pages: 1,
+                });
             }
 
             let noun = if kind == TaskKind::PullRequests {
@@ -139,7 +248,10 @@ pub fn load_gitlab_work(
                 .run(&repo_path, &borrowed)
                 .await
                 .map_err(classify_glab_task_error)?;
-            parse_gitlab_work_items(&output.stdout)
+            parse_gitlab_work_items(&output.stdout).map(|items| TaskPageResult {
+                items,
+                total_pages: 1,
+            })
         },
         move |result| Message::TaskItemsLoaded {
             op,
@@ -276,31 +388,6 @@ fn parse_projects(raw: &str, query: &str) -> Result<Vec<TaskWorkItem>, String> {
                     .and_then(Value::as_str)
                     .unwrap_or("https://github.com")
                     .to_string(),
-            })
-        })
-        .collect())
-}
-
-fn parse_work_items(raw: &str) -> Result<Vec<TaskWorkItem>, String> {
-    let values: Vec<Value> = serde_json::from_str(raw)
-        .map_err(|_| "GitHub returned unexpected task data.".to_string())?;
-    Ok(values
-        .into_iter()
-        .filter_map(|value| {
-            Some(TaskWorkItem {
-                number: value.get("number")?.as_u64()?,
-                title: value.get("title")?.as_str()?.to_string(),
-                state: value
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("OPEN")
-                    .to_string(),
-                updated_at: value
-                    .get("updatedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                url: value.get("url")?.as_str()?.to_string(),
             })
         })
         .collect())
@@ -660,10 +747,48 @@ pub fn view(state: &AppState) -> Element<'_, Message> {
         .width(Length::Fill)
         .style(theme::session_card);
 
+    let pagination: Element<'_, Message> =
+        if github_selected && kind != TaskKind::Projects && state.task_total_pages() > 1 {
+            let current = state.task_current_page();
+            let total = state.task_total_pages();
+            row![
+                button(text("Previous").size(11))
+                    .on_press_maybe(
+                        (current > 0 && !state.task_items_loading())
+                            .then_some(Message::TaskPageRequested(current.saturating_sub(1))),
+                    )
+                    .padding([4, 8])
+                    .style(theme::ghost_button),
+                text(format!("Page {} of {total}", current + 1))
+                    .size(11)
+                    .color(theme::MUTED),
+                button(text("Next").size(11))
+                    .on_press_maybe(
+                        (current + 1 < total && !state.task_items_loading())
+                            .then_some(Message::TaskPageRequested(current + 1)),
+                    )
+                    .padding([4, 8])
+                    .style(theme::ghost_button),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            Space::new().height(Length::Fixed(0.0)).into()
+        };
+
     container(
-        column![top, project_scope, sections, scope, query, results]
-            .spacing(7)
-            .padding([30, 22]),
+        column![
+            top,
+            project_scope,
+            sections,
+            scope,
+            query,
+            results,
+            pagination
+        ]
+        .spacing(7)
+        .padding([30, 22]),
     )
     .width(Length::Fill)
     .height(Length::Fill)
@@ -867,14 +992,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_github_work_item_list_without_exposing_raw_shape_to_the_view() {
-        let items = parse_work_items(
-            r#"[{"number":42,"title":"Clone tasks","state":"OPEN","updatedAt":"2026-07-28T01:02:03Z","url":"https://github.com/stablyai/orca/issues/42"}]"#,
+    fn parses_github_search_pages_and_caps_the_advertised_window() {
+        let page = parse_github_search_page(
+            r#"{"total_count":1400,"items":[{"number":42,"title":"Clone tasks","state":"open","updated_at":"2026-07-28T01:02:03Z","html_url":"https://github.com/stablyai/orca/issues/42"}]}"#,
         )
         .unwrap();
-        assert_eq!(items[0].number, 42);
-        assert_eq!(items[0].title, "Clone tasks");
-        assert_eq!(short_date(&items[0].updated_at), "2026-07-28");
+        assert_eq!(page.items[0].number, 42);
+        assert_eq!(page.items[0].title, "Clone tasks");
+        assert_eq!(short_date(&page.items[0].updated_at), "2026-07-28");
+        assert_eq!(page.total_pages, 20);
+    }
+
+    #[test]
+    fn github_search_query_adds_only_the_missing_kind_and_repository_qualifiers() {
+        assert_eq!(
+            github_search_query(TaskKind::Issues, "assignee:@me is:issue", "acme/repo"),
+            "assignee:@me is:issue repo:acme/repo"
+        );
+        assert_eq!(
+            github_search_query(TaskKind::PullRequests, "author:@me", "acme/repo"),
+            "author:@me is:pr repo:acme/repo"
+        );
     }
 
     #[test]

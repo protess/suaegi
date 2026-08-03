@@ -256,10 +256,10 @@ fn terminal_content_bounds(bounds: Rectangle, padding_x: f32, padding_y: f32) ->
     }
 }
 
-/// 이 pane의 IME 전략. 포커스가 있을 때만 IME를 켜고, 조합창을 터미널 커서 셀에
-/// 놓는다. 메트릭이나 커서가 없으면(측정 실패·커서 숨김) 위젯 좌상단으로 폴백한다
-/// — 조합은 되고 위치만 대략이다. preedit는 내용만 넘긴다: 런타임이 그걸 over-the-spot
-/// 오버레이로 그려 조합 중 글자가 보인다(인라인 렌더링은 follow-up).
+/// 이 pane의 IME 전략. 포커스가 있을 때만 IME를 켜고, 후보창을 터미널 커서 셀에
+/// 놓는다. 메트릭이나 커서가 없으면(측정 실패·커서 숨김) 위젯 좌상단으로 폴백한다.
+/// 정상 경로의 preedit는 렌더러가 on-the-spot으로 그리므로 런타임에 중복 오버레이를
+/// 요청하지 않는다. 인라인 렌더링이 불가능한 폴백에서만 over-the-spot을 사용한다.
 fn ime_strategy(state: &State, bounds: Rectangle, snapshot: &TerminalSnapshot) -> InputMethod {
     if !state.focused {
         return InputMethod::Disabled;
@@ -276,15 +276,19 @@ fn ime_strategy(state: &State, bounds: Rectangle, snapshot: &TerminalSnapshot) -
     };
     InputMethod::Enabled {
         cursor,
-        purpose: input_method::Purpose::Normal,
-        preedit: state
-            .ime_preedit
-            .as_ref()
-            .map(|content| input_method::Preedit {
-                content: content.clone(),
-                selection: None,
-                text_size: None,
-            }),
+        purpose: input_method::Purpose::Terminal,
+        preedit: if state.metrics.is_some() && snapshot.cursor.is_some() {
+            None
+        } else {
+            state
+                .ime_preedit
+                .as_ref()
+                .map(|content| input_method::Preedit {
+                    content: content.clone(),
+                    selection: None,
+                    text_size: None,
+                })
+        },
     }
 }
 
@@ -482,5 +486,78 @@ where
 {
     fn from(terminal: Terminal<'a>) -> Self {
         Element::new(terminal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::TermMode;
+    use suaegi_term::grid::{GridSize, SnapshotCursor};
+
+    fn snapshot(cursor: Option<SnapshotCursor>) -> TerminalSnapshot {
+        TerminalSnapshot {
+            rows: vec![],
+            size: GridSize { rows: 24, cols: 80 },
+            cursor,
+            display_offset: 0,
+            history_size: 0,
+            mode: TermMode::NONE,
+            selection: None,
+        }
+    }
+
+    #[test]
+    fn ime_uses_terminal_purpose_and_avoids_a_duplicate_runtime_overlay() {
+        let mut state = State {
+            focused: true,
+            metrics: state::CellMetrics::new(8.0, 16.0),
+            ime_preedit: Some("한글".into()),
+            ..State::default()
+        };
+        let with_cursor = snapshot(Some(SnapshotCursor {
+            row: 2,
+            col: 4,
+            shape: CursorShape::Block,
+            blinking: false,
+        }));
+
+        let InputMethod::Enabled {
+            cursor,
+            purpose,
+            preedit,
+        } = ime_strategy(
+            &state,
+            Rectangle::new(Point::ORIGIN, Size::new(800.0, 400.0)),
+            &with_cursor,
+        )
+        else {
+            panic!("a focused terminal must enable IME");
+        };
+        assert_eq!(purpose, input_method::Purpose::Terminal);
+        assert_eq!(cursor.position(), Point::new(32.0, 32.0));
+        assert!(preedit.is_none(), "the renderer owns the inline preedit");
+
+        state.metrics = None;
+        let InputMethod::Enabled { preedit, .. } = ime_strategy(
+            &state,
+            Rectangle::new(Point::ORIGIN, Size::new(800.0, 400.0)),
+            &with_cursor,
+        ) else {
+            panic!("the fallback must keep IME enabled");
+        };
+        assert_eq!(preedit.map(|value| value.content), Some("한글".into()));
+    }
+
+    #[test]
+    fn an_unfocused_terminal_disables_ime() {
+        assert_eq!(
+            ime_strategy(
+                &State::default(),
+                Rectangle::new(Point::ORIGIN, Size::new(800.0, 400.0)),
+                &snapshot(None),
+            ),
+            InputMethod::Disabled
+        );
     }
 }

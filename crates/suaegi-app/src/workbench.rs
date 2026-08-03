@@ -42,6 +42,23 @@ use crate::theme;
 /// 두 경로(이 구독의 알림, 재요청 루프)가 같은 주기로 안정된다.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
+fn terminal_font_family(configured: &str, macos: bool) -> Family {
+    match configured {
+        // macOS exposes the system font's real family to fontdb/cosmic-text as
+        // `.SF NS Mono`. `SF Mono` is its CSS-facing alias, which Chromium
+        // resolves for Orca but Iced does not. Passing the unresolved alias
+        // makes cosmic-text fall back to a proportional font; the terminal
+        // then measures a wide `M` as the cell width and draws narrow glyphs
+        // in those cells, producing the low-resolution/letter-spaced look.
+        "SF Mono" if macos => Family::Name(".SF NS Mono"),
+        "SF Mono" => Family::Name("SF Mono"),
+        "Menlo" => Family::Name("Menlo"),
+        "JetBrains Mono" => Family::Name("JetBrains Mono"),
+        "Fira Code" => Family::Name("Fira Code"),
+        _ => Family::Monospace,
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<Color> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 {
@@ -126,16 +143,69 @@ where
                 theme::top_bar
             },
         );
+        let mut title_tabs = row![tab].spacing(2).align_y(iced::Alignment::Center);
+        if state.focused_session() == Some(session_id) {
+            if let Some(worktree) = state.worktree_for_session(session_id) {
+                for editor_tab in state
+                    .editor()
+                    .tabs()
+                    .into_iter()
+                    .filter(|editor_tab| &editor_tab.worktree == worktree)
+                {
+                    let name = std::path::Path::new(&editor_tab.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&editor_tab.path)
+                        .to_string();
+                    let marker = if editor_tab.saving {
+                        "…"
+                    } else if editor_tab.dirty {
+                        "M"
+                    } else {
+                        ""
+                    };
+                    let select = button(
+                        row![
+                            text("▤").size(12).color(theme::MUTED),
+                            text(name).size(13),
+                            text(marker).size(11).color(theme::MUTED),
+                        ]
+                        .spacing(5)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .on_press(Message::EditorTabSelected {
+                        worktree: editor_tab.worktree.clone(),
+                        path: editor_tab.path.clone(),
+                    })
+                    .padding([3, 5])
+                    .style(theme::ghost_button);
+                    let close = button(text("×").size(12))
+                        .on_press(Message::EditorTabCloseRequested {
+                            worktree: editor_tab.worktree,
+                            path: editor_tab.path,
+                        })
+                        .padding([2, 4])
+                        .style(theme::ghost_button);
+                    title_tabs = title_tabs.push(
+                        container(
+                            row![select, close]
+                                .spacing(0)
+                                .align_y(iced::Alignment::Center),
+                        )
+                        .style(theme::top_bar),
+                    );
+                }
+            }
+        }
         let title_bar = pane_grid::TitleBar::new(
-            row![
-                tab,
-                button(text("+").size(14))
-                    .on_press(Message::BrowserOpenRequested)
-                    .padding([2, 6])
-                    .style(theme::ghost_button),
-                Space::new().width(Length::Fill),
-            ]
-            .align_y(iced::Alignment::Center),
+            title_tabs
+                .push(
+                    button(text("+").size(14))
+                        .on_press(Message::BrowserOpenRequested)
+                        .padding([2, 6])
+                        .style(theme::ghost_button),
+                )
+                .push(Space::new().width(Length::Fill)),
         )
         .padding(4);
 
@@ -218,13 +288,10 @@ where
     } else {
         state.ui_settings().terminal_theme_dark.as_str()
     };
-    let family = match state.ui_settings().terminal_font_family.as_str() {
-        "SF Mono" => Family::Name("SF Mono"),
-        "Menlo" => Family::Name("Menlo"),
-        "JetBrains Mono" => Family::Name("JetBrains Mono"),
-        "Fira Code" => Family::Name("Fira Code"),
-        _ => Family::Monospace,
-    };
+    let family = terminal_font_family(
+        &state.ui_settings().terminal_font_family,
+        cfg!(target_os = "macos"),
+    );
     let weight = match state.ui_settings().terminal_font_weight {
         0..=349 => Weight::Light,
         350..=449 => Weight::Normal,
@@ -408,6 +475,26 @@ mod tests {
     use iced::{Event, Point, Rectangle, Size, Theme};
 
     const BOUNDS: Size = Size::new(800.0, 600.0);
+
+    #[test]
+    fn macos_sf_mono_uses_the_real_fontdb_family() {
+        assert_eq!(
+            terminal_font_family("SF Mono", true),
+            Family::Name(".SF NS Mono")
+        );
+        assert_eq!(
+            terminal_font_family("SF Mono", false),
+            Family::Name("SF Mono"),
+            "the private dot-prefixed family is macOS-specific"
+        );
+        assert_eq!(terminal_font_family("Menlo", true), Family::Name("Menlo"));
+        assert_eq!(
+            terminal_font_family("unknown proportional font", true),
+            Family::Monospace,
+            "an unsupported family must stay monospaced instead of silently \
+             stretching terminal cells around proportional glyphs"
+        );
+    }
 
     fn two_pane_state() -> AppState {
         let (mut panes, first) = pane_grid::State::new(SessionId(1));

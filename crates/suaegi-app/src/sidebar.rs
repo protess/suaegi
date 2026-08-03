@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, text_input, Space,
 };
 use iced::{Alignment, Color, Element, Length};
 
@@ -248,6 +248,29 @@ pub fn view(state: &AppState) -> Element<'_, Message> {
     }
     if let Some(status) = status_line(state) {
         footer = footer.push(text(status).size(14));
+    }
+    if state.future_schema_guarded() {
+        let controls: Element<'static, Message> = if state.future_schema_override_confirming() {
+            row![
+                button(text("Cancel").size(11))
+                    .on_press(Message::FutureSchemaOverrideCancelled)
+                    .padding([3, 6])
+                    .style(theme::ghost_button),
+                button(text("Back up & replace").size(11))
+                    .on_press(Message::FutureSchemaOverrideConfirmed)
+                    .padding([3, 6])
+                    .style(theme::danger_ghost_button),
+            ]
+            .spacing(3)
+            .into()
+        } else {
+            button(text("Review save options…").size(11))
+                .on_press(Message::FutureSchemaOverrideRequested)
+                .padding([3, 6])
+                .style(theme::ghost_button)
+                .into()
+        };
+        footer = footer.push(controls);
     }
 
     let layout = column![
@@ -662,6 +685,7 @@ fn worktree_entry<'a>(state: &'a AppState, entry: &'a WorktreeEntry) -> Element<
             is_pinned: state.worktree_is_pinned(&worktree_id),
             is_unread: state.worktree_is_unread(&worktree_id),
             is_sleeping: state.worktree_is_sleeping(&worktree_id),
+            is_dragging: state.worktree_is_dragging(&worktree_id),
             badge: state.worktree_badge(&worktree_id),
             presence: state.worktree_presence(&worktree_id),
             prompt_cache_seconds: state.prompt_cache_remaining_seconds(&worktree_id),
@@ -732,6 +756,7 @@ struct WorktreeRowState {
     is_pinned: bool,
     is_unread: bool,
     is_sleeping: bool,
+    is_dragging: bool,
     badge: BadgeState,
     presence: AgentPresence,
     prompt_cache_seconds: Option<u64>,
@@ -822,6 +847,8 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
     };
 
     let select_id = worktree_id.clone();
+    let hover_id = worktree_id.clone();
+    let drag_id = worktree_id.clone();
     let actions: Element<'static, Message> = if state.is_selected || state.actions_open {
         button(icons::view(Icon::Ellipsis, 11.0, theme::MUTED))
             .on_press(Message::WorktreeActionsToggled(worktree_id))
@@ -835,20 +862,33 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
             .into()
     };
 
-    row![
-        button(container(content).padding(metrics.content_padding))
-            .on_press(Message::WorktreeSelected(select_id))
-            .padding(0)
-            .width(Length::Fill)
-            .style(if state.is_selected {
-                theme::selected_button
-            } else {
-                theme::ghost_button
-            }),
-        actions,
-    ]
-    .spacing(1)
-    .align_y(Alignment::Center)
+    mouse_area(
+        row![
+            mouse_area(
+                container(text("⠿").size(9).color(theme::MUTED))
+                    .padding([8, 2])
+                    .style(if state.is_dragging {
+                        theme::active_card
+                    } else {
+                        theme::card
+                    }),
+            )
+            .on_press(Message::WorktreeDragStarted(drag_id)),
+            button(container(content).padding(metrics.content_padding))
+                .on_press(Message::WorktreeSelected(select_id))
+                .padding(0)
+                .width(Length::Fill)
+                .style(if state.is_selected {
+                    theme::selected_button
+                } else {
+                    theme::ghost_button
+                }),
+            actions,
+        ]
+        .spacing(1)
+        .align_y(Alignment::Center),
+    )
+    .on_enter(Message::WorktreeDragHovered(hover_id))
     .into()
 }
 
@@ -1255,6 +1295,11 @@ fn jira_issue_row(
 /// 절대 에러처럼 보이면 안 된다 — 안 그러면 사용자가 상태 표시줄 자체를
 /// 무시하는 법을 배운다.
 fn status_line(state: &AppState) -> Option<String> {
+    if state.future_schema_guarded() {
+        return Some(
+            "Settings came from a newer Suaegi. Saving is paused to protect them.".to_string(),
+        );
+    }
     if let Some(SaveStatus::Failed(message)) = state.last_save_status() {
         return Some(format!("Save failed: {message}"));
     }
@@ -1359,6 +1404,19 @@ mod tests {
         assert!(status_line(&AppState::fresh()).is_none());
         assert!(status_line(&AppState::recovery_failed()).is_some());
         assert!(status_line(&AppState::recovered(0)).is_some());
+    }
+
+    #[test]
+    fn a_future_schema_guard_takes_priority_over_a_generic_save_failure() {
+        let state = AppState::from_load(LoadDiagnostics {
+            state: PersistedState::default(),
+            origin: LoadOrigin::RecoveryFailed,
+            save_blocked: true,
+        });
+        assert!(state.future_schema_guarded());
+        assert!(status_line(&state)
+            .expect("a guarded boot must always be visible")
+            .contains("newer Suaegi"));
     }
 
     /// Task 8: `PersistenceHandle::spawn`이 만드는 `LoadDiagnostics`가 실제로

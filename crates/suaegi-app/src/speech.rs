@@ -4,6 +4,7 @@
 //! explicitly selected one of Orca's OpenAI speech models.
 
 use std::cell::RefCell;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -18,6 +19,19 @@ const CLOUD_SAMPLE_RATE: u32 = 16_000;
 pub struct AudioCapture {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicrophoneDevice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStarted {
+    pub device_id: Option<String>,
+    pub device_label: String,
+    pub fell_back_to_default: bool,
 }
 
 struct ActiveCapture {
@@ -63,14 +77,81 @@ where
         .map_err(|error| format!("Could not open microphone input: {error}"))
 }
 
-pub fn start_capture() -> Result<(), String> {
+fn device_label(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "Microphone".to_string())
+}
+
+pub fn list_input_devices() -> Result<Vec<MicrophoneDevice>, String> {
+    let host = cpal::default_host();
+    let devices = host
+        .input_devices()
+        .map_err(|error| format!("Could not list microphone devices: {error}"))?;
+    let mut devices = devices
+        .filter_map(|device| {
+            let id = device.id().ok()?.to_string();
+            Some(MicrophoneDevice {
+                id,
+                label: device_label(&device),
+            })
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        left.label
+            .to_lowercase()
+            .cmp(&right.label.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    devices.dedup_by(|left, right| left.id == right.id);
+    Ok(devices)
+}
+
+pub fn start_capture(
+    preferred_device_id: Option<&str>,
+    preferred_device_label: Option<&str>,
+) -> Result<CaptureStarted, String> {
     if ACTIVE_CAPTURE.with(|slot| slot.borrow().is_some()) {
         return Err("Voice dictation is already recording.".into());
     }
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
+    let preferred_device_id = preferred_device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let preferred_device_label = preferred_device_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut selected = preferred_device_id
+        .and_then(|value| cpal::DeviceId::from_str(value).ok())
+        .and_then(|id| host.device_by_id(&id))
+        .filter(|device| device.default_input_config().is_ok());
+
+    // Audio backends may rotate their stable id after an OS update. A unique
+    // matching label safely heals the preference; duplicate labels are
+    // deliberately ambiguous and therefore fall back to the system default.
+    if selected.is_none() && preferred_device_id.is_some() {
+        if let Some(wanted_label) = preferred_device_label {
+            let matches = host
+                .input_devices()
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter(|device| device_label(device).eq_ignore_ascii_case(wanted_label))
+                .take(2)
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                selected = matches.into_iter().next();
+            }
+        }
+    }
+
+    let fell_back_to_default = preferred_device_id.is_some() && selected.is_none();
+    let device = selected
+        .or_else(|| host.default_input_device())
         .ok_or_else(|| "No microphone input device is available.".to_string())?;
+    let device_id = device.id().ok().map(|id| id.to_string());
+    let device_label = device_label(&device);
     let supported = device
         .default_input_config()
         .map_err(|error| format!("Could not read microphone configuration: {error}"))?;
@@ -102,7 +183,11 @@ pub fn start_capture() -> Result<(), String> {
             sample_rate,
         });
     });
-    Ok(())
+    Ok(CaptureStarted {
+        device_id,
+        device_label,
+        fell_back_to_default,
+    })
 }
 
 pub fn stop_capture() -> Result<AudioCapture, String> {

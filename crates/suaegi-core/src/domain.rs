@@ -494,6 +494,13 @@ pub struct UiSettings {
     pub terminal_font_size: u16,
     pub terminal_font_family: String,
     pub terminal_font_weight: u16,
+    /// `false` only for settings written before Suaegi matched Orca's macOS
+    /// terminal typography defaults. A field-level default is intentional:
+    /// `UiSettings::default()` is a new install (`true`), while a missing JSON
+    /// key is an older install that still needs the one-time 400 → 500
+    /// migration.
+    #[serde(default)]
+    pub terminal_font_defaults_orca_v2: bool,
     pub terminal_line_height_percent: u16,
     pub terminal_scroll_sensitivity_percent: u16,
     pub terminal_fast_scroll_sensitivity_percent: u16,
@@ -619,6 +626,14 @@ pub struct UiSettings {
     pub voice_models_dir: String,
     pub voice_language: String,
     pub voice_dictation_mode: String,
+    /// Stable CPAL device id for the preferred dictation microphone. `None`
+    /// follows the operating system default.
+    #[serde(default)]
+    pub voice_microphone_device_id: Option<String>,
+    /// Cached display name used to recover a preference when an audio backend
+    /// rotates the stable id, and to identify an unplugged device in Settings.
+    #[serde(default)]
+    pub voice_microphone_device_label: Option<String>,
     pub voice_terminal_confirm_before_insert: bool,
     pub voice_openai_api_key_configured: bool,
     pub voice_user_models: Vec<VoiceUserModelSetting>,
@@ -790,7 +805,8 @@ impl Default for UiSettings {
             window_background_blur: false,
             terminal_font_size: 14,
             terminal_font_family: "SF Mono".to_string(),
-            terminal_font_weight: 400,
+            terminal_font_weight: 500,
+            terminal_font_defaults_orca_v2: true,
             terminal_line_height_percent: 100,
             terminal_scroll_sensitivity_percent: 115,
             terminal_fast_scroll_sensitivity_percent: 500,
@@ -901,6 +917,8 @@ impl Default for UiSettings {
             voice_models_dir: String::new(),
             voice_language: "en".to_string(),
             voice_dictation_mode: "toggle".to_string(),
+            voice_microphone_device_id: None,
+            voice_microphone_device_label: None,
             voice_terminal_confirm_before_insert: false,
             voice_openai_api_key_configured: false,
             voice_user_models: Vec::new(),
@@ -1088,6 +1106,44 @@ impl Default for PersistedState {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn terminal_typography_defaults_match_orca_and_detect_legacy_json() {
+        let current = UiSettings::default();
+        assert_eq!(current.terminal_font_family, "SF Mono");
+        assert_eq!(current.terminal_font_weight, 500);
+        assert!(current.terminal_font_defaults_orca_v2);
+
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_font_defaults_orca_v2");
+        legacy["terminal_font_weight"] = serde_json::json!(400);
+        let legacy: UiSettings = serde_json::from_value(legacy).unwrap();
+        assert!(
+            !legacy.terminal_font_defaults_orca_v2,
+            "a missing marker must identify settings written by the old renderer"
+        );
+        assert_eq!(legacy.terminal_font_weight, 400);
+    }
+
+    #[test]
+    fn legacy_voice_settings_follow_the_system_default_microphone() {
+        let mut legacy = serde_json::to_value(UiSettings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("voice_microphone_device_id");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("voice_microphone_device_label");
+
+        let legacy: UiSettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.voice_microphone_device_id, None);
+        assert_eq!(legacy.voice_microphone_device_label, None);
+    }
 
     #[test]
     fn persisted_state_round_trips_through_json() {

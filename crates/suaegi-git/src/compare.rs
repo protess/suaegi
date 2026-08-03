@@ -1,3 +1,4 @@
+use crate::fs::{EDITOR_TEMP_PREFIX, EDITOR_TEMP_SUFFIX};
 use crate::refname::validate_user_ref;
 use crate::runner::{GitError, GitRunner};
 use std::collections::HashMap;
@@ -358,7 +359,7 @@ pub async fn branch_compare(
         .await?;
     for record in status_out.stdout.split('\0') {
         if let Some(path) = record.strip_prefix("?? ") {
-            if path == INJECTED_SETTINGS_PATH {
+            if path == INJECTED_SETTINGS_PATH || is_orphaned_editor_temp(path) {
                 continue;
             }
             files.push(ChangedFile {
@@ -375,6 +376,17 @@ pub async fn branch_compare(
         ahead_count: ahead,
         files,
     }))
+}
+
+fn is_orphaned_editor_temp(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(EDITOR_TEMP_PREFIX)
+                && name.ends_with(EDITOR_TEMP_SUFFIX)
+                && name.len() > EDITOR_TEMP_PREFIX.len() + EDITOR_TEMP_SUFFIX.len()
+        })
 }
 
 /// worktree 안에서 파일 하나가 실제로 무엇인지.
@@ -645,7 +657,15 @@ mod parser_tests {
     //! M0에서 추출한 `-z` 파서의 직접 단위 테스트. `branch_compare`의 통합
     //! 테스트가 같은 코드를 간접적으로 덮지만(rename/copy 케이스), 추출 함수를
     //! **직접** 못박아 두 레코드 소비 mutant를 이 레벨에서도 죽인다.
-    use super::{parse_name_status_z, parse_numstat_z, ChangeStatus};
+    use super::{is_orphaned_editor_temp, parse_name_status_z, parse_numstat_z, ChangeStatus};
+
+    #[test]
+    fn only_the_reserved_editor_temp_namespace_is_hidden() {
+        assert!(is_orphaned_editor_temp("src/.suaegi-editor-tmp-abc123.tmp"));
+        assert!(!is_orphaned_editor_temp("src/.suaegi-editor-tmp-.tmp"));
+        assert!(!is_orphaned_editor_temp("src/.suaegi-editor-tmp-user.txt"));
+        assert!(!is_orphaned_editor_temp("src/.tmpabc123"));
+    }
 
     /// rename의 numstat `-z`는 `"adds\tdels\t"`(빈 경로) 뒤 from, to가 각각 별도
     /// NUL 레코드로 온다 — 실측 `git diff --numstat -z -M` 출력 그대로.
