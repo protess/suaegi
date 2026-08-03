@@ -79,16 +79,17 @@ pub struct HookEvent {
     /// First known agent prompt, bounded during parsing and never persisted.
     /// It is used only to derive an optional stable tab title.
     pub prompt: Option<String>,
-    /// **`Stop`에서만 `None`을 "비지 않음"으로 취급한다**(보수적). 백그라운드
-    /// 서브에이전트가 도는 중에 `Done`을 찍으면 배지가 done↔working으로 깜빡인다
-    /// (실측 §1.6.6: 한 턴에 `Stop`이 두 번 오고, 첫 번째 뒤에 도구 호출이 8개 더 왔다).
-    ///
-    /// **`StopFailure`에는 이 필드가 구조적으로 없다**(실측 §1.6.2 — `session_crons`,
-    /// `permission_mode`도 없는 훨씬 얇은 페이로드다). 가끔 빠지는 게 아니라 아예
-    /// 없으므로 보수적 기본값을 적용하면 `StopFailure`가 **영원히 `Done`이 될 수 없고**,
-    /// 무한 스피너를 막으려고 등록한 이벤트가 그 원인이 된다. 그래서 리듀서가
-    /// [`HookEventName`]으로 분기한다 — 이 필드만 보고 판단하지 않는다.
-    pub background_tasks_empty: Option<bool>,
+    /// `background_tasks` inventory가 있으면 현재 non-terminal 작업이 하나라도
+    /// 있는지 보수적으로 정규화한 값이다. `None`은 inventory 부재이며, 앱은 pane에
+    /// 마지막으로 받아들인 권위 있는 값을 유지한다.
+    pub background_work_active: Option<bool>,
+    /// `session_crons` inventory가 있으면 예약 작업 존재 여부다. background inventory가
+    /// 있는 turn boundary에서 이 필드만 빠진 경우는 최신 Claude의 "empty omitted"
+    /// 형식으로 간주해 앱이 기존 값을 지운다.
+    pub session_crons_active: Option<bool>,
+    /// lead Stop/StopFailure가 사용자의 interrupt로 끝났는지 여부. 인터럽트는 이전
+    /// background/cron 증거를 즉시 폐기할 수 있는 유일한 turn boundary다.
+    pub interrupted: bool,
     // **`prompt_is_task_notification`이 없는 것은 의도다.** 서브에이전트 완료가
     // 합성 `UserPromptSubmit`을 주입하지만(조사 §1.6.5에 접두사까지 실측돼 있다),
     // 이 플랜은 그걸 거르지 않는다 — 배지 결과가 같고(리드가 서브에이전트 결과를
@@ -108,7 +109,9 @@ impl std::fmt::Debug for HookEvent {
             .field("tool_name", &self.tool_name)
             .field("agent_id", &self.agent_id)
             .field("prompt", &self.prompt.as_ref().map(|_| "<redacted>"))
-            .field("background_tasks_empty", &self.background_tasks_empty)
+            .field("background_work_active", &self.background_work_active)
+            .field("session_crons_active", &self.session_crons_active)
+            .field("interrupted", &self.interrupted)
             .finish()
     }
 }
@@ -267,6 +270,17 @@ pub enum HookOutcome {
     Set(HookState),
 }
 
+pub fn is_ask_user_question_tool(tool_name: Option<&str>) -> bool {
+    tool_name.is_some_and(|tool| {
+        let normalized = tool
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        normalized == "askuserquestion" || normalized == "requestuserinput"
+    })
+}
+
 /// 이벤트 → 훅 상태. **전부 실측이다**(조사 §1.4, §1.6) — 여기서 다시 추론하지 않는다.
 ///
 /// | 이벤트 | 결과 | 근거 |
@@ -276,18 +290,12 @@ pub enum HookOutcome {
 /// | 일반 `PreToolUse`/`PostToolUse`/`PostToolUseFailure` | `Set(Working)` | |
 /// | `PreToolUse(AskUserQuestion)` | `Set(Waiting)` | 자동 허용 뒤 사람의 답을 기다린다 |
 /// | `PermissionRequest` | `Set(Waiting)` | 사용자 승인 대기 |
-/// | `Stop` + background 빔 | `Set(Done)` | |
-/// | `Stop` + background 안 빔 | `Set(Working)` | 서브에이전트가 도는 중이다 |
-/// | `StopFailure` | `Set(Done)` **무조건** | 이 이벤트엔 `background_tasks`가 **구조적으로 없다** |
+/// | `Stop`/`StopFailure` | `Set(Done)` | pane 장부의 background/cron 증거는 앱에서 합성한다 |
 /// | `SubagentStop`/`SessionEnd` | `Ignore` | |
 ///
-/// **`StopFailure`가 `background_tasks`를 보지 않는 이유**가 이 함수에서 가장
-/// 틀리기 쉬운 곳이다. 페이로드에 그 필드가 **아예 없고**(`session_crons`,
-/// `permission_mode`도 없다 — `Stop`보다 훨씬 얇다), [`HookEvent`]의 보수적 규칙은
-/// `None`을 "비지 않음"으로 읽는다. 둘을 합치면 `StopFailure`는 **영원히 `Done`이
-/// 될 수 없고** pane이 계속 돈다 — 이 이벤트를 등록한 이유가 정확히 그 무한
-/// 스피너를 막는 것이었는데 그 자체가 원인이 된다. 필드가 가끔 빠지는 게 아니라
-/// 구조적으로 없으므로 보수적 기본값이 **이 이벤트에는 틀린다.**
+/// Turn-boundary의 effective state는 이 순수 매핑 뒤에 pane별 inventory를 가진
+/// `AppState::apply_hook`가 계산한다. 그래야 inventory가 빠진 다음 StopFailure도
+/// 직전의 살아 있는 background 작업을 보존하고, interrupt만 이를 명시적으로 끝낸다.
 ///
 /// **`SessionEnd`를 무시하는 이유**: 종료 판정은 presence 폴링의 `Exited`/`NoAgent`가
 /// 권위다. 훅은 async라 프로세스가 죽으면 아예 안 올 수도 있고, 폴링만이 그걸 본다.
@@ -301,31 +309,14 @@ pub fn hook_outcome(event: &HookEvent) -> HookOutcome {
         HookEventName::UserPromptSubmit
         | HookEventName::PostToolUse
         | HookEventName::PostToolUseFailure => HookOutcome::Set(HookState::Working),
-        HookEventName::PreToolUse
-            if event.tool_name.as_deref().is_some_and(|tool| {
-                let normalized = tool
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                normalized == "askuserquestion"
-            }) =>
-        {
+        HookEventName::PreToolUse if is_ask_user_question_tool(event.tool_name.as_deref()) => {
             // Claude auto-allows AskUserQuestion, so it emits PreToolUse while actually
             // blocked on the user's answer. Orca maps this exact case to waiting.
             HookOutcome::Set(HookState::Waiting)
         }
         HookEventName::PreToolUse => HookOutcome::Set(HookState::Working),
         HookEventName::PermissionRequest => HookOutcome::Set(HookState::Waiting),
-        HookEventName::Stop => match event.background_tasks_empty {
-            Some(true) => HookOutcome::Set(HookState::Done),
-            // **`None`은 "비지 않음"이다**(보수적). 없다고 done을 찍으면
-            // 백그라운드 서브에이전트가 도는 중에 끝난 것으로 보인다.
-            // `Working`으로 **덮어쓰는** 것이지 무시하는 것이 아니다 — 그래야
-            // 나이가 갱신돼, 오래 도는 서브에이전트가 `Unknown`으로 새지 않는다.
-            Some(false) | None => HookOutcome::Set(HookState::Working),
-        },
-        HookEventName::StopFailure => HookOutcome::Set(HookState::Done),
+        HookEventName::Stop | HookEventName::StopFailure => HookOutcome::Set(HookState::Done),
         HookEventName::SubagentStop | HookEventName::SessionEnd => HookOutcome::Ignore,
     }
 }
@@ -741,7 +732,7 @@ mod tests {
 
     // ---- 이벤트 → 훅 상태 매핑 (실측) ----
 
-    fn event(name: HookEventName, background_tasks_empty: Option<bool>) -> HookEvent {
+    fn event(name: HookEventName, background_work_active: Option<bool>) -> HookEvent {
         HookEvent {
             pane_key: PaneKey(WorktreeId("/tmp/wt".into())),
             spawn_nonce: SpawnNonce(1),
@@ -750,7 +741,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty,
+            background_work_active,
+            session_crons_active: None,
+            interrupted: false,
         }
     }
 
@@ -790,7 +783,12 @@ mod tests {
 
     #[test]
     fn claude_ask_user_question_pre_tool_is_waiting_like_orca() {
-        for tool_name in ["AskUserQuestion", "ask_user_question", "ask-user-question"] {
+        for tool_name in [
+            "AskUserQuestion",
+            "ask_user_question",
+            "ask-user-question",
+            "request_user_input",
+        ] {
             let mut event = event(HookEventName::PreToolUse, None);
             event.tool_name = Some(tool_name.to_string());
             assert_eq!(
@@ -807,53 +805,17 @@ mod tests {
         );
     }
 
-    /// **`Stop`은 "끝났다"가 아니다.** Agent 도구는 기본이 백그라운드 실행이라
-    /// 서브에이전트가 도는 중에 `Stop`이 먼저 온다(실측: 한 턴에 `Stop`이 두 번).
-    /// ①에서 done을 찍으면 배지가 done으로 갔다가 뒤따르는 도구 호출 8개에 다시
-    /// working으로 돌아온다.
     #[test]
-    fn stop_only_means_done_when_no_background_task_is_running() {
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, Some(true))),
-            HookOutcome::Set(HookState::Done),
-            "the final Stop carries an empty background_tasks and IS done"
-        );
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, Some(false))),
-            HookOutcome::Set(HookState::Working),
-            "a Stop while a subagent is still running must stay working, or the badge \
-             flickers done->working across the subagent's remaining tool calls"
-        );
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, None)),
-            HookOutcome::Set(HookState::Working),
-            "absent background_tasks is treated as NOT empty (conservative) — the wrong \
-             way round marks a running agent finished"
-        );
-    }
-
-    /// **`StopFailure`는 `background_tasks`를 보지 않는다.** 페이로드에 그 필드가
-    /// 구조적으로 없고, 보수적 규칙(`None` = 비지 않음)을 적용하면 이 이벤트는
-    /// **영원히 done이 될 수 없다** — 등록한 이유가 그 무한 스피너를 막는 것인데
-    /// 그 자체가 원인이 된다.
-    #[test]
-    fn stop_failure_is_done_unconditionally() {
-        for background in [None, Some(false), Some(true)] {
-            assert_eq!(
-                hook_outcome(&event(HookEventName::StopFailure, background)),
-                HookOutcome::Set(HookState::Done),
-                "StopFailure must reach done regardless of background_tasks ({background:?}) — \
-                 the field is structurally absent from this payload, so the conservative \
-                 default is wrong here and would strand the pane on a spinner forever"
-            );
+    fn turn_boundaries_report_done_before_stateful_background_evidence_is_applied() {
+        for name in [HookEventName::Stop, HookEventName::StopFailure] {
+            for background in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    hook_outcome(&event(name, background)),
+                    HookOutcome::Set(HookState::Done),
+                    "pane-level background state must be applied after the pure event mapping"
+                );
+            }
         }
-        // 대조군: 같은 `background` 값으로 `Stop`은 갈린다 — 위가 "무조건 done"이
-        // 아니라 "이 이벤트만 무조건"임을 고정한다.
-        assert_eq!(
-            hook_outcome(&event(HookEventName::Stop, None)),
-            HookOutcome::Set(HookState::Working),
-            "control: Stop with the same absent field does NOT reach done"
-        );
     }
 
     /// `SessionStart`는 `Ignore`가 아니라 `Reset`이다. 둘을 `None` 하나로 뭉개면

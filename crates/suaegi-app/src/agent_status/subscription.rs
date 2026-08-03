@@ -171,7 +171,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty: Some(true),
+            background_work_active: Some(false),
+            session_crons_active: Some(false),
+            interrupted: false,
         }
     }
 
