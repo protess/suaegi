@@ -12,7 +12,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 
@@ -24,6 +24,11 @@ use crate::agent_status::parse::{
 /// 요청 하나를 받는 데 허용하는 시간. slowloris(느리게 흘려 연결을 붙잡아 두는 공격)를
 /// 막는다. 훅 스크립트는 `curl --max-time 1.5`라 정상 요청은 한참 안쪽이다.
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A legitimate curl writes its request immediately after connect. Requiring
+/// the first byte promptly prevents a set of silent sockets from occupying all
+/// handler slots for the hook client's entire 1.5s lifetime.
+pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 요청 머리의 상한. 본문과 달리 머리는 작아야 한다 — 무한히 긴 헤더로 메모리를
 /// 밀어 넣는 길을 막는다.
@@ -182,12 +187,10 @@ fn serve(
 
 /// 연결 하나. **어떤 경로로도 패닉하지 않는다** — 돌려주는 것은 항상 상태 코드다.
 fn handle(stream: &TcpStream, token: &str, tx: &SharedSender, dropped: &AtomicU64) -> Status {
-    if stream.set_read_timeout(Some(RECV_TIMEOUT)).is_err() {
-        return Status::RequestTimeout;
-    }
+    let deadline = Instant::now() + RECV_TIMEOUT;
     let mut reader = BufReader::new(stream);
 
-    let (head_bytes, leftover) = match read_head(&mut reader) {
+    let (head_bytes, leftover) = match read_head(&mut reader, deadline) {
         Ok(v) => v,
         Err(status) => return status,
     };
@@ -200,7 +203,7 @@ fn handle(stream: &TcpStream, token: &str, tx: &SharedSender, dropped: &AtomicU6
         return status;
     }
 
-    let body = match read_body(&mut reader, leftover, head.content_length) {
+    let body = match read_body(&mut reader, leftover, head.content_length, deadline) {
         Ok(b) => b,
         Err(status) => return status,
     };
@@ -232,10 +235,23 @@ fn handle(stream: &TcpStream, token: &str, tx: &SharedSender, dropped: &AtomicU6
 
 /// `\r\n\r\n`까지 읽는다. 함께 읽힌 본문 앞부분은 두 번째 값으로 돌려준다 —
 /// 버리면 `Content-Length`만큼 다시 못 채운다.
-fn read_head(reader: &mut BufReader<&TcpStream>) -> Result<(Vec<u8>, Vec<u8>), Status> {
+fn read_head(
+    reader: &mut BufReader<&TcpStream>,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Vec<u8>), Status> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     loop {
+        let remaining = remaining_until(deadline)?;
+        let timeout = if buf.is_empty() {
+            remaining.min(FIRST_BYTE_TIMEOUT)
+        } else {
+            remaining
+        };
+        reader
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| Status::RequestTimeout)?;
         match reader.read(&mut byte) {
             Ok(0) => return Err(Status::BadRequest), // 머리가 끝나기 전에 끊겼다
             Ok(_) => buf.push(byte[0]),
@@ -255,6 +271,7 @@ fn read_body(
     reader: &mut BufReader<&TcpStream>,
     mut body: Vec<u8>,
     content_length: usize,
+    deadline: Instant,
 ) -> Result<Vec<u8>, Status> {
     // `parse_head`가 이미 상한을 봤지만 여기서도 본다 — 이 함수만 따로 불릴 수 있고,
     // 상한 검사가 한 곳에만 있으면 그 한 곳이 옮겨질 때 조용히 사라진다.
@@ -264,6 +281,10 @@ fn read_body(
     body.reserve(content_length.saturating_sub(body.len()));
     let mut chunk = [0u8; 8192];
     while body.len() < content_length {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining_until(deadline)?))
+            .map_err(|_| Status::RequestTimeout)?;
         let want = (content_length - body.len()).min(chunk.len());
         match reader.read(&mut chunk[..want]) {
             Ok(0) => return Err(Status::BadRequest), // 예고한 길이보다 짧게 끊겼다
@@ -272,6 +293,13 @@ fn read_body(
         }
     }
     Ok(body)
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, Status> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(Status::RequestTimeout)
 }
 
 /// 읽기 타임아웃만 408이다. 플랫폼마다 `WouldBlock`/`TimedOut`으로 갈려서 둘 다 본다.
@@ -534,15 +562,7 @@ mod tests {
         }
     }
 
-    /// **상한을 넘으면 즉시 503이고, 그 수를 센다.**
-    ///
-    /// 이 테스트는 **남아 있는 한계도 같이 못 박는다**: 조용한 연결
-    /// [`MAX_CONNECTIONS`]개는 여전히 정상 훅을 막는다. 스레드 풀은 그 비용을
-    /// **1개 → 16개**로 올리고, 실패를 **5초 지연 → 즉시 503 + 카운터**로 바꿀
-    /// 뿐 없애지는 않는다. 즉시 실패라 훅의 `--max-time 1.5` 안에 끝나고
-    /// `refused()`에 흔적이 남는다는 것이 개선의 내용이다 — "완전히 막았다"가
-    /// 아니다. 진짜로 없애려면 헤더 첫 바이트에 짧은 별도 타임아웃이 필요하다
-    /// (follow-up).
+    /// **상한을 넘으면 즉시 503이고, 조용한 슬롯은 훅 예산 안에 회수된다.**
     #[test]
     fn past_the_connection_cap_it_refuses_immediately_and_counts() {
         let (server, _rx) = bind("tok".into()).expect("bind");
@@ -555,7 +575,7 @@ mod tests {
             idle.push(TcpStream::connect(("127.0.0.1", p)).expect("connect"));
         }
         // 전부 accept되어 슬롯을 잡을 시간을 준다.
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(100));
 
         let started = std::time::Instant::now();
         let code = request(p, &post(pane, "1", "tok", BODY));
@@ -577,14 +597,20 @@ mod tests {
             "연결 거절을 dropped()에 세면 '앱이 느리다'와 '누가 두드린다'가 섞인다"
         );
 
-        // 대조군: 슬롯을 놓아주면 다시 정상 동작한다(영구 고장이 아니다).
-        drop(idle);
-        std::thread::sleep(Duration::from_millis(200));
+        // 클라이언트가 소켓을 놓아주지 않아도 첫 바이트 타임아웃이 슬롯을
+        // 회수해야 한다. 전체 회복이 curl의 1.5초 예산 안이어야 이벤트가 산다.
+        let recovery_started = std::time::Instant::now();
+        std::thread::sleep(FIRST_BYTE_TIMEOUT + Duration::from_millis(200));
         assert_eq!(
             request(p, &post(pane, "2", "tok", BODY)),
             204,
-            "연결이 풀린 뒤에도 서버가 살아 있어야 한다"
+            "조용한 클라이언트가 소켓을 쥔 채여도 슬롯이 자동 회수돼야 한다"
         );
+        assert!(
+            recovery_started.elapsed() < HOOK_CURL_MAX_TIME,
+            "슬롯 회복이 훅의 curl 예산을 넘으면 정상 이벤트가 유실된다"
+        );
+        drop(idle);
     }
 
     /// slowloris: 머리를 끝내지 않고 붙잡고 있으면 408로 끊는다. 5초를 실제로
