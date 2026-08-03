@@ -5285,35 +5285,35 @@ struct BundledSkillGuide {
 const BUNDLED_SKILL_GUIDES: &[BundledSkillGuide] = &[
     BundledSkillGuide {
         name: "computer-use",
-        markdown: include_str!("../../../reference/orca/skills/computer-use/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/computer-use.md"),
     },
     BundledSkillGuide {
         name: "linear-tickets",
-        markdown: include_str!("../../../reference/orca/skills/linear-tickets/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/linear-tickets.md"),
     },
     BundledSkillGuide {
         name: "orca-cli",
-        markdown: include_str!("../../../reference/orca/skills/orca-cli/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orca-cli.md"),
     },
     BundledSkillGuide {
         name: "orca-emulator",
-        markdown: include_str!("../../../reference/orca/skills/orca-emulator/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orca-emulator.md"),
     },
     BundledSkillGuide {
         name: "orca-emulator-android",
-        markdown: include_str!("../../../reference/orca/skills/orca-emulator-android/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orca-emulator-android.md"),
     },
     BundledSkillGuide {
         name: "orca-linear",
-        markdown: include_str!("../../../reference/orca/skills/orca-linear/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orca-linear.md"),
     },
     BundledSkillGuide {
         name: "orca-per-workspace-env",
-        markdown: include_str!("../../../reference/orca/skills/orca-per-workspace-env/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orca-per-workspace-env.md"),
     },
     BundledSkillGuide {
         name: "orchestration",
-        markdown: include_str!("../../../reference/orca/skills/orchestration/SKILL.md"),
+        markdown: include_str!("../assets/orca/skills/orchestration.md"),
     },
 ];
 
