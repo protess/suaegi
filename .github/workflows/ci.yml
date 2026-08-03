@@ -33,9 +33,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2.79.11
+        uses: taiki-e/install-action@v2.85.7
         with:
-          tool: cargo-nextest@0.9.140
+          tool: nextest@0.9.140
           fallback: none
 
       - name: Check formatting
