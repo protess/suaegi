@@ -1426,6 +1426,10 @@ mod tests {
             match_agent("C:\\tools\\codex\\codex.exe --help").map(|d| d.id),
             Some("codex")
         );
+        assert_eq!(
+            match_agent("C:\\Users\\me\\AppData\\Roaming\\npm\\CLAUDE.EXE --resume").map(|d| d.id),
+            Some("claude")
+        );
     }
 
     #[test]
