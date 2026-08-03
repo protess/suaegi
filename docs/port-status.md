@@ -359,9 +359,9 @@ paths remain implemented rather than counted complete by method name alone.
   nextest, and documentation-test gates. The CI profile bounds individual and
   global run time, serializes Darwin PTY users, and limits overall test
   concurrency to keep resource-sensitive coverage deterministic.
-- `cargo nextest run --workspace --profile ci`: 3795 passed, 6 opt-in tests
+- `cargo nextest run --workspace --profile ci`: 3797 passed, 6 opt-in tests
   skipped. `cargo test --workspace --doc` also passes.
-- `cargo test -p suaegi-app --lib`: 746 passed, 2 ignored after the current
+- `cargo test -p suaegi-app --lib`: 747 passed, 2 ignored after the current
   UI/runtime, settings-route, integration-preflight, Floating Workspace,
   browser dialog, orchestration, Linear, terminal IME, and daemon loop.
 - `cargo test -p suaegi-term --lib`: 289 tests passing, including authenticated
@@ -369,7 +369,7 @@ paths remain implemented rather than counted complete by method name alone.
 - `cargo test -p suaegi-term --test daemon_survival_test`: verifies the daemon
   is a detached session leader and the PTY accepts input after disconnect and
   reattach.
-- The app library's 746 passing tests sit alongside two opt-in live
+- The app library's 747 passing tests sit alongside two opt-in live
   credential/network probes that remain ignored, and cover the Floating
   Workspace lifecycle, multi-document editor tabs, browser
   URL/bounds/cookie/profile-store handling, remote pairing, usage, SSH,
