@@ -7250,7 +7250,11 @@ impl AppState {
             )
         } else {
             iced::Task::perform(
-                crate::editor::file_signature_now(entry.path.clone(), path.clone()),
+                crate::editor::file_signature_now(
+                    entry.path.clone(),
+                    path.clone(),
+                    expected.clone(),
+                ),
                 {
                     let worktree = worktree.clone();
                     let path = path.clone();
@@ -28285,6 +28289,8 @@ mod tests {
                 signature: suaegi_git::fs::FileSignature {
                     size: 1,
                     mtime: std::time::SystemTime::UNIX_EPOCH,
+                    change_marker: None,
+                    content_hash: Some([0; 32]),
                 },
             }),
         ));

@@ -752,9 +752,14 @@ pub fn load_file_now(worktree: PathBuf, path: String) -> Result<EditorLoad, Stri
     }
 }
 
-pub async fn file_signature_now(worktree: PathBuf, path: String) -> Result<FileSignature, String> {
+pub async fn file_signature_now(
+    worktree: PathBuf,
+    path: String,
+    expected: FileSignature,
+) -> Result<FileSignature, String> {
     tokio::task::spawn_blocking(move || {
-        suaegi_git::fs::file_signature(&worktree, &path).map_err(|error| error.to_string())
+        suaegi_git::fs::file_signature_for_compare(&worktree, &path, &expected)
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("File signature worker failed: {error}"))?
@@ -1222,6 +1227,8 @@ mod tests {
         FileSignature {
             size,
             mtime: SystemTime::UNIX_EPOCH,
+            change_marker: None,
+            content_hash: Some([0; 32]),
         }
     }
 

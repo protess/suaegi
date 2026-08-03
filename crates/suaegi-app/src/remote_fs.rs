@@ -183,6 +183,8 @@ fn signature(size: u64, mtime_ns: u64) -> FileSignature {
         mtime: UNIX_EPOCH
             .checked_add(Duration::from_nanos(mtime_ns))
             .unwrap_or(SystemTime::UNIX_EPOCH),
+        change_marker: None,
+        content_hash: None,
     }
 }
 
@@ -345,6 +347,8 @@ mod tests {
         let original = FileSignature {
             size: 7,
             mtime: UNIX_EPOCH + Duration::from_nanos(123_456),
+            change_marker: None,
+            content_hash: None,
         };
         assert_eq!(
             signature(original.size, signature_nanos(&original).unwrap()),

@@ -432,7 +432,15 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
 
 ## Plan 9 M5(안전 파일 write) 리뷰에서 넘긴 것
 
-30. **`FileSignature`(size+mtime)가 same-mtime-tick·same-size 외부 편집을 못 잡는다**
+30. ~~**`FileSignature`(size+mtime)가 same-mtime-tick·same-size 외부 편집을 못 잡는다.**~~
+    → 로컬 편집 문서의 signature에 Unix dev/inode/ctime 변경 표식과 SHA-256 내용 지문을
+    추가했다. macOS/Linux watcher는 stat-only 변경 표식으로 평상시 파일 내용을 다시 읽지
+    않고, 표식을 제공하지 않는 플랫폼만 size/mtime 동률 때 내용을 해시한다. stat 값을
+    일부러 같게 만든 테스트에서 watcher가 변경을 발견하고 autosave가
+    외부 내용 `bbbb`를 덮지 않는 것을 검증한다. 내용 해시를 제공하지 않는 원격 프로토콜은
+    기존 stat 계약을 유지한다.
+
+    기존 조사:
     (`crates/suaegi-git/src/fs.rs`, `FileSignature`/`write_file`). staleness 검사는
     `metadata.len()` + `metadata.modified()`만 비교한다 — 파일시스템 mtime 해상도 안에서
     같은 바이트 수로 외부 편집이 일어나면 지문이 그대로라 `write_file`이 clobber할 수
