@@ -239,10 +239,13 @@ impl PersistenceHandle {
         seq
     }
 
-    pub fn override_future_schema_guard(&self) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Request::OverrideFutureSchemaGuard);
-        }
+    /// Queue an explicit user-approved future-schema override. Returning
+    /// `false` means the persistence worker is already gone, so callers must
+    /// keep the warning visible instead of pretending saves were re-enabled.
+    pub fn override_future_schema_guard(&self) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Request::OverrideFutureSchemaGuard).is_ok())
     }
 
     /// Queue the final snapshot and retire this writer. Waiting on the returned
