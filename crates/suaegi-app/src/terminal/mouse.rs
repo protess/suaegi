@@ -126,6 +126,48 @@ pub fn hit_for(
     hit_test(cursor.position_in(bounds)?, metrics, size)
 }
 
+/// 진행 중인 드래그가 위젯 밖으로 나갔을 때 가장 가까운 그리드 가장자리 셀을
+/// 돌려준다. 일반 hover/휠에는 쓰지 않는다 — 밖에 있는 포인터를 다른 pane의
+/// 입력으로 오인하지 않고, 이미 이 위젯에서 시작한 제스처만 계속하기 위해서다.
+///
+/// `Point`도 함께 반환해 `State::cursor_pos`를 같은 가장자리로 갱신한다. 그 뒤
+/// 커서를 잃은 릴리스가 오더라도 마지막 선택 끝점을 그대로 복원할 수 있다.
+fn clamped_drag_hit(
+    cursor: iced_mouse::Cursor,
+    bounds: Rectangle,
+    metrics: CellMetrics,
+    size: GridSize,
+) -> Option<(ViewportHit, Point)> {
+    if size.rows == 0 || size.cols == 0 {
+        return None;
+    }
+    let relative = cursor.position_from(bounds.position())?;
+    if !relative.x.is_finite() || !relative.y.is_finite() {
+        return None;
+    }
+
+    let grid_width = size.cols as f32 * metrics.width();
+    let grid_height = size.rows as f32 * metrics.height();
+    // 오른쪽은 마지막 셀의 오른쪽 절반, 아래는 마지막 행의 중앙으로 붙인다.
+    // 정확히 grid_width/grid_height를 쓰면 hit_test의 반열린 범위에서 벗어난다.
+    let x = if relative.x < 0.0 {
+        0.0
+    } else if relative.x >= grid_width {
+        grid_width - metrics.width() * 0.25
+    } else {
+        relative.x
+    };
+    let y = if relative.y < 0.0 {
+        0.0
+    } else if relative.y >= grid_height {
+        grid_height - metrics.height() * 0.5
+    } else {
+        relative.y
+    };
+    let position = Point::new(x, y);
+    hit_test(position, metrics, size).map(|hit| (hit, position))
+}
+
 // ---------------------------------------------------------------------------
 // 스크롤 누산
 // ---------------------------------------------------------------------------
@@ -375,8 +417,19 @@ pub(crate) fn update_configured(
         return;
     };
 
-    let hit = hit_for(cursor, bounds, metrics, size);
+    let direct_hit = hit_for(cursor, bounds, metrics, size);
+    let owns_drag_event = match *mouse_event {
+        iced_mouse::Event::CursorMoved { .. } => state.held.is_some(),
+        iced_mouse::Event::ButtonReleased(button) => to_button(button) == state.held,
+        _ => false,
+    };
+    let clamped_hit = (direct_hit.is_none() && owns_drag_event)
+        .then(|| clamped_drag_hit(cursor, bounds, metrics, size))
+        .flatten();
+    let hit = direct_hit.or_else(|| clamped_hit.map(|(hit, _)| hit));
     if let Some(position) = cursor.position_in(bounds) {
+        state.cursor_pos = Some(position);
+    } else if let Some((_, position)) = clamped_hit {
         state.cursor_pos = Some(position);
     }
 
@@ -439,9 +492,9 @@ pub(crate) fn update_configured(
             }
         }
         iced_mouse::Event::CursorMoved { .. } => {
-            // 드래그 중이 아니면 모션은 보낼 것이 없다 — 마우스 모드 TUI만
-            // 순수 모션을 원하고, 그 판단은 그리드가 한다. 여기서는 bounds
-            // 안인지만 본다.
+            // 드래그 중 위젯 밖으로 나갔다면 `hit`은 가장 가까운 가장자리 셀로
+            // clamp돼 선택을 계속 늘린다. 버튼이 눌리지 않은 hover는 계속 bounds
+            // 안에서만 발행한다.
             let Some(hit) = hit else {
                 return;
             };
@@ -1167,10 +1220,8 @@ mod tests {
             got[0].action,
             MouseAction::Release(TermMouseButton::Left)
         ));
-        assert_eq!(
-            got[0].hit.col, 2,
-            "it falls back to the last cell we actually saw"
-        );
+        assert_eq!(got[0].hit.col, 0, "the release clamps to the left edge");
+        assert_eq!(got[0].hit.row, 0, "the release clamps to the top edge");
         assert_eq!(state.held, None);
     }
 
@@ -1587,26 +1638,57 @@ mod tests {
     }
 
     #[test]
-    fn motion_outside_the_widget_publishes_nothing() {
+    fn drag_motion_outside_the_widget_clamps_to_each_nearest_edge() {
         let mut state = wired_state();
-        // 먼저 안에서 눌러 last-known 셀을 만들어 둔다 — 그래야 이 테스트가
-        // "좌표를 몰라서 안 보냈다"가 아니라 "밖이라서 안 보냈다"를 보게 된다.
         let _ = run(
             &mut state,
             &press(iced_mouse::Button::Left),
-            cursor_at(2.0, 2.0),
+            cursor_at(10.0, 5.0),
         );
 
+        let cases = [
+            (
+                Point::new(-500.0, BOUNDS.y + 4.0 * 16.0 + 1.0),
+                4,
+                0,
+                alacritty_terminal::index::Side::Left,
+            ),
+            (
+                Point::new(900.0, BOUNDS.y + 6.0 * 16.0 + 1.0),
+                6,
+                19,
+                alacritty_terminal::index::Side::Right,
+            ),
+            (
+                Point::new(BOUNDS.x + 7.0 * 8.0 + 1.0, -500.0),
+                0,
+                7,
+                alacritty_terminal::index::Side::Left,
+            ),
+            (
+                Point::new(BOUNDS.x + 12.0 * 8.0 + 1.0, 900.0),
+                9,
+                12,
+                alacritty_terminal::index::Side::Left,
+            ),
+        ];
+        for (point, row, col, side) in cases {
+            let got = intents(&run(
+                &mut state,
+                &moved(),
+                iced_mouse::Cursor::Available(point),
+            ));
+            assert_eq!(got.len(), 1, "owned drag motion must remain routed");
+            assert_eq!((got[0].hit.row, got[0].hit.col), (row, col));
+            assert_eq!(got[0].hit.side, side);
+        }
+    }
+
+    #[test]
+    fn motion_outside_without_a_held_button_still_publishes_nothing() {
+        let mut state = wired_state();
         let outside = iced_mouse::Cursor::Available(Point::new(-500.0, -500.0));
-        assert!(
-            intents(&run(&mut state, &moved(), outside)).is_empty(),
-            "a drag that leaves the widget stops extending"
-        );
-        // 대조군: 안쪽 모션은 발행된다.
-        assert_eq!(
-            intents(&run(&mut state, &moved(), cursor_at(3.0, 2.0))).len(),
-            1
-        );
+        assert!(intents(&run(&mut state, &moved(), outside)).is_empty());
     }
 
     #[test]
