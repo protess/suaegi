@@ -45,6 +45,11 @@ by tests or live-app QA.
 - Safe filesystem backend: containment, symlink policy, directory listing,
   ignore/status queries, bounded reads, stale-write protection and external
   editor launch.
+- Native close requests enter a single bounded teardown path: the final state
+  snapshot is durably written by the persistence worker while the UI remains
+  responsive, duplicate close events cannot race another final write, and a
+  stalled filesystem cannot trap the main thread in a destructor join. A live
+  macOS close/relaunch preserved a valid current state file.
 - Git history/show, staging, commit, discard, fetch/pull/push and branch reads.
 - Backend crates for Quick Open, content search, automation schedules, browser
   URLs/screencast, MCP inspection and the smaller Orca protocol/normalizer ports.
