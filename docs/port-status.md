@@ -66,6 +66,10 @@ by tests or live-app QA.
   cannot restore its stale ordering.
 - Orca terminal themes, scoped shell history, cursor blinking, OSC 52 clipboard,
   macOS Option-as-Alt/JIS yen handling, bell and agent-completion notifications.
+- Modified Enter now follows Orca's live terminal policy: Ctrl+Enter uses CSI-u,
+  while Shift+Enter uses Kitty CSI-u only after the child negotiates the Kitty
+  keyboard protocol and otherwise falls back to legacy Meta+Enter. The tracker
+  follows push/pop, reset, alternate-screen, split-chunk, and replay semantics.
 - macOS terminal typography resolves Orca's `SF Mono` CSS alias to the native
   `.SF NS Mono` family, uses Orca's 500 default weight, and migrates the former
   400 default once without overwriting a user-selected weight.
