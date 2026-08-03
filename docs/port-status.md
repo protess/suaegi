@@ -12,6 +12,14 @@ scope is superseded. A settings row is not considered ported until its value is
 persisted, its runtime behavior is wired, and the behavior has been exercised
 by tests or live-app QA.
 
+## Local data
+
+- Durable application state and rolling backups live under the platform config
+  directory at `suaegi/data.json` (macOS:
+  `~/Library/Application Support/suaegi/data.json`).
+- Worktrees are separate user project data. Their default root is
+  `~/suaegi-workspaces`, or the custom workspace root selected in Settings.
+
 ## Implemented and wired
 
 - Repository registration, worktree create/list/remove, persistence and restore.
