@@ -60,6 +60,10 @@ by tests or live-app QA.
   configurable cwd, proxy/history/terminal preferences, button/status-bar
   triggers, attention state, and draggable/resizable geometry that survives
   relaunch.
+- Sidebar workspaces can be reordered with a dedicated drag grip. The live
+  vector order persists across relaunch, authoritative Git refreshes keep that
+  order while accepting fresh metadata, and a refresh that began before a drag
+  cannot restore its stale ordering.
 - Orca terminal themes, scoped shell history, cursor blinking, OSC 52 clipboard,
   macOS Option-as-Alt/JIS yen handling, bell and agent-completion notifications.
 - macOS terminal typography resolves Orca's `SF Mono` CSS alias to the native

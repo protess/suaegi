@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, text_input, Space,
 };
 use iced::{Alignment, Color, Element, Length};
 
@@ -662,6 +662,7 @@ fn worktree_entry<'a>(state: &'a AppState, entry: &'a WorktreeEntry) -> Element<
             is_pinned: state.worktree_is_pinned(&worktree_id),
             is_unread: state.worktree_is_unread(&worktree_id),
             is_sleeping: state.worktree_is_sleeping(&worktree_id),
+            is_dragging: state.worktree_is_dragging(&worktree_id),
             badge: state.worktree_badge(&worktree_id),
             presence: state.worktree_presence(&worktree_id),
             prompt_cache_seconds: state.prompt_cache_remaining_seconds(&worktree_id),
@@ -732,6 +733,7 @@ struct WorktreeRowState {
     is_pinned: bool,
     is_unread: bool,
     is_sleeping: bool,
+    is_dragging: bool,
     badge: BadgeState,
     presence: AgentPresence,
     prompt_cache_seconds: Option<u64>,
@@ -822,6 +824,8 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
     };
 
     let select_id = worktree_id.clone();
+    let hover_id = worktree_id.clone();
+    let drag_id = worktree_id.clone();
     let actions: Element<'static, Message> = if state.is_selected || state.actions_open {
         button(icons::view(Icon::Ellipsis, 11.0, theme::MUTED))
             .on_press(Message::WorktreeActionsToggled(worktree_id))
@@ -835,20 +839,33 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
             .into()
     };
 
-    row![
-        button(container(content).padding(metrics.content_padding))
-            .on_press(Message::WorktreeSelected(select_id))
-            .padding(0)
-            .width(Length::Fill)
-            .style(if state.is_selected {
-                theme::selected_button
-            } else {
-                theme::ghost_button
-            }),
-        actions,
-    ]
-    .spacing(1)
-    .align_y(Alignment::Center)
+    mouse_area(
+        row![
+            mouse_area(
+                container(text("⠿").size(9).color(theme::MUTED))
+                    .padding([8, 2])
+                    .style(if state.is_dragging {
+                        theme::active_card
+                    } else {
+                        theme::card
+                    }),
+            )
+            .on_press(Message::WorktreeDragStarted(drag_id)),
+            button(container(content).padding(metrics.content_padding))
+                .on_press(Message::WorktreeSelected(select_id))
+                .padding(0)
+                .width(Length::Fill)
+                .style(if state.is_selected {
+                    theme::selected_button
+                } else {
+                    theme::ghost_button
+                }),
+            actions,
+        ]
+        .spacing(1)
+        .align_y(Alignment::Center),
+    )
+    .on_enter(Message::WorktreeDragHovered(hover_id))
     .into()
 }
 

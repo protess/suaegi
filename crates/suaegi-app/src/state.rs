@@ -1565,6 +1565,8 @@ pub enum Message {
     },
     /// UI 선택 표시만 한다. worktree 선택으로 세션을 시작하는 것은 Task 5의 몫이다.
     WorktreeSelected(WorktreeId),
+    WorktreeDragStarted(WorktreeId),
+    WorktreeDragHovered(WorktreeId),
     /// Plan 9 M7: 선택한 worktree의 파일 트리를 열거나, 이미 같은 트리면 닫는다.
     FileExplorerToggled {
         worktree: WorktreeId,
@@ -2412,6 +2414,10 @@ pub struct AppState {
     floating_workspace_markdown_root: Option<PathBuf>,
     floating_workspace_pointer: Point,
     floating_workspace_drag: Option<FloatingWorkspaceDrag>,
+    /// Sidebar worktree currently being dragged. Reordering happens when the
+    /// pointer crosses another row and is persisted once on pointer release.
+    worktree_dragging: Option<WorktreeId>,
+    worktree_drag_changed: bool,
     floating_pending_commands: Vec<String>,
     keep_awake_process: Option<std::process::Child>,
     /// worktree당 세션 하나. 이미 열린 worktree를 다시 선택하면 새 세션을 또
@@ -2893,6 +2899,8 @@ impl Default for AppState {
             floating_workspace_markdown_root: None,
             floating_workspace_pointer: Point::ORIGIN,
             floating_workspace_drag: None,
+            worktree_dragging: None,
+            worktree_drag_changed: false,
             floating_pending_commands: Vec::new(),
             keep_awake_process: None,
             worktree_sessions: HashMap::new(),
@@ -4331,6 +4339,23 @@ impl AppState {
                 })
                 .map(ephemeral_worktree_entry),
         );
+        // A listing may have started before a sidebar drag completed. Preserve
+        // the live vector order for known rows while still accepting refreshed
+        // branch/head metadata and appending newly discovered worktrees.
+        if let Some(current) = self.worktrees_by_repo.get(&repo) {
+            let rank: HashMap<WorktreeId, usize> = current
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (worktree_id_for(&entry.path), index))
+                .collect();
+            let mut indexed = entries.into_iter().enumerate().collect::<Vec<_>>();
+            indexed.sort_by_key(|(incoming_index, entry)| {
+                rank.get(&worktree_id_for(&entry.path))
+                    .copied()
+                    .map_or((1, *incoming_index), |rank| (0, rank))
+            });
+            entries = indexed.into_iter().map(|(_, entry)| entry).collect();
+        }
         let still_present: HashSet<WorktreeId> =
             entries.iter().map(|e| worktree_id_for(&e.path)).collect();
         let vanished: Vec<WorktreeId> = self
@@ -4412,6 +4437,41 @@ impl AppState {
             .get(repo)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn worktree_is_dragging(&self, worktree: &WorktreeId) -> bool {
+        self.worktree_dragging.as_ref() == Some(worktree)
+    }
+
+    fn reorder_dragged_worktree_over(&mut self, target: &WorktreeId) -> bool {
+        let Some(source) = self.worktree_dragging.as_ref() else {
+            return false;
+        };
+        if source == target {
+            return false;
+        }
+        let Some((repo_id, source_index, target_index)) =
+            self.worktrees_by_repo
+                .iter()
+                .find_map(|(repo_id, entries)| {
+                    let source_index = entries
+                        .iter()
+                        .position(|entry| worktree_id_for(&entry.path) == *source)?;
+                    let target_index = entries
+                        .iter()
+                        .position(|entry| worktree_id_for(&entry.path) == *target)?;
+                    Some((repo_id.clone(), source_index, target_index))
+                })
+        else {
+            return false;
+        };
+        let entries = self
+            .worktrees_by_repo
+            .get_mut(&repo_id)
+            .expect("the matching repository was just found");
+        let moved = entries.remove(source_index);
+        entries.insert(target_index.min(entries.len()), moved);
+        true
     }
 
     pub(crate) fn worktree_is_visible(&self, entry: &WorktreeEntry) -> bool {
@@ -16291,13 +16351,18 @@ impl AppState {
                 iced::Task::none()
             }
             Message::FloatingWorkspacePointerReleased => {
+                self.worktree_dragging = None;
+                let reordered_worktree = std::mem::take(&mut self.worktree_drag_changed);
                 let Some(drag) = self.floating_workspace_drag.take() else {
+                    if reordered_worktree {
+                        self.persist();
+                    }
                     return iced::Task::none();
                 };
                 if drag.target == FloatingWorkspaceDragTarget::Trigger && !drag.moved {
                     return self.update(Message::FloatingWorkspaceToggled);
                 }
-                if drag.moved {
+                if drag.moved || reordered_worktree {
                     self.persist();
                 }
                 iced::Task::none()
@@ -18859,6 +18924,15 @@ impl AppState {
                         iced::Task::none()
                     }
                 }
+            }
+            Message::WorktreeDragStarted(id) => {
+                self.worktree_dragging = Some(id.clone());
+                self.worktree_drag_changed = false;
+                iced::Task::none()
+            }
+            Message::WorktreeDragHovered(target) => {
+                self.worktree_drag_changed |= self.reorder_dragged_worktree_over(&target);
+                iced::Task::none()
             }
             Message::WorktreeSelected(id) => {
                 self.automation_ui.close();
@@ -24157,6 +24231,37 @@ mod tests {
         assert!(
             state.worktree_names(&repo_id).is_empty(),
             "control: an authoritative empty listing IS evidence and does replace it"
+        );
+    }
+
+    #[test]
+    fn sidebar_drag_order_survives_a_concurrent_authoritative_refresh() {
+        let mut state = AppState::default();
+        let repo_id = RepoId("/tmp/reordered".into());
+        let a = entry_at("/tmp/reordered/a", "a");
+        let b = entry_at("/tmp/reordered/b", "b");
+        let c = entry_at("/tmp/reordered/c", "c");
+        state
+            .worktrees_by_repo
+            .insert(repo_id.clone(), vec![a.clone(), b.clone(), c.clone()]);
+
+        state.worktree_dragging = Some(worktree_id_for(&a.path));
+        assert!(state.reorder_dragged_worktree_over(&worktree_id_for(&c.path)));
+        assert_eq!(state.worktree_names(&repo_id), vec!["b", "c", "a"]);
+
+        let mut refreshed_a = a;
+        refreshed_a.head = Some("new-head".into());
+        state.note_list_issued(repo_id.clone(), OpId(1));
+        state.apply_authoritative_listing(repo_id.clone(), OpId(1), vec![refreshed_a, b, c]);
+        assert_eq!(
+            state.worktree_names(&repo_id),
+            vec!["b", "c", "a"],
+            "a refresh started before the drag must not restore stale list order"
+        );
+        assert_eq!(
+            state.worktrees_by_repo[&repo_id][2].head.as_deref(),
+            Some("new-head"),
+            "preserving order must still accept refreshed worktree metadata"
         );
     }
 
