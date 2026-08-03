@@ -79,9 +79,9 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
    **수정**: 공용 픽스처(`crates/suaegi-git/tests/fixture/mod.rs`)가 테스트 저장소에
    `core.excludesFile=/dev/null`을 설정한다. 새 테스트는 이 픽스처를 쓰면 자동으로 격리된다.
 
-5. **`CACHE_REVALIDATE_AFTER` 경계 미테스트** (`crates/suaegi-term/src/presence.rs`)
-   20회 히트 후 재검증 경로에 테스트가 없다. 폴링 주기를 소유하는 Plan 3에서
-   이 상수가 의미를 갖게 되므로 그때 단위 테스트를 추가한다.
+5. ~~**`CACHE_REVALIDATE_AFTER` 경계 미테스트**~~ (`crates/suaegi-term/src/presence.rs`)
+   → 첫 프로세스 조회 뒤 정확히 20회까지는 캐시된 에이전트를 반환하고, 21번째 히트에서
+   같은 pgid를 다시 조회해 셸로 바뀐 상태를 `NoAgent`로 반영하는 경계 테스트를 추가했다.
 
 ## 성능 — 실측 완료
 
