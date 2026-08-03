@@ -449,7 +449,12 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     content-hash(또는 inode+ctime)를 추가해 stat 동률일 때도 실제 변경을 감지한다.
     watcher 서브시스템(Plan 9 미포팅)이 붙는 후속 플랜과 함께 보는 게 자연스럽다.
 
-31. **크래시 시 `.tmpXXXXXX` 형제가 잔존해 diff 패널에 untracked로 뜬다**
+31. ~~**크래시 시 임시 형제가 잔존해 diff 패널에 untracked로 뜬다.**~~ → 편집기 원자
+    저장 임시 파일을 예약 이름 `.suaegi-editor-tmp-*.tmp`로 만들고, branch compare의
+    untracked 수집에서 접두·접미사와 비어 있지 않은 랜덤 본문이 모두 맞는 파일만 제외한다.
+    정상/오류 경로는 tempfile Drop이 계속 정리하고, 크래시 잔존물만 diff 잡음에서 사라진다.
+
+    기존 조사:
     (`crates/suaegi-git/src/fs.rs`, `write_file` step 7). 원자적 쓰기는
     `NamedTempFile::new_in(parent)`로 형제 temp를 만든 뒤 `persist`(rename)한다. 정상
     경로와 실패 경로(`Drop`)는 temp를 정리하지만, **`persist` 직전 프로세스가 크래시하면**

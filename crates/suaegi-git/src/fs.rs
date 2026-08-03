@@ -17,6 +17,10 @@ use std::time::SystemTime;
 /// 50 MB. **버퍼링 전에** stat 크기로 걸러 큰 파일을 통째로 메모리에 올리지 않는다
 /// (`filesystem.ts:565-569`). `FileDiff::TooLarge`와 같은 규율.
 pub const MAX_TEXT_FILE_SIZE: u64 = 50 * 1024 * 1024;
+/// Reserved sibling name used only for crash-safe editor writes. A process
+/// crash may leave one behind; compare.rs recognizes this exact namespace.
+pub const EDITOR_TEMP_PREFIX: &str = ".suaegi-editor-tmp-";
+pub const EDITOR_TEMP_SUFFIX: &str = ".tmp";
 
 /// 디렉터리 한 엔트리. `is_dir`/`is_symlink`는 **링크 자체**의 타입이다
 /// (`symlink_metadata`, Orca `withFileTypes` + `:447-462`) — 심링크→디렉터리라도
@@ -472,7 +476,10 @@ pub fn write_file(
     //    `NamedTempFile` drop이 정리한다(`persistence.rs:200-206` 패턴).
     //    NOTE(follow-up): persist 직전에 **크래시**하면 `.tmpXXXXXX` 형제가 남아
     //    `branch_compare`의 untracked 수집에 뜬다(잔존 정리는 `docs/follow-ups.md` 기록).
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(EDITOR_TEMP_PREFIX)
+        .suffix(EDITOR_TEMP_SUFFIX)
+        .tempfile_in(parent)?;
     tmp.write_all(content)?;
     tmp.as_file().sync_all()?;
     tmp.persist(&target).map_err(|e| e.error)?;
