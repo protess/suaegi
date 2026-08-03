@@ -33,6 +33,8 @@ by tests or live-app QA.
   follow-up hook. Turn boundaries retain pane-scoped non-terminal background
   task and scheduled-cron evidence across thin payloads, ignore completed
   inventory rows, and clear retained work on drain or explicit interruption.
+  All explicit hook rows share Orca's 30-minute freshness boundary, so Claude's
+  hook-less permission-denial path cannot strand a permanent waiting badge.
 - Diff panel and restored pane layouts.
 - GitHub and GitLab review providers; PR/MR create, status, review/comments and
   confirm-gated merge. Integrations settings run the real `gh`/`glab`

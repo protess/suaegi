@@ -163,12 +163,11 @@ pub enum HookState {
     Done,
 }
 
-/// `Working` 훅 상태가 이 나이를 넘으면 [`BadgeState::Unknown`]으로 떨어진다.
-/// **`Waiting`에는 적용하지 않는다** — 답 없는 `AskUserQuestion`은 몇 시간이고
-/// 정당하게 `Waiting`이다. 오래돼서 의심스러운 것은 `Working`뿐이다.
-///
-/// Orca와 같은 30분이다. 측정된 API 재시도 창(~210초)보다 길어 정상 재시도 중
-/// `Unknown`으로 튀지 않고, 긴 Claude 도구 작업도 Orca보다 먼저 회색으로 변하지 않는다.
+/// 훅 상태가 이 나이를 넘으면 [`BadgeState::Unknown`]으로 떨어진다.
+/// Orca의 `AGENT_STATUS_STALE_AFTER_MS`와 같은 30분이며 Working/Waiting/Done 모두
+/// 같은 freshness gate를 통과한다. 측정된 API 재시도 창(~210초)보다 길어 정상
+/// 재시도 중 `Unknown`으로 튀지 않으면서, 거부 뒤 후속 훅이 없는 PermissionRequest가
+/// 영구적인 주황 배지로 남는 것도 막는다.
 pub const HOOK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// `NoAgent`를 몇 번 연속으로 봐야 `Done`으로 확정하는가. `presence.rs`가 셸이
@@ -198,10 +197,12 @@ pub struct BadgeInput {
 /// | `Exited{code}` | 무엇이든 | `Done` (코드≠0이면 오류 표시) — **최우선** |
 /// | `NoAgent`, streak < 3 | 무엇이든 | `previous` 유지 (셸 exec 중 포그라운드 전이) |
 /// | `NoAgent`, streak ≥ 3 | 무엇이든 | `Done` |
-/// | `Agent(_)` | `Waiting` (나이 무관) | `Waiting` — **절대 감쇠시키지 않는다** |
+/// | `Agent(_)` | `Waiting`, [`HOOK_STALE_AFTER`] 이내 | `Waiting` |
+/// | `Agent(_)` | `Waiting`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
 /// | `Agent(_)` | `Working`, [`HOOK_STALE_AFTER`] 이내 | `Working` |
 /// | `Agent(_)` | `Working`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
-/// | `Agent(_)` | `Done`, 나이 무관 | `Done` |
+/// | `Agent(_)` | `Done`, [`HOOK_STALE_AFTER`] 이내 | `Done` |
+/// | `Agent(_)` | `Done`, [`HOOK_STALE_AFTER`] 초과 | `Unknown` |
 /// | `Agent(_)` | 없음 | `Unknown` |
 /// | `Unknown` | 있음 | 훅 그대로 (나이 규칙 동일) |
 /// | `Unknown` | 없음 | `Unknown` — **`Done`을 합성하지 않는다** |
@@ -209,12 +210,8 @@ pub struct BadgeInput {
 /// `Exited`가 최우선인 것은 크래시한 에이전트를 처리하는 규칙이다: 크래시한
 /// 에이전트는 `Stop`을 내지 않으므로 훅만으로는 영원히 `Working`이다.
 ///
-/// **단 "멈춘 배지를 막는 유일한 규칙"은 아니다 — 그렇게 적혀 있었고 틀렸다.**
-/// 이 행은 presence가 실제로 `Exited`로 관측될 때만 닿는다. 세션이 닫히면
-/// presence 조회가 `Unknown`으로 떨어져 이 행에 **영영 도달하지 못하고**, 그때
-/// 남아 있던 `Waiting` 훅은 나이로도 감쇠하지 않아 배지가 굳는다. 그쪽은
-/// 리듀서가 아니라 **호출부가 장부를 정리해서** 막는다
-/// (`AppState::close_session`이 `badges`에서 지운다).
+/// 세션이 닫힐 때는 호출부도 장부를 즉시 정리한다. freshness 감쇠만 기다리면 닫힌
+/// pane의 잘못된 상태가 최대 30분 남고 맵도 계속 자라기 때문이다.
 ///
 /// **`Agent(_)`와 `Unknown`이 같은 팔인 것은 표를 그대로 옮긴 결과다** — 위 표의
 /// 마지막 두 행이 `Agent(_)`의 대응 행과 글자 그대로 같다. presence가 "에이전트가
@@ -239,20 +236,12 @@ pub fn reduce(input: &BadgeInput) -> BadgeState {
             // **`Done`을 합성하지 않는다.** 훅을 못 봤다는 것은 끝났다는 뜻이
             // 아니다 — 신뢰 대화상자 대기 중이면 `SessionStart`조차 오지 않는다.
             None => BadgeState::Unknown,
-            // **나이를 보지 않는다.** 답 없는 권한 프롬프트는 몇 시간이고
-            // 정당하게 `Waiting`이다.
+            Some((_, at)) if input.now.saturating_duration_since(at) > HOOK_STALE_AFTER => {
+                BadgeState::Unknown
+            }
             Some((HookState::Waiting, _)) => BadgeState::Waiting,
             Some((HookState::Done, _)) => BadgeState::Done,
-            Some((HookState::Working, at)) => {
-                // 오래돼서 의심스러운 것은 `Working`뿐이다. `saturating_`인
-                // 이유는 시계가 뒤로 간 입력(테스트가 만드는)에서 패닉하지
-                // 않기 위해서다.
-                if input.now.saturating_duration_since(at) > HOOK_STALE_AFTER {
-                    BadgeState::Unknown
-                } else {
-                    BadgeState::Working
-                }
-            }
+            Some((HookState::Working, _)) => BadgeState::Working,
         },
     }
 }
@@ -525,10 +514,9 @@ mod tests {
             (Some(HookState::Working), FRESH, BadgeState::Working),
             (Some(HookState::Working), STALE, BadgeState::Unknown),
             (Some(HookState::Waiting), FRESH, BadgeState::Waiting),
-            // 나이 무관.
-            (Some(HookState::Waiting), STALE, BadgeState::Waiting),
+            (Some(HookState::Waiting), STALE, BadgeState::Unknown),
             (Some(HookState::Done), FRESH, BadgeState::Done),
-            (Some(HookState::Done), STALE, BadgeState::Done),
+            (Some(HookState::Done), STALE, BadgeState::Unknown),
         ];
         for (hook, age, want) in expected {
             let got = reduce(&input(
@@ -585,42 +573,37 @@ mod tests {
         );
     }
 
-    /// **`Waiting`은 절대 감쇠하지 않는다.** 답 없는 권한 프롬프트는 몇 시간이고
-    /// 정당하게 `Waiting`이다. 오래돼서 의심스러운 것은 `Working`뿐이다.
+    /// Orca는 모든 explicit agent row에 같은 30분 freshness gate를 적용한다.
+    /// Claude가 권한 거부 뒤 후속 훅을 주지 않아도 주황 배지가 영구히 남지 않는다.
     #[test]
-    fn waiting_never_decays_however_old_it_gets() {
-        for age in [
-            FRESH,
-            HOOK_STALE_AFTER,
-            HOOK_STALE_AFTER * 10,
-            Duration::from_secs(60 * 60 * 8),
-        ] {
+    fn every_hook_state_uses_orcas_shared_freshness_gate() {
+        for state in [HookState::Working, HookState::Waiting, HookState::Done] {
             assert_eq!(
                 reduce(&input(
                     AgentPresence::Agent("claude"),
-                    Some(HookState::Waiting),
-                    age,
+                    Some(state),
+                    HOOK_STALE_AFTER,
                     BadgeState::Unknown,
                     0
                 )),
-                BadgeState::Waiting,
-                "a permission prompt unanswered for {age:?} is still legitimately Waiting"
+                match state {
+                    HookState::Working => BadgeState::Working,
+                    HookState::Waiting => BadgeState::Waiting,
+                    HookState::Done => BadgeState::Done,
+                },
+                "the exact Orca boundary is still fresh for {state:?}"
             );
-            // 대조군: 같은 나이의 `Working`은 실제로 감쇠한다 — 위 단언이
-            // "나이가 아무 데도 안 쓰인다"로 설명되면 안 된다.
-            if age > HOOK_STALE_AFTER {
-                assert_eq!(
-                    reduce(&input(
-                        AgentPresence::Agent("claude"),
-                        Some(HookState::Working),
-                        age,
-                        BadgeState::Unknown,
-                        0
-                    )),
-                    BadgeState::Unknown,
-                    "control: Working at {age:?} DOES decay, so the age is genuinely consulted"
-                );
-            }
+            assert_eq!(
+                reduce(&input(
+                    AgentPresence::Agent("claude"),
+                    Some(state),
+                    HOOK_STALE_AFTER + Duration::from_millis(1),
+                    BadgeState::Done,
+                    0
+                )),
+                BadgeState::Unknown,
+                "one millisecond past Orca's freshness window decays {state:?}"
+            );
         }
     }
 

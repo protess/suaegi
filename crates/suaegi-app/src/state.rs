@@ -8802,9 +8802,9 @@ impl AppState {
             // **배지 장부도 같이 간다.** 남겨두면 세션이 사라진 뒤에도 마지막
             // 훅 상태가 살아 있는데, presence는 세션이 없으므로 `Unknown`으로
             // 떨어지고 — 리듀서의 `Unknown` 팔은 훅을 그대로 신뢰한다. 마지막
-            // 훅이 `Waiting`이었다면 **`Waiting`은 나이로 감쇠하지 않으므로**
-            // 사이드바 행(git 목록으로 그려지므로 세션과 무관하게 살아남는다)에
-            // 주황색 "사람을 기다림" 표시가 영구히 박힌다.
+            // 훅이 `Waiting`이었다면 freshness 만료까지 최대 30분 동안 사이드바
+            // 행(git 목록으로 그려지므로 세션과 무관하게 살아남는다)에 잘못된
+            // 주황색 "사람을 기다림" 표시가 남는다.
             // 지우면 `worktree_badge`가 `None` 가지를 타 `Unknown`이 된다 —
             // 세션이 없을 때 정직한 답이다. 맵이 무한히 자라는 것도 같이 막는다.
             self.badges.remove(&worktree_id);
@@ -25646,9 +25646,9 @@ mod tests {
     /// **닫힌 pane의 배지가 `Waiting`에 굳으면 안 된다.**
     ///
     /// 세션이 사라지면 presence는 `Unknown`으로 떨어지고, 리듀서의 `Unknown` 팔은
-    /// 훅을 그대로 신뢰한다. 마지막 훅이 `Waiting`이었다면 **`Waiting`은 나이로
-    /// 감쇠하지 않으므로** 사이드바 행(git 목록으로 그려져 세션과 무관하게
-    /// 살아남는다)에 주황색 표시가 영구히 박힌다. `Exited` 행은 이걸 못 막는다 —
+    /// 훅을 그대로 신뢰한다. 마지막 훅이 `Waiting`이었다면 freshness 만료까지
+    /// 최대 30분 동안 사이드바 행(git 목록으로 그려져 세션과 무관하게 살아남는다)에
+    /// 주황색 표시가 남는다. `Exited` 행은 이걸 못 막는다 —
     /// presence가 `Exited`로 관측될 일이 아예 없기 때문이다.
     #[test]
     fn closing_a_pane_does_not_strand_its_badge_on_waiting() {
@@ -25679,9 +25679,8 @@ mod tests {
         assert_eq!(
             state.worktree_badge(&worktree_id),
             BadgeState::Unknown,
-            "with the session gone the honest answer is Unknown — leaving Waiting puts a \
-             permanent orange 'needs you' marker on a worktree nobody is working in, and \
-             nothing can ever clear it because Waiting does not decay with age"
+            "with the session gone the honest answer is Unknown — leaving Waiting keeps an \
+             orange 'needs you' marker until the shared 30-minute freshness window expires"
         );
         assert!(
             !state.badges.contains_key(&worktree_id),
