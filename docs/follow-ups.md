@@ -304,42 +304,31 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
 
 ## Plan 5로 넘기는 것
 
-14. **세션 레이아웃 복원.** `PersistedState.session.active_worktree_id`는
-    Task 8에서 배선했다 — worktree를 선택할 때마다 `AppState::persist()`가
-    실제로 디스크에 쓴다(`state.rs`의 `Message::WorktreeSelected` 핸들러).
-    하지만 부팅 시(`AppState::boot`/`from_load`)에는 읽지 않는다 — 재시작 후
-    어느 worktree가 선택돼 있었는지, 어떤 pane 분할이 열려 있었는지 복원하는
-    UI는 Plan 5 몫이다.
+14. ~~**세션 레이아웃 복원.**~~ → `from_load`가 활성 worktree와 `PersistedPane`
+    트리를 읽고, hydration 뒤 세션을 재시작해 split 축·비율·활성 pane을 복원한다. 일부
+    worktree가 사라졌거나 시작에 실패하면 살아 있는 형제만 승격하며, 일시적 실패가 좋은
+    저장 레이아웃을 덮지 않도록 원본을 보존한다. 디스크 왕복과 부분 실패 테스트가 있다.
 
-15. **worktree 메타데이터가 재조회 때마다 유실된다.** `AppState::persisted_snapshot`
-    (`state.rs`)이 저장하는 `Worktree.created_at_unix_ms`/`created_with_agent`는
-    `worktrees_by_repo`(git이 돌려주는 `WorktreeEntry`)에서 매번 새로 합성한
-    자리표시자(`0`/`None`)다 — 실제 생성 시각·생성 에이전트를 추적하는 곳이
-    Plan 3엔 없다. git이 그 정보를 안 주므로, 어딘가(아마 세션 시작 시점)에서
-    직접 기록해 둬야 한다. 세션 레이아웃 복원이 이 메타데이터를 쓰게 되는
-    시점에 같이 처리한다.
+15. ~~**worktree 메타데이터가 재조회 때마다 유실된다.**~~ → 앱 소유
+    `WorktreeMeta`가 생성 에이전트·시각과 연결된 작업 항목을 보존한다. 부팅 시 디스크 값을
+    씨딩하고 저장 스냅샷에 재주입하므로 git 재조회나 앱 재시작이 값을 `0`/`None`으로
+    되돌리지 않는다. 생성 경로와 load→save 왕복을 테스트한다.
 
-16. **에이전트 상태 3색(working/waiting/done).** 지금 사이드바 배지는
-    "에이전트가 떠 있는가"만 안다(`AgentPresence`). hook 서버가 붙는 Plan 5의
-    몫이다(계획 문서에 이미 명시돼 있다).
+16. ~~**에이전트 상태 3색(working/waiting/done).**~~ → Claude hook, 프로세스 존재,
+    OSC title을 pane별 reducer에서 합성해 Unknown/Working/Waiting/Done을 구분한다. 사이드바는
+    네 상태를 서로 다른 glyph와 색으로 렌더하고 비정상 종료를 별도 오류 상태로 표시한다.
 
 ## Task 8에서 남긴 것
 
-17. **future-schema 저장 가드가 부팅 시점엔 조용하다.** `PersistenceHandle::spawn`이
-    반환하는 `LoadDiagnostics.save_blocked`는 `AppState::boot`이 지금 아무데도
-    쓰지 않는다 — 가드가 서 있어도 사용자가 뭔가를 바꿔 첫 `persist()` 호출이
-    실패할 때까지는(그제서야 `SaveStatus::Failed`가 상태 표시줄에 뜬다) 조용하다.
-    Task 0이 막으려 한 게 바로 이 케이스(손상된 본파일 + 미래 스키마 백업)인데,
-    사용자는 앱을 열고 몇 걸음 걷기 전까지는 "저장이 막혀 있다"는 걸 모른다.
-    부팅 직후에 바로 보여줄지, 그냥 첫 실패 시 알리는 지금 방식으로 충분한지는
-    UX 판단이 필요해 코드를 바꾸지 않고 남겨둔다.
+17. ~~**future-schema 저장 가드가 부팅 시점엔 조용하다.**~~ → `from_load`가
+    `save_blocked`를 즉시 상태로 올리고 사이드바가 첫 저장 전부터 영구 경고를 렌더한다.
+    2단계 `Review save options…` → `Back up & replace` 확인 전에는 원본을 건드리지 않으며,
+    승인하면 신버전 파일을 백업한 뒤 현재 스키마로 교체한다.
 
-18. **앱 데이터 파일 위치.** `crates/suaegi-app/src/persistence_thread.rs`의
-    `default_data_file()`이 `dirs::config_dir()/suaegi/data.json`(macOS:
-    `~/Library/Application Support/suaegi/data.json`)으로 정했다 —
-    `workspace_root`(worktree들이 실제로 생기는 곳, 기본값
-    `~/suaegi-workspaces`)와는 다른 위치다. 여태 이 결정이 어디에도 문서화돼
-    있지 않았다.
+18. ~~**앱 데이터 파일 위치.**~~ → `docs/port-status.md`의 Local data 절에
+    `dirs::config_dir()/suaegi/data.json`(macOS는
+    `~/Library/Application Support/suaegi/data.json`)과 기본 worktree 루트
+    `~/suaegi-workspaces`가 서로 다른 위치임을 명시했다.
 
 19. **Step 2(종단 흐름) 중 사람이 손으로 확인해야 하는 부분이 남아 있다.**
     담당 에이전트는 마우스/키보드로 앱 창을 직접 조작할 수 있는 수단이 없었고
@@ -354,7 +343,7 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
 
 ## Plan 3 최종 리뷰에서 넘긴 것
 
-20. **앱 종료 시 세션 drop이 UI 스레드에서 일어난다.** `AppState`/`SessionStore`가
+20. ~~**앱 종료 시 세션 drop이 UI 스레드에서 일어난다.**~~ `AppState`/`SessionStore`가
     보통 경로(`close()` → `Reaper`)를 거치는 건 pane을 하나씩 닫을 때뿐이다.
     창을 닫아 앱이 종료될 때는 `iced::application(...).run()`이 이벤트 루프를
     빠져나오며 `AppState`(그리고 그 안의 `SessionStore` 슬롯들)를 제자리에서
@@ -364,17 +353,10 @@ Plan 3의 워크벤치(`crates/suaegi-app/src/workbench.rs`)는 읽기 전용 �
     종료가 지연될 뿐이다. 하지만 "마지막 drop은 UI 스레드 밖에서" 규칙이 지켜지지
     않는 유일한 경로다.
 
-    깨끗한 수정은 `iced::window::close_requests()`를 구독해 첫 닫기 요청을
-    가로채고, 그 시점에 모든 세션을 `SessionStore::close()`(→ Reaper)로 은퇴시킨
-    뒤, 전부(또는 바운드된 타임아웃까지) 정리될 때까지 기다렸다가 그제서야
-    `window::close(id)`를 실제로 발행하는 것이다. 이번 리뷰에서는 이걸 구현하지
-    않았다: `Message` 변형과 구독 배선이 새로 필요하고, "창 닫기 요청을 가로채고
-    실제로 닫는" 흐름은 이 저장소의 테스트 하네스(진짜 창이 없는 plain `#[test]`)로
-    의미 있게 검증할 방법이 없다 — 마우스/키보드로 창을 조작하는 것도 이 플랜
-    범위에서 명시적으로 금지돼 있다(위 19번 참고). 검증 못 할 종료 경로 변경을
-    머지 직전에 밀어 넣는 것보다, "행이 아니라 지연된 종료"라는 지금 동작을
-    문서화해 두는 쪽을 택했다. 실제 창으로 종료를 조작해 확인할 수 있는 사람이
-    붙는 시점(또는 Plan 4/5에서 UI 자동화가 생기는 시점)에 다시 본다.
+    → 네이티브 `CloseRequested`를 `WindowClose`로 가로채 첫 요청에서만 최종 스냅샷을
+    persistence worker에 보낸다. 완료 대기는 UI 스레드 밖에서 최대 20초로 제한하고, 완료
+    또는 타임아웃 뒤 실제 `window::close`를 발행한다. 중복 close는 무시되며 최종 스냅샷이
+    대기 중 debounce 저장을 대체하는 worker 테스트와 실제 macOS close/relaunch로 검증했다.
 
 ## PR4 적대적 리뷰에서 넘긴 것
 
