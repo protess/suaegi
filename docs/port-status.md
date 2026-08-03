@@ -16,8 +16,9 @@ by tests or live-app QA.
 
 - Repository registration, worktree create/list/remove, persistence and restore.
 - Native PTY sessions, GPU terminal rendering, splits, focus, mouse, clipboard,
-  IME commit handling and all 35 Orca agent launch/detection entries, including
-  Trae CLI and Claude Agent Teams.
+  IME commit handling and cursor-anchored on-the-spot CJK preedit rendering, and
+  all 35 Orca agent launch/detection entries, including Trae CLI and Claude
+  Agent Teams.
 - Orca's Agents pane launch profiles are wired end-to-end: PATH refresh,
   enable/disable filtering, default selection, per-agent command/argument/env
   overrides, reserved-environment protection, and Yolo/Manual permission

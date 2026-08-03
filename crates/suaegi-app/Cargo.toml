@@ -56,6 +56,7 @@ bzip2 = "0.6"
 tempfile = { workspace = true }
 wait-timeout = "0.2"
 url = { workspace = true }
+unicode-width = { workspace = true }
 crypto_box = { version = "0.9.1", features = ["std", "getrandom"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 aes = "0.8.4"

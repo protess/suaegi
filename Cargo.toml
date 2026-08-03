@@ -46,3 +46,4 @@ chrono-tz = "0.10"
 # invalid → skip like JS try/catch). Hand-rolling WHATWG parsing is a huge error
 # surface, so we lean on the standard crate. See work-item-reference plan C2.
 url = "2"
+unicode-width = "0.2"
