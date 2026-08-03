@@ -1,5 +1,6 @@
 # 빌드 산출물
 /target/
+/dist/
 spikes/*/target/
 spikes/tauri-spike/src-tauri/target/
 spikes/tauri-spike/src-tauri/gen/
