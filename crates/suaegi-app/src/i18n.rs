@@ -14,11 +14,11 @@ use std::sync::{OnceLock, RwLock};
 use iced::advanced::text::IntoFragment;
 use iced::widget::Text;
 
-const EN: &str = include_str!("../../../reference/orca/src/renderer/src/i18n/locales/en.json");
-const ZH: &str = include_str!("../../../reference/orca/src/renderer/src/i18n/locales/zh.json");
-const KO: &str = include_str!("../../../reference/orca/src/renderer/src/i18n/locales/ko.json");
-const JA: &str = include_str!("../../../reference/orca/src/renderer/src/i18n/locales/ja.json");
-const ES: &str = include_str!("../../../reference/orca/src/renderer/src/i18n/locales/es.json");
+const EN: &str = include_str!("../assets/orca/locales/en.json");
+const ZH: &str = include_str!("../assets/orca/locales/zh.json");
+const KO: &str = include_str!("../assets/orca/locales/ko.json");
+const JA: &str = include_str!("../assets/orca/locales/ja.json");
+const ES: &str = include_str!("../assets/orca/locales/es.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Locale {
