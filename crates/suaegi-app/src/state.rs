@@ -1079,6 +1079,9 @@ pub enum Message {
     WindowOpened(iced::window::Id),
     AppWindowFocusChanged(bool),
     AppWindowResized(iced::Size),
+    FutureSchemaOverrideRequested,
+    FutureSchemaOverrideCancelled,
+    FutureSchemaOverrideConfirmed,
     BrowserOpenRequested,
     BrowserClosed,
     BrowserTabCreated,
@@ -2388,6 +2391,11 @@ pub struct AppState {
     /// 헛경고를 내지 않기 위한 안전한 값이다.
     load_origin: LoadOrigin,
     last_save_status: Option<SaveStatus>,
+    /// A newer Suaegi build wrote at least one persistence document. Saves
+    /// remain blocked until the user explicitly accepts a backup-and-replace
+    /// flow in the sidebar; never silently downgrade the on-disk schema.
+    future_schema_guarded: bool,
+    future_schema_override_confirming: bool,
     /// `None`이면 저장이 배선되지 않은 상태(테스트, 또는 미래에 실패한 부팅) —
     /// `persist()`는 조용히 아무것도 하지 않는다. 실 앱 경로에서는 `boot()`이
     /// 항상 `Some`을 채운다.
@@ -2884,6 +2892,8 @@ impl Default for AppState {
             daemon_action_confirm: None,
             load_origin: LoadOrigin::Fresh,
             last_save_status: None,
+            future_schema_guarded: false,
+            future_schema_override_confirming: false,
             persistence: None,
             shutdown_started: false,
             session_store: SessionStore::new(),
@@ -3168,6 +3178,7 @@ impl AppState {
     /// 그대로 쓴다.
     pub(crate) fn from_load(load: LoadDiagnostics) -> AppState {
         let mut state = AppState::default();
+        state.future_schema_guarded = load.save_blocked;
         state.repos = load.state.repos;
         state.workspace_root = load.state.settings.workspace_root;
         state.ui_settings = load.state.settings.ui;
@@ -7008,6 +7019,14 @@ impl AppState {
 
     pub(crate) fn last_save_status(&self) -> Option<&SaveStatus> {
         self.last_save_status.as_ref()
+    }
+
+    pub(crate) fn future_schema_guarded(&self) -> bool {
+        self.future_schema_guarded
+    }
+
+    pub(crate) fn future_schema_override_confirming(&self) -> bool {
+        self.future_schema_override_confirming
     }
 
     /// 존재하면 갱신, 없으면 등록 순서 끝에 추가한다 (등록 순서를 보존한다).
@@ -19987,6 +20006,38 @@ impl AppState {
                 }
                 iced::Task::none()
             }
+            Message::FutureSchemaOverrideRequested => {
+                self.future_schema_override_confirming = self.future_schema_guarded;
+                iced::Task::none()
+            }
+            Message::FutureSchemaOverrideCancelled => {
+                self.future_schema_override_confirming = false;
+                iced::Task::none()
+            }
+            Message::FutureSchemaOverrideConfirmed => {
+                if !self.future_schema_guarded {
+                    self.future_schema_override_confirming = false;
+                    return iced::Task::none();
+                }
+                let override_queued = self
+                    .persistence
+                    .as_ref()
+                    .is_some_and(PersistenceHandle::override_future_schema_guard);
+                if override_queued {
+                    // The worker channel is FIFO: the override is processed
+                    // before this snapshot. Store::save rotates the newer main
+                    // file into bak.0 before replacing it.
+                    self.future_schema_guarded = false;
+                    self.future_schema_override_confirming = false;
+                    self.last_save_status = None;
+                    self.persist();
+                } else {
+                    self.last_save_status = Some(SaveStatus::Failed(
+                        "Could not reach the settings persistence worker.".to_string(),
+                    ));
+                }
+                iced::Task::none()
+            }
             Message::BrowserOpenRequested => {
                 if self.floating_workspace_owns_browser() && !self.floating_workspace_open {
                     self.floating_workspace_content = FloatingWorkspaceContent::Empty;
@@ -24513,6 +24564,50 @@ mod tests {
             state.selected_worktree(),
             Some(&wt("/tmp/was-active")),
             "the field is written on every save; booting must actually read it back"
+        );
+    }
+
+    #[test]
+    fn future_schema_replacement_requires_two_steps_and_preserves_the_newer_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        let mut future = PersistedState {
+            schema_version: suaegi_core::domain::SCHEMA_VERSION + 1,
+            ..PersistedState::default()
+        };
+        future.repos.push(some_repo("newer-version"));
+        let future_json = serde_json::to_string_pretty(&future).unwrap();
+        std::fs::write(&file, &future_json).unwrap();
+
+        let boot = crate::persistence_thread::PersistenceHandle::spawn(file.clone());
+        let mut state = AppState::from_load(boot.load);
+        state.persistence = Some(boot.handle);
+        state.hydration = Hydration::opened();
+        assert!(state.future_schema_guarded());
+
+        let _ = state.update(Message::FutureSchemaOverrideRequested);
+        assert!(state.future_schema_guarded());
+        assert!(state.future_schema_override_confirming());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            future_json,
+            "opening the confirmation must never touch the newer document"
+        );
+
+        let _ = state.update(Message::FutureSchemaOverrideCancelled);
+        assert!(state.future_schema_guarded());
+        assert!(!state.future_schema_override_confirming());
+
+        let _ = state.update(Message::FutureSchemaOverrideRequested);
+        let _ = state.update(Message::FutureSchemaOverrideConfirmed);
+        assert!(!state.future_schema_guarded());
+        assert!(!state.future_schema_override_confirming());
+        let saved = flush_and_reload(state, &file);
+        assert_eq!(saved.schema_version, suaegi_core::domain::SCHEMA_VERSION);
+        assert_eq!(
+            std::fs::read_to_string(file.with_file_name("data.json.bak.0")).unwrap(),
+            future_json,
+            "confirming replacement must retain the newer file as the first backup"
         );
     }
 

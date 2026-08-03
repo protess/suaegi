@@ -143,3 +143,32 @@ fn a_future_schema_file_blocks_saves_visibly() {
         "a blocked save must report Failed, not silence"
     );
 }
+
+#[test]
+fn an_explicit_future_schema_override_backs_up_then_replaces_the_newer_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.json");
+    let mut future = state_with("from-the-future");
+    future.schema_version = SCHEMA_VERSION + 1;
+    let future_json = serde_json::to_string_pretty(&future).unwrap();
+    std::fs::write(&file, &future_json).unwrap();
+
+    let mut boot = PersistenceHandle::spawn(file.clone());
+    assert!(boot.load.save_blocked);
+    assert!(
+        boot.handle.override_future_schema_guard(),
+        "the live worker must accept the explicit override"
+    );
+    shutdown(&mut boot.handle, state_with("current-version"));
+    drop(boot.handle);
+
+    let main: PersistedState =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(main.schema_version, SCHEMA_VERSION);
+    assert_eq!(main.repos[0].display_name, "current-version");
+    assert_eq!(
+        std::fs::read_to_string(file.with_file_name("data.json.bak.0")).unwrap(),
+        future_json,
+        "the newer document must remain recoverable after the user accepts replacement"
+    );
+}
