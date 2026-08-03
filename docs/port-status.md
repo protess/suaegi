@@ -26,7 +26,12 @@ by tests or live-app QA.
   `--teammate-mode in-process` exactly once, while native panes install a
   private `tmux` shim and translate Claude's bounded tmux protocol into native
   Suaegi splits.
-- Claude hooks plus process/title-based agent status badges.
+- Claude hooks plus process/title-based agent status badges. Auto-allowed
+  `AskUserQuestion`/`request_user_input` calls enter the same waiting state as
+  Orca and plain Enter/Escape resolves that wait even when Claude omits the
+  follow-up hook. Turn boundaries retain pane-scoped non-terminal background
+  task and scheduled-cron evidence across thin payloads, ignore completed
+  inventory rows, and clear retained work on drain or explicit interruption.
 - Diff panel and restored pane layouts.
 - GitHub and GitLab review providers; PR/MR create, status, review/comments and
   confirm-gated merge. Integrations settings run the real `gh`/`glab`

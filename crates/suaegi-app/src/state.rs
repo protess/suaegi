@@ -31,7 +31,9 @@ use suaegi_keys::{KeybindingActionId, KeybindingFileSnapshot};
 use suaegi_secrets::Secret;
 use suaegi_term::agent::{agent_def_by_id, PromptInjection};
 use suaegi_term::grid::TerminalSnapshot;
-use suaegi_term::input_types::{CopyTargets, MouseAction, TermMouseButton, WriteOutcome};
+use suaegi_term::input_types::{
+    CopyTargets, KeyInput, MouseAction, NamedKey, TermKey, TermMouseButton, WriteOutcome,
+};
 use suaegi_term::presence::AgentPresence;
 use suaegi_tracker::{
     IssuePage, JiraAuthType, JiraConnection, JiraIssue, JiraPage, JiraViewer, LinearWorkspace,
@@ -39,8 +41,9 @@ use suaegi_tracker::{
 };
 
 use crate::agent_status::contract::{
-    hook_outcome, reduce, BadgeInput, BadgeState, HookEvent, HookOutcome, HookState, Hydration,
-    HydrationStep, PaneKey, SpawnNonce, LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
+    hook_outcome, is_ask_user_question_tool, reduce, BadgeInput, BadgeState, HookEvent,
+    HookOutcome, HookState, Hydration, HydrationStep, PaneKey, SpawnNonce, HOOK_STALE_AFTER,
+    LAYOUT_SAVE_DEBOUNCE, RESTORE_WATCHDOG,
 };
 use crate::agent_status::server::HookServer;
 use crate::automation::AutomationUiState;
@@ -2624,6 +2627,15 @@ struct PaneBadge {
     /// permission 대기 `Waiting`을 `Done`으로 덮어 MVP가 검증한 주황 배지를 회귀시킨다).
     /// **스폰마다 [`PaneBadge::new`]로 리셋되므로 세션 교체를 넘어 새지 않는다.**
     received_hook: bool,
+    /// The current Waiting state is Claude's interactive question rather than
+    /// a permission request. Claude emits no follow-up hook when Enter or
+    /// Escape resolves this surface, so terminal input supplies the fallback.
+    waiting_for_question: bool,
+    /// Latest authoritative lead-session background task inventory. This must
+    /// survive later hook payloads that omit the inventory.
+    claude_background_work_active: bool,
+    /// Latest authoritative lead-session scheduled-task inventory.
+    claude_session_crons_active: bool,
     /// `NoAgent` streak가 확정되기 전에 유지할 값.
     previous: BadgeState,
     no_agent_streak: u8,
@@ -2636,6 +2648,9 @@ impl PaneBadge {
             allow_reattach_nonce_bind: false,
             hook: None,
             received_hook: false,
+            waiting_for_question: false,
+            claude_background_work_active: false,
+            claude_session_crons_active: false,
             previous: BadgeState::Unknown,
             no_agent_streak: 0,
         }
@@ -6448,11 +6463,6 @@ impl AppState {
     /// 새 세션의 배지를 덮는 것을 막는 유일한 방어다.
     fn apply_hook(&mut self, event: &HookEvent) -> bool {
         let worktree_id = &event.pane_key.0;
-        let outcome = hook_outcome(event);
-        let should_notify = matches!(outcome, HookOutcome::Set(HookState::Done))
-            && self.ui_settings.notifications_enabled
-            && self.ui_settings.notification_agent_task_complete
-            && !(self.ui_settings.notification_suppress_when_focused && self.app_window_focused);
         // presence를 **먼저** 읽는다(아래에서 `badges`를 가변 대여하므로).
         let presence = self.worktree_presence(worktree_id);
         let Some((expected_nonce, allow_reattach_nonce_bind)) = self
@@ -6480,6 +6490,43 @@ impl AppState {
                 badge.allow_reattach_nonce_bind = false;
             }
         }
+        let is_turn_boundary = matches!(
+            event.event,
+            crate::agent_status::contract::HookEventName::Stop
+                | crate::agent_status::contract::HookEventName::StopFailure
+        );
+        let mut outcome = hook_outcome(event);
+        if event.agent_id.is_none() {
+            let badge = self
+                .badges
+                .get_mut(worktree_id)
+                .expect("badge existence was checked above");
+            if matches!(outcome, HookOutcome::Reset) || event.interrupted {
+                badge.claude_background_work_active = false;
+                badge.claude_session_crons_active = false;
+            } else {
+                if let Some(active) = event.background_work_active {
+                    badge.claude_background_work_active = active;
+                }
+                if let Some(active) = event.session_crons_active {
+                    badge.claude_session_crons_active = active;
+                } else if is_turn_boundary && event.background_work_active.is_some() {
+                    // Current Claude may omit an empty cron inventory while still
+                    // providing background_tasks at the turn boundary.
+                    badge.claude_session_crons_active = false;
+                }
+            }
+            if is_turn_boundary
+                && !event.interrupted
+                && (badge.claude_background_work_active || badge.claude_session_crons_active)
+            {
+                outcome = HookOutcome::Set(HookState::Working);
+            }
+        }
+        let should_notify = matches!(outcome, HookOutcome::Set(HookState::Done))
+            && self.ui_settings.notifications_enabled
+            && self.ui_settings.notification_agent_task_complete
+            && !(self.ui_settings.notification_suppress_when_focused && self.app_window_focused);
         self.note_agent_resume_hook(event, outcome);
         if self.ui_settings.tab_auto_generate_title {
             if let (Some(session_id), Some(title)) = (
@@ -6511,8 +6558,15 @@ impl AppState {
         badge.received_hook = true;
         match outcome {
             HookOutcome::Ignore => {}
-            HookOutcome::Reset => badge.hook = None,
-            HookOutcome::Set(state) => badge.hook = Some((state, Instant::now())),
+            HookOutcome::Reset => {
+                badge.hook = None;
+                badge.waiting_for_question = false;
+            }
+            HookOutcome::Set(state) => {
+                badge.hook = Some((state, Instant::now()));
+                badge.waiting_for_question = state == HookState::Waiting
+                    && is_ask_user_question_tool(event.tool_name.as_deref());
+            }
         }
         // **훅이 바뀌면 "유지할 값"도 같이 갱신한다.**
         //
@@ -8823,6 +8877,50 @@ impl AppState {
         }
     }
 
+    fn infer_claude_question_resolved(&mut self, id: SessionId, input: &KeyInput) -> bool {
+        let plain_submit_or_escape = !input.repeat
+            && !input.mods.shift
+            && !input.mods.ctrl
+            && !input.mods.alt
+            && !input.mods.logo
+            && matches!(
+                input.key,
+                TermKey::Named(NamedKey::Enter | NamedKey::Escape)
+            );
+        if !plain_submit_or_escape {
+            return false;
+        }
+        let Some(worktree_id) = self.session_worktrees.get(&id).cloned() else {
+            return false;
+        };
+        let presence = self.worktree_presence(&worktree_id);
+        let now = Instant::now();
+        let Some(badge) = self.badges.get_mut(&worktree_id) else {
+            return false;
+        };
+        let waiting_is_fresh = badge.hook.is_some_and(|(state, at)| {
+            state == HookState::Waiting && now.saturating_duration_since(at) <= HOOK_STALE_AFTER
+        });
+        if !badge.received_hook || !badge.waiting_for_question || !waiting_is_fresh {
+            return false;
+        }
+
+        // Claude sends no hook after AskUserQuestion is submitted or dismissed.
+        // The key was successfully queued to this exact session and this badge
+        // is still the same fresh waiting baseline, so synthesize the omitted
+        // post-question state. A later real hook remains authoritative.
+        badge.hook = Some((HookState::Working, now));
+        badge.waiting_for_question = false;
+        if !matches!(presence, AgentPresence::NoAgent) {
+            badge.previous = BadgeState::Working;
+        }
+        self.prompt_cache_started.remove(&worktree_id);
+        if let Some(live) = self.live_agent_resume.get_mut(&worktree_id) {
+            live.done_at = None;
+        }
+        true
+    }
+
     /// 위젯이 발행한 커맨드를 세션에 적용한다. 실행 스레드는 Task 0.8의 정책
     /// 표를 따른다: `Key`/`Paste`/`Mouse`/`Scroll`은 UI 스레드에서 곧바로(그리드가
     /// 짧은 term 락으로 인코딩 후 `try_send`), `Resize`와 선택 추출은 워커로.
@@ -8846,6 +8944,9 @@ impl AppState {
                 self.pending_injections.remove(&id);
                 self.terminal_last_input_at.insert(id, Instant::now());
                 let outcome = session.send_key(&input);
+                if outcome == WriteOutcome::Queued {
+                    self.infer_claude_question_resolved(id, &input);
+                }
                 self.note_write(id, outcome);
                 iced::Task::none()
             }
@@ -24464,7 +24565,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty: Some(true),
+            background_work_active: Some(false),
+            session_crons_active: Some(false),
+            interrupted: false,
         }
     }
 
@@ -24567,6 +24670,63 @@ mod tests {
         assert!(!state.badges.contains_key(&wt("/tmp/other")));
     }
 
+    #[test]
+    fn enter_and_escape_clear_only_a_fresh_claude_question_wait() {
+        use suaegi_term::input_types::{KeyLocation, Mods};
+
+        for key in [NamedKey::Enter, NamedKey::Escape] {
+            let (mut state, id, worktree, _pane) = state_with_one_open_session();
+            state
+                .badges
+                .insert(worktree.clone(), PaneBadge::new(SpawnNonce(7)));
+            let mut question = hook(&worktree.0, 7, HookEventName::PreToolUse);
+            question.tool_name = Some("AskUserQuestion".into());
+            assert!(state.apply_hook(&question));
+            assert!(state.badges[&worktree].waiting_for_question);
+
+            assert!(state.infer_claude_question_resolved(
+                id,
+                &KeyInput {
+                    key: TermKey::Named(key),
+                    physical_latin: None,
+                    location: KeyLocation::Standard,
+                    mods: Mods::default(),
+                    text: None,
+                    repeat: false,
+                }
+            ));
+            assert_eq!(
+                state.badges[&worktree].hook.map(|(state, _)| state),
+                Some(HookState::Working)
+            );
+            assert!(!state.badges[&worktree].waiting_for_question);
+        }
+
+        let (mut permission, id, worktree, _pane) = state_with_one_open_session();
+        permission
+            .badges
+            .insert(worktree.clone(), PaneBadge::new(SpawnNonce(8)));
+        let mut bash = hook(&worktree.0, 8, HookEventName::PermissionRequest);
+        bash.tool_name = Some("Bash".into());
+        assert!(permission.apply_hook(&bash));
+        assert!(!permission.infer_claude_question_resolved(
+            id,
+            &KeyInput {
+                key: TermKey::Named(NamedKey::Escape),
+                physical_latin: None,
+                location: KeyLocation::Standard,
+                mods: Mods::default(),
+                text: None,
+                repeat: false,
+            }
+        ));
+        assert_eq!(
+            permission.badges[&worktree].hook.map(|(state, _)| state),
+            Some(HookState::Waiting),
+            "Escape must not clear an ordinary permission request"
+        );
+    }
+
     /// `SessionStart`는 장부를 **지운다**. 옛 세션의 `Working`을 물려받으면 아무
     /// 일도 안 하는 pane이 도는 스피너로 보인다.
     #[test]
@@ -24591,6 +24751,62 @@ mod tests {
             state.badges[&wt("/tmp/wt-a")].hook.is_none(),
             "a fresh session starts from Unknown, not from whatever the last one was doing"
         );
+    }
+
+    #[test]
+    fn turn_boundaries_preserve_live_background_and_cron_evidence_until_drained_or_interrupted() {
+        let id = wt("/tmp/wt-a");
+        let mut state = state_with_badge(&id.0, 1);
+
+        let mut running = hook(&id.0, 1, HookEventName::Stop);
+        running.background_work_active = Some(true);
+        running.session_crons_active = Some(true);
+        assert!(state.apply_hook(&running));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working)
+        );
+
+        let mut thin_failure = hook(&id.0, 1, HookEventName::StopFailure);
+        thin_failure.background_work_active = None;
+        thin_failure.session_crons_active = None;
+        assert!(state.apply_hook(&thin_failure));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working),
+            "a thin non-interrupted StopFailure cannot discard prior live work"
+        );
+
+        let mut drained = hook(&id.0, 1, HookEventName::Stop);
+        drained.background_work_active = Some(false);
+        drained.session_crons_active = None;
+        assert!(state.apply_hook(&drained));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Done),
+            "a present drained task inventory also clears an omitted empty cron inventory"
+        );
+
+        let mut scheduled = hook(&id.0, 1, HookEventName::Stop);
+        scheduled.background_work_active = Some(false);
+        scheduled.session_crons_active = Some(true);
+        assert!(state.apply_hook(&scheduled));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Working)
+        );
+
+        let mut interrupted = hook(&id.0, 1, HookEventName::StopFailure);
+        interrupted.background_work_active = None;
+        interrupted.session_crons_active = None;
+        interrupted.interrupted = true;
+        assert!(state.apply_hook(&interrupted));
+        assert_eq!(
+            state.badges[&id].hook.map(|(state, _)| state),
+            Some(HookState::Done)
+        );
+        assert!(!state.badges[&id].claude_background_work_active);
+        assert!(!state.badges[&id].claude_session_crons_active);
     }
 
     #[test]
@@ -24905,7 +25121,9 @@ mod tests {
             tool_name: Some("Bash".into()),
             agent_id: None,
             prompt: None,
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
 
         assert_eq!(
@@ -24932,7 +25150,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Review community PR https://github.com/acme/app/pull/1094".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(state.session_tab_title(id), "PR 1094 - Review community");
 
@@ -24944,7 +25164,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please replace the first title".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(
             state.session_tab_title(id),
@@ -24985,7 +25207,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please fix the auth bug".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert!(state.auto_branch_rename_in_flight.contains(&worktree_id));
 
@@ -25004,7 +25228,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: Some("Please fix the auth bug".into()),
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert!(
             !imported.auto_branch_rename_in_flight.contains(&imported_id),
@@ -25177,7 +25403,9 @@ mod tests {
             tool_name: None,
             agent_id: None,
             prompt: None,
-            background_tasks_empty: None,
+            background_work_active: None,
+            session_crons_active: None,
+            interrupted: false,
         }));
         assert_eq!(
             state.worktree_badge(&worktree_id),
@@ -28148,6 +28376,9 @@ mod tests {
                 allow_reattach_nonce_bind: false,
                 hook: Some((HookState::Done, now - Duration::from_secs(61))),
                 received_hook: true,
+                waiting_for_question: false,
+                claude_background_work_active: false,
+                claude_session_crons_active: false,
                 previous: BadgeState::Done,
                 no_agent_streak: 0,
             },
