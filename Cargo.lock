@@ -5918,6 +5918,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite",
+ "unicode-width",
  "url",
  "wait-timeout",
  "window-vibrancy",
