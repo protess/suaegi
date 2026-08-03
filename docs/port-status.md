@@ -347,19 +347,22 @@ paths remain implemented rather than counted complete by method name alone.
 
 ## Verification baseline
 
-- `cargo test -p suaegi-app --lib`: 733 passed, 2 ignored after the current
+- GitHub Actions now runs Rust 1.94 on macOS with formatting, workspace Clippy,
+  nextest, and documentation-test gates. The CI profile bounds individual and
+  global run time, serializes Darwin PTY users, and limits overall test
+  concurrency to keep resource-sensitive coverage deterministic.
+- `cargo nextest run --workspace --profile ci`: 3795 passed, 6 opt-in tests
+  skipped. `cargo test --workspace --doc` also passes.
+- `cargo test -p suaegi-app --lib`: 746 passed, 2 ignored after the current
   UI/runtime, settings-route, integration-preflight, Floating Workspace,
-  browser dialog, orchestration, Linear, and daemon loop.
-- `cargo test --workspace`: passing after the final native Claude Agent Teams,
-  browser-dialog, Linear deep-context, and headless runtime loop; all unit,
-  integration, and documentation tests completed.
-- `cargo test -p suaegi-term --lib`: 286 tests passing, including authenticated
+  browser dialog, orchestration, Linear, terminal IME, and daemon loop.
+- `cargo test -p suaegi-term --lib`: 289 tests passing, including authenticated
   PTY I/O, warm replay and duplicate terminal-query suppression.
 - `cargo test -p suaegi-term --test daemon_survival_test`: verifies the daemon
   is a detached session leader and the PTY accepts input after disconnect and
   reattach.
-- `cargo test -p suaegi-app --lib`: 733 tests passing with two opt-in live
-  credential/network probes ignored, including the Floating
+- The app library's 746 passing tests sit alongside two opt-in live
+  credential/network probes that remain ignored, and cover the Floating
   Workspace lifecycle, multi-document editor tabs, browser
   URL/bounds/cookie/profile-store handling, remote pairing, usage, SSH,
   emulator, voice, encrypted runtime server, and current settings/runtime
