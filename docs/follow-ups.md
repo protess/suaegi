@@ -99,13 +99,12 @@ MVP를 실제로 띄워 사람 눈으로 확인하다가 나온 것들. 헤드�
 
 ## 결정 필요 (코드 변경 보류)
 
-8. **Windows에서 `claude.exe` 미탐지** (`crates/suaegi-term/src/agent.rs`)
-   `process_names`가 codex는 `&["codex", "codex.exe"]`로 두 형태를 다 갖고
-   있지만 claude는 `&["claude", "claude-code"]`뿐이라 `.exe` 확장자가 없다.
-   Windows에서 basename 매칭이 `claude.exe`를 놓친다(pre-existing, 이
-   브랜치의 변경으로 생긴 문제 아님). `bcd6b5b`에서 확정한 basename-only
-   매칭 규칙과 어떻게 맞물릴지(단순히 `"claude.exe"`를 추가할지, 확장자를
-   벗기는 정규화를 basename_matches에 넣을지) 별도로 결정한 뒤에 고친다.
+8. ~~**Windows에서 `claude.exe` 미탐지**~~ (`crates/suaegi-term/src/agent.rs`) →
+   basename-only 규칙은 유지하고, 공용 `normalized_basename`이 `.exe`/`.cmd`/`.bat`/
+   `.ps1`을 대소문자 구분 없이 벗기도록 정리돼 있다. 따라서 Claude만 별칭을 늘리는 대신
+   모든 등록 에이전트가 동일한 Windows 규칙을 쓴다. 대문자 `CLAUDE.EXE`가 포함된 전체
+   Windows 경로를 Claude로 잡고, 이름이 디렉터리에만 등장하는 경로는 계속 거부하는
+   회귀 테스트로 고정했다.
 
 ## Plan 5 리뷰에서 결정이 필요해 남긴 것
 
