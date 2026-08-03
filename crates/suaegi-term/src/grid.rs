@@ -15,6 +15,7 @@ use crate::input_types::{
     CopyRequest, CopyTargets, GridMouseResult, KeyInput, MouseAction, MouseEncodeError,
     MouseIntent, MouseRoute, PointerLatch, TermMouseButton,
 };
+use crate::kitty_keyboard_mode_tracker::KittyKeyboardModeTracker;
 
 fn semantic_escape_chars_setting() -> &'static RwLock<String> {
     static SETTING: OnceLock<RwLock<String>> = OnceLock::new();
@@ -404,6 +405,7 @@ fn clip_selection(
 pub struct TerminalGrid {
     state: FairMutex<GridState>,
     parser: Mutex<Processor>,
+    kitty_keyboard: Mutex<KittyKeyboardModeTracker>,
     proxy: GridEventProxy,
 }
 
@@ -429,6 +431,7 @@ impl TerminalGrid {
                 last_seen_selection,
             }),
             parser: Mutex::new(Processor::new()),
+            kitty_keyboard: Mutex::new(KittyKeyboardModeTracker::default()),
             proxy,
         }
     }
@@ -440,6 +443,10 @@ impl TerminalGrid {
         let mut parser = self.parser.lock().expect("parser mutex");
         parser.advance(&mut state.term, bytes);
         drop(parser);
+        self.kitty_keyboard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scan(bytes);
         bump_after_feed(&mut state);
     }
 
@@ -468,7 +475,13 @@ impl TerminalGrid {
 
     pub fn encode_key_locked(&self, input: &KeyInput) -> Option<Vec<u8>> {
         let state = self.state.lock();
-        encode::encode_key(input, *state.term.mode())
+        let kitty_active = self
+            .kitty_keyboard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flags()
+            > 0;
+        encode::encode_key_with_kitty(input, *state.term.mode(), kitty_active)
     }
 
     pub fn encode_paste_locked(&self, text: &str) -> Vec<u8> {
@@ -1080,6 +1093,39 @@ mod tests {
             b"\x1b[200~hi\x1b[201~".to_vec()
         );
         assert_eq!(grid.encode_focus_locked(true), Some(b"\x1b[I".to_vec()));
+    }
+
+    #[test]
+    fn shift_enter_tracks_the_kitty_mode_negotiated_by_the_live_tui() {
+        let grid = TerminalGrid::new(GridSize { rows: 4, cols: 10 }, 100);
+        let shift_enter = KeyInput {
+            key: TermKey::Named(NamedKey::Enter),
+            physical_latin: None,
+            location: KeyLocation::Standard,
+            mods: Mods {
+                shift: true,
+                ..Mods::default()
+            },
+            text: None,
+            repeat: false,
+        };
+
+        assert_eq!(
+            grid.encode_key_locked(&shift_enter),
+            Some(b"\x1b\r".to_vec())
+        );
+
+        grid.feed(b"\x1b[>1u");
+        assert_eq!(
+            grid.encode_key_locked(&shift_enter),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+
+        grid.feed(b"\x1b[<u");
+        assert_eq!(
+            grid.encode_key_locked(&shift_enter),
+            Some(b"\x1b\r".to_vec())
+        );
     }
 
     // -----------------------------------------------------------------------
