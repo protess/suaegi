@@ -1,7 +1,7 @@
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, text_input, Space,
 };
-use iced::{Alignment, Color, Element, Length};
+use iced::{mouse, Alignment, Color, Element, Length};
 
 use suaegi_core::domain::{Repo, RepoId};
 #[cfg(test)]
@@ -685,6 +685,7 @@ fn worktree_entry<'a>(state: &'a AppState, entry: &'a WorktreeEntry) -> Element<
             is_pinned: state.worktree_is_pinned(&worktree_id),
             is_unread: state.worktree_is_unread(&worktree_id),
             is_sleeping: state.worktree_is_sleeping(&worktree_id),
+            is_hovered: state.worktree_is_hovered(&worktree_id),
             is_dragging: state.worktree_is_dragging(&worktree_id),
             badge: state.worktree_badge(&worktree_id),
             presence: state.worktree_presence(&worktree_id),
@@ -756,6 +757,7 @@ struct WorktreeRowState {
     is_pinned: bool,
     is_unread: bool,
     is_sleeping: bool,
+    is_hovered: bool,
     is_dragging: bool,
     badge: BadgeState,
     presence: AgentPresence,
@@ -848,7 +850,6 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
 
     let select_id = worktree_id.clone();
     let hover_id = worktree_id.clone();
-    let drag_id = worktree_id.clone();
     let actions: Element<'static, Message> = if state.is_selected || state.actions_open {
         button(icons::view(Icon::Ellipsis, 11.0, theme::MUTED))
             .on_press(Message::WorktreeActionsToggled(worktree_id))
@@ -862,33 +863,29 @@ fn worktree_row(entry: &WorktreeEntry, state: WorktreeRowState) -> Element<'stat
             .into()
     };
 
+    let row_content = container(content)
+        .padding(metrics.content_padding)
+        .width(Length::Fill);
+    let row_content = if state.is_selected || state.is_hovered || state.is_dragging {
+        row_content.style(theme::active_card)
+    } else {
+        row_content
+    };
+
+    // A MouseArea publishes on the physical press, unlike Button::on_press
+    // which activates on release. Drag tracking must begin before the pointer
+    // crosses another row, so the full non-action surface is deliberately not
+    // a nested button. The ellipsis remains a child button and captures its own
+    // press without starting a drag.
     mouse_area(
-        row![
-            mouse_area(
-                container(text("⠿").size(9).color(theme::MUTED))
-                    .padding([8, 2])
-                    .style(if state.is_dragging {
-                        theme::active_card
-                    } else {
-                        theme::card
-                    }),
-            )
-            .on_press(Message::WorktreeDragStarted(drag_id)),
-            button(container(content).padding(metrics.content_padding))
-                .on_press(Message::WorktreeSelected(select_id))
-                .padding(0)
-                .width(Length::Fill)
-                .style(if state.is_selected {
-                    theme::selected_button
-                } else {
-                    theme::ghost_button
-                }),
-            actions,
-        ]
-        .spacing(1)
-        .align_y(Alignment::Center),
+        row![row_content, actions]
+            .spacing(1)
+            .align_y(Alignment::Center),
     )
-    .on_enter(Message::WorktreeDragHovered(hover_id))
+    .on_press(Message::WorktreeDragStarted(select_id))
+    .on_enter(Message::WorktreeDragHovered(hover_id.clone()))
+    .on_exit(Message::WorktreeHoverExited(hover_id))
+    .interaction(mouse::Interaction::Pointer)
     .into()
 }
 

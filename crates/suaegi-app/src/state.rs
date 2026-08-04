@@ -1566,10 +1566,14 @@ pub enum Message {
         branch: Option<String>,
         result: crate::repo_hooks::HookRunResult,
     },
-    /// UI 선택 표시만 한다. worktree 선택으로 세션을 시작하는 것은 Task 5의 몫이다.
+    /// Selects the worktree and focuses or starts its existing terminal session.
     WorktreeSelected(WorktreeId),
+    /// A primary press on the workspace row starts sortable tracking and uses
+    /// the same selection path as a normal click. The global pointer release
+    /// ends tracking and persists a changed order once.
     WorktreeDragStarted(WorktreeId),
     WorktreeDragHovered(WorktreeId),
+    WorktreeHoverExited(WorktreeId),
     /// Plan 9 M7: 선택한 worktree의 파일 트리를 열거나, 이미 같은 트리면 닫는다.
     FileExplorerToggled {
         worktree: WorktreeId,
@@ -2432,6 +2436,9 @@ pub struct AppState {
     floating_workspace_markdown_root: Option<PathBuf>,
     floating_workspace_pointer: Point,
     floating_workspace_drag: Option<FloatingWorkspaceDrag>,
+    /// Sidebar worktree currently under the pointer, used only for Orca-style
+    /// row hover feedback.
+    worktree_hovered: Option<WorktreeId>,
     /// Sidebar worktree currently being dragged. Reordering happens when the
     /// pointer crosses another row and is persisted once on pointer release.
     worktree_dragging: Option<WorktreeId>,
@@ -2919,6 +2926,7 @@ impl Default for AppState {
             floating_workspace_markdown_root: None,
             floating_workspace_pointer: Point::ORIGIN,
             floating_workspace_drag: None,
+            worktree_hovered: None,
             worktree_dragging: None,
             worktree_drag_changed: false,
             floating_pending_commands: Vec::new(),
@@ -4462,6 +4470,10 @@ impl AppState {
 
     pub(crate) fn worktree_is_dragging(&self, worktree: &WorktreeId) -> bool {
         self.worktree_dragging.as_ref() == Some(worktree)
+    }
+
+    pub(crate) fn worktree_is_hovered(&self, worktree: &WorktreeId) -> bool {
+        self.worktree_hovered.as_ref() == Some(worktree)
     }
 
     fn reorder_dragged_worktree_over(&mut self, target: &WorktreeId) -> bool {
@@ -18961,10 +18973,17 @@ impl AppState {
             Message::WorktreeDragStarted(id) => {
                 self.worktree_dragging = Some(id.clone());
                 self.worktree_drag_changed = false;
-                iced::Task::none()
+                self.update(Message::WorktreeSelected(id))
             }
             Message::WorktreeDragHovered(target) => {
+                self.worktree_hovered = Some(target.clone());
                 self.worktree_drag_changed |= self.reorder_dragged_worktree_over(&target);
+                iced::Task::none()
+            }
+            Message::WorktreeHoverExited(id) => {
+                if self.worktree_hovered.as_ref() == Some(&id) {
+                    self.worktree_hovered = None;
+                }
                 iced::Task::none()
             }
             Message::WorktreeSelected(id) => {
@@ -24346,6 +24365,37 @@ mod tests {
             Some("new-head"),
             "preserving order must still accept refreshed worktree metadata"
         );
+    }
+
+    #[test]
+    fn pressing_a_sidebar_row_selects_it_and_tracks_a_full_row_drag() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        let mut state = wired_state(&file);
+        let repo_id = RepoId("/tmp/row-drag".into());
+        let a = entry_at("/nonexistent-suaegi-row-drag/a", "a");
+        let b = entry_at("/nonexistent-suaegi-row-drag/b", "b");
+        let c = entry_at("/nonexistent-suaegi-row-drag/c", "c");
+        let a_id = worktree_id_for(&a.path);
+        let c_id = worktree_id_for(&c.path);
+        state
+            .worktrees_by_repo
+            .insert(repo_id.clone(), vec![a, b, c]);
+
+        let _ = state.update(Message::WorktreeDragStarted(a_id.clone()));
+        assert_eq!(state.selected_worktree(), Some(&a_id));
+        assert!(state.worktree_is_dragging(&a_id));
+
+        let _ = state.update(Message::WorktreeDragHovered(c_id.clone()));
+        assert_eq!(state.worktree_names(&repo_id), vec!["b", "c", "a"]);
+        assert!(state.worktree_is_hovered(&c_id));
+
+        let _ = state.update(Message::FloatingWorkspacePointerReleased);
+        assert!(!state.worktree_is_dragging(&a_id));
+        assert!(!state.worktree_drag_changed);
+
+        let _ = state.update(Message::WorktreeHoverExited(c_id.clone()));
+        assert!(!state.worktree_is_hovered(&c_id));
     }
 
     // ---- 저장 트리거와 디바운스 ----
