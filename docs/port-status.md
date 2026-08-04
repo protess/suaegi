@@ -71,10 +71,12 @@ by tests or live-app QA.
   configurable cwd, proxy/history/terminal preferences, button/status-bar
   triggers, attention state, and draggable/resizable geometry that survives
   relaunch.
-- Sidebar workspaces can be reordered with a dedicated drag grip. The live
-  vector order persists across relaunch, authoritative Git refreshes keep that
-  order while accepting fresh metadata, and a refresh that began before a drag
-  cannot restore its stale ordering.
+- Sidebar workspaces can be reordered by dragging the full row, matching Orca
+  without a separate grip that looks like a dead button. A primary press also
+  keeps the normal click-to-select behavior. The live vector order persists
+  across relaunch, authoritative Git refreshes keep that order while accepting
+  fresh metadata, and a refresh that began before a drag cannot restore its
+  stale ordering.
 - Orca terminal themes, scoped shell history, cursor blinking, OSC 52 clipboard,
   macOS Option-as-Alt/JIS yen handling, bell and agent-completion notifications.
 - Modified Enter now follows Orca's live terminal policy: Ctrl+Enter uses CSI-u,
